@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
@@ -45,8 +46,10 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	if ro.complete && ro.desired > 0 && ro.image == rc.TargetImage && !rc.Maintenance {
 		st.Image = rc.TargetImage
 	}
-	// Ready: at least one pod serves the current template and no old pods remain.
+	// Ready: at least one pod serves the current template and no old pods remain, or a
+	// rolling update is replacing pods while ready ones keep serving.
 	ready := ro.upToDate && ro.desired > 0 && dep.Status.ReadyReplicas > 0
+	rolling := !ready && ro.inFlight && ro.desired > 0 && dep.Status.ReadyReplicas > 0
 	// replicaFailure: the ReplicaSet cannot create pods (e.g. rejected by Pod Security
 	// admission, a quota or a webhook); without it the reason only shows in its events.
 	replicaFailure := !ready && !rc.Maintenance && ro.replicaFailure != ""
@@ -55,6 +58,9 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	case ready:
 		rc.SetCondition(forgejov1.ConditionReady, metav1.ConditionTrue, "Available",
 			fmt.Sprintf("%d/%d replicas ready", dep.Status.ReadyReplicas, ro.desired))
+	case rolling && !rc.Maintenance:
+		rc.SetCondition(forgejov1.ConditionReady, metav1.ConditionTrue, "RollingUpdate",
+			fmt.Sprintf("%d replicas serving while %d/%d are updated", dep.Status.ReadyReplicas, dep.Status.UpdatedReplicas, ro.desired))
 	case rc.Maintenance:
 		rc.SetCondition(forgejov1.ConditionReady, metav1.ConditionFalse, "Maintenance", "Scaled down: "+rc.MaintenanceReason)
 	case !found:
@@ -99,16 +105,21 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	case ro.inFlight && st.ReadyReplicas > 0:
 		// A rolling update that is still serving traffic.
 		st.Phase = forgejov1.PhaseRunning
-	case st.Image == "" || ro.inFlight:
-		// First install, or a rollout (e.g. a config change with Recreate) in flight.
+	case st.Image == "" || ro.inFlight || ro.starting:
+		// First install, a rollout (e.g. a config change with Recreate) in flight, or pods
+		// still starting after a scale-up from zero (e.g. the end of a restore).
 		st.Phase = forgejov1.PhaseProvisioning
 	default:
 		st.Phase = forgejov1.PhaseDegraded
 	}
 
-	updateInstanceMetrics(rc, ready)
+	updateInstanceMetrics(rc, ready || (rolling && !rc.Maintenance))
 	return forgejo.StepResult{}, nil
 }
+
+// startingGrace is how long pods may take to become ready after a scale-up from zero before
+// the phase turns Degraded (the startup probe allows longer; this only affects the phase).
+const startingGrace = 10 * time.Minute
 
 // reasonReplicaFailure reports the Deployment's ReplicaFailure condition.
 const reasonReplicaFailure = "ReplicaFailure"
@@ -121,7 +132,10 @@ type rollout struct {
 	// upToDate: the current template is observed and no pods of older templates remain.
 	upToDate bool
 	// inFlight: the Deployment is still replacing pods (not merely missing ready ones).
-	inFlight         bool
+	inFlight bool
+	// starting: no pod is ready yet, but the Deployment became unavailable less than
+	// startingGrace ago (a scale-up from zero) and nothing reports a failure.
+	starting         bool
 	deadlineExceeded bool
 	desired          int32
 	image, message   string
@@ -157,6 +171,10 @@ func observeRollout(dep *appsv1.Deployment, found bool) rollout {
 				ro.replicaFailure = c.Reason
 			}
 		}
+		if c.Type == appsv1.DeploymentAvailable && c.Status == corev1.ConditionFalse &&
+			s.ReadyReplicas == 0 && ro.desired > 0 && time.Since(c.LastTransitionTime.Time) < startingGrace {
+			ro.starting = true
+		}
 		if c.Type != appsv1.DeploymentProgressing {
 			continue
 		}
@@ -170,6 +188,9 @@ func observeRollout(dep *appsv1.Deployment, found bool) rollout {
 	}
 	if oldPods && !ro.complete && !ro.deadlineExceeded {
 		ro.inFlight = true
+	}
+	if ro.deadlineExceeded || ro.replicaFailure != "" {
+		ro.starting = false
 	}
 	return ro
 }

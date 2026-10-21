@@ -2499,6 +2499,7 @@ spec:
                     format: int32
                     type: integer
                   healthy:
+                    description: healthy is always reported, false included.
                     type: boolean
                   lastCheckTime:
                     format: date-time

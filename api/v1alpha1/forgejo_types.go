@@ -873,8 +873,9 @@ type BackupStatusSummary struct {
 
 // HealthStatus reports operator-observed application health.
 type HealthStatus struct {
+	// healthy is always reported, false included.
 	// +optional
-	Healthy bool `json:"healthy,omitempty"`
+	Healthy bool `json:"healthy"`
 	// +optional
 	LastCheckTime *metav1.Time `json:"lastCheckTime,omitempty"`
 	// +optional
