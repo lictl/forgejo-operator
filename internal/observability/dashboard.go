@@ -42,6 +42,9 @@ func reconcileDashboard(ctx context.Context, rc *forgejo.ReconcileContext, want 
 	if !want {
 		return deleteIfOwned(ctx, rc, cm)
 	}
+	if err := validateLabels(specLabels(f.Spec.Monitoring.GrafanaDashboard)); err != nil {
+		return err
+	}
 	_, err := rc.CreateOrUpdate(ctx, cm, true, func() error {
 		labels := objectLabels(f, specLabels(f.Spec.Monitoring.GrafanaDashboard))
 		labels[dashboardLabel] = "1"

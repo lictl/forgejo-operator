@@ -109,9 +109,16 @@ The operator renders `app.ini` into `<name>-config`. Its hash is
 `status.configHash`; the operator also tracks the hash the spec would produce.
 
 1. **Last known good (LKG).** When the Deployment is fully rolled out with the desired
-   config, every pod has been Ready for 1 minute, and `status.health.healthy` is true, the
-   config is copied to `<name>-config-lkg`. Its hash is stored in
-   `status.autoPilot.lastKnownGoodConfigHash` (event `LastKnownGoodConfig`).
+   config, every replica is listed and has been Ready for 1 minute, and
+   `status.health.healthy` is true, the config is copied to `<name>-config-lkg`. Its hash is
+   stored in `status.autoPilot.lastKnownGoodConfigHash` (event `LastKnownGoodConfig`).
+   - Pods in phase `Failed` or `Succeeded` are ignored here and everywhere else in the
+     autopilot. Such pods, for example ones evicted under node pressure or stopped by a
+     graceful node shutdown, stay in the API until pod GC after their ReplicaSet has
+     replaced them.
+   - When the operator cannot reach Forgejo at all (`HealthProbeUnreachable`, see
+     [Health-based restarts](#health-based-restarts)), pod readiness stands in for
+     `status.health.healthy`. The kubelet's readiness probe calls the same `/api/healthz`.
 2. **Detection.** A pod running a config that differs from the LKG counts as failing when
    any of its containers, init containers included (the `bootstrap` init container runs
    `forgejo migrate` with the same app.ini), meets one of these:
@@ -158,10 +165,40 @@ two ways:
   shuts down gracefully and keeps file locks (for example the LevelDB queue of a non-HA
   instance) that its replacement needs. Records `PodRestarted`.
 - **Instance level.** `status.health.consecutiveFailures ≥ failureThreshold` while at least
-  one pod is Ready and every server container is running and not crash-looping. Health is
-  probed through the Service by the observability feature and only counts while a pod is
-  Ready. The response is a rolling restart: annotation
-  `forgejo.lucas.icu/restarted-at` on the pod template. Records `PodRestarted`.
+  one pod is Ready and every server container is running and not crash-looping, and the
+  latest failing probe was answered by Forgejo itself: `/api/healthz` returned its list of
+  checks with at least one failing (`status.health.checks`). Health is probed through the
+  Service by the observability feature and only counts while a pod is Ready. The response
+  is a rolling restart: annotation `forgejo.lucas.icu/restarted-at` on the pod
+  template. Records `PodRestarted`.
+  - In practice this covers a healthz that flaps: it fails at every operator probe but
+    never three kubelet probes in a row. When Forgejo fails healthz steadily, the kubelet's
+    readiness probe on the same endpoint marks the pods NotReady within about 30s. That
+    resets the streak and leaves the hang to the pod-level check.
+- **Unanswered probes never restart.** Some probes say nothing about Forgejo:
+  - a timeout, a refused or reset connection, or a DNS failure;
+  - a reply that is not Forgejo's healthz document, for example from a mesh sidecar.
+
+  The health step reports these as `Healthy=Unknown` with reason `Unreachable`, or, for a
+  connection that was accepted and then hung, as a failure without `checks`. When they
+  continue for 1 minute while pods keep passing their readiness probe, the operator cannot
+  reach Forgejo, but Forgejo is serving. Restarting would only cause outages, so the
+  operator instead:
+  - sets `Degraded=True` with reason `HealthProbeUnreachable`, unless `Degraded` is already
+    held by another reason;
+  - emits a `HealthProbeUnreachable` Warning event at most hourly;
+  - records the last known good config from pod readiness.
+
+  The condition clears once a probe gets through again.
+
+Network requirements: the operator probes
+`http://<name>-http.<namespace>.svc.cluster.local:<port>`, so it must run in the cluster (or
+somewhere that resolves and routes `svc.cluster.local`). Under a default-deny ingress
+NetworkPolicy, allow the operator's namespace to reach the Forgejo pods on the HTTP
+container port (3000). With a service mesh in STRICT mTLS mode, either add the operator to
+the mesh or exempt that port. Otherwise `status.health`, version and statistics stay empty
+and instance-level restarts never happen. The pod-level check still works, because it
+relies on the kubelet's readiness probe and an LKG recorded from pod readiness.
 
 Safeguards:
 - Only while the database is ready. With HA, Valkey must also be ready, otherwise the

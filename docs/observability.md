@@ -44,6 +44,24 @@ grafana:
 If your Prometheus selects objects by label (for example `release: kps`), add that label to
 each object with `spec.monitoring.serviceMonitor.labels` and `spec.monitoring.prometheusRule.labels`.
 
+### Network access from the operator
+
+The `health` step probes Forgejo from the operator pod through
+`http://<name>-http.<namespace>.svc.cluster.local:<port>` (port 3000 by default). The operator
+must be allowed to open that connection:
+
+- **NetworkPolicy:** if the Forgejo namespace denies ingress by default, allow ingress to the
+  Forgejo pods on the HTTP port from the operator's namespace (`forgejo-operator-system` with the
+  default kustomization).
+- **Service mesh:** with Istio `STRICT` mTLS (or an authorization policy that only admits the
+  ingress gateway), either use `PERMISSIVE` mode for that port, give the operator a sidecar, or
+  allow its identity.
+
+If the operator cannot reach Forgejo, the Healthy condition is `Unknown` with reason
+`Unreachable`, and a `HealthCheckUnreachable` event names the error. Unreachable probes never
+count as health failures, so they never trigger self-healing restarts. Health, version and
+statistics are not updated until the operator can reach Forgejo again.
+
 ### Scraping the operator
 
 Enable `../prometheus` in `config/default/kustomization.yaml` (the `[PROMETHEUS]` sections).
@@ -70,6 +88,23 @@ The `monitoring` step creates these objects. Each gets the standard labels plus
 | ConfigMap (Grafana dashboard) | `<name>-dashboard` | `spec.monitoring.enabled` and `spec.monitoring.grafanaDashboard.enabled` (default **false**) |
 
 Turning a toggle off deletes the object again, but only if this instance controls it.
+
+Monitoring is optional and never blocks the rest of the reconcile. The three objects are applied
+independently, so an invalid ServiceMonitor does not keep the PrometheusRule (with its backup and
+volume alerts) from being created. When an object cannot be applied, the operator does this:
+
+- It sets `Degraded=True` with reason `MonitoringFailed`, unless another feature already reports
+  `Degraded`. The message names the object and the error.
+- It emits a `MonitoringFailed` Warning event, once for each distinct error and then at most once
+  an hour.
+- It retries every minute.
+
+The steps after `monitoring` (scheduled backups, health checks and autopilot) keep running.
+Examples of such errors are a scrape interval that is not a Prometheus duration (`1min` instead of
+`1m`), a label key or value Kubernetes rejects, or an object of the same name that another owner
+controls. The operator checks the interval and labels itself before sending anything, and leaves
+an existing object unchanged when they are invalid. `ForgejoDown` is rendered only while the
+ServiceMonitor exists.
 
 ```yaml
 spec:
@@ -208,16 +243,30 @@ within the window.
 ### `status.health`
 
 The `health` step fills `status.health` by probing `GET /api/healthz` through
-`http://<name>-http.<namespace>.svc.cluster.local:<port>` with a 5s timeout.
+`http://<name>-http.<namespace>.svc.cluster.local:<port>`. The connection, including the DNS
+lookup, must be made within 2s, and the response headers must arrive within 5s after that. See
+[Network access from the operator](#network-access-from-the-operator).
 
 | Field | Meaning |
 |-------|---------|
-| `healthy` | Last probe returned 200 with `status` pass or warn. False while probes are suspended |
-| `lastCheckTime` | Time of the last probe |
+| `healthy` | Last probe returned 200 with `status` pass or warn. False while probes are suspended or Forgejo is unreachable |
+| `lastCheckTime` | Time of the last probe, unreachable ones included |
 | `lastHealthyTime` | Time of the last successful probe |
-| `consecutiveFailures` | Failed probes in a row against Ready pods. Reset by a success or while probes are suspended |
+| `consecutiveFailures` | Failed probes in a row against Ready pods. Reset by a success, an unreachable probe, or while probes are suspended |
 | `message` | `all checks pass`, the failing checks (`status fail: database:ping=fail`), the connection error, or why probing is suspended |
 | `checks` | Map from check name to status, e.g. `database:ping: pass`, `cache:ping: pass` |
+
+Each probe has one of three outcomes:
+
+| Outcome | When | Effect |
+|---------|------|--------|
+| Passed | HTTP 200 with `status` pass or warn | Healthy `True`, streak reset |
+| Failed | Forgejo answered with anything else (424 `fail`, another status, a body that is not a health document), or accepted the connection and sent no response headers within 5s (a hung process) | Healthy `False` (`HealthCheckFailed`), `consecutiveFailures` and `forgejo_operator_health_check_failures_total` increase |
+| Unreachable | No answer from Forgejo: DNS error, dial timeout, connection refused, or the connection reset or closed before a response (a NetworkPolicy or mesh mTLS shutting the operator out). An HTTP 401, 403, 502, 503 or 504 that is not a health document also counts here, because Forgejo always answers `/api/healthz` with one, so it came from a proxy in between. | Healthy `Unknown` (`Unreachable`), streak reset, nothing counted, `HealthCheckUnreachable` event |
+
+Only Failed probes feed self-healing. A hung Forgejo whose accept backlog is full may look like a
+dial timeout and be reported as Unreachable. Its pod also fails its readiness probe, and
+autopilot's pod-level hung-pod check covers it.
 
 How probing behaves:
 
@@ -252,12 +301,12 @@ monitoring is enabled. The values are also exported as `forgejo_operator_stats`.
 |------|--------|---------|
 | `Ready` | core | Forgejo is serving with the desired spec |
 | `Progressing` | core | A rollout, upgrade or restore is in flight |
-| `Degraded` | core / orchestrator | Something is wrong but the operator keeps trying (e.g. `ReconcileError` names the failing step) |
+| `Degraded` | core / orchestrator, feature packages | Something is wrong but the operator keeps trying (e.g. `ReconcileError` names the failing step, `MonitoringFailed` a monitoring object that could not be applied) |
 | `DatabaseReady` | core | The PostgreSQL backend is reachable/healthy |
 | `Upgrading` | upgrade | A version upgrade is being orchestrated |
 | `BackupHealthy` | backup | State of scheduled backups |
 | `StorageHealthy` | autopilot | PVC capacity/usage |
-| `Healthy` | observability | Result of the operator's `/api/healthz` probe. Reasons: `HealthCheckPassed`, `HealthCheckFailed` (message includes the streak), `NoReadyReplicas`, `Maintenance` |
+| `Healthy` | observability | Result of the operator's `/api/healthz` probe. Reasons: `HealthCheckPassed`, `HealthCheckFailed` (message includes the streak), `Unreachable` (the operator cannot connect; status `Unknown`), `NoReadyReplicas`, `Maintenance` |
 
 ## Events
 
@@ -265,8 +314,10 @@ The observability steps emit these events on the `Forgejo` object:
 
 | Reason | Type | When |
 |--------|------|------|
-| `HealthCheckFailed` | Warning | The probe outcome changes from passing (or never probed) to failing |
-| `HealthCheckRecovered` | Normal | The probe outcome changes from failing to passing |
+| `HealthCheckFailed` | Warning | The probe outcome changes to failing (from passing, unreachable or never probed) |
+| `HealthCheckUnreachable` | Warning | The probe outcome changes to unreachable. The message names the error and the network requirement |
+| `HealthCheckRecovered` | Normal | The probe outcome changes from failing or unreachable to passing |
+| `MonitoringFailed` | Warning | A ServiceMonitor, PrometheusRule or dashboard ConfigMap could not be applied (once per distinct error, then at most hourly) |
 | `VersionDetected` | Normal | `/api/v1/version` reports a different version than `status.version` |
 
 Other packages emit their own events:

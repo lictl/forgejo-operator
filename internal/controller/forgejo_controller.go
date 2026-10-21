@@ -24,6 +24,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -55,12 +56,22 @@ import (
 // drives health probing, statistics sampling and autopilot decisions.
 const defaultResync = 60 * time.Second
 
+const (
+	// restoreLiveCheckWindow is how long after a ForgejoRestore failed the restore guard
+	// double-checks for its Job with a live read, in case the cache had not caught up with it.
+	restoreLiveCheckWindow = 5 * time.Minute
+	// restoreGuardRequeue is how often a held maintenance re-checks the restore workload.
+	restoreGuardRequeue = 5 * time.Second
+)
+
 // ForgejoReconciler reconciles a Forgejo object by running an ordered list of steps,
 // each owned by a feature package.
 type ForgejoReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
+	// APIReader is an uncached reader (mgr.GetAPIReader()); it defaults to Client.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	Recorder  events.EventRecorder
 }
 
 type namedStep struct {
@@ -75,6 +86,7 @@ var steps = []namedStep{
 	{"high-availability", autopilot.ReconcileHA},
 	{"storage", core.ReconcileStorage},
 	{"maintenance", backup.ReconcileMaintenance},
+	{"restore-guard", reconcileRestoreGuard},
 	{"upgrade", upgrade.Reconcile},
 	{"tuning", autopilot.ReconcileTuning},
 	{"config", core.ReconcileConfig},
@@ -100,6 +112,7 @@ var steps = []namedStep{
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
 
 // Reconcile drives a Forgejo instance towards its spec.
 func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -118,8 +131,13 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	original := instance.DeepCopy()
+	apiReader := r.APIReader
+	if apiReader == nil {
+		apiReader = r.Client
+	}
 	rc := &forgejo.ReconcileContext{
 		Client:     r.Client,
+		APIReader:  apiReader,
 		Scheme:     r.Scheme,
 		Recorder:   r.Recorder,
 		RESTMapper: r.RESTMapper(),
@@ -194,6 +212,100 @@ func (r *ForgejoReconciler) patchStatus(ctx context.Context, original, instance 
 	// The optimistic lock keeps a reconcile working from a stale cache from overwriting
 	// status written by a newer one; conflicts are requeued by the caller.
 	return r.Status().Patch(ctx, instance, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{}))
+}
+
+// reconcileRestoreGuard keeps the instance in maintenance while a restore Job of this
+// instance still runs although no ForgejoRestore holds maintenance any more, e.g. when the
+// restore was marked failed while its Job kept running, or the Job was orphaned. Starting
+// Forgejo then would run migrations and serve traffic on a database and volume that
+// pg_restore and the archive extraction are still rewriting.
+func reconcileRestoreGuard(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
+	if rc.Maintenance {
+		return forgejo.StepResult{}, nil
+	}
+	f := rc.Instance
+	running, err := runningRestoreWorkload(ctx, rc.Client, f)
+	if err != nil {
+		return forgejo.StepResult{}, err
+	}
+	if running == "" {
+		// A restore that failed moments ago may have done so because the cache had not yet
+		// seen its freshly created Job; confirm with a live read before scaling up.
+		recent, err := restoreFailedRecently(ctx, rc.Client, f)
+		if err != nil {
+			return forgejo.StepResult{}, err
+		}
+		if recent {
+			if running, err = runningRestoreWorkload(ctx, rc.APIReader, f); err != nil {
+				return forgejo.StepResult{}, err
+			}
+		}
+	}
+	if running == "" {
+		return forgejo.StepResult{}, nil
+	}
+
+	rc.Maintenance = true
+	rc.MaintenanceReason = fmt.Sprintf("%s is still running although no ForgejoRestore is active; "+
+		"Forgejo stays scaled down until it finishes", running)
+	if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionProgressing); c == nil || c.Message != rc.MaintenanceReason {
+		rc.Event(corev1.EventTypeWarning, "RestoreJobStillRunning", "Restore", "%s", rc.MaintenanceReason)
+	}
+	return forgejo.StepResult{RequeueAfter: restoreGuardRequeue}, nil
+}
+
+// runningRestoreWorkload names the first restore Job or pod of the instance that has not
+// finished, or returns "" when there is none.
+func runningRestoreWorkload(ctx context.Context, r client.Reader, f *forgejov1.Forgejo) (string, error) {
+	sel := client.MatchingLabels{
+		forgejo.LabelName:      forgejo.AppName,
+		forgejo.LabelInstance:  f.Name,
+		forgejo.LabelComponent: forgejo.ComponentRestore,
+	}
+	jobs := &batchv1.JobList{}
+	if err := r.List(ctx, jobs, client.InNamespace(f.Namespace), sel); err != nil {
+		return "", fmt.Errorf("listing restore jobs: %w", err)
+	}
+	for i := range jobs.Items {
+		if !jobFinished(&jobs.Items[i]) {
+			return "restore job " + jobs.Items[i].Name, nil
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(f.Namespace), sel); err != nil {
+		return "", fmt.Errorf("listing restore pods: %w", err)
+	}
+	for _, p := range pods.Items {
+		if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
+			return "restore pod " + p.Name, nil
+		}
+	}
+	return "", nil
+}
+
+func jobFinished(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// restoreFailedRecently reports whether a ForgejoRestore of the instance failed within
+// restoreLiveCheckWindow.
+func restoreFailedRecently(ctx context.Context, c client.Client, f *forgejov1.Forgejo) (bool, error) {
+	restores, err := backup.ListRestores(ctx, c, f.Namespace, f.Name)
+	if err != nil {
+		return false, fmt.Errorf("listing restores: %w", err)
+	}
+	for _, rs := range restores {
+		if rs.Status.Phase == forgejov1.RestorePhaseFailed && rs.Status.CompletionTime != nil &&
+			time.Since(rs.Status.CompletionTime.Time) < restoreLiveCheckWindow {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

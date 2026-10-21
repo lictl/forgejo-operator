@@ -33,7 +33,10 @@ type DBConnection struct {
 // Steps read the outputs of earlier steps and record their own outputs here. The
 // orchestrator persists Instance.Status once, after all steps have run.
 type ReconcileContext struct {
-	Client     client.Client
+	Client client.Client
+	// APIReader reads straight from the API server, bypassing the informer cache. Use it
+	// only where acting on a stale cache would be unsafe; it is never nil.
+	APIReader  client.Reader
 	Scheme     *runtime.Scheme
 	Recorder   events.EventRecorder
 	RESTMapper meta.RESTMapper

@@ -44,7 +44,14 @@ What happens:
   `spec.backup.storage` (`size` 20Gi by default, `storageClassName`), or uses
   `spec.backup.storage.existingClaim`. It is `ReadWriteOnce`. The PVC is owned by the
   `Forgejo` object (and deleted with it) only when `spec.storage.retainPolicy: Delete`.
-* A Job `<backup>-job` runs one pod:
+* Raising `spec.backup.storage.size` grows the existing operator-managed PVC on the next
+  reconcile, without waiting for a backup, when its StorageClass has
+  `allowVolumeExpansion: true`. Otherwise a `StorageResizeUnsupported` Warning event is
+  recorded on the `Forgejo`. The claim is never shrunk; a lower size, or one below what was
+  already grown by hand, is ignored. An `existingClaim` is never resized. Plan for about
+  `(retention + 1) ×` the size of one backup, plus manual and pre-upgrade backups, which
+  retention does not prune.
+* A Job `<backup>-backup` runs one pod:
   * Init container `dump-database` uses the instance's PostgreSQL image
     (`spec.database.cnpg.imageName`, also for external databases). It connects with
     `PGHOST`/`PGPORT`/`PGDATABASE`/`PGSSLMODE`, and `PGUSER`/`PGPASSWORD` come from the
@@ -73,9 +80,13 @@ What happens:
                         # timestamps, sizes, excluded paths, tar warnings
 ```
 
-Every file is first written under a temporary name and renamed when complete. A crashed
-backup never leaves a half-written `db.dump` or `data.tar.gz`. The data archive is checked
-with `tar -tzf` before it is renamed.
+Every file is first written under a temporary name (`*.partial`) and renamed when complete.
+A crashed backup never leaves a half-written `db.dump` or `data.tar.gz`. The data archive is
+checked with `tar -tzf` before it is renamed. A failing step deletes its partial files on exit.
+When a backup fails, the operator also runs the cleanup Job `<backup>-cleanup` to remove its
+whole directory, after its Job has stopped. This covers a container killed by OOM, for
+example. A failed backup cannot be restored, and its leftovers would otherwise keep a full
+volume full. The `ForgejoBackup` object stays, so you can still see its status.
 
 The data archive leaves out content Forgejo recreates or rebuilds by itself:
 `lost+found`, `gitea/tmp`, `gitea/repo-archive` (archive download cache), `gitea/log`,
@@ -103,7 +114,8 @@ are re-populated from the database on start).
 
 `ForgejoBackup` objects carry the finalizer `forgejo.lucas.icu/finalizer`. Deleting
 one stops its Job if it is still running, then runs a cleanup Job `<backup>-cleanup` that
-removes `<pvc>/<backup-name>/`. The finalizer is released once that is done. Cleanup waits
+removes `<pvc>/<backup-name>/`. If that Job already ran because the backup failed, deletion
+finishes right away. The finalizer is released once that is done. Cleanup waits
 while an unfinished `ForgejoRestore` is reading the backup. The finalizer is also released
 when the PVC no longer exists, when cleanup fails, or after 10 minutes; a Warning event tells
 you to remove the directory by hand.
@@ -131,9 +143,11 @@ spec:
   another backup of the instance is `Pending` or `Running` waits for that backup to finish.
 * The first tick after enabling is the next schedule time; there is no immediate backup.
 * While scheduling is enabled, retention keeps the newest `retention` **completed**
-  scheduled backups. It also removes failed scheduled backups that are older than the
-  newest completed one. Manual and pre-upgrade backups are never pruned, and neither is a
-  backup that an unfinished restore is reading. Pruning deletes the `ForgejoBackup`, and
+  scheduled backups. Of the failed scheduled backups, it keeps only the newest, so that
+  `BackupHealthy` can report it, and only while no completed backup is newer. It removes
+  the rest whether or not a backup has succeeded since. Completed backups within
+  `retention` are never removed to make room. Manual and pre-upgrade backups are never
+  pruned, and neither is a backup that an unfinished restore is reading. Pruning deletes the `ForgejoBackup`, and
   the finalizer then removes its files.
 * Scheduled backups get an owner reference to the `Forgejo` object only under
   `retainPolicy: Delete`. With `Retain` they outlive the instance.
@@ -172,9 +186,39 @@ spec:
 |-------|--------------|
 | `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance. Fails otherwise. Waits for another restore of the instance to finish. |
 | `ScalingDown` | The Forgejo pipeline turns on maintenance mode: `status.backup.activeRestore` is set, the Deployment is scaled to 0, the phase becomes `Restoring` and health checks and autopilot actions are suspended. The restore waits until no Forgejo pod exists and no backup of the instance is running. It fails after 15 minutes if Forgejo does not scale down, for example because `spec.paused` is set or the reconcile is blocked earlier. |
-| `Restoring` | Job `<restore>-job` runs (see below). If its pod cannot start within 10 minutes, the restore fails before anything is changed. |
+| `Restoring` | Job `<restore>-restore` runs (see below). If its newest pod cannot start within 10 minutes, the Job is stopped and the restore fails. It reports "nothing was changed" only when no earlier pod got past `verify`. Otherwise the failure counts as one that may have changed the instance (see below). |
 | `ScalingUp` | Maintenance ends and Forgejo is scaled back up. The bootstrap init container runs `forgejo migrate` against the restored database. The restore waits up to 15 minutes for the Deployment to be available. |
-| `Completed` / `Failed` | Terminal. A failed restore also ends maintenance. |
+| `Completed` / `Failed` | Terminal. See below for when a failed restore ends maintenance. |
+
+Each kind has its own Job suffix (`-backup`, `-cleanup`, `-restore`), so a restore may have
+the same name as its backup. A backup or restore never uses a Job it does not control. If a
+Job with its name already exists and belongs to something else, the object fails with
+reason `JobNameConflict`. For a restore this happens before maintenance mode starts. A Job
+that is being deleted, or that was left by an earlier object of the same name, is waited for.
+
+The restore records how far its Job got in the condition `DataModified`. The controller
+looks at every pod of the Job, not only the newest:
+
+| `DataModified` | Meaning |
+|----------------|---------|
+| absent / `False` | Nothing was changed. No pod passed `verify`, or `restore-database` failed and its transaction was rolled back. |
+| `Unknown` | A pod passed `verify`, and whether it committed anything is not known. |
+| `True` | `restore-database` exited 0 (the transaction committed) or `restore-data` started (it empties the volume first). |
+
+A failed restore whose `DataModified` is `False` ends maintenance, and Forgejo runs on the
+untouched instance. A failed restore whose `DataModified` is `True` or `Unknown` **keeps
+Forgejo scaled to zero**. Its message, the `Forgejo`'s `Ready=False/Maintenance` condition
+and a `MaintenanceHeld` event say so. The data volume may be empty or half-extracted, and
+the database may already hold the backup. The hold ends when one of these happens:
+
+* A new `ForgejoRestore` of the instance gets to `ScalingUp`. This is the usual fix: correct
+  the cause, then restore again. The new restore takes over maintenance mode while it runs.
+* You set `forgejo.lucas.icu/release-maintenance: "true"` on the failed restore. This
+  starts Forgejo on whatever the restore left behind.
+* You delete the failed restore.
+
+During an upgrade rollback the same hold applies. The rollback is reported as failed, and
+Forgejo stays scaled to zero.
 
 The restore Job:
 
@@ -193,9 +237,11 @@ The restore Job:
    * This requires the app user to be able to drop schema `public`, that is, to own the
      database, as with CloudNativePG. An external database user without that right falls
      back to `pg_restore --clean --if-exists` (logged as a warning).
-3. `restore-data` (Forgejo image, runs as root with only `CHOWN`, `FOWNER` and
-   `DAC_OVERRIDE`) deletes everything on the data volume except `lost+found`, extracts the
-   archive, and `chown -R 1000:1000`. Root is needed to replace files of any owner on any
+3. `restore-data` (Forgejo image, runs as root with only `CHOWN`, `FOWNER`, `DAC_OVERRIDE`
+   and `FSETID`) deletes everything on the data volume except `lost+found`, extracts the
+   archive, and `chown -R 1000:1000`. This step cannot be rolled back. A failure here
+   leaves the database restored and the volume partly extracted, so the instance stays in
+   maintenance (see above). Root is needed to replace files of any owner on any
    storage backend. In a namespace that enforces the `restricted` Pod Security Standard,
    data restores are rejected; use `baseline`.
 
@@ -206,8 +252,16 @@ Notes:
   emits a `NewerBackup` warning event when `status.forgejoImage` of the backup is newer
   than the deployed image.
 * Excluded content (search indexes, queues, caches) is rebuilt after the restore.
-* Do not delete a `ForgejoRestore` while it is `Restoring`. Its Job is garbage-collected
-  and the data may be left half-restored.
+* `ForgejoRestore` objects carry the finalizer `forgejo.lucas.icu/finalizer`.
+  Deleting one stops its Job. The object, and maintenance mode while it is `ScalingDown`
+  or `Restoring`, stays until none of the Job's pods can still write. The `restore-data`
+  step stops within seconds of the TERM signal. A pod stuck on a lost node keeps the
+  deletion waiting until the pod is gone; force-delete the pod once the node is known to
+  be down.
+* Do not delete a `ForgejoRestore` while it is `Restoring` unless you mean to abort it.
+  Once the pods are gone, maintenance ends and Forgejo starts on a database or data volume
+  that may be half-restored. A `RestoreAborted` Warning event on the `Forgejo` reports this.
+  To recover, run another restore.
 * Metric: `forgejo_operator_restores_total{result}`.
 
 ### Restoring into a new instance (disaster recovery)

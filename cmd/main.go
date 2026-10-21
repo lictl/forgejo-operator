@@ -17,20 +17,25 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"os"
 	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -188,9 +193,10 @@ func main() {
 	autopilot.SetRESTConfig(mgr.GetConfig())
 
 	if err := (&controller.ForgejoReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("forgejo-controller"),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("forgejo-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "forgejo")
 		os.Exit(1)
@@ -222,10 +228,50 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := ctrl.SetupSignalHandler()
+	reportUndecodableForgejos(ctx, mgr.GetAPIReader(), watchNamespaces)
+
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
+	}
+}
+
+// reportUndecodableForgejos names every stored Forgejo that the typed informer cannot decode
+// (e.g. a duration such as "1d" stored before the CRD validated durations). One such object
+// fails the whole list, so the cache never syncs and the manager exits; the informer's own
+// error does not say which object is at fault.
+func reportUndecodableForgejos(ctx context.Context, r client.Reader, namespaces string) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	nss := []string{}
+	for _, ns := range strings.Split(namespaces, ",") {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			nss = append(nss, ns)
+		}
+	}
+	if len(nss) == 0 {
+		nss = []string{""} // all namespaces
+	}
+	for _, ns := range nss {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(forgejov1alpha1.GroupVersion.WithKind("ForgejoList"))
+		if err := r.List(ctx, list, client.InNamespace(ns)); err != nil {
+			setupLog.Info("Could not pre-check stored Forgejo objects", "namespace", ns, "error", err.Error())
+			continue
+		}
+		for i := range list.Items {
+			item := &list.Items[i]
+			raw, err := item.MarshalJSON()
+			if err == nil {
+				err = json.Unmarshal(raw, &forgejov1alpha1.Forgejo{})
+			}
+			if err != nil {
+				setupLog.Error(err, "Stored Forgejo cannot be decoded; no Forgejo is reconciled until it is fixed or deleted",
+					"namespace", item.GetNamespace(), "name", item.GetName())
+			}
+		}
 	}
 }
 

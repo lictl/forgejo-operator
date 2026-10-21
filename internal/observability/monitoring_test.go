@@ -1,0 +1,238 @@
+package observability
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
+	"github.com/lictl/forgejo-operator/internal/forgejo"
+)
+
+func monitoringRC(t *testing.T, f *forgejov1.Forgejo, funcs interceptor.Funcs) (*forgejo.ReconcileContext, *events.FakeRecorder) {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := forgejov1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	mapper := meta.NewDefaultRESTMapper(nil)
+	for _, gvk := range []schema.GroupVersionKind{forgejo.ServiceMonitorGVK, forgejo.PrometheusRuleGVK} {
+		s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+		s.AddKnownTypeWithName(gvk.GroupVersion().WithKind(gvk.Kind+"List"), &unstructured.UnstructuredList{})
+		mapper.Add(gvk, meta.RESTScopeNamespace)
+	}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f).WithInterceptorFuncs(funcs).Build()
+	rec := events.NewFakeRecorder(20)
+	return &forgejo.ReconcileContext{Client: c, Scheme: s, Recorder: rec, RESTMapper: mapper, Instance: f}, rec
+}
+
+func testInstance(name string) *forgejov1.Forgejo {
+	return &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name, UID: types.UID("uid-" + name)}}
+}
+
+func exists(t *testing.T, rc *forgejo.ReconcileContext, gvk schema.GroupVersionKind, name string) *unstructured.Unstructured {
+	t.Helper()
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk)
+	if err := rc.Client.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: name}, u); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	return u
+}
+
+func hasRule(u *unstructured.Unstructured, alert string) bool {
+	groups, _, _ := unstructured.NestedSlice(u.Object, "spec", "groups")
+	for _, g := range groups {
+		rules, _, _ := unstructured.NestedSlice(g.(map[string]any), "rules")
+		for _, r := range rules {
+			if r.(map[string]any)["alert"] == alert {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func degraded(rc *forgejo.ReconcileContext) *metav1.Condition {
+	return meta.FindStatusCondition(rc.Instance.Status.Conditions, forgejov1.ConditionDegraded)
+}
+
+func TestMonitoringFailuresDoNotStopThePipeline(t *testing.T) {
+	ctx := context.Background()
+	f := testInstance("bad-interval")
+	f.Spec.Monitoring.ServiceMonitor = &forgejov1.PrometheusResourceSpec{Interval: "1min"}
+	rc, rec := monitoringRC(t, f, interceptor.Funcs{})
+
+	res, err := ReconcileMonitoring(ctx, rc)
+	if err != nil {
+		t.Fatalf("step returned %v; optional monitoring must not stop the pipeline", err)
+	}
+	if rc.RequeueAfter != monitoringRetry || res.Stop {
+		t.Fatalf("requeue %s stop %v", rc.RequeueAfter, res.Stop)
+	}
+	c := degraded(rc)
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != ReasonMonitoringFailed || !strings.Contains(c.Message, `"1min"`) {
+		t.Fatalf("Degraded %+v", c)
+	}
+	if exists(t, rc, forgejo.ServiceMonitorGVK, "bad-interval") != nil {
+		t.Fatal("invalid ServiceMonitor was created")
+	}
+	pr := exists(t, rc, forgejo.PrometheusRuleGVK, "bad-interval")
+	if pr == nil {
+		t.Fatal("PrometheusRule not created next to the failing ServiceMonitor")
+	}
+	if hasRule(pr, "ForgejoDown") || !hasRule(pr, "ForgejoVolumeAlmostFull") {
+		t.Fatal("ForgejoDown must only be rendered while a ServiceMonitor exists")
+	}
+	if ev := drain(rec); len(ev) != 1 || !strings.Contains(ev[0], ReasonMonitoringFailed) {
+		t.Fatalf("events %v", ev)
+	}
+
+	// The same failure again: no new event.
+	if _, err := ReconcileMonitoring(ctx, rc); err != nil {
+		t.Fatal(err)
+	}
+	if ev := drain(rec); len(ev) != 0 {
+		t.Fatalf("repeated events %v", ev)
+	}
+
+	// Fixed: everything is applied and Degraded is cleared.
+	f.Spec.Monitoring.ServiceMonitor.Interval = "2m"
+	if _, err := ReconcileMonitoring(ctx, rc); err != nil {
+		t.Fatal(err)
+	}
+	if c := degraded(rc); c == nil || c.Status != metav1.ConditionFalse {
+		t.Fatalf("Degraded not cleared: %+v", c)
+	}
+	if exists(t, rc, forgejo.ServiceMonitorGVK, "bad-interval") == nil {
+		t.Fatal("ServiceMonitor missing")
+	}
+	if !hasRule(exists(t, rc, forgejo.PrometheusRuleGVK, "bad-interval"), "ForgejoDown") {
+		t.Fatal("ForgejoDown missing once the ServiceMonitor exists")
+	}
+}
+
+func TestMonitoringAPIErrors(t *testing.T) {
+	ctx := context.Background()
+	invalid := apierrors.NewInvalid(schema.GroupKind{Group: "monitoring.coreos.com", Kind: "ServiceMonitor"}, "x",
+		field.ErrorList{field.Invalid(field.NewPath("spec", "endpoints").Index(0).Child("interval"), "1min", "bad")})
+	isKind := func(obj client.Object, kind string) bool {
+		u, ok := obj.(*unstructured.Unstructured)
+		return ok && u.GetKind() == kind
+	}
+
+	t.Run("rejected ServiceMonitor", func(t *testing.T) {
+		rc, _ := monitoringRC(t, testInstance("rejected"), interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if isKind(obj, "ServiceMonitor") {
+					return invalid
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		})
+		if _, err := ReconcileMonitoring(ctx, rc); err != nil {
+			t.Fatalf("step returned %v", err)
+		}
+		if c := degraded(rc); c == nil || c.Reason != ReasonMonitoringFailed || !strings.Contains(c.Message, "ServiceMonitor rejected") {
+			t.Fatalf("Degraded %+v", c)
+		}
+		if exists(t, rc, forgejo.PrometheusRuleGVK, "rejected") == nil {
+			t.Fatal("PrometheusRule not created")
+		}
+	})
+
+	t.Run("conflict is returned for a quick retry", func(t *testing.T) {
+		rc, _ := monitoringRC(t, testInstance("conflict"), interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if isKind(obj, "PrometheusRule") {
+					return apierrors.NewConflict(schema.GroupResource{Resource: "prometheusrules"}, "conflict", nil)
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		})
+		if _, err := ReconcileMonitoring(ctx, rc); !apierrors.IsConflict(err) {
+			t.Fatalf("got %v, want a conflict", err)
+		}
+	})
+
+	t.Run("owned by someone else", func(t *testing.T) {
+		f := testInstance("taken")
+		rc, _ := monitoringRC(t, f, interceptor.Funcs{})
+		other := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "taken-dashboard", UID: "other",
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: "x", UID: "x", Controller: new(true)}}}}
+		if err := rc.Client.Create(ctx, other); err != nil {
+			t.Fatal(err)
+		}
+		f.Spec.Monitoring.GrafanaDashboard = &forgejov1.PrometheusResourceSpec{Enabled: new(true)}
+		if _, err := ReconcileMonitoring(ctx, rc); err != nil {
+			t.Fatalf("step returned %v", err)
+		}
+		if c := degraded(rc); c == nil || c.Reason != ReasonMonitoringFailed || !strings.Contains(c.Message, "taken-dashboard") {
+			t.Fatalf("Degraded %+v", c)
+		}
+		if exists(t, rc, forgejo.ServiceMonitorGVK, "taken") == nil || exists(t, rc, forgejo.PrometheusRuleGVK, "taken") == nil {
+			t.Fatal("ServiceMonitor/PrometheusRule not applied")
+		}
+	})
+}
+
+func TestMonitoringInvalidLabels(t *testing.T) {
+	f := testInstance("labels")
+	f.Spec.Monitoring.PrometheusRule = &forgejov1.PrometheusResourceSpec{Labels: map[string]string{"release": "kube prometheus"}}
+	rc, _ := monitoringRC(t, f, interceptor.Funcs{})
+	if _, err := ReconcileMonitoring(context.Background(), rc); err != nil {
+		t.Fatal(err)
+	}
+	if c := degraded(rc); c == nil || !strings.Contains(c.Message, `label "release" value "kube prometheus"`) {
+		t.Fatalf("Degraded %+v", c)
+	}
+	if exists(t, rc, forgejo.PrometheusRuleGVK, "labels") != nil {
+		t.Fatal("PrometheusRule with invalid labels was applied")
+	}
+	if exists(t, rc, forgejo.ServiceMonitorGVK, "labels") == nil {
+		t.Fatal("ServiceMonitor not applied")
+	}
+}
+
+func TestMonitoringKeepsOtherDegradedReasons(t *testing.T) {
+	f := testInstance("other")
+	f.Spec.Monitoring.ServiceMonitor = &forgejov1.PrometheusResourceSpec{Interval: "soon"}
+	rc, _ := monitoringRC(t, f, interceptor.Funcs{})
+	rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionTrue, "ConfigRolledBack", "rolled back")
+	if _, err := ReconcileMonitoring(context.Background(), rc); err != nil {
+		t.Fatal(err)
+	}
+	if c := degraded(rc); c.Reason != "ConfigRolledBack" {
+		t.Fatalf("Degraded overwritten: %+v", c)
+	}
+
+	// A stale orchestrator ReconcileError is replaced.
+	rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionTrue, "ReconcileError", `step "monitoring": ...`)
+	if _, err := ReconcileMonitoring(context.Background(), rc); err != nil {
+		t.Fatal(err)
+	}
+	if c := degraded(rc); c.Reason != ReasonMonitoringFailed {
+		t.Fatalf("Degraded %+v", c)
+	}
+}

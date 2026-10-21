@@ -95,8 +95,15 @@ func reconcileIngress(ctx context.Context, rc *forgejo.ReconcileContext) error {
 		ing.Labels = mergeMaps(ing.Labels, forgejo.Labels(f, forgejo.ComponentServer))
 		ing.Annotations = mergeMaps(ing.Annotations, spec.Annotations)
 		pathType := networkingv1.PathTypePrefix
+		// The DefaultIngressClass admission plugin fills in the cluster default class on
+		// create only. Keep it (or one set by hand) when className is unset, or the next
+		// update would strip it and controllers that ignore class-less Ingresses drop the route.
+		class := ing.Spec.IngressClassName
+		if spec.ClassName != nil {
+			class = spec.ClassName
+		}
 		ing.Spec = networkingv1.IngressSpec{
-			IngressClassName: spec.ClassName,
+			IngressClassName: class,
 			Rules: []networkingv1.IngressRule{{
 				Host: spec.Host,
 				IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{

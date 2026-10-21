@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -9,10 +10,14 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
@@ -24,6 +29,10 @@ const (
 	// so that removed ones are dropped without touching parameters set by others.
 	annotationManagedPGParams = "forgejo.lucas.icu/managed-pg-parameters"
 	dbNotReadyRequeue         = 10 * time.Second
+	// cnpgDegradedRequeue re-checks a cluster that serves from its primary while replicas
+	// are missing (the Cluster watch reports most changes sooner).
+	cnpgDegradedRequeue   = 30 * time.Second
+	reasonClusterDegraded = "ClusterDegraded"
 )
 
 // ReconcileDatabase ensures the CNPG Cluster (or validates the external DB secret) and
@@ -54,19 +63,50 @@ func reconcileExternalDB(ctx context.Context, rc *forgejo.ReconcileContext) (for
 	if err != nil {
 		return dbNotReady(rc, "CredentialsUnavailable", err.Error(), 30*time.Second)
 	}
-	addr := net.JoinHostPort(db.Host, strconv.Itoa(int(db.Port)))
-	conn, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", addr)
-	if err != nil {
-		st.Phase = "Unreachable"
-		return dbNotReady(rc, "Unreachable", fmt.Sprintf("cannot connect to %s: %v", addr, err), 30*time.Second)
+	// Forgejo resolves the host from its own namespace; the operator may run elsewhere.
+	// db.Host itself goes into app.ini and the backup jobs unchanged.
+	port := strconv.Itoa(int(db.Port))
+	var errs []string
+	addr := ""
+	for _, host := range probeHosts(db.Host, f.Namespace) {
+		a := net.JoinHostPort(host, port)
+		conn, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", a)
+		if err != nil {
+			errs = append(errs, err.Error())
+			// Only a name that does not exist moves on; a name that resolved is the target.
+			if dnsErr := (*net.DNSError)(nil); errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+				continue
+			}
+			break
+		}
+		_ = conn.Close()
+		addr = a
+		break
 	}
-	_ = conn.Close()
+	if addr == "" {
+		st.Phase = "Unreachable"
+		return dbNotReady(rc, "Unreachable", fmt.Sprintf("cannot connect to %s: %s",
+			net.JoinHostPort(db.Host, port), strings.Join(errs, "; ")), 30*time.Second)
+	}
 
 	st.Phase = "Reachable"
 	rc.DB = db
 	rc.DatabaseReady = true
 	rc.SetCondition(forgejov1.ConditionDatabaseReady, metav1.ConditionTrue, "Reachable", "External PostgreSQL at "+addr+" is reachable")
 	return forgejo.StepResult{}, nil
+}
+
+// probeHosts lists the names to probe for an external database host, in the order a pod in
+// namespace resolves them: a single-label name is a Service in that namespace first
+// ("<host>.<ns>.svc" resolves through the pod's search path whatever the cluster domain;
+// the cluster.local form serves an operator running outside the cluster), then the name as
+// given (node or corporate search domains).
+func probeHosts(host, namespace string) []string {
+	if net.ParseIP(host) != nil || strings.Contains(host, ".") || strings.EqualFold(host, "localhost") {
+		return []string{host}
+	}
+	svc := host + "." + namespace + ".svc"
+	return []string{svc, svc + ".cluster.local", host}
 }
 
 func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
@@ -99,14 +139,27 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 
 	ready, _, _ := unstructured.NestedInt64(cluster.Object, "status", "readyInstances")
 	phase, _, _ := unstructured.NestedString(cluster.Object, "status", "phase")
+	current, _, _ := unstructured.NestedString(cluster.Object, "status", "currentPrimary")
+	target, _, _ := unstructured.NestedString(cluster.Object, "status", "targetPrimary")
 	st.ReadyInstances = int32(ready)
 	st.Phase = phase
-	if phase != cnpgHealthyPhase || int32(ready) < st.Instances {
-		if phase == "" {
-			phase = "Creating"
+	if phase == "" {
+		phase = "Creating"
+	}
+	summary := fmt.Sprintf("CNPG cluster %s: %s (%d/%d instances ready)", name, phase, ready, st.Instances)
+	healthy := phase == cnpgHealthyPhase && int32(ready) >= st.Instances
+	if !healthy && f.Status.Image == "" {
+		// First install: wait for the whole cluster, as CNPG reports it.
+		return dbNotReady(rc, "ClusterNotReady", summary, dbNotReadyRequeue)
+	}
+	if !healthy {
+		// A lost replica must not stop the pipeline (and with it backups and restores) while
+		// the primary serves Forgejo; only an unavailable primary does.
+		if why, err := cnpgPrimaryUnavailable(ctx, rc, phase, current, target, ready); err != nil {
+			return forgejo.StepResult{}, err
+		} else if why != "" {
+			return dbNotReady(rc, "ClusterNotReady", summary+": "+why, dbNotReadyRequeue)
 		}
-		return dbNotReady(rc, "ClusterNotReady",
-			fmt.Sprintf("CNPG cluster %s: %s (%d/%d instances ready)", name, phase, ready, st.Instances), dbNotReadyRequeue)
 	}
 
 	db, err := forgejo.ResolveDB(ctx, rc.Client, f)
@@ -115,9 +168,64 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 	}
 	rc.DB = db
 	rc.DatabaseReady = true
-	rc.SetCondition(forgejov1.ConditionDatabaseReady, metav1.ConditionTrue, "ClusterHealthy",
-		fmt.Sprintf("CNPG cluster %s is healthy (%d/%d instances ready)", name, ready, st.Instances))
-	return forgejo.StepResult{}, nil
+	if healthy {
+		rc.SetCondition(forgejov1.ConditionDatabaseReady, metav1.ConditionTrue, "ClusterHealthy",
+			fmt.Sprintf("CNPG cluster %s is healthy (%d/%d instances ready)", name, ready, st.Instances))
+		return forgejo.StepResult{}, nil
+	}
+	if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionDatabaseReady); c == nil || c.Reason != reasonClusterDegraded {
+		rc.Event(corev1.EventTypeWarning, "DatabaseDegraded", "Database",
+			"%s; the primary %s serves Forgejo, backups and restores", summary, current)
+	}
+	rc.SetCondition(forgejov1.ConditionDatabaseReady, metav1.ConditionTrue, reasonClusterDegraded,
+		summary+"; primary "+current+" is available")
+	return forgejo.StepResult{RequeueAfter: cnpgDegradedRequeue}, nil
+}
+
+// cnpgPrimaryBlockedPhases are CNPG phases during which the primary does not accept
+// connections (or is about to change).
+var cnpgPrimaryBlockedPhases = map[string]bool{
+	"Setting up primary":                                       true,
+	"Failing over":                                             true,
+	"Switchover in progress":                                   true,
+	"Primary instance is being restarted in-place":             true,
+	"Primary instance is being restarted without a switchover": true,
+	"Upgrading Postgres major version":                         true,
+}
+
+// cnpgPrimaryUnavailable explains why the primary of a CNPG cluster that is not fully
+// healthy cannot serve Forgejo, or returns "" when it can.
+func cnpgPrimaryUnavailable(ctx context.Context, rc *forgejo.ReconcileContext, phase, current, target string, ready int64) (string, error) {
+	switch {
+	case current == "":
+		return "no primary yet", nil
+	case target != current:
+		return fmt.Sprintf("primary changing from %s to %s", current, target), nil
+	case cnpgPrimaryBlockedPhases[phase]:
+		return "primary unavailable", nil
+	case ready < 1:
+		return "no instance ready", nil
+	}
+	pod := &corev1.Pod{}
+	if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: rc.Instance.Namespace, Name: current}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "primary pod " + current + " not found", nil
+		}
+		return "", fmt.Errorf("primary pod %s: %w", current, err)
+	}
+	if !pod.DeletionTimestamp.IsZero() || !podReady(pod) {
+		return "primary pod " + current + " is not ready", nil
+	}
+	return "", nil
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func cnpgInstances(f *forgejov1.Forgejo) int32 {

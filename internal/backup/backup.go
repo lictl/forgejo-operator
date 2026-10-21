@@ -20,22 +20,21 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
+
 // ReconcileMaintenance sets rc.Maintenance while a ForgejoRestore targets this instance and
 // records it in status.backup.activeRestore. The restore controller waits for that
-// acknowledgement and for the server pods to be gone before it touches any data.
+// acknowledgement and for the server pods to be gone before it touches any data. A failed
+// restore that already changed the database or the data volume keeps the instance in
+// maintenance until it is released (see HoldsMaintenance).
 func ReconcileMaintenance(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	restores, err := ListRestores(ctx, rc.Client, f.Namespace, f.Name)
 	if err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("listing restores: %w", err)
 	}
-	var active *forgejov1.ForgejoRestore
-	for i := range restores {
-		if NeedsMaintenance(&restores[i]) {
-			active = &restores[i]
-			break
-		}
-	}
+	active, held := MaintenanceRestore(restores)
 
 	previous := ""
 	if f.Status.Backup != nil {
@@ -50,18 +49,63 @@ func ReconcileMaintenance(ctx context.Context, rc *forgejo.ReconcileContext) (fo
 	}
 
 	rc.Maintenance = true
-	rc.MaintenanceReason = fmt.Sprintf("ForgejoRestore %s is restoring backup %s", active.Name, active.Spec.BackupName)
 	summary(f).ActiveRestore = active.Name
+	if held {
+		rc.MaintenanceReason = fmt.Sprintf("ForgejoRestore %s failed after it changed the instance; fix the cause and run a new restore, "+
+			"or annotate the restore with %s=true (or delete it) to start Forgejo as it is", active.Name, AnnotationReleaseMaintenance)
+		if previous != active.Name {
+			rc.Event(corev1.EventTypeWarning, "MaintenanceHeld", "Restore", "%s", rc.MaintenanceReason)
+		}
+		return forgejo.StepResult{}, nil
+	}
+	rc.MaintenanceReason = fmt.Sprintf("ForgejoRestore %s is restoring backup %s", active.Name, active.Spec.BackupName)
 	if previous != active.Name {
 		rc.Event(corev1.EventTypeNormal, "MaintenanceStarted", "Restore", "Scaling down for ForgejoRestore %s", active.Name)
 	}
 	return forgejo.StepResult{}, nil
 }
 
+// MaintenanceRestore picks the restore that keeps the instance scaled to zero from restores
+// (oldest first): the oldest running one, otherwise the newest failed restore that holds
+// maintenance (held=true) and has not been superseded by a later restore that succeeded.
+// Running restores win so that a new restore can take over from a held one.
+func MaintenanceRestore(restores []forgejov1.ForgejoRestore) (*forgejov1.ForgejoRestore, bool) {
+	var held *forgejov1.ForgejoRestore
+	for i := range restores {
+		r := &restores[i]
+		if NeedsMaintenance(r) {
+			return r, false
+		}
+		if HoldsMaintenance(r) && !restoredAfter(restores[i+1:]) {
+			held = r
+		}
+	}
+	return held, held != nil
+}
+
+// restoredAfter reports whether one of the (later) restores has finished restoring.
+func restoredAfter(later []forgejov1.ForgejoRestore) bool {
+	for i := range later {
+		if p := later[i].Status.Phase; p == forgejov1.RestorePhaseScalingUp || p == forgejov1.RestorePhaseCompleted {
+			return true
+		}
+	}
+	return false
+}
+
 // ReconcileSchedule creates scheduled ForgejoBackups, prunes old ones and maintains
 // status.backup and the BackupHealthy condition.
 func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
+	warn := func(reason, msg string) { rc.Event(corev1.EventTypeWarning, reason, "ResizeVolume", "%s", msg) }
+	if grown, err := GrowBackupPVC(ctx, rc.Client, f, warn); err != nil {
+		return forgejo.StepResult{}, err
+	} else if grown {
+		size := BackupClaimSize(f)
+		rc.Event(corev1.EventTypeNormal, "BackupStorageResized", "ResizeVolume", "Requested %s for backup PVC %s",
+			size.String(), forgejo.BackupPVCName(f))
+	}
+
 	backups, err := ListBackups(ctx, rc.Client, f.Namespace, f.Name)
 	if err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("listing backups: %w", err)
@@ -226,35 +270,14 @@ func scheduledBackups(backups []forgejov1.ForgejoBackup) []*forgejov1.ForgejoBac
 	return out
 }
 
-// prune keeps the newest spec.backup.retention completed scheduled backups and removes failed
-// scheduled backups older than the newest completed one. Manual and pre-upgrade backups are
-// never pruned. Deleting a ForgejoBackup removes its files (finalizer).
+// prune removes the scheduled backups that pruneCandidates selects. Manual and pre-upgrade
+// backups are never pruned. Deleting a ForgejoBackup removes its files (finalizer).
 func prune(ctx context.Context, rc *forgejo.ReconcileContext, scheduled []*forgejov1.ForgejoBackup) error {
 	keep := int(rc.Instance.Spec.Backup.Retention)
 	if keep < 1 {
 		keep = 7
 	}
-	var completed []*forgejov1.ForgejoBackup
-	for _, b := range scheduled {
-		if b.Status.Phase == forgejov1.BackupPhaseCompleted {
-			completed = append(completed, b)
-		}
-	}
-	sort.SliceStable(completed, func(i, j int) bool { return finishedAt(completed[j]).Before(finishedAt(completed[i])) })
-
-	var doomed []*forgejov1.ForgejoBackup
-	if len(completed) > keep {
-		doomed = append(doomed, completed[keep:]...)
-	}
-	if len(completed) > 0 {
-		newest := completed[0]
-		for _, b := range scheduled {
-			if b.Status.Phase == forgejov1.BackupPhaseFailed && b.CreationTimestamp.Before(&newest.CreationTimestamp) {
-				doomed = append(doomed, b)
-			}
-		}
-	}
-	for _, b := range doomed {
+	for _, b := range pruneCandidates(scheduled, keep) {
 		if inUse, err := RestoreUsing(ctx, rc.Client, b); err != nil || inUse != "" {
 			if err != nil {
 				return err
@@ -267,6 +290,36 @@ func prune(ctx context.Context, rc *forgejo.ReconcileContext, scheduled []*forge
 		rc.Event(corev1.EventTypeNormal, "BackupPruned", "Backup", "Deleted %s scheduled backup %s (retention %d)", b.Status.Phase, b.Name, keep)
 	}
 	return nil
+}
+
+// pruneCandidates selects from scheduled (newest first) the completed backups beyond the
+// newest keep, and every failed one except the newest failed backup, which is kept (so
+// BackupHealthy can report it) only while no completed backup is newer. Failed backups are
+// removed whether or not a newer success exists, so failed runs cannot pile up on a full
+// volume; completed backups within retention are never removed to make room.
+func pruneCandidates(scheduled []*forgejov1.ForgejoBackup, keep int) []*forgejov1.ForgejoBackup {
+	var completed, failed []*forgejov1.ForgejoBackup
+	for _, b := range scheduled {
+		switch b.Status.Phase {
+		case forgejov1.BackupPhaseCompleted:
+			completed = append(completed, b)
+		case forgejov1.BackupPhaseFailed:
+			failed = append(failed, b)
+		}
+	}
+	sort.SliceStable(completed, func(i, j int) bool { return finishedAt(completed[j]).Before(finishedAt(completed[i])) })
+
+	var doomed []*forgejov1.ForgejoBackup
+	if len(completed) > keep {
+		doomed = append(doomed, completed[keep:]...)
+	}
+	for i, b := range failed {
+		if i == 0 && (len(completed) == 0 || !b.CreationTimestamp.Before(&completed[0].CreationTimestamp)) {
+			continue
+		}
+		doomed = append(doomed, b)
+	}
+	return doomed
 }
 
 func finishedAt(b *forgejov1.ForgejoBackup) time.Time {

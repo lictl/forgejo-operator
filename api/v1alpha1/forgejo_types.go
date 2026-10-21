@@ -507,6 +507,10 @@ type UpgradeSpec struct {
 
 	// timeout for the new version to become Ready.
 	// +kubebuilder:default="15m"
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="must be a positive Go duration such as 30s, 5m or 1h"
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
@@ -538,6 +542,10 @@ type MonitoringSpec struct {
 
 	// statsInterval is how often the operator samples Forgejo statistics into status.stats.
 	// +kubebuilder:default="5m"
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="must be a positive Go duration such as 30s, 5m or 1h"
 	// +optional
 	StatsInterval *metav1.Duration `json:"statsInterval,omitempty"`
 }
@@ -648,6 +656,10 @@ type SelfHealingSpec struct {
 
 	// healthCheckInterval between /api/healthz probes performed by the operator.
 	// +kubebuilder:default="30s"
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="must be a positive Go duration such as 30s, 5m or 1h"
 	// +optional
 	HealthCheckInterval *metav1.Duration `json:"healthCheckInterval,omitempty"`
 
@@ -784,7 +796,7 @@ type DatabaseStatus struct {
 }
 
 // UpgradePhase tracks an orchestrated upgrade.
-// +kubebuilder:validation:Enum=Pending;BackingUp;RollingOut;Verifying;Succeeded;Failed;RollingBack;RolledBack
+// +kubebuilder:validation:Enum=Pending;BackingUp;RollingOut;Verifying;Succeeded;Failed;RollingBack;RolledBack;Cancelled
 type UpgradePhase string
 
 const (
@@ -796,6 +808,8 @@ const (
 	UpgradePhaseFailed      UpgradePhase = "Failed"
 	UpgradePhaseRollingBack UpgradePhase = "RollingBack"
 	UpgradePhaseRolledBack  UpgradePhase = "RolledBack"
+	// UpgradePhaseCancelled: spec.image changed again before the new image was deployed.
+	UpgradePhaseCancelled UpgradePhase = "Cancelled"
 )
 
 // UpgradeStatus reports the latest upgrade.
@@ -812,11 +826,25 @@ type UpgradeStatus struct {
 	RestoreName string `json:"restoreName,omitempty"`
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
+	// rolloutStartTime is when the new image was first deployed; spec.upgrade.timeout counts from it.
+	// +optional
+	RolloutStartTime *metav1.Time `json:"rolloutStartTime,omitempty"`
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 	// failedImage is not retried until spec.image changes to something else.
 	// +optional
 	FailedImage string `json:"failedImage,omitempty"`
+	// failureReason explains why the new version was considered failed.
+	// +optional
+	FailureReason string `json:"failureReason,omitempty"`
+	// retry marks the rollout of an image that a failed upgrade left deployed. Its server pods
+	// created before startTime belong to the failed attempt.
+	// +optional
+	Retry bool `json:"retry,omitempty"`
+	// rollbackRestoreFailed is set when the rollback's ForgejoRestore failed: the database may
+	// still be in the new version's state, so Forgejo is kept stopped until a backup is restored.
+	// +optional
+	RollbackRestoreFailed bool `json:"rollbackRestoreFailed,omitempty"`
 	// +optional
 	Message string `json:"message,omitempty"`
 }

@@ -263,10 +263,18 @@ func tmpVolume() corev1.Volume {
 const shellFail = `fail() { echo "$*" >&2; printf '%s' "$*" | head -c 3000 > /dev/termination-log; exit 1; }
 `
 
+// removePartials deletes the temporary files of a backup that did not finish, so a failed
+// run (e.g. on a full volume) does not keep occupying the space; on success they are already
+// renamed. A killed container cannot run it; the controller then removes the directory of a
+// failed backup with a cleanup Job. Only the backup scripts use it: restores mount the backup
+// volume read-only.
+const removePartials = `trap 'rm -f "$BACKUP_DIR"/*.partial' EXIT
+`
+
 // dumpScript runs in the PostgreSQL image. The dump is a single transactionally consistent
 // snapshot; it is written under a temporary name so a partial file is never mistaken for a dump.
 const dumpScript = `set -eu
-` + shellFail + `umask 077
+` + shellFail + removePartials + `umask 077
 mkdir -p "$BACKUP_DIR"
 rm -f "$BACKUP_DIR/db.dump.partial"
 pg_dump --version > "$BACKUP_DIR/.pg_dump_version"
@@ -285,7 +293,7 @@ func archiveScript() string {
 		excludes.WriteString(" --exclude ./" + e)
 	}
 	return `set -eu
-` + shellFail + `umask 077
+` + shellFail + removePartials + `umask 077
 dump="$BACKUP_DIR/db.dump"
 [ -s "$dump" ] || fail "database dump $dump is missing or empty"
 db_size=$(stat -c %s "$dump")
@@ -389,12 +397,18 @@ echo "database restored"
 `
 
 // restoreDataScript replaces the data volume's contents (except lost+found) with the archive.
+// The shell is PID 1, which ignores SIGTERM without a handler, so the long steps run in the
+// background and a TERM (pod deletion) stops them right away instead of after the grace period:
+// the handler restores the default disposition (ignored by PID 1) and signals the whole process
+// group, which also reaches the rm/chown processes started by find.
 const restoreDataScript = `set -eu
 ` + shellFail + `[ "$RESTORE_DATA" = true ] || exit 0
 archive="$BACKUP_DIR/data.tar.gz"
-find /data -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +
-tar -xzf "$archive" -C /data || fail "extracting $archive failed"
+trap 'trap - TERM INT; kill -TERM 0 2>/dev/null; exit 143' TERM INT
+run() { "$@" & wait $!; }
+run find /data -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} + || fail "clearing the data volume failed"
+run tar -xzf "$archive" -C /data || fail "extracting $archive failed"
 chown "$OWNER" /data
-find /data -mindepth 1 -maxdepth 1 ! -name lost+found -exec chown -R -h "$OWNER" {} +
+run find /data -mindepth 1 -maxdepth 1 ! -name lost+found -exec chown -R -h "$OWNER" {} + || fail "changing the owner of the restored files failed"
 echo "data volume restored"
 `

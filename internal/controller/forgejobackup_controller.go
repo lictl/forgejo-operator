@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -86,7 +87,7 @@ func (r *ForgejoBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	if !backup.IsBackupActive(b) {
-		return ctrl.Result{}, nil
+		return r.removeFailedFiles(ctx, b)
 	}
 
 	f := &forgejov1.Forgejo{}
@@ -145,7 +146,8 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	if err != nil {
 		return r.waitForDependency(ctx, b, "DatabaseNotReady", err.Error())
 	}
-	pvc, err := backup.EnsureBackupPVC(ctx, r.Client, r.Scheme, f)
+	warn := func(reason, msg string) { r.eventOn(f, corev1.EventTypeWarning, reason, "ResizeVolume", "%s", msg) }
+	pvc, err := backup.EnsureBackupPVC(ctx, r.Client, r.Scheme, f, warn)
 	if err != nil {
 		return r.waitForDependency(ctx, b, "BackupStorageUnavailable", err.Error())
 	}
@@ -172,8 +174,16 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
-		return ctrl.Result{}, fmt.Errorf("creating backup job: %w", err)
+	if err := backup.CreateJob(ctx, r.Client, b, job); err != nil {
+		var conflict *backup.JobConflictError
+		if !errors.As(err, &conflict) {
+			return ctrl.Result{}, fmt.Errorf("creating backup job: %w", err)
+		}
+		if conflict.Transient {
+			return r.wait(ctx, b, fmt.Sprintf("Waiting for the old Job %s to be deleted", conflict.Job), 5*time.Second)
+		}
+		return ctrl.Result{}, r.fail(ctx, b, "JobNameConflict",
+			fmt.Sprintf("Cannot run the backup: %v; delete that Job or use a different ForgejoBackup name", conflict))
 	}
 
 	orig := b.DeepCopy()
@@ -203,6 +213,11 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, r.fail(ctx, b, "JobMissing", fmt.Sprintf("Backup job %s disappeared", b.Status.JobName))
+	}
+	// Never read the state of a Job this backup does not control: a foreign Job that
+	// succeeded would otherwise report a backup that wrote nothing.
+	if err := backup.CheckOwned(job, b); err != nil {
+		return ctrl.Result{}, r.fail(ctx, b, "JobNameConflict", fmt.Sprintf("Backup job %s was replaced: %v", b.Status.JobName, err))
 	}
 	pods, err := backup.JobPods(ctx, r.Client, job)
 	if err != nil {
@@ -350,7 +365,7 @@ func (r *ForgejoBackupReconciler) cleanup(ctx context.Context, b *forgejov1.Forg
 	if b.Status.JobName != "" {
 		job := &batchv1.Job{}
 		err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.JobName}, job)
-		if err == nil {
+		if err == nil && metav1.IsControlledBy(job, b) {
 			if state, _ := backup.StateOf(job); state == backup.JobRunning {
 				if job.DeletionTimestamp.IsZero() {
 					if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
@@ -378,10 +393,23 @@ func (r *ForgejoBackupReconciler) cleanup(ctx context.Context, b *forgejov1.Forg
 	job := &batchv1.Job{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: backup.CleanupJobName(b)}, job)
 	if apierrors.IsNotFound(err) {
-		return false, r.createCleanupJob(ctx, b)
+		err = r.createCleanupJob(ctx, b)
+	} else if err == nil {
+		err = backup.CheckOwned(job, b)
 	}
 	if err != nil {
-		return false, err
+		var conflict *backup.JobConflictError
+		if !errors.As(err, &conflict) {
+			return false, err
+		}
+		if conflict.Transient {
+			return false, nil
+		}
+		r.event(b, corev1.EventTypeWarning, "CleanupFailed", "Delete", "Could not remove %s:%s: %v", b.Status.PVCName, b.Status.Path, conflict)
+		return true, nil
+	}
+	if job.Name == "" {
+		return false, nil // just created
 	}
 	switch state, msg := backup.StateOf(job); state {
 	case backup.JobSucceeded:
@@ -419,10 +447,73 @@ func (r *ForgejoBackupReconciler) createCleanupJob(ctx context.Context, b *forge
 	if err != nil {
 		return err
 	}
-	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := backup.CreateJob(ctx, r.Client, b, job); err != nil {
+		var conflict *backup.JobConflictError
+		if errors.As(err, &conflict) {
+			return err
+		}
 		return fmt.Errorf("creating cleanup job: %w", err)
 	}
 	return nil
+}
+
+// removeFailedFiles deletes the directory of a failed backup with the cleanup Job, once
+// nothing of the backup Job can still write: whatever a failed run left behind (a partial
+// archive on a full volume, for example) cannot be restored and would only take space from
+// later backups. The object stays so its status remains visible; the cleanup Job, which is
+// kept, records that the files are gone, and deleting the backup later finds it finished.
+func (r *ForgejoBackupReconciler) removeFailedFiles(ctx context.Context, b *forgejov1.ForgejoBackup) (ctrl.Result, error) {
+	if b.Status.Phase != forgejov1.BackupPhaseFailed || b.Status.PVCName == "" {
+		return ctrl.Result{}, nil
+	}
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: backup.CleanupJobName(b)}, job); err == nil {
+		var conflict *backup.JobConflictError
+		if errors.As(backup.CheckOwned(job, b), &conflict) && conflict.Transient {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil // wait for the old Job to go away
+		}
+		return ctrl.Result{}, nil // done, running, or someone else's Job (handled on deletion)
+	} else if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	if b.Status.JobName != "" {
+		bj := &batchv1.Job{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.JobName}, bj)
+		if err == nil && metav1.IsControlledBy(bj, b) {
+			if state, _ := backup.StateOf(bj); state == backup.JobRunning {
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+		} else if err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		pods, err := backup.JobPodsByName(ctx, r.Client, b.Namespace, b.Status.JobName)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if backup.UnfinishedPods(pods) > 0 {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.PVCName}, pvc); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if !pvc.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+	if err := r.createCleanupJob(ctx, b); err != nil {
+		var conflict *backup.JobConflictError
+		if errors.As(err, &conflict) {
+			if conflict.Transient {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			logf.FromContext(ctx).Info("not removing the files of the failed backup", "reason", conflict.Error())
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	r.event(b, corev1.EventTypeNormal, "RemovingFiles", "Cleanup", "Removing what the failed backup left in %s:%s", b.Status.PVCName, b.Status.Path)
+	return ctrl.Result{}, nil
 }
 
 func (r *ForgejoBackupReconciler) event(b *forgejov1.ForgejoBackup, eventType, reason, action, note string, args ...any) {

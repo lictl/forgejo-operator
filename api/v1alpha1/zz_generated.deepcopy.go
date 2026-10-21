@@ -600,6 +600,10 @@ func (in *ForgejoRestoreStatus) DeepCopyInto(out *ForgejoRestoreStatus) {
 		in, out := &in.CompletionTime, &out.CompletionTime
 		*out = (*in).DeepCopy()
 	}
+	if in.JobStartTime != nil {
+		in, out := &in.JobStartTime, &out.JobStartTime
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))
@@ -1202,6 +1206,10 @@ func (in *UpgradeStatus) DeepCopyInto(out *UpgradeStatus) {
 	*out = *in
 	if in.StartTime != nil {
 		in, out := &in.StartTime, &out.StartTime
+		*out = (*in).DeepCopy()
+	}
+	if in.RolloutStartTime != nil {
+		in, out := &in.RolloutStartTime, &out.RolloutStartTime
 		*out = (*in).DeepCopy()
 	}
 	if in.CompletionTime != nil {

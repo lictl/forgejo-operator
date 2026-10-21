@@ -69,12 +69,24 @@ func ReconcileConfigGuard(ctx context.Context, rc *forgejo.ReconcileContext) (fo
 
 // recordLastKnownGood copies the deployed app.ini to "<name>-config-lkg" once it has been
 // fully rolled out, every pod is Ready for lkgSoak and Forgejo reports healthy.
-func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep *appsv1.Deployment, pods []corev1.Pod) error {
+//
+// When the operator cannot reach Forgejo at all (unreachable, see trackUnreachable), the
+// kubelet's readiness probe, which calls the same /api/healthz, stands in for the
+// operator's: the pods must still have been Ready for lkgSoak. Without that, no LKG would
+// ever be recorded in such clusters, which also disables config rollback and the pod-level
+// hung check.
+func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep *appsv1.Deployment, pods []corev1.Pod, unreachable bool) error {
 	f := rc.Instance
 	if rc.ConfigHash == "" || rc.ConfigHash != rc.DesiredConfigHash || rc.Upgrading || rc.Maintenance {
 		return nil
 	}
-	if f.Status.Health == nil || !f.Status.Health.Healthy || !fullyRolledOut(dep, rc.ConfigHash) {
+	healthy := f.Status.Health != nil && f.Status.Health.Healthy
+	if (!healthy && !unreachable) || !fullyRolledOut(dep, rc.ConfigHash) {
+		return nil
+	}
+	// Every replica must be listed, so that the soak check below cannot pass vacuously on
+	// a pod cache that lags behind the Deployment status.
+	if len(pods) < int(*dep.Spec.Replicas) {
 		return nil
 	}
 	for i := range pods {

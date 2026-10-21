@@ -21,7 +21,15 @@ import (
 const (
 	adminUsernameKey = "username"
 	adminPasswordKey = "password"
+	// adminPasswordLength of generated admin passwords; well above Forgejo's default
+	// MIN_PASSWORD_LENGTH so that common hardening settings accept it.
+	adminPasswordLength = 32
 )
+
+// secretKeyAdminSyncSalt in "<name>-secrets" salts the digest of the admin credentials the
+// bootstrap init container keeps on the data volume (see bootstrapScript). It lives outside
+// the volume, so data backups do not carry a digest that could be brute-forced on its own.
+const secretKeyAdminSyncSalt = "admin-sync-salt"
 
 // ReconcileSecrets ensures "<name>-secrets" (SECRET_KEY, INTERNAL_TOKEN, JWT secrets,
 // metrics token) and the admin credentials secret exist. Never rotates existing values.
@@ -33,6 +41,7 @@ func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		forgejo.SecretKeyJWTSecret:     func() (string, error) { return randomBase64(32) },
 		forgejo.SecretKeyLFSJWTSecret:  func() (string, error) { return randomBase64(32) },
 		forgejo.SecretKeyMetricsToken:  func() (string, error) { return randomString(40) },
+		secretKeyAdminSyncSalt:         func() (string, error) { return randomBase64(32) },
 	}
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace}}
 	if err := apply(ctx, rc, sec, rc.OwnerRefsEnabled(), func() error {
@@ -75,7 +84,7 @@ func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		}
 		admin.Data[adminUsernameKey] = []byte(AdminUsername(f))
 		if len(admin.Data[adminPasswordKey]) == 0 {
-			pw, err := randomString(24)
+			pw, err := randomPassword(adminPasswordLength)
 			if err != nil {
 				return err
 			}

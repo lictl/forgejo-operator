@@ -13,6 +13,8 @@ spec:
   # ingress:
   #   enabled: true
   #   host: git.example.com
+  #   # Unset: the cluster's default IngressClass, applied when the Ingress is created, is kept.
+  #   className: nginx
   #   tlsSecretName: git-example-com-tls
   database:
     # An operator-managed CloudNativePG cluster "<name>-db".

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -25,12 +26,19 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/backup"
@@ -62,20 +70,30 @@ type ForgejoRestoreReconciler struct {
 
 // Reconcile drives a restore through Pending → ScalingDown → Restoring → ScalingUp →
 // Completed. The Forgejo pipeline's maintenance step keeps the instance scaled to zero while
-// the restore is in ScalingDown or Restoring.
+// the restore is in ScalingDown or Restoring, and after a failure that had already changed
+// the database or the data volume (DataModified condition) until that is acknowledged.
 func (r *ForgejoRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	rs := &forgejov1.ForgejoRestore{}
 	if err := r.Get(ctx, req.NamespacedName, rs); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if !rs.DeletionTimestamp.IsZero() || !backup.IsRestoreActive(rs) {
+	if !rs.DeletionTimestamp.IsZero() {
+		return r.finalize(ctx, rs)
+	}
+	if !backup.IsRestoreActive(rs) {
 		return ctrl.Result{}, nil
 	}
+	// The finalizer is in place before any Job exists: deleting the restore must not end
+	// maintenance while a restore pod may still be writing.
+	changed := controllerutil.AddFinalizer(rs, forgejo.FinalizerName)
 	if rs.Labels[forgejo.LabelForgejo] != rs.Spec.ForgejoRef.Name {
 		if rs.Labels == nil {
 			rs.Labels = map[string]string{}
 		}
 		rs.Labels[forgejo.LabelForgejo] = rs.Spec.ForgejoRef.Name
+		changed = true
+	}
+	if changed {
 		return ctrl.Result{}, r.Update(ctx, rs)
 	}
 
@@ -146,6 +164,16 @@ func (r *ForgejoRestoreReconciler) validate(ctx context.Context, rs *forgejov1.F
 		if o := &restores[i]; o.Name != rs.Name && backup.IsRestoreActive(o) && o.Status.Phase != "" && o.Status.Phase != forgejov1.RestorePhasePending {
 			return r.wait(ctx, rs, fmt.Sprintf("Waiting for ForgejoRestore %s to finish", o.Name))
 		}
+	}
+
+	// Refuse a Job name taken by something else before maintenance mode is turned on.
+	existing := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: backup.RestoreJobName(rs)}, existing); err == nil {
+		if res, done, err := r.jobConflict(ctx, rs, f, backup.CheckOwned(existing, rs)); done {
+			return res, err
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
 	}
 
 	if from, ok := forgejo.ImageVersion(b.Status.ForgejoImage); ok {
@@ -233,7 +261,10 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := backup.CreateJob(ctx, r.Client, rs, job); err != nil {
+		if res, done, cerr := r.jobConflict(ctx, rs, f, err); done {
+			return res, cerr
+		}
 		return ctrl.Result{}, fmt.Errorf("creating restore job: %w", err)
 	}
 
@@ -249,7 +280,23 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
 }
 
+// jobConflict handles a *backup.JobConflictError from err: it waits while the Job is going
+// away and fails the restore otherwise. done is false when err is no conflict.
+func (r *ForgejoRestoreReconciler) jobConflict(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo, err error) (ctrl.Result, bool, error) {
+	var conflict *backup.JobConflictError
+	if !errors.As(err, &conflict) {
+		return ctrl.Result{}, false, nil
+	}
+	if conflict.Transient {
+		res, err := r.wait(ctx, rs, fmt.Sprintf("Waiting for the old Job %s to be deleted", conflict.Job))
+		return res, true, err
+	}
+	return ctrl.Result{}, true, r.fail(ctx, rs, f, "JobNameConflict",
+		fmt.Sprintf("Cannot run the restore: %v. Nothing was changed; delete that Job or use a different ForgejoRestore name", conflict))
+}
+
 func (r *ForgejoRestoreReconciler) track(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo) (ctrl.Result, error) {
+	recorded := backup.RecordedModification(rs)
 	job := &batchv1.Job{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Status.JobName}, job); err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -258,33 +305,55 @@ func (r *ForgejoRestoreReconciler) track(ctx context.Context, rs *forgejov1.Forg
 		if rs.Status.StartTime != nil && time.Since(rs.Status.StartTime.Time) < jobAppearGrace {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		return ctrl.Result{}, r.fail(ctx, rs, f, "JobMissing", fmt.Sprintf("Restore job %s disappeared", rs.Status.JobName))
+		return ctrl.Result{}, r.failModified(ctx, rs, f, "JobMissing", fmt.Sprintf("Restore job %s disappeared", rs.Status.JobName), recorded, "")
+	}
+	// Never read the state of a Job this restore does not control: a foreign Job that
+	// succeeded would otherwise report a restore that never ran.
+	if err := backup.CheckOwned(job, rs); err != nil {
+		return ctrl.Result{}, r.failModified(ctx, rs, f, "JobNameConflict",
+			fmt.Sprintf("Restore job %s was replaced: %v", rs.Status.JobName, err), recorded, "")
 	}
 	pods, err := backup.JobPods(ctx, r.Client, job)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	observed, why := backup.RestoreModification(pods)
 	switch state, jobMsg := backup.StateOf(job); state {
 	case backup.JobFailed:
 		msg := backup.FailureMessage(pods)
 		if msg == "" {
 			msg = jobMsg
 		}
-		return ctrl.Result{}, r.fail(ctx, rs, f, "JobFailed", "Restore job failed: "+msg)
+		// The pods have the final word unless one may still be running or has vanished;
+		// what was already recorded as committed stays committed.
+		mod := observed
+		if !backup.PodsSettled(job, pods) || recorded == backup.Modified {
+			mod = max(mod, recorded)
+		}
+		return ctrl.Result{}, r.failModified(ctx, rs, f, "JobFailed", "Restore job failed: "+msg, mod, why)
 	case backup.JobRunning:
+		mod := max(observed, recorded)
 		if stalled := backup.Stalled(job, pods, podStartTimeout); stalled != "" {
 			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{}, r.fail(ctx, rs, f, "JobStalled", "Restore job did not start (nothing was changed): "+stalled)
+			if mod == backup.Unmodified {
+				return ctrl.Result{}, r.failModified(ctx, rs, f, "JobStalled", "Restore job did not start (nothing was changed): "+stalled, mod, "")
+			}
+			// An earlier pod got past verification, so the newest pod being stuck does not
+			// mean nothing was changed.
+			return ctrl.Result{}, r.failModified(ctx, rs, f, "JobStalled", "Restore job stalled after an earlier attempt had started restoring: "+stalled, mod, why)
 		}
 		msg := backup.PendingMessage(pods)
 		if msg == "" {
 			msg = fmt.Sprintf("Restore job %s is running", job.Name)
 		}
-		if msg != rs.Status.Message {
+		if msg != rs.Status.Message || mod > recorded {
 			orig := rs.DeepCopy()
 			rs.Status.Message = msg
+			if mod > recorded {
+				meta.SetStatusCondition(&rs.Status.Conditions, backup.ModificationCondition(mod, rs.Generation, why))
+			}
 			if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -296,6 +365,7 @@ func (r *ForgejoRestoreReconciler) track(ctx context.Context, rs *forgejov1.Forg
 	rs.Status.Phase = forgejov1.RestorePhaseScalingUp
 	rs.Status.Message = "Backup restored; waiting for Forgejo to become available"
 	setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionFalse, "ScalingUp", rs.Status.Message)
+	meta.SetStatusCondition(&rs.Status.Conditions, backup.ModificationCondition(backup.Modified, rs.Generation, "The backup was restored"))
 	if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -327,7 +397,8 @@ func (r *ForgejoRestoreReconciler) scaleUp(ctx context.Context, rs *forgejov1.Fo
 		since = rs.Status.StartTime.Time
 	}
 	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Status.JobName}, job); err == nil && job.Status.CompletionTime != nil {
+	if err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Status.JobName}, job); err == nil &&
+		metav1.IsControlledBy(job, rs) && job.Status.CompletionTime != nil {
 		since = job.Status.CompletionTime.Time
 	}
 	if time.Since(since) > scaleUpTimeout {
@@ -370,6 +441,26 @@ func (r *ForgejoRestoreReconciler) complete(ctx context.Context, rs *forgejov1.F
 	return nil
 }
 
+// failModified fails a restore whose Job had started and records in the DataModified
+// condition how far it got. A restore that (maybe) changed the instance keeps it in
+// maintenance until it is released.
+func (r *ForgejoRestoreReconciler) failModified(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo,
+	reason, msg string, mod backup.Modification, why string) error {
+	switch {
+	case mod != backup.Unmodified:
+		meta.SetStatusCondition(&rs.Status.Conditions, backup.ModificationCondition(mod, rs.Generation, why))
+		if why != "" {
+			why = " (" + why + ")"
+		}
+		msg += fmt.Sprintf(". The database or the data volume may already have been changed%s, so Forgejo stays scaled down: "+
+			"fix the cause and run a new ForgejoRestore, or set annotation %s=true on this ForgejoRestore (or delete it) to start Forgejo as it is",
+			why, backup.AnnotationReleaseMaintenance)
+	case meta.FindStatusCondition(rs.Status.Conditions, backup.ConditionDataModified) != nil:
+		meta.SetStatusCondition(&rs.Status.Conditions, backup.ModificationCondition(mod, rs.Generation, "The restore job failed before it changed anything"))
+	}
+	return r.fail(ctx, rs, f, reason, msg)
+}
+
 func (r *ForgejoRestoreReconciler) fail(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo, reason, msg string) error {
 	orig := rs.DeepCopy()
 	now := metav1.Now()
@@ -394,11 +485,86 @@ func (r *ForgejoRestoreReconciler) eventOn(obj runtime.Object, eventType, reason
 	}
 }
 
+// finalize stops the restore Job and keeps the object (and with it maintenance mode, while
+// it is ScalingDown or Restoring) until none of the Job's pods can still write: pods only go
+// away once their containers were killed. The Forgejo instance is not needed for this.
+func (r *ForgejoRestoreReconciler) finalize(ctx context.Context, rs *forgejov1.ForgejoRestore) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(rs, forgejo.FinalizerName) {
+		return ctrl.Result{}, nil
+	}
+	names := []string{backup.RestoreJobName(rs)}
+	if rs.Status.JobName != "" && rs.Status.JobName != names[0] {
+		names = append(names, rs.Status.JobName)
+	}
+	running := 0
+	for _, name := range names {
+		job := &batchv1.Job{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: name}, job)
+		switch {
+		case apierrors.IsNotFound(err):
+		case err != nil:
+			return ctrl.Result{}, err
+		case !metav1.IsControlledBy(job, rs):
+			continue // not ours: neither stop it nor wait for it
+		case job.DeletionTimestamp.IsZero():
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		pods, err := backup.JobPodsByName(ctx, r.Client, rs.Namespace, name)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		for i := range pods {
+			if ref := metav1.GetControllerOf(&pods[i]); ref != nil && ref.Kind == "Job" && !backup.PodFinished(&pods[i]) {
+				running++
+			}
+		}
+	}
+	if running > 0 {
+		logf.FromContext(ctx).Info("waiting for restore pods to terminate before releasing the ForgejoRestore", "pods", running)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+	if rs.Status.Phase == forgejov1.RestorePhaseRestoring && backup.RecordedModification(rs) != backup.Unmodified {
+		f := &forgejov1.Forgejo{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Spec.ForgejoRef.Name}, f); err == nil {
+			r.eventOn(f, corev1.EventTypeWarning, "RestoreAborted", "Restore",
+				"ForgejoRestore %s was deleted while restoring; the database or the data volume may be partially restored", rs.Name)
+		}
+	}
+	controllerutil.RemoveFinalizer(rs, forgejo.FinalizerName)
+	return ctrl.Result{}, client.IgnoreNotFound(r.Update(ctx, rs))
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ForgejoRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&forgejov1.ForgejoRestore{}).
 		Owns(&batchv1.Job{}).
+		// Container transitions inside a restore pod (verify done, database committed, data
+		// step started) do not always change the Job; watch the pods to record DataModified
+		// promptly.
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToRestore),
+			builder.WithPredicates(predicate.NewPredicateFuncs(func(o client.Object) bool {
+				return o.GetLabels()[forgejo.LabelComponent] == forgejo.ComponentRestore
+			}))).
 		Named("forgejorestore").
 		Complete(r)
+}
+
+// mapPodToRestore maps a restore Job's pod to the ForgejoRestore controlling that Job.
+func (r *ForgejoRestoreReconciler) mapPodToRestore(ctx context.Context, obj client.Object) []reconcile.Request {
+	name := obj.GetLabels()[batchv1.JobNameLabel]
+	if name == "" {
+		return nil
+	}
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: obj.GetNamespace(), Name: name}, job); err != nil {
+		return nil
+	}
+	ref := metav1.GetControllerOf(job)
+	if ref == nil || ref.Kind != "ForgejoRestore" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: job.Namespace, Name: ref.Name}}}
 }

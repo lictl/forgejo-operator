@@ -151,6 +151,13 @@ spec:
                 x-kubernetes-list-type: map
               jobName:
                 type: string
+              jobStartTime:
+                description: |-
+                  jobStartTime is when the restore Job was created (the transition to Restoring). Grace
+                  periods for the Job to show up in the operator's cache count from here, not from
+                  startTime, which also covers scaling down.
+                format: date-time
+                type: string
               message:
                 type: string
               phase:

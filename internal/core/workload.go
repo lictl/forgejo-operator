@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
@@ -33,17 +34,27 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	if rc.ConfigHash == "" {
 		return forgejo.StepResult{Stop: true, RequeueAfter: dbNotReadyRequeue}, nil
 	}
+	restore, err := migratingRestore(ctx, rc)
+	if err != nil {
+		return forgejo.StepResult{}, err
+	}
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: forgejo.DeploymentName(f), Namespace: f.Namespace}}
-	err := apply(ctx, rc, dep, true, func() error {
+	err = apply(ctx, rc, dep, true, func() error {
 		exists := dep.ResourceVersion != ""
 		restartedAt := dep.Spec.Template.Annotations[forgejo.AnnotationRestartedAt]
+		hold := migrationHold(dep, restore)
 
 		dep.Labels = mergeMaps(dep.Labels, podLabels(rc, nil))
-		dep.Spec.Replicas = ptr.To(desiredReplicas(rc, exists, dep.Spec.Replicas))
+		if hold != "" {
+			dep.Annotations = mergeMaps(dep.Annotations, map[string]string{annotationMigrationHold: hold})
+		} else {
+			delete(dep.Annotations, annotationMigrationHold)
+		}
+		dep.Spec.Replicas = ptr.To(desiredReplicas(rc, exists, dep.Spec.Replicas, hold != ""))
 		if !exists {
 			dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: forgejo.SelectorLabels(f)}
 		}
-		dep.Spec.Strategy = deploymentStrategy(rc)
+		dep.Spec.Strategy = deploymentStrategy(rc, hold != "")
 		dep.Spec.RevisionHistoryLimit = ptr.To[int32](revisionHistory)
 		dep.Spec.ProgressDeadlineSeconds = ptr.To[int32](progressDeadline)
 
@@ -65,10 +76,10 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	return forgejo.StepResult{}, nil
 }
 
-// desiredReplicas: 0 in maintenance, an explicit override, 1 while upgrading or before
-// the first successful rollout (migrations run with a single pod), the HPA's choice when
-// it owns scaling, else spec.replicas.
-func desiredReplicas(rc *forgejo.ReconcileContext, exists bool, current *int32) int32 {
+// desiredReplicas: 0 in maintenance, an explicit override, 1 while upgrading, before the
+// first successful rollout or while a restored database is migrated (migrations run with a
+// single pod), the HPA's choice when it owns scaling, else spec.replicas.
+func desiredReplicas(rc *forgejo.ReconcileContext, exists bool, current *int32, migrationHold bool) int32 {
 	switch {
 	case rc.Maintenance:
 		return 0
@@ -76,14 +87,37 @@ func desiredReplicas(rc *forgejo.ReconcileContext, exists bool, current *int32) 
 		return *rc.ReplicasOverride
 	case rc.Upgrading || rc.Instance.Status.Image == "":
 		return 1
-	case rc.HPAManaged && exists && current != nil:
-		return *current
+	case rc.HPAManaged:
+		if exists && current != nil && *current > 0 {
+			return *current
+		}
+		// An HPA never scales a target at 0 replicas (ScalingDisabled). Maintenance, a cold
+		// pre-upgrade backup or a stopped rollback leave the Deployment at 0, so hand the
+		// HPA a non-zero starting point; it raises the count to its minimum itself.
+		if migrationHold {
+			return 1
+		}
+		return hpaMinReplicas(rc.Instance)
+	case migrationHold:
+		return min(forgejo.DesiredReplicas(rc.Instance), 1)
 	}
 	return forgejo.DesiredReplicas(rc.Instance)
 }
 
-func deploymentStrategy(rc *forgejo.ReconcileContext) appsv1.DeploymentStrategy {
-	if rc.Instance.Spec.HighAvailability.Enabled && !rc.Upgrading {
+// hpaMinReplicas is the HPA's replica floor, clamped exactly like autopilot.ensureHPA.
+func hpaMinReplicas(f *forgejov1.Forgejo) int32 {
+	h := f.Spec.Autoscaling.Horizontal
+	if h == nil {
+		return 1
+	}
+	maxR := max(h.MaxReplicas, 1)
+	return min(max(h.MinReplicas, 1), maxR)
+}
+
+// deploymentStrategy rolls HA instances without downtime, except while a migration must run
+// in a single pod (upgrade or restored database), where no surge pod may start next to it.
+func deploymentStrategy(rc *forgejo.ReconcileContext, migrationHold bool) appsv1.DeploymentStrategy {
+	if rc.Instance.Spec.HighAvailability.Enabled && !rc.Upgrading && !migrationHold {
 		zero, one := intstr.FromInt32(0), intstr.FromInt32(1)
 		return appsv1.DeploymentStrategy{
 			Type:          appsv1.RollingUpdateDeploymentStrategyType,
@@ -91,6 +125,51 @@ func deploymentStrategy(rc *forgejo.ReconcileContext) appsv1.DeploymentStrategy 
 		}
 	}
 	return appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
+}
+
+// annotationMigrationHold on the Deployment names the ForgejoRestore whose database the
+// bootstrap init container is migrating. While it is set the Deployment runs one pod, so
+// "forgejo migrate" (which takes no lock) never runs in several pods at once.
+const annotationMigrationHold = "forgejo.lucas.icu/migration-hold"
+
+// migratingRestore returns the name of a ForgejoRestore of this instance that restored the
+// database and is now waiting for Forgejo to come back (phase ScalingUp). The restored
+// schema may be older than the running image, so the first pod migrates it.
+func migratingRestore(ctx context.Context, rc *forgejo.ReconcileContext) (string, error) {
+	f := rc.Instance
+	list := &forgejov1.ForgejoRestoreList{}
+	if err := rc.Client.List(ctx, list, client.InNamespace(f.Namespace)); err != nil {
+		return "", fmt.Errorf("listing restores: %w", err)
+	}
+	for _, r := range list.Items {
+		if r.Spec.ForgejoRef.Name == f.Name && r.Status.Phase == forgejov1.RestorePhaseScalingUp &&
+			forgejo.BoolOr(r.Spec.RestoreDatabase, true) {
+			return r.Name, nil
+		}
+	}
+	return "", nil
+}
+
+// migrationHold decides the hold for the live Deployment: set while a restore is migrating,
+// and kept after it (a restore gives up waiting after a timeout) until a pod of the current
+// template is available, i.e. its bootstrap migration has finished.
+func migrationHold(dep *appsv1.Deployment, restore string) string {
+	if restore != "" {
+		return restore
+	}
+	held := dep.Annotations[annotationMigrationHold]
+	if held == "" || singlePodAvailable(dep) {
+		return ""
+	}
+	return held
+}
+
+// singlePodAvailable reports whether the Deployment's current template has an available pod
+// and no pods of older templates remain.
+func singlePodAvailable(dep *appsv1.Deployment) bool {
+	s := dep.Status
+	return dep.Spec.Replicas != nil && *dep.Spec.Replicas > 0 && s.ObservedGeneration >= dep.Generation &&
+		s.UpdatedReplicas > 0 && s.AvailableReplicas > 0 && s.Replicas == s.UpdatedReplicas
 }
 
 func podLabels(rc *forgejo.ReconcileContext, extra map[string]string) map[string]string {
@@ -189,6 +268,11 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 			LocalObjectReference: corev1.LocalObjectReference{Name: adminSecretName(f)},
 			Key:                  AdminPasswordKey(f),
 		}}},
+		corev1.EnvVar{Name: "ADMIN_SYNC_SALT", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: forgejo.SecretsName(f)},
+			Key:                  secretKeyAdminSyncSalt,
+			Optional:             ptr.To(true),
+		}}},
 	)
 	bootstrap := corev1.Container{
 		Name:                     "bootstrap",
@@ -273,20 +357,43 @@ chmod 0700 %s
 `, strings.Join(dirs, " "), l.UID, l.GID, ssh)
 }
 
-// bootstrapScript migrates the database, then creates the admin or resets its password so
-// that the admin Secret stays authoritative. The password only travels through the env.
+// adminSyncMarker (on the data volume) holds a salted digest of the admin credentials last
+// written to Forgejo, so the password is only reset when the admin Secret changes.
+const adminSyncMarker = ".admin-password-sync"
+
+// bootstrapScript migrates the database, then creates the admin or, when the admin Secret
+// changed since the last sync, resets its password so that the Secret stays authoritative.
+// The password only travels through the env. A failed migration is fatal; a failed admin
+// sync (e.g. a password that does not meet PASSWORD_COMPLEXITY / MIN_PASSWORD_LENGTH /
+// PASSWORD_CHECK_PWN) only logs a warning, so it can never keep Forgejo from starting.
 func bootstrapScript(l forgejo.ImageLayout) string {
 	return fmt.Sprintf(`set -eu
 F=%s
 C=%s
+M=%s
 "$F" migrate --config "$C"
+want=""
+if [ -n "${ADMIN_SYNC_SALT:-}" ]; then
+  want=$(printf '%%s\n%%s\n%%s' "$ADMIN_SYNC_SALT" "$ADMIN_USERNAME" "$ADMIN_PASSWORD" | sha256sum | cut -d' ' -f1)
+fi
+mark() {
+  if [ -n "$want" ]; then printf '%%s\n' "$want" > "$M" || true; fi
+}
 users=$("$F" admin user list --config "$C")
 if printf '%%s\n' "$users" | awk -v u="$ADMIN_USERNAME" 'NR > 1 && tolower($2) == tolower(u) { found = 1 } END { exit !found }'; then
-  "$F" admin user change-password --config "$C" --username "$ADMIN_USERNAME" --password "$ADMIN_PASSWORD" --must-change-password=false
+  if [ -n "$want" ] && [ -f "$M" ] && [ "$(cat "$M")" = "$want" ]; then
+    echo "admin password is in sync with the Secret"
+  elif "$F" admin user change-password --config "$C" --username "$ADMIN_USERNAME" --password="$ADMIN_PASSWORD" --must-change-password=false; then
+    mark
+  else
+    echo "WARNING: could not set the admin password from the Secret (password policy?); keeping the current password" >&2
+  fi
+elif "$F" admin user create --config "$C" --admin --username "$ADMIN_USERNAME" --password="$ADMIN_PASSWORD" --email "$ADMIN_EMAIL" --must-change-password=false; then
+  mark
 else
-  "$F" admin user create --config "$C" --admin --username "$ADMIN_USERNAME" --password "$ADMIN_PASSWORD" --email "$ADMIN_EMAIL" --must-change-password=false
+  echo "WARNING: could not create the admin user $ADMIN_USERNAME" >&2
 fi
-`, l.CLI, l.ConfigPath)
+`, l.CLI, l.ConfigPath, l.WorkPath+"/"+adminSyncMarker)
 }
 
 // dedupeEnv concatenates env lists; a later variable replaces an earlier one with the

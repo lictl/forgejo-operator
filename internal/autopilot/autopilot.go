@@ -46,6 +46,7 @@ const (
 	ReasonConfigRolledBack            = "ConfigRolledBack"
 	ReasonExpansionUnsupported        = "ExpansionUnsupported"
 	ReasonMaxSizeReached              = "MaxSizeReached"
+	ReasonHealthProbeUnreachable      = "HealthProbeUnreachable"
 )
 
 // serverContainerName is the Forgejo container in the server pods.
@@ -73,7 +74,9 @@ func Reconcile(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepR
 
 	var errs []error
 	errs = append(errs, cleanupValkey(ctx, rc, dep))
-	errs = append(errs, recordLastKnownGood(ctx, rc, dep, pods))
+	unreachable := trackUnreachable(st, f, pods)
+	errs = append(errs, recordLastKnownGood(ctx, rc, dep, pods, unreachable))
+	reportProbeUnreachable(rc, st, pods, unreachable)
 	if forgejo.SelfHealingEnabled(f) {
 		errs = append(errs, rollbackFailingConfig(ctx, rc, st, pods))
 		errs = append(errs, restartUnhealthy(ctx, rc, dep, pods))
@@ -86,7 +89,12 @@ func Reconcile(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepR
 	return forgejo.StepResult{}, errors.Join(errs...)
 }
 
-// serverPods lists the Forgejo server pods of the instance that are not being deleted.
+// serverPods lists the Forgejo server pods of the instance that are neither terminating nor
+// terminated. Terminal pods (phase Failed or Succeeded, e.g. evicted under node pressure or
+// stopped by a graceful node shutdown) stay in the API until pod GC, while their ReplicaSet
+// has already replaced them; they would otherwise block LKG bookkeeping and self-healing
+// forever. With restartPolicy Always, a bad config shows as a crash loop in phase Running,
+// never as a terminal phase, so config rollback loses nothing.
 func serverPods(ctx context.Context, rc *forgejo.ReconcileContext) ([]corev1.Pod, error) {
 	list := &corev1.PodList{}
 	if err := rc.Client.List(ctx, list, client.InNamespace(rc.Instance.Namespace),
@@ -95,9 +103,10 @@ func serverPods(ctx context.Context, rc *forgejo.ReconcileContext) ([]corev1.Pod
 	}
 	pods := list.Items[:0]
 	for _, p := range list.Items {
-		if p.DeletionTimestamp == nil {
-			pods = append(pods, p)
+		if p.DeletionTimestamp != nil || p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded {
+			continue
 		}
+		pods = append(pods, p)
 	}
 	return pods, nil
 }
@@ -173,6 +182,8 @@ type instanceState struct {
 
 	lastStorageCheck time.Time
 	du               map[string]duResult // claim -> last du measurement
+
+	unansweredSince time.Time // start of the current run of unanswered health probes
 }
 
 func (s *instanceState) allow(key string, every time.Duration) bool {

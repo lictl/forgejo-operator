@@ -10,8 +10,10 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -84,10 +86,13 @@ func Reason(b *forgejov1.ForgejoBackup) forgejov1.BackupReason {
 // BackupDir is the backup's directory as seen by jobs.
 func BackupDir(backupName string) string { return BackupMountPath + "/" + backupName }
 
-// BackupJobName, CleanupJobName and RestoreJobName are the Jobs run for each object.
-func BackupJobName(b *forgejov1.ForgejoBackup) string   { return childName(b.Name, "-job") }
+// BackupJobName, CleanupJobName and RestoreJobName are the Jobs run for each object. Every
+// kind has its own suffix (kept on the hashed path too), so a ForgejoBackup and a
+// ForgejoRestore of the same name never share a Job. The controllers additionally refuse
+// Jobs they do not control (CreateJob, CheckOwned).
+func BackupJobName(b *forgejov1.ForgejoBackup) string   { return childName(b.Name, "-backup") }
 func CleanupJobName(b *forgejov1.ForgejoBackup) string  { return childName(b.Name, "-cleanup") }
-func RestoreJobName(r *forgejov1.ForgejoRestore) string { return childName(r.Name, "-job") }
+func RestoreJobName(r *forgejov1.ForgejoRestore) string { return childName(r.Name, "-restore") }
 
 // childName appends suffix to base, shortening base with a hash so the result is a valid
 // 63-character DNS label (Job names end up in pod labels).
@@ -111,10 +116,74 @@ func IsRestoreActive(r *forgejov1.ForgejoRestore) bool {
 	return r.Status.Phase != forgejov1.RestorePhaseCompleted && r.Status.Phase != forgejov1.RestorePhaseFailed
 }
 
-// NeedsMaintenance reports whether a restore requires the instance to be scaled to zero.
-// ScalingUp is excluded: the restore is done and waits for Forgejo to come back.
+// NeedsMaintenance reports whether a running restore requires the instance to be scaled to
+// zero. ScalingUp is excluded: the restore is done and waits for Forgejo to come back.
 func NeedsMaintenance(r *forgejov1.ForgejoRestore) bool {
 	return r.Status.Phase == forgejov1.RestorePhaseScalingDown || r.Status.Phase == forgejov1.RestorePhaseRestoring
+}
+
+const (
+	// ConditionDataModified on a ForgejoRestore records whether its Job may already have
+	// changed the instance: True once the database transaction committed or the data step
+	// started, Unknown while a pod is past verification and the outcome is not known, False
+	// when the Job failed without changing anything.
+	ConditionDataModified = "DataModified"
+	// AnnotationReleaseMaintenance="true" on a failed ForgejoRestore that holds the instance
+	// in maintenance lets Forgejo start again on whatever the restore left behind.
+	AnnotationReleaseMaintenance = "forgejo.lucas.icu/release-maintenance"
+)
+
+// Modification is how far a restore Job may have changed the instance.
+type Modification int
+
+const (
+	Unmodified Modification = iota
+	// MaybeModified: a pod got past verification, so the database or the data volume may be
+	// changing, and it is not known whether anything was committed.
+	MaybeModified
+	// Modified: the database restore committed or the data step started.
+	Modified
+)
+
+// RecordedModification reads the DataModified condition of a restore.
+func RecordedModification(r *forgejov1.ForgejoRestore) Modification {
+	c := meta.FindStatusCondition(r.Status.Conditions, ConditionDataModified)
+	switch {
+	case c == nil:
+		return Unmodified
+	case c.Status == metav1.ConditionTrue:
+		return Modified
+	case c.Status == metav1.ConditionUnknown:
+		return MaybeModified
+	}
+	return Unmodified
+}
+
+// ModificationCondition is the DataModified condition for m.
+func ModificationCondition(m Modification, generation int64, msg string) metav1.Condition {
+	c := metav1.Condition{Type: ConditionDataModified, ObservedGeneration: generation, Message: msg}
+	switch m {
+	case Modified:
+		c.Status, c.Reason = metav1.ConditionTrue, "Modified"
+	case MaybeModified:
+		c.Status, c.Reason = metav1.ConditionUnknown, "MaybeModified"
+	default:
+		c.Status, c.Reason = metav1.ConditionFalse, "Unchanged"
+	}
+	if c.Message == "" {
+		c.Message = c.Reason
+	}
+	return c
+}
+
+// HoldsMaintenance reports whether a failed restore had (or may have) already changed the
+// database or the data volume, so the instance must stay scaled to zero until someone
+// releases it (annotation, deleting the restore, or a later restore that succeeds).
+func HoldsMaintenance(r *forgejov1.ForgejoRestore) bool {
+	return r.Status.Phase == forgejov1.RestorePhaseFailed &&
+		RecordedModification(r) != Unmodified &&
+		r.DeletionTimestamp.IsZero() &&
+		r.Annotations[AnnotationReleaseMaintenance] != "true"
 }
 
 // BlocksBackups reports whether a restore must finish before a backup of the instance starts.
@@ -169,9 +238,9 @@ func DatabaseReady(f *forgejov1.Forgejo) bool {
 }
 
 // EnsureBackupPVC creates "<name>-backups" (or checks spec.backup.storage.existingClaim) and
-// returns the claim name. The size is only applied at creation; growing it is left to the
-// storage auto-expansion.
-func EnsureBackupPVC(ctx context.Context, c client.Client, scheme *runtime.Scheme, f *forgejov1.Forgejo) (string, error) {
+// returns the claim name. A larger spec.backup.storage.size grows an existing operator-managed
+// claim when its StorageClass allows expansion (never shrinks it); warn reports why it cannot.
+func EnsureBackupPVC(ctx context.Context, c client.Client, scheme *runtime.Scheme, f *forgejov1.Forgejo, warn Warner) (string, error) {
 	name := BackupClaimName(f)
 	if f.Spec.Backup.Storage.ExistingClaim != "" {
 		pvc := &corev1.PersistentVolumeClaim{}
@@ -191,8 +260,10 @@ func EnsureBackupPVC(ctx context.Context, c client.Client, scheme *runtime.Schem
 			pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
 			pvc.Spec.StorageClassName = f.Spec.Backup.Storage.StorageClassName
 			pvc.Spec.Resources.Requests = corev1.ResourceList{
-				corev1.ResourceStorage: forgejo.QuantityOr(f.Spec.Backup.Storage.Size, "20Gi"),
+				corev1.ResourceStorage: BackupClaimSize(f),
 			}
+		} else if want, grow := needsGrowth(pvc, BackupClaimSize(f)); grow && expansionAllowed(ctx, c, pvc, warn) {
+			pvc.Spec.Resources.Requests[corev1.ResourceStorage] = want
 		}
 		if forgejo.RetainData(f) {
 			if metav1.IsControlledBy(pvc, f) {
@@ -206,6 +277,69 @@ func EnsureBackupPVC(ctx context.Context, c client.Client, scheme *runtime.Schem
 		return "", fmt.Errorf("backup claim %q: %w", name, err)
 	}
 	return name, nil
+}
+
+// Warner reports a problem the caller should surface as a Warning event; it may be nil.
+type Warner func(reason, msg string)
+
+// BackupClaimSize is the requested size of the operator-managed backup PVC.
+func BackupClaimSize(f *forgejov1.Forgejo) resource.Quantity {
+	return forgejo.QuantityOr(f.Spec.Backup.Storage.Size, "20Gi")
+}
+
+// GrowBackupPVC raises the request of an existing operator-managed backup PVC to
+// spec.backup.storage.size, so a resize does not wait for the next backup. It does nothing
+// when the claim does not exist yet (it is created on first use), for an existingClaim, when
+// the claim is already as large (autopilot or a person may have grown it further), or when
+// its StorageClass does not allow expansion (warn says so). It reports whether it resized.
+func GrowBackupPVC(ctx context.Context, c client.Client, f *forgejov1.Forgejo, warn Warner) (bool, error) {
+	if f.Spec.Backup.Storage.ExistingClaim != "" {
+		return false, nil
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.BackupPVCName(f)}, pvc); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	want, grow := needsGrowth(pvc, BackupClaimSize(f))
+	if !grow || !pvc.DeletionTimestamp.IsZero() || !expansionAllowed(ctx, c, pvc, warn) {
+		return false, nil
+	}
+	orig := pvc.DeepCopy()
+	pvc.Spec.Resources.Requests[corev1.ResourceStorage] = want
+	if err := c.Patch(ctx, pvc, client.MergeFrom(orig)); err != nil {
+		return false, fmt.Errorf("growing backup claim %s to %s: %w", pvc.Name, want.String(), err)
+	}
+	return true, nil
+}
+
+// needsGrowth reports whether the claim requests less than want. It never asks to shrink.
+func needsGrowth(pvc *corev1.PersistentVolumeClaim, want resource.Quantity) (resource.Quantity, bool) {
+	if pvc.Spec.Resources.Requests == nil {
+		pvc.Spec.Resources.Requests = corev1.ResourceList{}
+	}
+	cur, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	return want, ok && want.Cmp(cur) > 0
+}
+
+// expansionAllowed reports whether the claim's StorageClass supports resizing.
+func expansionAllowed(ctx context.Context, c client.Client, pvc *corev1.PersistentVolumeClaim, warn Warner) bool {
+	if warn == nil {
+		warn = func(string, string) {}
+	}
+	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
+		warn("StorageResizeUnsupported", fmt.Sprintf("cannot grow backup PVC %s: it has no StorageClass", pvc.Name))
+		return false
+	}
+	sc := &storagev1.StorageClass{}
+	if err := c.Get(ctx, types.NamespacedName{Name: *pvc.Spec.StorageClassName}, sc); err != nil {
+		warn("StorageResizeUnsupported", fmt.Sprintf("cannot grow backup PVC %s: StorageClass %s: %v", pvc.Name, *pvc.Spec.StorageClassName, err))
+		return false
+	}
+	if sc.AllowVolumeExpansion == nil || !*sc.AllowVolumeExpansion {
+		warn("StorageResizeUnsupported", fmt.Sprintf("cannot grow backup PVC %s: StorageClass %s does not allow volume expansion", pvc.Name, sc.Name))
+		return false
+	}
+	return true
 }
 
 // Placement returns the affinity that lets a job mount the data volume: next to running

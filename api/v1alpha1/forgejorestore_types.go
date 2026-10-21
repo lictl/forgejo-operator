@@ -63,6 +63,11 @@ type ForgejoRestoreStatus struct {
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 	// +optional
 	JobName string `json:"jobName,omitempty"`
+	// jobStartTime is when the restore Job was created (the transition to Restoring). Grace
+	// periods for the Job to show up in the operator's cache count from here, not from
+	// startTime, which also covers scaling down.
+	// +optional
+	JobStartTime *metav1.Time `json:"jobStartTime,omitempty"`
 	// +optional
 	Message string `json:"message,omitempty"`
 	// +listType=map

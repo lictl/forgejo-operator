@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"math/big"
+	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -21,6 +22,8 @@ import (
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores,verbs=get;list;watch
 
 // setOwnership makes the instance the controller owner of obj when owned is true and
 // drops that reference otherwise (data-bearing children under retainPolicy Retain).
@@ -85,18 +88,65 @@ func randomBase64(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-const alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+const (
+	lowerChars   = "abcdefghijklmnopqrstuvwxyz"
+	upperChars   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	digitChars   = "0123456789"
+	alphanumeric = lowerChars + upperChars + digitChars
+	// passwordSymbols is a subset of Forgejo's PASSWORD_COMPLEXITY "spec" class that needs no
+	// quoting or escaping in shells, YAML or URLs.
+	passwordSymbols = "-_.~"
+)
 
 // randomString returns n random alphanumeric characters.
 func randomString(n int) (string, error) {
-	out := make([]byte, n)
-	max := big.NewInt(int64(len(alphanumeric)))
-	for i := range out {
-		idx, err := rand.Int(rand.Reader, max)
+	return randomFrom(alphanumeric, n)
+}
+
+// randomPassword returns n (at least 4) random characters with at least one lower-case
+// letter, upper-case letter, digit and symbol, so that it satisfies every Forgejo
+// PASSWORD_COMPLEXITY class ("lower,upper,digit,spec").
+func randomPassword(n int) (string, error) {
+	classes := []string{lowerChars, upperChars, digitChars, passwordSymbols}
+	n = max(n, len(classes))
+	out := make([]byte, 0, n)
+	for _, c := range classes {
+		ch, err := randomFrom(c, 1)
 		if err != nil {
 			return "", err
 		}
-		out[i] = alphanumeric[idx.Int64()]
+		out = append(out, ch...)
+	}
+	rest, err := randomFrom(alphanumeric+passwordSymbols, n-len(classes))
+	if err != nil {
+		return "", err
+	}
+	out = append(out, rest...)
+	// Fisher-Yates, so the forced characters are not always in front.
+	for i := len(out) - 1; i > 0; i-- {
+		j, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		if err != nil {
+			return "", err
+		}
+		out[i], out[j.Int64()] = out[j.Int64()], out[i]
+	}
+	// Never start with a symbol: "-..." reads like a flag to CLIs that take it as an argument.
+	if i := strings.IndexAny(string(out), alphanumeric); i > 0 {
+		out[0], out[i] = out[i], out[0]
+	}
+	return string(out), nil
+}
+
+// randomFrom returns n characters drawn uniformly from alphabet.
+func randomFrom(alphabet string, n int) (string, error) {
+	out := make([]byte, n)
+	limit := big.NewInt(int64(len(alphabet)))
+	for i := range out {
+		idx, err := rand.Int(rand.Reader, limit)
+		if err != nil {
+			return "", err
+		}
+		out[i] = alphabet[idx.Int64()]
 	}
 	return string(out), nil
 }

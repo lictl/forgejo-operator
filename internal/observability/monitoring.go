@@ -3,6 +3,7 @@ package observability
 import (
 	"fmt"
 	"hash/fnv"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -62,11 +63,17 @@ type rule struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
+// promDuration is prometheus-operator's Duration pattern (ServiceMonitor endpoint interval).
+var promDuration = regexp.MustCompile(`^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$`)
+
 // serviceMonitorSpec scrapes the "http" port of "<name>-http" with the generated bearer token.
-func serviceMonitorSpec(f *forgejov1.Forgejo) *smSpec {
+func serviceMonitorSpec(f *forgejov1.Forgejo) (*smSpec, error) {
 	interval := defaultScrapeInterval
 	if sm := f.Spec.Monitoring.ServiceMonitor; sm != nil && sm.Interval != "" {
 		interval = sm.Interval
+	}
+	if !promDuration.MatchString(interval) {
+		return nil, fmt.Errorf("spec.monitoring.serviceMonitor.interval %q is not a Prometheus duration (e.g. 30s, 1m, 1h30m)", interval)
 	}
 	return &smSpec{
 		Selector:          metav1.LabelSelector{MatchLabels: forgejo.SelectorLabels(f)},
@@ -84,7 +91,7 @@ func serviceMonitorSpec(f *forgejov1.Forgejo) *smSpec {
 				},
 			},
 		}},
-	}
+	}, nil
 }
 
 // prometheusRuleSpec renders alerts scoped to one instance. Operator metrics carry the

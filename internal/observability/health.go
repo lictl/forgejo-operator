@@ -8,15 +8,19 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,19 +33,42 @@ import (
 const (
 	defaultHealthInterval = 30 * time.Second
 	defaultStatsInterval  = 5 * time.Minute
-	probeTimeout          = 5 * time.Second
-	maxBody               = 8 << 20
+	// dialTimeout bounds DNS resolution plus the TCP connect. A blackholed Service
+	// (NetworkPolicy, CNI fault) must not hold the reconcile worker for long.
+	dialTimeout = 2 * time.Second
+	// probeTimeout is how long Forgejo may take to send response headers once the
+	// connection is established.
+	probeTimeout = 5 * time.Second
+	maxBody      = 8 << 20
 )
 
 // Healthy condition reasons.
 const (
 	ReasonHealthy         = "HealthCheckPassed"
 	ReasonUnhealthy       = "HealthCheckFailed"
+	ReasonUnreachable     = "Unreachable"
 	ReasonNoReadyReplicas = "NoReadyReplicas"
 	ReasonMaintenance     = "Maintenance"
 )
 
-var httpClient = &http.Client{Timeout: probeTimeout}
+// httpClient talks to Forgejo through its HTTP Service. It uses its own transport so a
+// failed probe can be classified (see probeError): dial and header timeouts fire before
+// the overall client timeout and keep their own errors, no proxy is consulted for
+// cluster-internal URLs, and every probe opens a fresh connection.
+var httpClient = newProbeClient(dialTimeout, probeTimeout)
+
+func newProbeClient(dial, header time.Duration) *http.Client {
+	return &http.Client{
+		// Covers dial + headers + reading a /metrics body; the specific timeouts fire first.
+		Timeout: dial + header + 5*time.Second,
+		Transport: &http.Transport{
+			Proxy:                 nil,
+			DialContext:           (&net.Dialer{Timeout: dial}).DialContext,
+			ResponseHeaderTimeout: header,
+			DisableKeepAlives:     true,
+		},
+	}
+}
 
 // statsMetrics maps Forgejo metric names to the "kind" label of forgejo_operator_stats.
 var statsMetrics = map[string]string{
@@ -56,7 +83,10 @@ var statsMetrics = map[string]string{
 //
 // Probes go through the HTTP Service and only count while at least one pod is Ready and
 // no restore is running: status.health.consecutiveFailures drives self-healing restarts,
-// so it must only reflect real failures of pods that are serving traffic.
+// so it must only reflect real failures of pods that are serving traffic. For the same
+// reason a probe that never got an answer from Forgejo (DNS, dial or connection-reset
+// errors: a NetworkPolicy or service-mesh mTLS shutting the operator out) is reported as
+// Unreachable and resets the streak instead of extending it.
 func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	if f.Status.Health == nil {
@@ -100,6 +130,10 @@ func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 
 	base := forgejo.InternalHTTPURL(f)
 	res := probeHealthz(ctx, base)
+	if res.unreachable {
+		recordUnreachable(rc, res, metav1.NewTime(now))
+		return forgejo.StepResult{}, nil
+	}
 	recordHealth(rc, res, metav1.NewTime(now))
 	if !res.healthy {
 		return forgejo.StepResult{}, nil
@@ -178,12 +212,69 @@ func lastProbeFailed(h *forgejov1.HealthStatus) bool {
 	return h.LastCheckTime != nil && (h.LastHealthyTime == nil || h.LastHealthyTime.Before(h.LastCheckTime))
 }
 
-// recordHealth stores a probe result. Events are emitted when the probe outcome flips,
-// independent of skipped periods in between.
+// Outcomes of the last probe, as far as status still tells them apart.
+const (
+	outcomeNone        = ""
+	outcomePassed      = "passed"
+	outcomeFailed      = "failed"
+	outcomeUnreachable = "unreachable"
+)
+
+// lastOutcome is the outcome of the previous probe. The Healthy condition names it until
+// a suspended period overwrites the reason; after that only "passed" or "failed" can be
+// told apart from the timestamps.
+func lastOutcome(rc *forgejo.ReconcileContext) string {
+	h := rc.Instance.Status.Health
+	if h.LastCheckTime == nil {
+		return outcomeNone
+	}
+	if c := meta.FindStatusCondition(rc.Instance.Status.Conditions, forgejov1.ConditionHealthy); c != nil {
+		switch c.Reason {
+		case ReasonHealthy:
+			return outcomePassed
+		case ReasonUnhealthy:
+			return outcomeFailed
+		case ReasonUnreachable:
+			return outcomeUnreachable
+		}
+	}
+	if lastProbeFailed(h) {
+		return outcomeFailed
+	}
+	return outcomePassed
+}
+
+// recordUnreachable stores a probe that got no answer from Forgejo. It is not a health
+// failure: the streak is reset like for a suspended probe, so self-healing never restarts
+// pods the operator merely cannot talk to.
+func recordUnreachable(rc *forgejo.ReconcileContext, res healthResult, now metav1.Time) {
+	f := rc.Instance
+	h := f.Status.Health
+	prev := lastOutcome(rc)
+
+	h.LastCheckTime = &now
+	h.Healthy = false
+	h.ConsecutiveFailures = 0
+	h.Message = res.message
+	h.Checks = nil
+	msg := fmt.Sprintf("The operator cannot reach Forgejo (%s). It must be allowed to connect to "+
+		"Service %s.%s port %d: check NetworkPolicies and service-mesh mTLS (PERMISSIVE, or a sidecar for "+
+		"the operator). Unreachable probes do not count towards self-healing.",
+		res.message, forgejo.HTTPServiceName(f), f.Namespace, forgejo.HTTPServicePort(f))
+	rc.SetCondition(forgejov1.ConditionHealthy, metav1.ConditionUnknown, ReasonUnreachable, msg)
+	if prev != outcomeUnreachable {
+		rc.Event(corev1.EventTypeWarning, "HealthCheckUnreachable", "HealthCheck", "%s", msg)
+	}
+}
+
+// recordHealth stores the result of a probe Forgejo answered (or accepted and then hung
+// on). Events are emitted when the probe outcome flips, independent of skipped periods in
+// between.
 func recordHealth(rc *forgejo.ReconcileContext, res healthResult, now metav1.Time) {
 	f := rc.Instance
 	h := f.Status.Health
-	wasFailing := lastProbeFailed(h)
+	prev := lastOutcome(rc)
+	wasFailing := prev == outcomeFailed || prev == outcomeUnreachable
 
 	h.LastCheckTime = &now
 	h.Healthy = res.healthy
@@ -202,15 +293,17 @@ func recordHealth(rc *forgejo.ReconcileContext, res healthResult, now metav1.Tim
 	forgejo.HealthCheckFailures.WithLabelValues(f.Namespace, f.Name).Inc()
 	rc.SetCondition(forgejov1.ConditionHealthy, metav1.ConditionFalse, ReasonUnhealthy,
 		fmt.Sprintf("%s (%d consecutive failures)", res.message, h.ConsecutiveFailures))
-	if !wasFailing {
+	if prev != outcomeFailed {
 		rc.Event(corev1.EventTypeWarning, "HealthCheckFailed", "HealthCheck", "Forgejo health check failed: %s", res.message)
 	}
 }
 
 type healthResult struct {
 	healthy bool
-	message string
-	checks  map[string]string
+	// unreachable: Forgejo never answered (see probeError); not a health failure.
+	unreachable bool
+	message     string
+	checks      map[string]string
 }
 
 type healthzResponse struct {
@@ -223,14 +316,54 @@ type healthzResponse struct {
 
 var statusRank = map[string]int{"pass": 0, "warn": 1, "fail": 2}
 
-// probeHealthz calls Forgejo's /api/healthz (200 for pass/warn, 424 for fail).
+// intermediaryStatus are codes that a proxy (service-mesh sidecar, authorization policy)
+// returns when it does not let a request through to Forgejo. Combined with a body that is
+// not a health document they mean Forgejo was never asked.
+var intermediaryStatus = map[int]bool{
+	http.StatusUnauthorized:       true,
+	http.StatusForbidden:          true,
+	http.StatusBadGateway:         true,
+	http.StatusServiceUnavailable: true,
+	http.StatusGatewayTimeout:     true,
+}
+
+// snippet returns the start of a response body for messages.
+func snippet(body []byte) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if len(s) > 80 {
+		s = s[:80] + "..."
+	}
+	return s
+}
+
+// probeHealthz calls Forgejo's /api/healthz (200 for pass/warn, 424 for fail). Any HTTP
+// answer other than 200 pass/warn, and a connection Forgejo accepted but never answered
+// (a hung process), count as failures; everything else is unreachable.
 func probeHealthz(ctx context.Context, base string) healthResult {
 	body, code, err := get(ctx, base+"/api/healthz", "")
 	if err != nil {
-		return healthResult{message: "GET /api/healthz: " + err.Error()}
+		var pe *probeError
+		if errors.As(err, &pe) && pe.hung {
+			return healthResult{message: "GET /api/healthz: " + err.Error()}
+		}
+		if code == 0 {
+			return healthResult{unreachable: true, message: "GET /api/healthz: " + err.Error()}
+		}
+		// The headers arrived but reading the body failed.
+		return healthResult{message: fmt.Sprintf("GET /api/healthz: HTTP %d, reading body: %v", code, err)}
 	}
 	var hz healthzResponse
-	if err := json.Unmarshal(body, &hz); err != nil {
+	if err := json.Unmarshal(body, &hz); err != nil || hz.Status == "" {
+		if intermediaryStatus[code] {
+			// Forgejo always answers /api/healthz with a health document; this answer came
+			// from a proxy in between, e.g. a service mesh denying the operator.
+			return healthResult{unreachable: true, message: fmt.Sprintf(
+				"GET /api/healthz: HTTP %d without a health document (%q), answered by a proxy rather than Forgejo",
+				code, snippet(body))}
+		}
+		if err == nil {
+			err = errors.New(`no "status"`)
+		}
 		return healthResult{message: fmt.Sprintf("GET /api/healthz: HTTP %d, unparsable body: %v", code, err)}
 	}
 
@@ -366,8 +499,31 @@ func publishStats(f *forgejov1.Forgejo) {
 	}
 }
 
+// probeError is a request that got no HTTP response. hung is set when a connection was
+// established and the request sent, but no response headers arrived in time: Forgejo
+// (or at least its kernel) accepted the connection and then did not answer. DNS and dial
+// errors, and connections reset or closed before any response (e.g. a service mesh
+// rejecting the operator's plaintext request), leave it unset.
+type probeError struct {
+	err  error
+	hung bool
+}
+
+func (e *probeError) Error() string {
+	if e.hung {
+		return e.err.Error() + " (connection accepted, no response)"
+	}
+	return e.err.Error()
+}
+
+func (e *probeError) Unwrap() error { return e.err }
+
+// get performs a GET. A non-zero status code means Forgejo answered, even if reading the
+// body then failed; transport failures are returned as *probeError.
 func get(ctx context.Context, url, bearer string) ([]byte, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var connected atomic.Bool
+	trace := &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { connected.Store(true) }}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -376,7 +532,9 @@ func get(ctx context.Context, url, bearer string) ([]byte, int, error) {
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		var ne net.Error
+		hung := connected.Load() && ctx.Err() == nil && errors.As(err, &ne) && ne.Timeout()
+		return nil, 0, &probeError{err: err, hung: hung}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))

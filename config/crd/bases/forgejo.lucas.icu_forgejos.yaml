@@ -122,7 +122,13 @@ spec:
                         default: 30s
                         description: healthCheckInterval between /api/healthz probes
                           performed by the operator.
+                        maxLength: 32
+                        pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+$
                         type: string
+                        x-kubernetes-validations:
+                        - message: must be a positive Go duration such as 30s, 5m
+                            or 1h
+                          rule: duration(self) > duration('0s')
                     type: object
                   storageAutoExpand:
                     default: {}
@@ -813,7 +819,12 @@ spec:
                     default: 5m
                     description: statsInterval is how often the operator samples Forgejo
                       statistics into status.stats.
+                    maxLength: 32
+                    pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+$
                     type: string
+                    x-kubernetes-validations:
+                    - message: must be a positive Go duration such as 30s, 5m or 1h
+                      rule: duration(self) > duration('0s')
                 type: object
               paused:
                 description: paused stops the operator from changing any child resource.
@@ -2190,7 +2201,12 @@ spec:
                   timeout:
                     default: 15m
                     description: timeout for the new version to become Ready.
+                    maxLength: 32
+                    pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+$
                     type: string
+                    x-kubernetes-validations:
+                    - message: must be a positive Go duration such as 30s, 5m or 1h
+                      rule: duration(self) > duration('0s')
                 type: object
             type: object
           status:
@@ -2579,6 +2595,10 @@ spec:
                     description: failedImage is not retried until spec.image changes
                       to something else.
                     type: string
+                  failureReason:
+                    description: failureReason explains why the new version was considered
+                      failed.
+                    type: string
                   fromImage:
                     type: string
                   message:
@@ -2594,8 +2614,24 @@ spec:
                     - Failed
                     - RollingBack
                     - RolledBack
+                    - Cancelled
                     type: string
                   restoreName:
+                    type: string
+                  retry:
+                    description: |-
+                      retry marks the rollout of an image that a failed upgrade left deployed. Its server pods
+                      created before startTime belong to the failed attempt.
+                    type: boolean
+                  rollbackRestoreFailed:
+                    description: |-
+                      rollbackRestoreFailed is set when the rollback's ForgejoRestore failed: the database may
+                      still be in the new version's state, so Forgejo is kept stopped until a backup is restored.
+                    type: boolean
+                  rolloutStartTime:
+                    description: rolloutStartTime is when the new image was first
+                      deployed; spec.upgrade.timeout counts from it.
+                    format: date-time
                     type: string
                   startTime:
                     format: date-time
