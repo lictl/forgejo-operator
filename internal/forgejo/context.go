@@ -54,8 +54,9 @@ type ReconcileContext struct {
 	DatabaseReady bool
 	// ValkeyURL (redis://host:port) is set by the HA step when highAvailability is enabled.
 	ValkeyURL string
-	// Maintenance is set by the maintenance step while a ForgejoRestore is active;
-	// the workload is scaled to zero.
+	// Maintenance is set by the maintenance step while a ForgejoRestore holds the instance
+	// (ScalingDown, Restoring, or failed after changing it), and by the restore guard while a
+	// restore Job still runs; the workload is scaled to zero.
 	Maintenance       bool
 	MaintenanceReason string
 	// RestoreMigrating is set by the maintenance step while a restored database waits for
@@ -65,7 +66,8 @@ type ReconcileContext struct {
 	// TargetImage is the image the workload step must deploy. Set by the upgrade step;
 	// defaults to Status.Image (if set) or the spec image.
 	TargetImage string
-	// Upgrading is true while the upgrade step is orchestrating an image change.
+	// Upgrading is true while the upgrade step is orchestrating an image change. When that
+	// step does not complete, the orchestrator sets it from status.upgrade (UpgradeInFlight).
 	// The workload uses the Recreate strategy and a single replica while it is set.
 	Upgrading bool
 	// Tuning holds app.ini overrides from auto-tuning as section -> key -> value. User
@@ -94,7 +96,8 @@ type ReconcileContext struct {
 
 // StepResult tells the orchestrator how to continue.
 type StepResult struct {
-	// Stop ends this reconciliation after status is persisted (e.g. waiting for a dependency).
+	// Stop reports that the step is waiting (e.g. for a dependency). The steps that need it
+	// are skipped in this pass; the others still run, and status is persisted as usual.
 	Stop bool
 	// RequeueAfter asks for another reconciliation.
 	RequeueAfter time.Duration

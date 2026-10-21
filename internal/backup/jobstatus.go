@@ -173,6 +173,45 @@ func CreateJob(ctx context.Context, c client.Client, owner client.Object, job *b
 	return CheckOwned(existing, owner)
 }
 
+// RemoveJob deletes job with background propagation, so that garbage collection also removes
+// its pods. A finished pod still names the PVCs it mounted, and the PVC protection controller
+// keeps a deleted claim (Terminating) until such pods are gone; so once a controller has
+// recorded what a Job did, the Job and its pods must go. The UID precondition makes sure a
+// newer Job of the same name is never deleted instead.
+func RemoveJob(ctx context.Context, c client.Client, job *batchv1.Job) error {
+	opts := []client.DeleteOption{client.PropagationPolicy(metav1.DeletePropagationBackground)}
+	if job.UID != "" {
+		opts = append(opts, client.Preconditions{UID: &job.UID})
+	}
+	err := c.Delete(ctx, job, opts...)
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		return nil // gone already, or replaced by a Job that is not this one
+	}
+	return err
+}
+
+// DeleteFinishedJob removes the Job of that name in owner's namespace (see RemoveJob) when
+// owner controls it and it has finished. A missing Job, a running one, one being deleted and
+// a Job of another object are left alone. It is cheap (one cache read) and idempotent, so
+// controllers call it on every reconcile of a finished ForgejoBackup or ForgejoRestore; that
+// also removes Jobs an earlier operator version kept.
+func DeleteFinishedJob(ctx context.Context, c client.Client, owner client.Object, name string) error {
+	if name == "" {
+		return nil
+	}
+	job := &batchv1.Job{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: owner.GetNamespace(), Name: name}, job); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !job.DeletionTimestamp.IsZero() || !metav1.IsControlledBy(job, owner) {
+		return nil
+	}
+	if state, _ := StateOf(job); state == JobRunning {
+		return nil
+	}
+	return RemoveJob(ctx, c, job)
+}
+
 // CheckOwned returns nil when owner is the Job's controller, otherwise a *JobConflictError.
 func CheckOwned(job *batchv1.Job, owner client.Object) error {
 	if metav1.IsControlledBy(job, owner) {

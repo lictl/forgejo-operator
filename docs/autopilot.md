@@ -57,9 +57,14 @@ because bleve indexes cannot be shared between pods.
   retry logic re-creates most queued tasks. A PVC would tie Valkey to one node and add a
   storage dependency for data that is mostly transient, so emptyDir is the deliberate
   compromise.
-- **Ordering.** Forgejo is only given the redis configuration once Valkey is ready.
-  Reconciliation pauses, with a `WaitingForValkey` event and requeues every 5s, while
-  Valkey is not ready.
+- **Ordering.** Pods are only rolled onto the redis configuration once Valkey is ready.
+  While Valkey is not ready, the `high-availability` step stops, so the steps that depend
+  on it (app.ini, workload, HPA, post-rollout actions) wait, with a `WaitingForValkey`
+  event and requeues every 5s. The redis URL itself (`rc.ValkeyURL`) is set as soon as the
+  password is known, ready or not, so every step renders the same app.ini. During a restore
+  the step does not stop: Forgejo is scaled to zero anyway, and scaling it down must not
+  wait for Valkey. If the cache has not seen `<name>-secrets` yet, the password is read
+  live.
 - **Disabling HA.** Valkey is deleted only when nothing can bring a redis app.ini back:
   - the desired (non-redis) app.ini is deployed, not a rolled-back last known good one, and
     no rollback is pending;
@@ -300,10 +305,18 @@ Volumes are always measured and reported. `spec.autoPilot.storageAutoExpand.enab
 `StorageHealthy` condition and the `forgejo_operator_volume_used_ratio` metric (and so the
 `ForgejoVolumeAlmostFull` alert) stay.
 
+Storage is its own pipeline step (`autopilot.ReconcileStorage`) with no prerequisites. A
+full volume is often the reason an earlier step stops: PostgreSQL cannot start on a full
+CNPG volume, so the database step waits, and with it the workload and post-rollout steps.
+The storage step still runs then, without the database, before the Deployment exists and
+during maintenance, and it is the only place the storage pass runs.
+
 - **Volumes.** The data PVC (`<name>-data` or `storage.existingClaim`) and the CNPG PVCs
   (label `cnpg.io/cluster=<name>-db`, data and WAL).
 - **Measurement.** Through `pods/exec` in a running container that mounts the claim (the
-  `forgejo` container, or CNPG's `postgres`), at most once a minute per claim.
+  `forgejo` container, or CNPG's `postgres`), at most once a minute per claim. Pods are
+  found by label: the server pods (from the operator's cache) and, when there are CNPG
+  volumes, the pods labelled `cnpg.io/cluster=<name>-db`.
   - `df -Pk <mountPath>` gives the file system's size and usage. When the size is at most
     125% of the claim's request, the file system is the volume itself and df is the
     measurement.
@@ -329,6 +342,7 @@ Volumes are always measured and reported. `spec.autoPilot.storageAutoExpand.enab
   | True `WithinThreshold` | every volume is below `thresholdPercent` |
   | True `Expanding` | a volume above the threshold is being expanded |
   | False `ExpansionStalled` | a resize has been pending for 30 minutes; the message lists the PVC's resize conditions (`ControllerResizeError`, `NodeResizeError`, `FileSystemResizePending`, …) and `allocatedResourceStatuses` (e.g. `ControllerResizeInfeasible`). Warning event at most hourly per claim |
+  | False `DatabaseClusterMissing` | a CNPG volume above the threshold whose Cluster `<name>-db` (or the CNPG API) does not exist, so it cannot be grown; Warning event at most hourly per claim |
   | False `ExpansionUnsupported` | above the threshold, StorageClass without `allowVolumeExpansion`; Warning event at most hourly per claim |
   | False `MaxSizeReached` | above the threshold and already at `maxSize` |
   | False `AutoExpandDisabled` | above the threshold with `storageAutoExpand.enabled: false`; Warning event at most hourly per claim |
@@ -344,11 +358,20 @@ Volumes are always measured and reported. `spec.autoPilot.storageAutoExpand.enab
   - Records `StorageExpanded`.
   - No new expansion of a claim while a resize is pending, within 5 minutes of the last
     one, or more than once per volume role per check.
+  - No new expansion on a measurement taken before the volume last grew. When no pod can
+    run to measure it (PostgreSQL on a full disk), the last measurement is still reported,
+    but once the PVC's capacity has grown it no longer counts: `StorageHealthy` stays
+    `Expanding` until a fresh measurement comes in. A measurement taken by the running
+    operator is compared with the PVC capacity at the time; one carried over in
+    `status.storage` after a restart counts as older when its size is more than 10% below
+    the PVC's capacity.
 - **Offline file system resize.** Some drivers grow the file system only while mounting
   the volume (`FileSystemResizePending`). When the data PVC has waited for that for 10
   minutes, the operator restarts Forgejo once per pending resize through the
-  `restarted-at` annotation (not during migration holds or restores, at most once per 10
-  minutes) and records `PodRestarted`. CNPG volumes are only reported.
+  `restarted-at` annotation (not during migration holds, restores or upgrades, including
+  those only recorded in `status.backup.activeRestore` and `status.upgrade`, not at zero
+  replicas, and at most once per 10 minutes) and records `PodRestarted`. CNPG volumes are
+  only reported.
 - **Upgrades and restores.** Measurement and expansion continue during them, since growing
   a volume is safe online. While a restore has scaled Forgejo to zero, the data PVC keeps
   its last measurement.

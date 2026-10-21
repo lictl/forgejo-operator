@@ -254,20 +254,38 @@ func gaugeValue(t *testing.T, ns, name string) float64 {
 func TestLastSuccessGaugeIsExportedFromStatus(t *testing.T) {
 	t1 := metav1.NewTime(time.Unix(1_700_000_000, 0))
 	t2 := metav1.NewTime(t1.Add(time.Hour))
-	ExportLastSuccess("gauge", "fb", &t2)
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: "gauge"}}
+	withSuccess := func(at *metav1.Time) *forgejov1.Forgejo {
+		g := f.DeepCopy()
+		g.Status.Backup = &forgejov1.BackupStatusSummary{LastSuccessfulBackupTime: at}
+		return g
+	}
+	ExportLastSuccess(withSuccess(&t2))
 	if v := gaugeValue(t, "gauge", "fb"); v != float64(t2.Unix()) {
 		t.Errorf("gauge = %v, want %v", v, t2.Unix())
 	}
 	// A summary from a lagging cache never moves the gauge back.
-	ExportLastSuccess("gauge", "fb", &t1)
+	ExportLastSuccess(withSuccess(&t1))
 	if v := gaugeValue(t, "gauge", "fb"); v != float64(t2.Unix()) {
 		t.Errorf("gauge went back to %v", v)
 	}
-	// No successful backup left: the series is removed.
-	ExportLastSuccess("gauge", "fb", nil)
+	// Called on every reconcile: an instance without a recorded success (status not written
+	// yet, or the step that writes it skipped) does not remove the series.
+	ExportLastSuccess(f)
+	ExportLastSuccess(withSuccess(nil))
+	if v := gaugeValue(t, "gauge", "fb"); v != float64(t2.Unix()) {
+		t.Errorf("gauge = %v after exporting an empty status, want %v", v, t2.Unix())
+	}
+	// No successful backup left: the series is removed, and a later success starts afresh.
+	ForgetLastSuccess("gauge", "fb")
 	if forgejo.BackupLastSuccess.DeleteLabelValues("gauge", "fb") {
 		t.Error("series still exported without a successful backup")
 	}
+	ExportLastSuccess(withSuccess(&t1))
+	if v := gaugeValue(t, "gauge", "fb"); v != float64(t1.Unix()) {
+		t.Errorf("gauge = %v after forgetting, want %v", v, t1.Unix())
+	}
+	ForgetLastSuccess("gauge", "fb")
 }
 
 func TestReconcileScheduleExportsLastSuccessAndDefersDuringUpgrade(t *testing.T) {

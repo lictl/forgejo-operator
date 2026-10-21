@@ -63,6 +63,29 @@ type ForgejoRestoreReconciler struct {
 	Recorder  events.EventRecorder
 }
 
+// releaseJobs deletes the finished restore Job of a finished restore. Status keeps what it
+// did (phase, message, DataModified, times); its pod would otherwise keep the data and
+// backup PVCs from being deleted with the instance (see backup.RemoveJob). The Job is kept
+// while the restore is ScalingUp: its completion time starts the scale-up timeout.
+func (r *ForgejoRestoreReconciler) releaseJobs(ctx context.Context, rs *forgejov1.ForgejoRestore) error {
+	names := []string{backup.RestoreJobName(rs)}
+	if rs.Status.JobName != "" && rs.Status.JobName != names[0] {
+		names = append(names, rs.Status.JobName)
+	}
+	for _, name := range names {
+		if err := backup.DeleteFinishedJob(ctx, r.Client, rs, name); err != nil {
+			return fmt.Errorf("deleting finished restore job: %w", err)
+		}
+	}
+	return nil
+}
+
+// patchStatus writes rs's status changes relative to orig, failing with a conflict when rs is
+// not the latest version (see Reconcile).
+func (r *ForgejoRestoreReconciler) patchStatus(ctx context.Context, rs, orig *forgejov1.ForgejoRestore) error {
+	return r.Status().Patch(ctx, rs, client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{}))
+}
+
 // reader returns the live API reader (the cache in tests that do not set one).
 func (r *ForgejoRestoreReconciler) reader() client.Reader {
 	if r.APIReader != nil {
@@ -83,7 +106,19 @@ func (r *ForgejoRestoreReconciler) reader() client.Reader {
 // Completed. The Forgejo pipeline's maintenance step keeps the instance scaled to zero while
 // the restore is in ScalingDown or Restoring, and after a failure that had already changed
 // the database or the data volume (DataModified condition) until that is acknowledged.
+//
+// Status is patched with optimistic locking: a pass that started from a stale copy (e.g.
+// still Restoring after the restore finished and its Job was deleted) must not overwrite what
+// a newer pass recorded, so a conflict just retries.
 func (r *ForgejoRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.reconcile(ctx, req)
+	if apierrors.IsConflict(err) {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	return res, err
+}
+
+func (r *ForgejoRestoreReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	rs := &forgejov1.ForgejoRestore{}
 	if err := r.Get(ctx, req.NamespacedName, rs); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -92,7 +127,9 @@ func (r *ForgejoRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return r.finalize(ctx, rs)
 	}
 	if !backup.IsRestoreActive(rs) {
-		return ctrl.Result{}, nil
+		// A Job that still ran when the restore was failed goes once it finishes (its watch
+		// brings the restore back here); so do Jobs that earlier operator versions kept.
+		return ctrl.Result{}, r.releaseJobs(ctx, rs)
 	}
 	// The finalizer is in place before any Job exists: deleting the restore must not end
 	// maintenance while a restore pod may still be writing.
@@ -201,7 +238,7 @@ func (r *ForgejoRestoreReconciler) validate(ctx context.Context, rs *forgejov1.F
 	rs.Status.StartTime = &now
 	rs.Status.Message = "Waiting for Forgejo to scale down"
 	setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionFalse, "ScalingDown", rs.Status.Message)
-	if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
+	if err := r.patchStatus(ctx, rs, orig); err != nil {
 		return ctrl.Result{}, err
 	}
 	r.eventOn(rs, corev1.EventTypeNormal, "RestoreStarted", "Restore", "Restoring backup %s (database: %t, data: %t)", b.Name, restoreDB, restoreData)
@@ -298,7 +335,7 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 	}
 	rs.Status.Message = fmt.Sprintf("Restore job %s is running", job.Name)
 	setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionFalse, "Restoring", rs.Status.Message)
-	if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
+	if err := r.patchStatus(ctx, rs, orig); err != nil {
 		return ctrl.Result{}, err
 	}
 	r.eventOn(rs, corev1.EventTypeNormal, "Restoring", "Restore", "Started job %s", job.Name)
@@ -410,7 +447,7 @@ func (r *ForgejoRestoreReconciler) track(ctx context.Context, rs *forgejov1.Forg
 	case backup.JobRunning:
 		mod := max(observed, recorded)
 		if stalled := backup.Stalled(job, pods, podStartTimeout); stalled != "" {
-			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+			if err := backup.RemoveJob(ctx, r.Client, job); err != nil {
 				return ctrl.Result{}, err
 			}
 			if mod == backup.Unmodified {
@@ -430,7 +467,7 @@ func (r *ForgejoRestoreReconciler) track(ctx context.Context, rs *forgejov1.Forg
 			if mod > recorded {
 				meta.SetStatusCondition(&rs.Status.Conditions, backup.ModificationCondition(mod, rs.Generation, why))
 			}
-			if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
+			if err := r.patchStatus(ctx, rs, orig); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -442,7 +479,7 @@ func (r *ForgejoRestoreReconciler) track(ctx context.Context, rs *forgejov1.Forg
 	rs.Status.Message = "Backup restored; waiting for Forgejo to become available"
 	setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionFalse, "ScalingUp", rs.Status.Message)
 	meta.SetStatusCondition(&rs.Status.Conditions, backup.ModificationCondition(backup.Modified, rs.Generation, "The backup was restored"))
-	if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
+	if err := r.patchStatus(ctx, rs, orig); err != nil {
 		return ctrl.Result{}, err
 	}
 	r.eventOn(rs, corev1.EventTypeNormal, "Restored", "Restore", "Backup %s restored", rs.Spec.BackupName)
@@ -452,6 +489,11 @@ func (r *ForgejoRestoreReconciler) track(ctx context.Context, rs *forgejov1.Forg
 // scaleUp completes the restore once the Deployment serves again (or immediately when the
 // instance has no Deployment or wants zero replicas).
 func (r *ForgejoRestoreReconciler) scaleUp(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo) (ctrl.Result, error) {
+	if !f.DeletionTimestamp.IsZero() {
+		// Nothing will come up; finishing now also releases the Job, whose pod would keep the
+		// instance's volumes from being deleted (e.g. a foreground deletion waits for them).
+		return ctrl.Result{}, r.complete(ctx, rs, f, "Backup restored; the Forgejo instance is being deleted")
+	}
 	if f.Status.Backup != nil && f.Status.Backup.ActiveRestore != "" && f.Status.Backup.ActiveRestore != rs.Name {
 		return ctrl.Result{}, r.complete(ctx, rs, f, fmt.Sprintf("Backup restored; ForgejoRestore %s keeps Forgejo in maintenance", f.Status.Backup.ActiveRestore))
 	}
@@ -498,7 +540,7 @@ func (r *ForgejoRestoreReconciler) wait(ctx context.Context, rs *forgejov1.Forge
 		}
 		rs.Status.Message = msg
 		setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionFalse, string(rs.Status.Phase), msg)
-		if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
+		if err := r.patchStatus(ctx, rs, orig); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -512,7 +554,7 @@ func (r *ForgejoRestoreReconciler) complete(ctx context.Context, rs *forgejov1.F
 	rs.Status.CompletionTime = &now
 	rs.Status.Message = msg
 	setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionTrue, "Completed", msg)
-	if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
+	if err := r.patchStatus(ctx, rs, orig); err != nil {
 		return err
 	}
 	forgejo.RestoreTotal.WithLabelValues(rs.Namespace, rs.Spec.ForgejoRef.Name, "succeeded").Inc()
@@ -520,7 +562,7 @@ func (r *ForgejoRestoreReconciler) complete(ctx context.Context, rs *forgejov1.F
 	if f != nil {
 		r.eventOn(f, corev1.EventTypeNormal, "RestoreCompleted", "Restore", "ForgejoRestore %s completed: %s", rs.Name, msg)
 	}
-	return nil
+	return r.releaseJobs(ctx, rs)
 }
 
 // failModified fails a restore whose Job had started and records in the DataModified
@@ -550,7 +592,7 @@ func (r *ForgejoRestoreReconciler) fail(ctx context.Context, rs *forgejov1.Forge
 	rs.Status.CompletionTime = &now
 	rs.Status.Message = msg
 	setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionFalse, reason, msg)
-	if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
+	if err := r.patchStatus(ctx, rs, orig); err != nil {
 		return err
 	}
 	forgejo.RestoreTotal.WithLabelValues(rs.Namespace, rs.Spec.ForgejoRef.Name, "failed").Inc()
@@ -558,7 +600,9 @@ func (r *ForgejoRestoreReconciler) fail(ctx context.Context, rs *forgejov1.Forge
 	if f != nil {
 		r.eventOn(f, corev1.EventTypeWarning, "RestoreFailed", "Restore", "ForgejoRestore %s failed: %s", rs.Name, msg)
 	}
-	return nil
+	// Message and DataModified keep what the Job did; a Job that is still running is left
+	// alone (see releaseJobs).
+	return r.releaseJobs(ctx, rs)
 }
 
 func (r *ForgejoRestoreReconciler) eventOn(obj runtime.Object, eventType, reason, action, note string, args ...any) {

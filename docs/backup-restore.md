@@ -33,7 +33,9 @@ before-migration   forgejo   Manual   Completed   12s         40s
 `status` records `phase` (`Pending` → `Running` → `Completed`/`Failed`), `startTime`,
 `completionTime`, `jobName`, `pvcName`, `path`, `forgejoImage` (the image running when the
 backup was taken), `databaseSizeBytes`, `dataSizeBytes`, `includesData`, `message` and a
-`Ready` condition. Events are recorded on the backup and on the `Forgejo` object.
+`Ready` condition. Events are recorded on the backup and on the `Forgejo` object. Status is
+the record of a finished backup: the Job is deleted once its outcome is written there (see
+[Jobs are deleted when they finish](#jobs-are-deleted-when-they-finish)).
 
 What happens:
 
@@ -105,7 +107,17 @@ checked with `tar -tzf` before it is renamed. A failing step deletes its partial
 When a backup fails, the operator also runs the cleanup Job `<backup>-cleanup` to remove its
 whole directory, after its Job has stopped. This covers a container killed by OOM, for
 example. A failed backup cannot be restored, and its leftovers would otherwise keep a full
-volume full. The `ForgejoBackup` object stays, so you can still see its status.
+volume full. The `ForgejoBackup` object stays, so you can still see its status. The outcome
+goes into the condition `FilesRemoved`, and then the cleanup Job is deleted:
+
+| `FilesRemoved` | Meaning |
+|----------------|---------|
+| `True`/`Removed` | The directory is gone. |
+| `True`/`VolumeDeleted` | The backup PVC was deleted (or is being deleted) while the cleanup ran. |
+| `False`/`CleanupFailed` | The cleanup Job failed; the message has its output. |
+| `False`/`CleanupStalled` | Its pod could not start a container within 10 minutes. |
+
+When the condition is `False`, deleting the `ForgejoBackup` tries the cleanup again.
 
 The data archive leaves out content Forgejo recreates or rebuilds by itself:
 `lost+found`, `gitea/tmp`, `gitea/repo-archive` (archive download cache), `gitea/log`,
@@ -151,8 +163,9 @@ are re-populated from the database on start).
 
 `ForgejoBackup` objects carry the finalizer `forgejo.lucas.icu/finalizer`. Deleting
 one stops its Job if it is still running, then runs a cleanup Job `<backup>-cleanup` that
-removes `<pvc>/<backup-name>/`. If that Job already ran because the backup failed, deletion
-finishes right away. The finalizer is released once that is done. Cleanup waits
+removes `<pvc>/<backup-name>/`. If the files of a failed backup were already removed
+(`FilesRemoved=True`), deletion finishes right away. The finalizer is released once that is
+done, and the cleanup Job goes with the object. Cleanup waits
 while an unfinished `ForgejoRestore` is reading the backup. The finalizer is also released
 when the PVC no longer exists, when cleanup fails, or after 10 minutes; a Warning event tells
 you to remove the directory by hand.
@@ -220,9 +233,9 @@ spec:
 * Metrics:
   * `forgejo_operator_backups_total{reason,result}`
   * `forgejo_operator_backup_last_success_timestamp_seconds`: completion time of the newest
-    successful backup of any reason. It is exported from the instance's backups on every
-    reconcile, so it is back right after an operator restart; it disappears when the
-    instance has no successful backup left.
+    successful backup of any reason, from `status.backup.lastSuccessfulBackupTime`. It is
+    exported on every reconcile, so it is back right after an operator restart, and it never
+    moves back; it disappears when the instance has no successful backup left.
   * `forgejo_operator_backup_duration_seconds`
   * `forgejo_operator_backup_size_bytes{part="database|data"}`
 
@@ -247,7 +260,7 @@ spec:
 | `ScalingDown` | The Forgejo pipeline turns on maintenance mode: `status.backup.activeRestore` is set, the Deployment is scaled to 0, the phase becomes `Restoring` and health checks and autopilot actions are suspended. The restore waits until no Forgejo pod exists, no backup of the instance is running and no Job or pod of another restore of the instance is still running. It fails after 15 minutes if that does not happen, for example because `spec.paused` is set or the reconcile is blocked earlier. |
 | `Restoring` | Job `<restore>-restore` runs (see below); `status.jobStartTime` records when it was created. If its newest pod cannot start within 10 minutes, the Job is stopped and the restore fails. It reports "nothing was changed" only when no earlier pod got past `verify`. Otherwise the failure counts as one that may have changed the instance (see below). A Job that is not found a minute after `jobStartTime` fails the restore with `JobMissing` only after the operator has confirmed with the API server that it is gone. |
 | `ScalingUp` | Maintenance ends and Forgejo is scaled back up. The bootstrap init container runs `forgejo migrate` against the restored database, in a single pod until that pod is available. The restore waits up to 15 minutes for the Deployment to be available. It completes right away when the instance wants no pods (`spec.replicas: 0` without horizontal autoscaling; with an HPA, `minReplicas` applies). |
-| `Completed` / `Failed` | Terminal. See below for when a failed restore ends maintenance. |
+| `Completed` / `Failed` | Terminal. The restore Job is deleted (see [Jobs are deleted when they finish](#jobs-are-deleted-when-they-finish)). See below for when a failed restore ends maintenance. |
 
 Each kind has its own Job suffix (`-backup`, `-cleanup`, `-restore`), so a restore may have
 the same name as its backup. A backup or restore never uses a Job it does not control. If a
@@ -338,6 +351,38 @@ Notes:
   that may be half-restored. A `RestoreAborted` Warning event on the `Forgejo` reports this.
   To recover, run another restore.
 * Metric: `forgejo_operator_restores_total{result}`.
+
+### Jobs are deleted when they finish
+
+A finished pod still names the PVCs it mounted, and Kubernetes' PVC protection keeps a
+deleted claim `Terminating` until such pods are gone. Backup, restore and cleanup pods mount
+the data PVC and the backup PVC, so keeping their Jobs would leave those claims `Terminating`
+when an instance with `retainPolicy: Delete` is deleted (a manual backup or a restore is not
+owned by the instance, so garbage collection would not remove them). The operator therefore
+deletes each Job, with background propagation so that its pods go too, as soon as it has
+written the outcome to status:
+
+* `<backup>-backup`: when the backup is `Completed` or `Failed`. `status.message` keeps the
+  failing container's output (termination message, or the tail of its log), and
+  `databaseSizeBytes`, `dataSizeBytes`, `startTime` and `completionTime` the rest.
+* `<backup>-cleanup` of a failed backup: when `FilesRemoved` is recorded. The cleanup Job of
+  a deleted backup goes with the `ForgejoBackup`.
+* `<restore>-restore`: when the restore is `Completed` or `Failed`. It is kept while the
+  restore is `ScalingUp`, because its completion time starts the 15-minute scale-up
+  timeout; a restore that is `ScalingUp` completes right away when its instance is being
+  deleted. `status.message` and `DataModified` keep what the Job did.
+
+A Job that still runs when its object fails (for example a restore whose instance was
+deleted) is deleted once it finishes. Finished Jobs left by earlier operator versions are
+deleted on the next reconcile. Jobs are not given `ttlSecondsAfterFinished`: a Job removed
+while the operator is down would be reported as `JobMissing`, failing a backup or restore
+that succeeded. Use `kubectl get events` or the `ForgejoBackup`/`ForgejoRestore` status to
+look at past runs, not the Jobs.
+
+Status updates of `ForgejoBackup` and `ForgejoRestore` use optimistic locking, so a
+reconcile that started from an outdated copy (still `Running`, say, after the Job was
+recorded and deleted) cannot overwrite the recorded result with `JobMissing`; it retries
+with the current object instead.
 
 ### Restoring into a new instance (disaster recovery)
 

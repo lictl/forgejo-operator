@@ -4,8 +4,7 @@ import (
 	"sync"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
+	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
@@ -17,19 +16,27 @@ var lastSuccess = struct {
 	at map[string]int64
 }{at: map[string]int64{}}
 
-// ExportLastSuccess publishes the instance's last successful backup time from its status. It
-// runs on every reconcile, so the gauge is back right after an operator restart instead of
-// only after the next successful backup (the staleness alerts depend on it). nil removes the
-// series: the instance has no successful backup left.
-func ExportLastSuccess(namespace, name string, t *metav1.Time) {
-	if t == nil {
-		lastSuccess.Lock()
-		defer lastSuccess.Unlock()
-		delete(lastSuccess.at, namespace+"/"+name)
-		forgejo.BackupLastSuccess.DeleteLabelValues(namespace, name)
+// ExportLastSuccess publishes forgejo.BackupLastSuccess for f from
+// status.backup.lastSuccessfulBackupTime. It makes no API call (one map lookup under a
+// mutex), so it can run on every reconcile, also when the backup-schedule step is skipped:
+// the gauge is back right after an operator restart instead of only after the next
+// successful backup (the staleness alerts depend on it). It only raises the gauge; an
+// instance without a recorded success leaves it as it is. ReconcileSchedule removes the
+// series once the instance has no successful backup left (ForgetLastSuccess).
+func ExportLastSuccess(f *forgejov1.Forgejo) {
+	if f == nil || f.Status.Backup == nil || f.Status.Backup.LastSuccessfulBackupTime == nil {
 		return
 	}
-	RecordLastSuccess(namespace, name, t.Time)
+	RecordLastSuccess(f.Namespace, f.Name, f.Status.Backup.LastSuccessfulBackupTime.Time)
+}
+
+// ForgetLastSuccess removes the instance's last-success series (and what RecordLastSuccess
+// remembers for it): the instance has no successful backup left, or it is gone.
+func ForgetLastSuccess(namespace, name string) {
+	lastSuccess.Lock()
+	defer lastSuccess.Unlock()
+	delete(lastSuccess.at, namespace+"/"+name)
+	forgejo.BackupLastSuccess.DeleteLabelValues(namespace, name)
 }
 
 // RecordLastSuccess raises the instance's last-success gauge to t; it never lowers it.

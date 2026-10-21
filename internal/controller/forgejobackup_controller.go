@@ -82,8 +82,18 @@ type ForgejoBackupReconciler struct {
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile runs a backup Job for each ForgejoBackup and removes the backup files when the
-// object is deleted.
+// object is deleted. Status is patched with optimistic locking: a pass that started from a
+// stale copy (e.g. still Running after the backup was recorded and its Job deleted) must not
+// overwrite what a newer pass recorded, so a conflict just retries.
 func (r *ForgejoBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.reconcile(ctx, req)
+	if apierrors.IsConflict(err) {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	return res, err
+}
+
+func (r *ForgejoBackupReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	b := &forgejov1.ForgejoBackup{}
 	if err := r.Get(ctx, req.NamespacedName, b); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -117,12 +127,37 @@ func (r *ForgejoBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// Re-exported after an operator restart even when the Forgejo pipeline is blocked.
 			backup.RecordLastSuccess(b.Namespace, f.Name, b.Status.CompletionTime.Time)
 		}
+		if err := r.releaseJobs(ctx, b); err != nil {
+			return ctrl.Result{}, err
+		}
 		return r.removeFailedFiles(ctx, b)
 	}
 	if b.Status.Phase == forgejov1.BackupPhaseRunning {
 		return r.track(ctx, b, f)
 	}
 	return r.start(ctx, b, f)
+}
+
+// releaseJobs deletes the finished Jobs of a finished backup: its backup Job, whose outcome
+// status records (phase, message, sizes, times), and the cleanup Job of a failed backup once
+// the FilesRemoved condition records its outcome. Their pods would otherwise keep the data
+// and backup PVCs from being deleted with the instance (see backup.RemoveJob).
+func (r *ForgejoBackupReconciler) releaseJobs(ctx context.Context, b *forgejov1.ForgejoBackup) error {
+	if err := backup.DeleteFinishedJob(ctx, r.Client, b, b.Status.JobName); err != nil {
+		return fmt.Errorf("deleting finished backup job: %w", err)
+	}
+	if meta.FindStatusCondition(b.Status.Conditions, backup.ConditionFilesRemoved) != nil {
+		if err := backup.DeleteFinishedJob(ctx, r.Client, b, backup.CleanupJobName(b)); err != nil {
+			return fmt.Errorf("deleting finished cleanup job: %w", err)
+		}
+	}
+	return nil
+}
+
+// patchStatus writes b's status changes relative to orig, failing with a conflict when b is
+// not the latest version (see Reconcile).
+func (r *ForgejoBackupReconciler) patchStatus(ctx context.Context, b, orig *forgejov1.ForgejoBackup) error {
+	return r.Status().Patch(ctx, b, client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{}))
 }
 
 // syncOwnership applies the instance's current retain policy to the backup's owner
@@ -239,7 +274,7 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	b.Status.IncludesData = includeData
 	b.Status.Message = fmt.Sprintf("Backup job %s is running", job.Name)
 	setCondition(&b.Status.Conditions, b.Generation, metav1.ConditionFalse, "Running", b.Status.Message)
-	if err := r.Status().Patch(ctx, b, client.MergeFrom(orig)); err != nil {
+	if err := r.patchStatus(ctx, b, orig); err != nil {
 		return ctrl.Result{}, err
 	}
 	r.event(b, corev1.EventTypeNormal, "BackupStarted", "Backup", "Started job %s writing to %s:%s", job.Name, pvc, b.Status.Path)
@@ -280,10 +315,15 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 		if msg == "" {
 			msg = jobMsg
 		}
-		return ctrl.Result{}, r.fail(ctx, b, "JobFailed", "Backup job failed: "+msg)
+		if err := r.fail(ctx, b, "JobFailed", "Backup job failed: "+msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		// The message above keeps the failing container's output; the Job is not needed any
+		// more. removeFailedFiles waits for its pods to stop before it removes the files.
+		return ctrl.Result{}, backup.RemoveJob(ctx, r.Client, job)
 	case backup.JobRunning:
 		if stalled := backup.Stalled(job, pods, podStartTimeout); stalled != "" {
-			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+			if err := backup.RemoveJob(ctx, r.Client, job); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, r.fail(ctx, b, "JobStalled", "Backup job did not start: "+stalled)
@@ -295,7 +335,7 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 		if msg != b.Status.Message {
 			orig := b.DeepCopy()
 			b.Status.Message = msg
-			if err := r.Status().Patch(ctx, b, client.MergeFrom(orig)); err != nil {
+			if err := r.patchStatus(ctx, b, orig); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -320,7 +360,7 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 		b.Status.Message += fmt.Sprintf("; %d file(s) changed or vanished while archiving", res.Warnings)
 	}
 	setCondition(&b.Status.Conditions, b.Generation, metav1.ConditionTrue, "Completed", b.Status.Message)
-	if err := r.Status().Patch(ctx, b, client.MergeFrom(orig)); err != nil {
+	if err := r.patchStatus(ctx, b, orig); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -336,7 +376,9 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 	if f != nil {
 		r.eventOn(f, corev1.EventTypeNormal, "BackupCompleted", "Backup", "ForgejoBackup %s completed", b.Name)
 	}
-	return ctrl.Result{}, nil
+	// Status now holds everything the Job reported; its pod would only keep the data and
+	// backup PVCs from being deleted.
+	return ctrl.Result{}, backup.RemoveJob(ctx, r.Client, job)
 }
 
 // waitForDependency keeps the backup Pending until dependencyTimeout, then fails it.
@@ -353,7 +395,7 @@ func (r *ForgejoBackupReconciler) wait(ctx context.Context, b *forgejov1.Forgejo
 		b.Status.Phase = forgejov1.BackupPhasePending
 		b.Status.Message = msg
 		setCondition(&b.Status.Conditions, b.Generation, metav1.ConditionFalse, "Pending", msg)
-		if err := r.Status().Patch(ctx, b, client.MergeFrom(orig)); err != nil {
+		if err := r.patchStatus(ctx, b, orig); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -367,7 +409,7 @@ func (r *ForgejoBackupReconciler) fail(ctx context.Context, b *forgejov1.Forgejo
 	b.Status.CompletionTime = &now
 	b.Status.Message = msg
 	setCondition(&b.Status.Conditions, b.Generation, metav1.ConditionFalse, reason, msg)
-	if err := r.Status().Patch(ctx, b, client.MergeFrom(orig)); err != nil {
+	if err := r.patchStatus(ctx, b, orig); err != nil {
 		return err
 	}
 	ns, inst := b.Namespace, b.Spec.ForgejoRef.Name
@@ -394,11 +436,21 @@ func (r *ForgejoBackupReconciler) finalize(ctx context.Context, b *forgejov1.For
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 	}
 	controllerutil.RemoveFinalizer(b, forgejo.FinalizerName)
-	return ctrl.Result{}, client.IgnoreNotFound(r.Update(ctx, b))
+	if err := r.Update(ctx, b); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	// Garbage collection removes the cleanup Job with the object; deleting a finished one
+	// right away releases the backup PVC sooner (it may be waiting to be deleted with the
+	// instance). Nothing depends on this, so a failure is only logged.
+	if err := backup.DeleteFinishedJob(ctx, r.Client, b, backup.CleanupJobName(b)); err != nil {
+		logf.FromContext(ctx).Info("could not delete the finished cleanup job; garbage collection will", "error", err.Error())
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *ForgejoBackupReconciler) cleanup(ctx context.Context, b *forgejov1.ForgejoBackup) (bool, error) {
-	if b.Status.PVCName == "" {
+	// FilesRemoved: the files of this failed backup were already removed.
+	if b.Status.PVCName == "" || backup.FilesRemoved(b) {
 		return true, nil
 	}
 	if name, err := backup.RestoreUsing(ctx, r.Client, b); err != nil || name != "" {
@@ -544,19 +596,24 @@ func (r *ForgejoBackupReconciler) createCleanupJob(ctx context.Context, b *forge
 // removeFailedFiles deletes the directory of a failed backup with the cleanup Job, once
 // nothing of the backup Job can still write: whatever a failed run left behind (a partial
 // archive on a full volume, for example) cannot be restored and would only take space from
-// later backups. The object stays so its status remains visible; the cleanup Job, which is
-// kept, records that the files are gone, and deleting the backup later finds it finished.
+// later backups. The object stays so its status remains visible. The FilesRemoved condition
+// records how the cleanup went, after which its Job is deleted (see trackFileRemoval);
+// deleting the backup later finishes right away when its files are known to be gone.
 func (r *ForgejoBackupReconciler) removeFailedFiles(ctx context.Context, b *forgejov1.ForgejoBackup) (ctrl.Result, error) {
-	if b.Status.Phase != forgejov1.BackupPhaseFailed || b.Status.PVCName == "" {
+	if b.Status.Phase != forgejov1.BackupPhaseFailed || b.Status.PVCName == "" ||
+		meta.FindStatusCondition(b.Status.Conditions, backup.ConditionFilesRemoved) != nil {
 		return ctrl.Result{}, nil
 	}
 	job := &batchv1.Job{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: backup.CleanupJobName(b)}, job); err == nil {
 		var conflict *backup.JobConflictError
-		if errors.As(backup.CheckOwned(job, b), &conflict) && conflict.Transient {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil // wait for the old Job to go away
+		if errors.As(backup.CheckOwned(job, b), &conflict) {
+			if conflict.Transient {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil // wait for the old Job to go away
+			}
+			return ctrl.Result{}, nil // someone else's Job (handled on deletion)
 		}
-		return ctrl.Result{}, nil // done, running, or someone else's Job (handled on deletion)
+		return r.trackFileRemoval(ctx, b, job)
 	} else if !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
@@ -597,7 +654,62 @@ func (r *ForgejoBackupReconciler) removeFailedFiles(ctx context.Context, b *forg
 		return ctrl.Result{}, err
 	}
 	r.event(b, corev1.EventTypeNormal, "RemovingFiles", "Cleanup", "Removing what the failed backup left in %s:%s", b.Status.PVCName, b.Status.Path)
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// trackFileRemoval follows the cleanup Job of a failed backup. Once it has finished (or can
+// no longer matter) the outcome goes into the FilesRemoved condition and the Job is deleted,
+// so that its pod does not keep the backup PVC from being deleted.
+func (r *ForgejoBackupReconciler) trackFileRemoval(ctx context.Context, b *forgejov1.ForgejoBackup, job *batchv1.Job) (ctrl.Result, error) {
+	where := b.Status.PVCName + ":" + b.Status.Path
+	cond := metav1.Condition{Type: backup.ConditionFilesRemoved, ObservedGeneration: b.Generation,
+		Status: metav1.ConditionTrue, Reason: "Removed", Message: "Removed " + where}
+	state, jobMsg := backup.StateOf(job)
+	switch state {
+	case backup.JobFailed:
+		pods, err := backup.JobPods(ctx, r.Client, job)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if msg := backup.FailureMessage(pods); msg != "" {
+			jobMsg = msg
+		}
+		cond.Status, cond.Reason = metav1.ConditionFalse, "CleanupFailed"
+		cond.Message = fmt.Sprintf("Could not remove %s: %s; deleting the ForgejoBackup tries again", where, jobMsg)
+	case backup.JobRunning:
+		pvc := &corev1.PersistentVolumeClaim{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.PVCName}, pvc)
+		switch {
+		case err != nil && !apierrors.IsNotFound(err):
+			return ctrl.Result{}, err
+		case err != nil || !pvc.DeletionTimestamp.IsZero():
+			// The volume, and with it the files, is going away; a pod that waits for it would
+			// only keep it from being deleted.
+			cond.Reason, cond.Message = "VolumeDeleted", fmt.Sprintf("Backup volume %s is deleted", b.Status.PVCName)
+		default:
+			pods, err := backup.JobPods(ctx, r.Client, job)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			stalled := backup.Stalled(job, pods, podStartTimeout)
+			if stalled == "" {
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+			cond.Status, cond.Reason = metav1.ConditionFalse, "CleanupStalled"
+			cond.Message = fmt.Sprintf("Could not remove %s: %s; deleting the ForgejoBackup tries again", where, stalled)
+		}
+	}
+	orig := b.DeepCopy()
+	meta.SetStatusCondition(&b.Status.Conditions, cond)
+	if err := r.patchStatus(ctx, b, orig); err != nil {
+		return ctrl.Result{}, err
+	}
+	if cond.Status == metav1.ConditionTrue {
+		r.event(b, corev1.EventTypeNormal, "FilesRemoved", "Cleanup", "%s", cond.Message)
+	} else {
+		r.event(b, corev1.EventTypeWarning, cond.Reason, "Cleanup", "%s", cond.Message)
+	}
+	return ctrl.Result{}, backup.RemoveJob(ctx, r.Client, job)
 }
 
 func (r *ForgejoBackupReconciler) event(b *forgejov1.ForgejoBackup, eventType, reason, action, note string, args ...any) {

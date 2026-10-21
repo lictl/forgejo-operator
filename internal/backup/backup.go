@@ -125,11 +125,11 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 		return forgejo.StepResult{}, fmt.Errorf("listing backups: %w", err)
 	}
 	summarize(f, backups)
-	var succeeded *metav1.Time
-	if f.Status.Backup != nil {
-		succeeded = f.Status.Backup.LastSuccessfulBackupTime
+	if f.Status.Backup == nil || f.Status.Backup.LastSuccessfulBackupTime == nil {
+		ForgetLastSuccess(f.Namespace, f.Name)
+	} else {
+		ExportLastSuccess(f)
 	}
-	ExportLastSuccess(f.Namespace, f.Name, succeeded)
 
 	if !f.Spec.Backup.Enabled {
 		meta.RemoveStatusCondition(&f.Status.Conditions, forgejov1.ConditionBackupHealthy)

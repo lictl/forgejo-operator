@@ -831,7 +831,8 @@ type UpgradeStatus struct {
 	RestoreName string `json:"restoreName,omitempty"`
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
-	// rolloutStartTime is when the new image was first deployed; spec.upgrade.timeout counts from it.
+	// rolloutStartTime is when the new image was first deployed; spec.upgrade.timeout counts
+	// from it. A restore that pauses the upgrade moves it to the end of that pause.
 	// +optional
 	RolloutStartTime *metav1.Time `json:"rolloutStartTime,omitempty"`
 	// +optional

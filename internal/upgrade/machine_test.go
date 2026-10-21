@@ -36,7 +36,7 @@ func fixture(u *forgejov1.UpgradeStatus) *forgejov1.Forgejo {
 	}
 }
 
-func reconcile(t *testing.T, f *forgejov1.Forgejo, objs ...client.Object) (*forgejo.ReconcileContext, client.Client) {
+func newClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	s := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(s); err != nil {
@@ -45,8 +45,13 @@ func reconcile(t *testing.T, f *forgejov1.Forgejo, objs ...client.Object) (*forg
 	if err := forgejov1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
-	return reconcileWith(t, c, s, f), c
+	return fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
+}
+
+func reconcile(t *testing.T, f *forgejov1.Forgejo, objs ...client.Object) (*forgejo.ReconcileContext, client.Client) {
+	t.Helper()
+	c := newClient(t, objs...)
+	return reconcileWith(t, c, c.Scheme(), f), c
 }
 
 func reconcileWith(t *testing.T, c client.Client, s *runtime.Scheme, f *forgejov1.Forgejo) *forgejo.ReconcileContext {

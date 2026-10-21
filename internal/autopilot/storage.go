@@ -3,6 +3,7 @@ package autopilot
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,10 +13,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
@@ -68,14 +72,43 @@ const (
 	roleWAL
 )
 
+// ReconcileStorage is the storage pipeline step: it measures the data and CNPG volumes,
+// reports status.storage and StorageHealthy, and grows volumes above the threshold.
+//
+// It needs no other step. A full volume is often why an earlier step stops: PostgreSQL
+// cannot start on a full CNPG volume, so the database step waits, and with it the workload
+// and post-rollout steps. Growing that volume must not depend on them. The step therefore
+// reads only the instance, its claims, pods and Deployment, and copes with rc.DB being nil,
+// the workload not existing yet, maintenance and a missing CNPG Cluster.
+func ReconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
+	st := stateFor(rc.Instance)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !storageCheckDue(rc.Instance, st) {
+		return forgejo.StepResult{}, nil
+	}
+	dep, err := serverDeployment(ctx, rc)
+	if err != nil {
+		return forgejo.StepResult{}, err
+	}
+	return forgejo.StepResult{}, reconcileStorage(ctx, rc, st, dep)
+}
+
+// storageCheckDue reports whether volumes should be measured and reported again: once per
+// storageCheckInterval, and as soon as a background measurement has finished.
+func storageCheckDue(f *forgejov1.Forgejo, st *instanceState) bool {
+	return f.Status.Storage == nil || time.Since(st.lastStorageCheck) >= storageCheckInterval || st.measure.updatedSince(st.lastStorageCheck)
+}
+
 // reconcileStorage measures the data and CNPG PVCs, reports status.storage, the
 // VolumeUsedRatio metric and StorageHealthy, and expands volumes above the threshold when
 // auto-expansion is enabled. Measuring and reporting continue with auto-expansion turned
-// off, so the ForgejoVolumeAlmostFull alert and StorageHealthy keep working.
+// off, so the ForgejoVolumeAlmostFull alert and StorageHealthy keep working. dep is the
+// Forgejo Deployment, nil when it does not exist. Must be called with st.mu held.
 func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState, dep *appsv1.Deployment) error {
 	f := rc.Instance
 	m := st.measure
-	if f.Status.Storage != nil && time.Since(st.lastStorageCheck) < storageCheckInterval && !m.updatedSince(st.lastStorageCheck) {
+	if !storageCheckDue(f, st) {
 		return nil
 	}
 
@@ -83,15 +116,15 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 	if err != nil {
 		return err
 	}
-	podList := &corev1.PodList{}
-	if err := rc.Client.List(ctx, podList, client.InNamespace(f.Namespace)); err != nil {
+	pods, err := mountingPods(ctx, rc, claims)
+	if err != nil {
 		return err
 	}
 	names := make([]string, 0, len(claims))
 	var started []<-chan struct{}
 	for _, c := range claims {
 		names = append(names, c.pvc.Name)
-		if ch := m.start(logger(ctx), podList.Items, c.pvc); ch != nil {
+		if ch := m.start(logger(ctx), pods, c.pvc); ch != nil {
 			started = append(started, ch)
 		}
 	}
@@ -151,12 +184,13 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 			delete(st.resizeSeen, pvc.Name)
 		}
 
-		used, capacity, ok := m.result(pvc.Name)
+		res, ok := m.result(pvc.Name)
 		if !ok {
 			if p, found := prev[pvc.Name]; found && p.CapacityBytes > 0 {
-				used, capacity, ok = p.UsedBytes, p.CapacityBytes, true
+				res, ok = measurement{used: p.UsedBytes, capacity: p.CapacityBytes}, true
 			}
 		}
+		used, capacity := res.used, res.capacity
 		if !ok || capacity <= 0 {
 			volumes = append(volumes, vu)
 			continue
@@ -181,10 +215,22 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 					"PVC %s is %d%% full and already at maxSize %s", pvc.Name, vu.UsedPercent, maxSize.String())
 			case pending || (vu.LastExpansionTime != nil && time.Since(vu.LastExpansionTime.Time) < expansionSettle) || expandedRoles[c.role]:
 				expanding = true
+			case res.predatesResize(pvc):
+				// The volume has grown since this measurement was taken, typically because
+				// the pods that mount it cannot run (PostgreSQL on a full volume): wait for a
+				// fresh measurement instead of growing it again on stale numbers.
+				expanding = true
 			default:
 				newSize := grownSize(req, int64(ae.IncrementPercent), maxSize)
 				if err := expandClaim(ctx, rc, c, newSize); err != nil {
-					return err
+					if c.role == roleData || !clusterMissing(err) {
+						return err
+					}
+					msg := fmt.Sprintf("%s is %d%% full but CNPG Cluster %s, through which it is grown, does not exist",
+						pvc.Name, vu.UsedPercent, forgejo.DatabaseClusterName(f))
+					addProblem(ReasonDatabaseClusterMissing, msg)
+					warnEvery(rc, st, "storage-nocluster/"+pvc.Name, time.Hour, ReasonDatabaseClusterMissing, "%s", msg)
+					break
 				}
 				expandedRoles[c.role] = true
 				expanding = true
@@ -222,14 +268,45 @@ func problemRank(reason string) int {
 	switch reason {
 	case ReasonExpansionStalled:
 		return 0
-	case ReasonExpansionUnsupported:
+	case ReasonDatabaseClusterMissing:
 		return 1
-	case ReasonMaxSizeReached:
+	case ReasonExpansionUnsupported:
 		return 2
-	case ReasonAutoExpandDisabled:
+	case ReasonMaxSizeReached:
 		return 3
+	case ReasonAutoExpandDisabled:
+		return 4
 	}
 	return 99
+}
+
+// clusterMissing reports whether growing a CNPG volume failed because its Cluster (or the
+// CNPG API) is gone, e.g. a retained volume whose Cluster was deleted.
+func clusterMissing(err error) bool {
+	return apierrors.IsNotFound(err) || meta.IsNoMatchError(err)
+}
+
+// mountingPods lists the pods through which the claims can be measured: the Forgejo server
+// pods and, for CNPG volumes, the Cluster's pods. Both are selected by label, so the server
+// pods come from the operator's filtered cache and only the Cluster's pods are read live.
+// Backup and restore Job pods are left out: while a restore has scaled Forgejo to zero, the
+// data volume keeps its last measurement.
+func mountingPods(ctx context.Context, rc *forgejo.ReconcileContext, claims []instanceClaim) ([]corev1.Pod, error) {
+	f := rc.Instance
+	list := &corev1.PodList{}
+	if err := rc.Client.List(ctx, list, client.InNamespace(f.Namespace), client.MatchingLabels(forgejo.SelectorLabels(f))); err != nil {
+		return nil, err
+	}
+	pods := list.Items
+	if !slices.ContainsFunc(claims, func(c instanceClaim) bool { return c.role != roleData }) {
+		return pods, nil
+	}
+	db := &corev1.PodList{}
+	if err := rc.Client.List(ctx, db, client.InNamespace(f.Namespace),
+		client.MatchingLabels{cnpgClusterLabel: forgejo.DatabaseClusterName(f)}); err != nil {
+		return nil, err
+	}
+	return append(pods, db.Items...), nil
 }
 
 type instanceClaim struct {
@@ -281,10 +358,34 @@ func instanceClaims(ctx context.Context, rc *forgejo.ReconcileContext) ([]instan
 // Failed attempts are recorded as well and back off exponentially (up to an hour), so a
 // volume that cannot be measured is not retried on every reconcile.
 
+// measurement is one claim's usage.
+type measurement struct {
+	used, capacity int64
+	// claimCapacity is the PVC's status.capacity when the measurement started; zero when
+	// unknown (a measurement carried over in status.storage).
+	claimCapacity int64
+}
+
+// predatesResize reports whether the volume has grown since m was taken, so that m says
+// nothing about how full it is now. For a measurement taken by this process the PVC's
+// capacity is compared exactly; for one carried over in status.storage (after an operator
+// restart) the measured size must be clearly, more than 10%, below the PVC's capacity. The
+// smallest increment is 10% and file system overhead takes a few percent.
+func (m measurement) predatesResize(pvc *corev1.PersistentVolumeClaim) bool {
+	current := pvc.Status.Capacity.Storage().Value()
+	if current <= 0 {
+		return false
+	}
+	if m.claimCapacity > 0 {
+		return current > m.claimCapacity
+	}
+	return m.capacity*10 < current*9
+}
+
 // claimMeasurement is what the operator knows about one claim's usage.
 type claimMeasurement struct {
-	used, capacity int64     // last successful measurement
-	at             time.Time // when it was taken; zero when there is none
+	measurement           // last successful measurement
+	at          time.Time // when it was taken; zero when there is none
 
 	attempt  time.Time // start of the last measurement job
 	failures int       // consecutive jobs that produced no usable measurement
@@ -335,6 +436,7 @@ func (m *measureState) claim(name string) *claimMeasurement {
 // running. It returns a channel that is closed when the measurement finishes, or nil.
 func (m *measureState) start(log logr.Logger, pods []corev1.Pod, pvc *corev1.PersistentVolumeClaim) <-chan struct{} {
 	requested := pvc.Spec.Resources.Requests.Storage().Value()
+	claimCapacity := pvc.Status.Capacity.Storage().Value()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c := m.claim(pvc.Name)
@@ -347,11 +449,11 @@ func (m *measureState) start(log logr.Logger, pods []corev1.Pod, pvc *corev1.Per
 	}
 	c.running, c.attempt = true, time.Now()
 	done := make(chan struct{})
-	go m.run(log, pvc.Name, pvc.Namespace, pod, container, path, requested, done)
+	go m.run(log, pvc.Name, pvc.Namespace, pod, container, path, requested, claimCapacity, done)
 	return done
 }
 
-func (m *measureState) run(log logr.Logger, claim, namespace, pod, container, path string, requested int64, done chan struct{}) {
+func (m *measureState) run(log logr.Logger, claim, namespace, pod, container, path string, requested, claimCapacity int64, done chan struct{}) {
 	defer close(done)
 	measureSem <- struct{}{}
 	defer func() { <-measureSem }()
@@ -375,7 +477,7 @@ func (m *measureState) run(log logr.Logger, claim, namespace, pod, container, pa
 		m.mu.Unlock()
 	}
 	if dfErr == nil && size > 0 && (requested <= 0 || size <= requested*5/4) {
-		c.used, c.capacity, c.at = used, size, time.Now()
+		c.measurement, c.at = measurement{used: used, capacity: size, claimCapacity: claimCapacity}, time.Now()
 		finish(true, nil)
 		return
 	}
@@ -401,7 +503,7 @@ func (m *measureState) run(log logr.Logger, claim, namespace, pod, container, pa
 		return
 	}
 	c.duFailures = 0
-	c.used, c.capacity, c.at = duUsed, requested, time.Now()
+	c.measurement, c.at = measurement{used: duUsed, capacity: requested, claimCapacity: claimCapacity}, time.Now()
 	finish(true, nil)
 }
 
@@ -426,14 +528,14 @@ func (m *measureState) logFailure(log logr.Logger, claim, pod string, err error,
 }
 
 // result returns the last successful measurement of the claim.
-func (m *measureState) result(claim string) (used, capacity int64, ok bool) {
+func (m *measureState) result(claim string) (measurement, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c, found := m.claims[claim]
 	if !found || c.at.IsZero() {
-		return 0, 0, false
+		return measurement{}, false
 	}
-	return c.used, c.capacity, true
+	return c.measurement, true
 }
 
 func (m *measureState) anyRunning() bool {
@@ -670,10 +772,16 @@ func resizeDetail(pvc *corev1.PersistentVolumeClaim) string {
 
 // restartForFilesystemResize restarts Forgejo once per pending resize of its data volume
 // when only the file system resize is left, so the kubelet resizes it while mounting.
+//
+// The storage step needs no other step, so the maintenance or upgrade step may have failed
+// or not run yet in this pass; the restore and upgrade recorded in status count as well.
+// A Deployment scaled to zero mounts nothing; its next pod resizes the file system anyway.
 func restartForFilesystemResize(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState, dep *appsv1.Deployment,
 	pvc *corev1.PersistentVolumeClaim, since time.Time) error {
 	f := rc.Instance
-	if dep == nil || rc.Maintenance || workloadHeld(rc) || inCooldown(f, ActionPodRestarted, restartCooldown) {
+	restoring := f.Status.Backup != nil && f.Status.Backup.ActiveRestore != ""
+	if dep == nil || ptr.Deref(dep.Spec.Replicas, 1) == 0 || rc.Maintenance || restoring || workloadHeld(rc) ||
+		forgejo.UpgradeInFlight(f) || inCooldown(f, ActionPodRestarted, restartCooldown) {
 		return nil
 	}
 	if t, ok := st.resizeRestarted[pvc.Name]; ok && t.After(since) {

@@ -6,8 +6,10 @@
 //   - ReconcileTuning      rc.Tuning, rc.TuningEnv, rc.ResourcesOverride, rc.HPAManaged
 //   - ReconcileConfigGuard switches to the last-known-good app.ini after a rejected config
 //   - ReconcileScaling     HPA and PodDisruptionBudget
+//   - ReconcileStorage     volume measurement, StorageHealthy and PVC auto-expansion; has no
+//     prerequisites, so a stopped database step (e.g. a full CNPG volume) cannot starve it
 //   - Reconcile            post-rollout actions: LKG bookkeeping, config rollback,
-//     health-based restarts, OOM and usage-based right-sizing, storage expansion
+//     health-based restarts, OOM and usage-based right-sizing
 package autopilot
 
 import (
@@ -50,25 +52,23 @@ const (
 	ReasonHPAMissingResourceRequests  = "HPAMissingResourceRequests"
 	ReasonAutoExpandDisabled          = "AutoExpandDisabled"
 	ReasonExpansionStalled            = "ExpansionStalled"
+	ReasonDatabaseClusterMissing      = "DatabaseClusterMissing"
 )
 
 // serverContainerName is the Forgejo container in the server pods.
 const serverContainerName = "forgejo"
 
-// Reconcile runs post-rollout autonomous actions: storage auto-expansion, vertical
-// right-sizing, self-healing and last-known-good bookkeeping.
+// Reconcile runs post-rollout autonomous actions: vertical right-sizing, self-healing and
+// last-known-good bookkeeping. Storage is handled by ReconcileStorage, its own step.
 func Reconcile(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	st := stateFor(f)
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	dep := &appsv1.Deployment{}
-	if err := rc.Client.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return forgejo.StepResult{}, err
-		}
-		dep = nil
+	dep, err := serverDeployment(ctx, rc)
+	if err != nil {
+		return forgejo.StepResult{}, err
 	}
 	pods, err := serverPods(ctx, rc)
 	if err != nil {
@@ -95,8 +95,20 @@ func Reconcile(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepR
 		rsScaled := rightSize(ctx, rc, st, pods, oomSeen || reverted)
 		errs = append(errs, recordVerticalBase(ctx, rc, dep, reverted || oomScaled || rsScaled))
 	}
-	errs = append(errs, reconcileStorage(ctx, rc, st, dep))
 	return forgejo.StepResult{}, errors.Join(errs...)
+}
+
+// serverDeployment returns the Forgejo Deployment, or nil when it does not exist (yet).
+func serverDeployment(ctx context.Context, rc *forgejo.ReconcileContext) (*appsv1.Deployment, error) {
+	f := rc.Instance
+	dep := &appsv1.Deployment{}
+	if err := rc.Client.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return dep, nil
 }
 
 // workloadHeld reports whether a migration owns the workload: an upgrade in progress, a

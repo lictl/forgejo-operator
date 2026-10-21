@@ -29,6 +29,10 @@ const stopTimeout = 15 * time.Minute
 // was in flight, so the event is not repeated on every reconcile.
 var queued sync.Map
 
+// paused remembers, per instance, that an UpgradePaused event was emitted for the current
+// maintenance window, so that it is not repeated and the end of the window is reported.
+var paused sync.Map
+
 // machine advances an upgrade that is in flight by one phase per reconcile.
 type machine struct {
 	ctx context.Context
@@ -54,6 +58,12 @@ func (m *machine) run(desired string) error {
 		}
 		m.reportQueued(desired)
 	}
+	if m.heldByMaintenance() {
+		m.pause()
+		m.apply(desired)
+		return nil
+	}
+	m.resume()
 	var err error
 	switch m.u.Phase {
 	case forgejov1.UpgradePhasePending:
@@ -110,13 +120,69 @@ func (m *machine) apply(desired string) {
 }
 
 func (m *machine) reportQueued(desired string) {
-	key := m.rc.Instance.Namespace + "/" + m.rc.Instance.Name
+	key := instanceKey(m.rc)
 	if prev, ok := queued.Load(key); ok && prev == desired {
 		return
 	}
 	queued.Store(key, desired)
 	m.rc.Event(corev1.EventTypeNormal, "UpgradeQueued", eventAction,
 		"spec.image changed to %s while the upgrade to %s is in progress; it is handled once this upgrade has finished", desired, m.u.ToImage)
+}
+
+// heldByMaintenance reports whether maintenance mode (rc.Maintenance: a ForgejoRestore, or a
+// restore Job that still runs) keeps the instance at zero replicas on behalf of something
+// else than this upgrade. The rollback's own restore is what RollingBack waits for, so its
+// maintenance (including a failed restore that holds it) does not pause the upgrade.
+func (m *machine) heldByMaintenance() bool {
+	rc, u := m.rc, m.u
+	if !rc.Maintenance {
+		return false
+	}
+	if b := rc.Instance.Status.Backup; u.Phase == forgejov1.UpgradePhaseRollingBack && u.RestoreName != "" &&
+		b != nil && b.ActiveRestore == u.RestoreName {
+		return false
+	}
+	return true
+}
+
+// pause holds the upgrade in its phase while maintenance mode stops Forgejo: the phase
+// handlers would otherwise take the stopped pods for a finished cold stop, start a rollout no
+// pod can run, or let spec.upgrade.timeout expire. No phase advances, no backup or restore is
+// created and no timeout runs. A cancellation (spec.image changed before the new image was
+// deployed) still applies, since it deploys nothing.
+func (m *machine) pause() {
+	rc, u := m.rc, m.u
+	if u.Phase == forgejov1.UpgradePhaseVerifying {
+		// The verified pod is gone: after maintenance the new image starts again and migrates
+		// the database (which a restore may have replaced) once more.
+		u.Phase = forgejov1.UpgradePhaseRollingOut
+	}
+	if u.RolloutStartTime != nil &&
+		(u.Phase == forgejov1.UpgradePhaseRollingOut || u.Phase == forgejov1.UpgradePhaseRollingBack) {
+		// The timeouts of these phases count from rolloutStartTime (for RollingBack: from the
+		// later of it and the restore's completion). Keeping it at the current time while paused
+		// makes them count from the end of maintenance, also across operator restarts.
+		now := metav1.Now()
+		u.RolloutStartTime = &now
+	}
+	u.Message = fmt.Sprintf("Paused in phase %s while the instance is in maintenance (%s); the upgrade to %s resumes once maintenance has ended",
+		u.Phase, rc.MaintenanceReason, u.ToImage)
+	if _, loaded := paused.LoadOrStore(instanceKey(rc), true); !loaded {
+		rc.Event(corev1.EventTypeNormal, "UpgradePaused", eventAction, "%s", u.Message)
+	}
+	rc.Requeue(10 * time.Second)
+}
+
+// resume reports the end of a pause seen by this operator process.
+func (m *machine) resume() {
+	if _, ok := paused.LoadAndDelete(instanceKey(m.rc)); ok {
+		m.rc.Event(corev1.EventTypeNormal, "UpgradeResumed", eventAction,
+			"Maintenance has ended; resuming the upgrade to %s in phase %s", m.u.ToImage, m.u.Phase)
+	}
+}
+
+func instanceKey(rc *forgejo.ReconcileContext) string {
+	return rc.Instance.Namespace + "/" + rc.Instance.Name
 }
 
 func (m *machine) transition(p forgejov1.UpgradePhase, msg string) {
@@ -285,13 +351,15 @@ func (m *machine) abort(reason string) {
 	m.rc.Event(corev1.EventTypeWarning, ReasonFailed, eventAction, "%s", m.u.Message)
 }
 
-// rollingOut deploys the new image and watches it until core reports it as the verified
-// running image, a failure is detected, or the timeout expires.
+// rollingOut deploys the new image and watches it until it is verified, a failure is
+// detected, or the timeout expires.
 func (m *machine) rollingOut() error {
-	rc, u, f := m.rc, m.u, m.rc.Instance
-	if f.Status.Image == u.ToImage {
-		m.succeed()
-		return nil
+	rc, u := m.rc, m.u
+	if ok, err := m.verified(); err != nil || ok {
+		if ok {
+			m.succeed()
+		}
+		return err
 	}
 	now := time.Now()
 	if u.RolloutStartTime == nil {
@@ -305,7 +373,7 @@ func (m *machine) rollingOut() error {
 		m.rolloutFailed(reason)
 		return nil
 	}
-	timeout := forgejo.DurationOr(f.Spec.Upgrade.Timeout, defaultTimeout)
+	timeout := forgejo.DurationOr(rc.Instance.Spec.Upgrade.Timeout, defaultTimeout)
 	left := timeout - now.Sub(u.RolloutStartTime.Time)
 	if left <= 0 {
 		m.rolloutFailed(fmt.Sprintf("%s did not become available within %s", u.ToImage, timeout))
@@ -319,6 +387,25 @@ func (m *machine) rollingOut() error {
 	u.Message = msg
 	rc.Requeue(min(left+time.Second, 10*time.Second))
 	return nil
+}
+
+// verified reports whether the new image is verified: core reports it as the running image
+// (status.image), and the Deployment has rolled it out with every replica available. The
+// second check keeps the machine from relying on when core updates status.image.
+func (m *machine) verified() (bool, error) {
+	rc, u, f := m.rc, m.u, m.rc.Instance
+	if f.Status.Image != u.ToImage {
+		return false, nil
+	}
+	dep := &appsv1.Deployment{}
+	err := rc.Client.Get(m.ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return rolledOut(dep, u.ToImage), nil
 }
 
 // leftover reports a pod of the failed attempt that a retry started with.
@@ -422,7 +509,12 @@ func (m *machine) rollingBack() error {
 			m.rolledBack()
 			return nil
 		}
-		if done := rs.Status.CompletionTime; done != nil && time.Since(done.Time) > timeout {
+		done := rs.Status.CompletionTime
+		if done != nil && u.RolloutStartTime != nil && u.RolloutStartTime.After(done.Time) {
+			// Maintenance after the restore paused the wait (see pause).
+			done = u.RolloutStartTime
+		}
+		if done != nil && time.Since(done.Time) > timeout {
 			// The data is consistent and the old version is only slow: it keeps running.
 			m.rollbackFailed(fmt.Sprintf("%s did not become available within %s after backup %s was restored", u.FromImage, timeout, u.BackupName))
 			return nil
@@ -492,7 +584,8 @@ func (m *machine) finish(p forgejov1.UpgradePhase, result, msg string) {
 	if p == forgejov1.UpgradePhaseFailed || p == forgejov1.UpgradePhaseRolledBack {
 		u.FailedImage = u.ToImage
 	}
-	queued.Delete(f.Namespace + "/" + f.Name)
+	queued.Delete(instanceKey(m.rc))
+	paused.Delete(instanceKey(m.rc))
 	if result != "" {
 		forgejo.UpgradeTotal.WithLabelValues(f.Namespace, f.Name, result).Inc()
 	}

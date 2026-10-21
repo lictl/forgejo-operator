@@ -2641,8 +2641,9 @@ spec:
                       still be in the new version's state, so Forgejo is kept stopped until a backup is restored.
                     type: boolean
                   rolloutStartTime:
-                    description: rolloutStartTime is when the new image was first
-                      deployed; spec.upgrade.timeout counts from it.
+                    description: |-
+                      rolloutStartTime is when the new image was first deployed; spec.upgrade.timeout counts
+                      from it. A restore that pauses the upgrade moves it to the end of that pause.
                     format: date-time
                     type: string
                   startTime:

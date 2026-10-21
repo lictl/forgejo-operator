@@ -48,8 +48,8 @@ spec.image ───────────► Pending ─► BackingUp ─► 
 | `Pending` | `fromImage`, `toImage`, `startTime` and the backup name are recorded. | old image, unchanged (a [retry](#retrying) keeps the new image) |
 | `BackingUp` | Forgejo is stopped. Once no server pod is left, `ForgejoBackup <name>-pre-upgrade-<start>` (`reason: PreUpgrade`) is created and the operator waits for it to complete. If server pods are still there 15 minutes after `startTime` (a pod stuck terminating on an unreachable node or behind a finalizer), the upgrade is aborted (`Failed`, old image back at its usual scale) instead of taking a backup while something may still write. | old image, 0 replicas |
 | `RollingOut` | The new image is deployed with the `Recreate` strategy and one replica, in the same reconcile that records `rolloutStartTime`. The `bootstrap` init container runs `forgejo migrate`. | new image, 1 replica |
-| `Verifying` | The migration finished and the server container started; the operator waits until the pod is Ready and core reports the image as verified. | new image, 1 replica |
-| `Succeeded` | `status.image` is the new image. The usual replica count, strategy and HPA come back. | new image |
+| `Verifying` | The migration finished and the server container started; the operator waits until the pod is Ready, core reports the image as verified (`status.image`), and the Deployment has rolled it out (its current generation observed, every replica updated and available). | new image, 1 replica |
+| `Succeeded` | `status.image` is the new image and the Deployment runs it with every replica available. The usual replica count, strategy and HPA come back. | new image |
 | `RollingBack` | `ForgejoRestore <name>-rollback-<start>` restores the database and the data volume from the pre-upgrade backup while Forgejo is stopped, then the old image starts again. | old image, 0 → 1 replica |
 | `RolledBack` | The old image is available again on the restored data. | old image |
 | `Failed` | See [Failures without a rollback](#failures-without-a-rollback) and [Automatic rollback](#automatic-rollback). | old image; the new image with 1 replica; or 0 replicas after a failed rollback restore |
@@ -76,6 +76,7 @@ While an upgrade is in flight:
   handled from there: nothing to do when it is the running image again, otherwise a new
   upgrade. Reverting a mistaken major upgrade during the backup therefore needs no restore.
 - Self-healing, config rollback, vertical scaling and the HPA leave the instance alone.
+- A `ForgejoRestore` pauses the upgrade, see [Restores during an upgrade](#restores-during-an-upgrade).
 
 ## Version gate
 
@@ -93,6 +94,35 @@ An orchestrated upgrade does not start while a `ForgejoRestore` holds the instan
 maintenance mode (`Upgrading=False`, reason `WaitingForRestore`); it starts once the restore
 has finished.
 
+## Restores during an upgrade
+
+When maintenance mode starts while an upgrade is in flight (a `ForgejoRestore` scales the
+instance to zero, a failed restore that changed the data holds it there, or a restore Job is
+still running), the upgrade is **paused** in its phase until maintenance has ended:
+
+- No phase advances: `Pending` does not stop Forgejo or deploy the new image, `BackingUp` does
+  not create the pre-upgrade backup nor start the rollout once the backup has completed, and
+  `RollingBack` does not create its restore. No failure is detected on the stopped pods.
+- No timeout runs. `rolloutStartTime` is not set while paused, and when it is already set
+  (`RollingOut`, `Verifying`, `RollingBack`) it is kept at the current time, so
+  `spec.upgrade.timeout` counts again from the end of maintenance. The 15-minute stop
+  timeout of `BackingUp` keeps counting from `startTime`: maintenance stops the pods as well.
+- `Verifying` goes back to `RollingOut`: the pod is stopped, and after maintenance the new
+  image starts again and migrates the database, which the restore may have replaced.
+- `status.upgrade.message` says what the upgrade waits for, `Upgrading` stays `True` with the
+  phase as its reason, and `UpgradePaused` / `UpgradeResumed` events mark the window.
+- A cancellation still applies (`spec.image` changed in `Pending` or `BackingUp`): it deploys
+  nothing.
+
+The rollback's own `ForgejoRestore` (`status.upgrade.restoreName`) is what `RollingBack` waits
+for, so the maintenance mode it causes does not pause the upgrade, and its failure ends the
+rollback as described under [Automatic rollback](#automatic-rollback).
+
+Once maintenance has ended the upgrade continues on whatever the restore left behind. The
+restore waits in `ScalingUp` for Forgejo to come back, which happens when the upgrade has
+deployed its image: in `BackingUp` the pre-upgrade backup is then taken of the restored data,
+and in `RollingOut` the new image migrates the restored database.
+
 ## Failure detection
 
 The upgrade fails when the new image's pods show any of:
@@ -101,7 +131,8 @@ The upgrade fails when the new image's pods show any of:
   the image name is invalid;
 - a container (including the `bootstrap` init container, which means a failed migration) in
   `CrashLoopBackOff` after crashing at least twice, or restarted 3 times;
-- not available within `spec.upgrade.timeout`, counted from `status.upgrade.rolloutStartTime`.
+- not available within `spec.upgrade.timeout`, counted from `status.upgrade.rolloutStartTime`
+  (or from the end of a maintenance window that [paused](#restores-during-an-upgrade) the upgrade).
 
 The reason is stored in `status.upgrade.failureReason` and in an `UpgradeFailed` event.
 
@@ -233,7 +264,7 @@ status:
     backupName: up-pre-upgrade-20261021071501
     restoreName: up-rollback-20261021071501
     startTime: ...
-    rolloutStartTime: ...
+    rolloutStartTime: ...         # spec.upgrade.timeout counts from here
     completionTime: ...
     failedImage: codeberg.org/forgejo/forgejo:99
     failureReason: 'image codeberg.org/forgejo/forgejo:99 could not be pulled for 2m0s: ...'
@@ -251,7 +282,7 @@ status:
   `PreUpgradeBackup`, `PreUpgradeBackupCompleted`, `UpgradeRollingOut`, `UpgradeSucceeded`,
   `UpgradeFailed`, `UpgradeRollingBack`, `UpgradeRolledBack`, `UpgradeRollbackFailed`,
   `UpgradeRollbackRestored`, `UpgradeRecovered`, `UpgradeQueued`, `UpgradeCancelled`,
-  `UpgradeRetry`, `DowngradeRefused`.
+  `UpgradePaused`, `UpgradeResumed`, `UpgradeRetry`, `DowngradeRefused`.
 - Metric: `forgejo_operator_upgrades_total{result="succeeded|failed|rolledback"}`; the
   `ForgejoUpgradeFailed` alert fires on the latter two. Cancelled upgrades are not counted.
 

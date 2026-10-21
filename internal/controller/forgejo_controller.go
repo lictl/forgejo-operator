@@ -99,24 +99,31 @@ type namedStep struct {
 
 // Step names referenced by the orchestrator itself.
 const (
-	stepMaintenance    = "maintenance"
-	stepRestoreGuard   = "restore-guard"
-	stepUpgrade        = "upgrade"
-	stepBackupSchedule = "backup-schedule"
+	stepMaintenance      = "maintenance"
+	stepRestoreGuard     = "restore-guard"
+	stepUpgrade          = "upgrade"
+	stepBackupSchedule   = "backup-schedule"
+	stepBackupOwnership  = "backup-ownership"
+	stepStorageAutopilot = "storage-autopilot"
 )
 
-// steps run in order. The first eleven form a chain: each produces outputs the next ones
-// consume, so a failure or Stop skips the rest of the chain (e.g. no app.ini without the
-// database, no rollout onto an unready Valkey). The steps after it only need part of the
-// chain and keep running when an unrelated step fails, so that one rejected Ingress or a
-// Valkey outage does not also stop scheduled backups, health checks or the restore
-// handshake.
+// steps run in order. maintenance → restore-guard → secrets → database → high-availability
+// → storage → upgrade → tuning → config → config-guard → workload form a chain: each
+// produces outputs the next ones consume, so a failure or Stop skips the rest of the chain
+// (e.g. no app.ini without the database, no rollout onto an unready Valkey). The other steps
+// only need part of the chain, or nothing, and keep running when an unrelated step fails, so
+// that one rejected Ingress or a Valkey outage does not also stop scheduled backups, health
+// checks, the restore handshake or volume expansion.
 var steps = []namedStep{
 	// Maintenance comes first: it only reads ForgejoRestores, and a restore must be able to
 	// take the instance down while the database or Valkey is unavailable.
 	{name: stepMaintenance, fn: backup.ReconcileMaintenance},
 	{name: stepRestoreGuard, fn: reconcileRestoreGuard, needs: []string{stepMaintenance}},
 	{name: "secrets", fn: core.ReconcileSecrets, needs: []string{stepRestoreGuard}},
+	// Owner references of the ForgejoBackups and the backup PVC follow
+	// spec.storage.retainPolicy. It reads only the instance and its backups, so a database
+	// or Valkey that is down must not delay it (the instance may be deleted meanwhile).
+	{name: stepBackupOwnership, fn: backup.ReconcileOwnership},
 	{name: "database", fn: core.ReconcileDatabase, needs: []string{"secrets"}},
 	{name: "high-availability", fn: autopilot.ReconcileHA, needs: []string{"database"}},
 	{name: "storage", fn: core.ReconcileStorage, needs: []string{"high-availability"}},
@@ -138,6 +145,11 @@ var steps = []namedStep{
 	{name: "health", fn: observability.ReconcileHealth, needs: []string{stepRestoreGuard}},
 	// Self-healing, LKG bookkeeping and right-sizing must never act on a partial pass.
 	{name: "autopilot", fn: autopilot.Reconcile, needs: []string{"workload", "health"}},
+	// Volume measurement, StorageHealthy and PVC auto-expansion. No needs: a full CNPG
+	// volume is a common reason why the database step stops, and growing it must not wait
+	// for that step. Last, so that it sees this pass's rc.Maintenance, rc.Upgrading and
+	// rc.RestoreMigrating, and its file-system-resize restart follows the workload update.
+	{name: stepStorageAutopilot, fn: autopilot.ReconcileStorage},
 }
 
 // pipelineResult is the outcome of one pass over the steps.
@@ -264,7 +276,7 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	instance := &forgejov1.Forgejo{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		if apierrors.IsNotFound(err) {
-			forgejo.DeleteInstanceMetrics(req.Namespace, req.Name)
+			forgetInstance(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -272,6 +284,10 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if !instance.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
+	// No API call: the last-success gauge is back right after an operator restart, also
+	// while the backup-schedule step is skipped or the instance is paused (the backup
+	// staleness alerts depend on it).
+	backup.ExportLastSuccess(instance)
 
 	original := instance.DeepCopy()
 	apiReader := r.APIReader
@@ -296,10 +312,13 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if instance.Spec.Paused {
 		instance.Status.Phase = forgejov1.PhasePaused
 		rc.SetCondition(forgejov1.ConditionProgressing, metav1.ConditionFalse, "Paused", "Reconciliation is paused by spec.paused")
-		// The alerts' expected-down selector matches phase="Paused"; ReconcileStatus, which
-		// normally exports the phase, does not run while paused.
+		// ReconcileStatus, which normally exports these, does not run while paused. The
+		// alerts' expected-down selector matches instance_info{phase="Paused"}, and a missing
+		// instance_ready (e.g. after an operator restart) would fire
+		// ForgejoOperatorMetricsMissing.
 		forgejo.SetInstanceInfo(instance, rc.TargetImage)
-		return ctrl.Result{}, r.patchStatus(ctx, original, instance)
+		exportInstanceReady(instance)
+		return r.finish(ctx, original, instance, ctrl.Result{}, nil)
 	}
 
 	p := runPipeline(ctx, rc, steps)
@@ -328,24 +347,55 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	instance.Status.ObservedGeneration = instance.Generation
 
+	rc.Requeue(defaultResync)
+	return r.finish(ctx, original, instance, ctrl.Result{RequeueAfter: rc.RequeueAfter}, stepErr)
+}
+
+// finish persists the status and returns the reconcile result: stepErr (which makes the
+// controller back off) when the status was saved, a quick retry on a conflict, and nothing
+// when the instance was deleted during the pass.
+func (r *ForgejoReconciler) finish(ctx context.Context, original, instance *forgejov1.Forgejo,
+	res ctrl.Result, stepErr error) (ctrl.Result, error) {
 	if err := r.patchStatus(ctx, original, instance); err != nil {
-		if apierrors.IsConflict(err) {
+		switch {
+		case apierrors.IsConflict(err):
 			return ctrl.Result{Requeue: true}, nil
+		case apierrors.IsNotFound(err):
+			// Deleted while this pass ran (its children are garbage-collected); the delete
+			// event's reconcile finds it gone and drops its metrics.
+			logf.FromContext(ctx).V(1).Info("instance was deleted during the reconcile")
+			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if stepErr != nil {
 		return ctrl.Result{}, stepErr
 	}
-
-	rc.Requeue(defaultResync)
-	return ctrl.Result{RequeueAfter: rc.RequeueAfter}, nil
+	return res, nil
 }
 
 func (r *ForgejoReconciler) patchStatus(ctx context.Context, original, instance *forgejov1.Forgejo) error {
 	// The optimistic lock keeps a reconcile working from a stale cache from overwriting
 	// status written by a newer one; conflicts are requeued by the caller.
 	return r.Status().Patch(ctx, instance, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{}))
+}
+
+// forgetInstance drops every metric series and the in-memory bookkeeping of an instance
+// that no longer exists.
+func forgetInstance(namespace, name string) {
+	forgejo.DeleteInstanceMetrics(namespace, name)
+	backup.ForgetLastSuccess(namespace, name)
+	observability.ForgetInstance(namespace, name)
+}
+
+// exportInstanceReady sets forgejo_operator_instance_ready from the Ready condition, as
+// core.ReconcileStatus does when the pipeline runs.
+func exportInstanceReady(f *forgejov1.Forgejo) {
+	v := 0.0
+	if meta.IsStatusConditionTrue(f.Status.Conditions, forgejov1.ConditionReady) {
+		v = 1
+	}
+	forgejo.InstanceReady.WithLabelValues(f.Namespace, f.Name).Set(v)
 }
 
 // reconcileRestoreGuard keeps the instance in maintenance while a restore Job of this

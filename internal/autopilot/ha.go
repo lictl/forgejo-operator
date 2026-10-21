@@ -43,6 +43,12 @@ const (
 // (cache and sessions are rebuilt, queued tasks are re-created by Forgejo's cron/retry
 // logic). A PVC would survive rescheduling but ties Valkey to one node and adds a
 // provisioning dependency on every cluster, for data that is mostly transient.
+//
+// rc.ValkeyURL is set as soon as the password is known, whether or not Valkey is ready: it
+// only depends on the instance and the password, so every step renders the same app.ini.
+// While Valkey is not ready the step stops, so that no pod is rolled onto a dead backend,
+// except in maintenance: a restore keeps Forgejo scaled to zero, and the workload step that
+// scales it down must not wait for Valkey.
 func ReconcileHA(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	if !f.Spec.HighAvailability.Enabled {
@@ -51,14 +57,26 @@ func ReconcileHA(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.Ste
 		return forgejo.StepResult{}, nil
 	}
 
-	password, err := ensureValkeyPassword(ctx, rc)
+	password, err := ensureValkeyPassword(ctx, rc, rc.Client)
+	if (apierrors.IsConflict(err) || apierrors.IsNotFound(err)) && rc.APIReader != nil {
+		// The secrets step just created or changed the Secret and the cache lags behind;
+		// read it live.
+		password, err = ensureValkeyPassword(ctx, rc, rc.APIReader)
+	}
 	if err != nil {
-		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
-			// The generated-secrets step just created or changed the Secret; retry with a fresh copy.
+		if !apierrors.IsConflict(err) && !apierrors.IsNotFound(err) {
+			return forgejo.StepResult{}, err
+		}
+		// Still racing with another writer; retry with a fresh copy.
+		if !rc.Maintenance {
 			return forgejo.StepResult{Stop: true, RequeueAfter: 2 * time.Second}, nil
 		}
-		return forgejo.StepResult{}, err
+		// Forgejo is scaled to zero, so an app.ini without Valkey does no harm until the
+		// password is read on the next pass; scaling down must not wait for it.
+		logger(ctx).Info("cannot read the Valkey password yet; continuing in maintenance", "error", err.Error())
+		return forgejo.StepResult{RequeueAfter: 2 * time.Second}, nil
 	}
+	rc.ValkeyURL = valkeyURL(f, password)
 	if err := ensureValkeyService(ctx, rc); err != nil {
 		return forgejo.StepResult{}, err
 	}
@@ -74,16 +92,21 @@ func ReconcileHA(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.Ste
 		return forgejo.StepResult{}, err
 	}
 
-	// Forgejo is only switched to (or kept rendering) the redis config once Valkey answers,
-	// so an outage pauses reconciliation instead of rolling pods onto a dead backend.
+	// Pods are only rolled onto the redis config once Valkey answers, so an outage pauses
+	// the steps that depend on this one instead of rolling pods onto a dead backend.
 	if !deploymentReady(dep) {
 		if st.allow("waiting-valkey", 5*time.Minute) {
 			rc.Event(corev1.EventTypeNormal, "WaitingForValkey", "HighAvailability", "waiting for Valkey %s to become ready", dep.Name)
 		}
-		return forgejo.StepResult{Stop: true, RequeueAfter: 5 * time.Second}, nil
+		return forgejo.StepResult{Stop: !rc.Maintenance, RequeueAfter: 5 * time.Second}, nil
 	}
-	rc.ValkeyURL = fmt.Sprintf("redis://:%s@%s:%d", password, forgejo.ServiceHost(forgejo.ValkeyName(f), f.Namespace), valkeyPort)
 	return forgejo.StepResult{}, nil
+}
+
+// valkeyURL is the redis URL Forgejo uses for Valkey. It depends only on the instance and
+// the password, so it is the same whether or not Valkey is ready.
+func valkeyURL(f *forgejov1.Forgejo, password string) string {
+	return fmt.Sprintf("redis://:%s@%s:%d", password, forgejo.ServiceHost(forgejo.ValkeyName(f), f.Namespace), valkeyPort)
 }
 
 func deploymentReady(dep *appsv1.Deployment) bool {
@@ -93,11 +116,12 @@ func deploymentReady(dep *appsv1.Deployment) bool {
 }
 
 // ensureValkeyPassword adds "valkey-password" to "<name>-secrets" without touching the other
-// keys. The optimistic lock prevents a stale cache read from generating a second password.
-func ensureValkeyPassword(ctx context.Context, rc *forgejo.ReconcileContext) (string, error) {
+// keys, reading the Secret through r. The optimistic lock prevents a stale read from
+// generating a second password.
+func ensureValkeyPassword(ctx context.Context, rc *forgejo.ReconcileContext, r client.Reader) (string, error) {
 	f := rc.Instance
 	sec := &corev1.Secret{}
-	if err := rc.Client.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err != nil {
 		return "", err
 	}
 	if pw := string(sec.Data[valkeyPasswordKey]); pw != "" {

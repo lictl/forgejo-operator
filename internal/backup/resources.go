@@ -132,7 +132,17 @@ const (
 	// AnnotationReleaseMaintenance="true" on a failed ForgejoRestore that holds the instance
 	// in maintenance lets Forgejo start again on whatever the restore left behind.
 	AnnotationReleaseMaintenance = "forgejo.lucas.icu/release-maintenance"
+	// ConditionFilesRemoved on a failed ForgejoBackup records the outcome of the cleanup Job
+	// that removed what the failed run left on the backup volume: True when the directory is
+	// gone, False (reason CleanupFailed) when the Job failed. The Job itself is deleted once
+	// this is recorded.
+	ConditionFilesRemoved = "FilesRemoved"
 )
+
+// FilesRemoved reports whether the files of a failed backup are known to be gone.
+func FilesRemoved(b *forgejov1.ForgejoBackup) bool {
+	return meta.IsStatusConditionTrue(b.Status.Conditions, ConditionFilesRemoved)
+}
 
 // Modification is how far a restore Job may have changed the instance.
 type Modification int
