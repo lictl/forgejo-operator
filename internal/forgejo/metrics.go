@@ -23,6 +23,11 @@ var (
 		Help: "Failed /api/healthz probes performed by the operator.",
 	}, []string{"namespace", "name"})
 
+	HealthCheckUnreachable = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "forgejo_operator_health_check_unreachable_total",
+		Help: "Health probes that never reached Forgejo (DNS, dial, reset, proxy replies); not counted as failures.",
+	}, []string{"namespace", "name"})
+
 	BackupLastSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "forgejo_operator_backup_last_success_timestamp_seconds",
 		Help: "Unix time of the last successful backup.",
@@ -71,7 +76,7 @@ var (
 
 func init() {
 	metrics.Registry.MustRegister(
-		InstanceReady, InstanceInfo, HealthCheckFailures,
+		InstanceReady, InstanceInfo, HealthCheckFailures, HealthCheckUnreachable,
 		BackupLastSuccess, BackupTotal, BackupDuration, BackupSize, RestoreTotal,
 		UpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats,
 	)
@@ -83,7 +88,7 @@ func DeleteInstanceMetrics(namespace, name string) {
 	for _, v := range []*prometheus.GaugeVec{InstanceReady, InstanceInfo, BackupLastSuccess, BackupDuration, BackupSize, VolumeUsedRatio, Stats} {
 		v.DeletePartialMatch(l)
 	}
-	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, BackupTotal, RestoreTotal, UpgradeTotal, AutoPilotActions} {
+	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, BackupTotal, RestoreTotal, UpgradeTotal, AutoPilotActions} {
 		v.DeletePartialMatch(l)
 	}
 }

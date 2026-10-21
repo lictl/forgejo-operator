@@ -250,6 +250,8 @@ type IngressSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
+	// className selects the IngressClass. When unset, the class the cluster's default
+	// IngressClass admission assigned at creation is kept.
 	// +optional
 	ClassName *string `json:"className,omitempty"`
 
@@ -325,6 +327,8 @@ type CNPGSpec struct {
 
 // ExternalDatabaseSpec points at an existing PostgreSQL server.
 type ExternalDatabaseSpec struct {
+	// host of the PostgreSQL server. Short names are resolved from the instance's namespace,
+	// like they are inside its pods.
 	// +kubebuilder:validation:MinLength=1
 	Host string `json:"host"`
 
@@ -556,7 +560,8 @@ type PrometheusResourceSpec struct {
 	Enabled *bool `json:"enabled,omitempty"`
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
-	// interval, for ServiceMonitor only.
+	// interval, for ServiceMonitor only, in Prometheus duration format (e.g. 60s, 1m30s).
+	// +kubebuilder:validation:Pattern=`^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$`
 	// +optional
 	Interval string `json:"interval,omitempty"`
 }

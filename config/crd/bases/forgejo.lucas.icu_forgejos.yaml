@@ -451,6 +451,9 @@ spec:
                         default: forgejo
                         type: string
                       host:
+                        description: |-
+                          host of the PostgreSQL server. Short names are resolved from the instance's namespace,
+                          like they are inside its pods.
                         minLength: 1
                         type: string
                       port:
@@ -749,6 +752,9 @@ spec:
                       type: string
                     type: object
                   className:
+                    description: |-
+                      className selects the IngressClass. When unset, the class the cluster's default
+                      IngressClass admission assigned at creation is kept.
                     type: string
                   enabled:
                     type: boolean
@@ -779,7 +785,9 @@ spec:
                       enabled:
                         type: boolean
                       interval:
-                        description: interval, for ServiceMonitor only.
+                        description: interval, for ServiceMonitor only, in Prometheus
+                          duration format (e.g. 60s, 1m30s).
+                        pattern: ^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$
                         type: string
                       labels:
                         additionalProperties:
@@ -793,7 +801,9 @@ spec:
                       enabled:
                         type: boolean
                       interval:
-                        description: interval, for ServiceMonitor only.
+                        description: interval, for ServiceMonitor only, in Prometheus
+                          duration format (e.g. 60s, 1m30s).
+                        pattern: ^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$
                         type: string
                       labels:
                         additionalProperties:
@@ -808,7 +818,9 @@ spec:
                       enabled:
                         type: boolean
                       interval:
-                        description: interval, for ServiceMonitor only.
+                        description: interval, for ServiceMonitor only, in Prometheus
+                          duration format (e.g. 60s, 1m30s).
+                        pattern: ^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$
                         type: string
                       labels:
                         additionalProperties:

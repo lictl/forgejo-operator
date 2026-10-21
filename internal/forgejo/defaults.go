@@ -77,6 +77,15 @@ func HorizontalAutoscalingEnabled(f *forgejov1.Forgejo) bool {
 	return h != nil && h.Enabled && f.Spec.HighAvailability.Enabled
 }
 
+// HPAMinReplicas is the HPA's replica floor: minReplicas clamped to [1, maxReplicas].
+func HPAMinReplicas(f *forgejov1.Forgejo) int32 {
+	h := f.Spec.Autoscaling.Horizontal
+	if h == nil {
+		return 1
+	}
+	return min(max(h.MinReplicas, 1), max(h.MaxReplicas, 1))
+}
+
 func VerticalAutoscalingEnabled(f *forgejov1.Forgejo) bool {
 	v := f.Spec.Autoscaling.Vertical
 	return v != nil && v.Enabled

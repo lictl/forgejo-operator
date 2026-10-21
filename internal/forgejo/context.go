@@ -58,6 +58,10 @@ type ReconcileContext struct {
 	// the workload is scaled to zero.
 	Maintenance       bool
 	MaintenanceReason string
+	// RestoreMigrating is set by the maintenance step while a restored database waits for
+	// its first pod to migrate it (restore in ScalingUp). The workload runs a single pod with
+	// the Recreate strategy and the HPA is held back until that pod is available.
+	RestoreMigrating bool
 	// TargetImage is the image the workload step must deploy. Set by the upgrade step;
 	// defaults to Status.Image (if set) or the spec image.
 	TargetImage string
