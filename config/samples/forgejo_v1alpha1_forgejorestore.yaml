@@ -1,3 +1,5 @@
+# Restores forgejobackup-sample into forgejo-sample. Forgejo is scaled to zero while the
+# database and the data volume are replaced, then scaled back up.
 apiVersion: forgejo.lucas.icu/v1alpha1
 kind: ForgejoRestore
 metadata:
@@ -6,4 +8,8 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: forgejorestore-sample
 spec:
-  # TODO(user): Add fields here
+  forgejoRef:
+    name: forgejo-sample
+  backupName: forgejobackup-sample
+  restoreDatabase: true
+  restoreData: true
