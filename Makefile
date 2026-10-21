@@ -175,6 +175,7 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 deploy-local: ## Build the image into the docker engine the local cluster runs on (set DOCKER_CONTEXT if it is not the current docker context) and deploy it; no registry needed.
 	$(CONTAINER_TOOL) build -t ${IMG} .
 	$(MAKE) deploy IMG=${IMG}
+	if $(KUBECTL) get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then "$(KUSTOMIZE)" build config/monitoring | $(KUBECTL) apply -f -; fi
 	$(KUBECTL) -n forgejo-operator-system rollout restart deployment/forgejo-operator-controller-manager
 	$(KUBECTL) -n forgejo-operator-system rollout status deployment/forgejo-operator-controller-manager --timeout=180s
 

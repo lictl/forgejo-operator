@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	forgejov1alpha1 "github.com/lictl/forgejo-operator/api/v1alpha1"
+	"github.com/lictl/forgejo-operator/internal/autopilot"
 	"github.com/lictl/forgejo-operator/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
@@ -183,6 +184,8 @@ func main() {
 		setupLog.Error(err, "Failed to start manager")
 		os.Exit(1)
 	}
+
+	autopilot.SetRESTConfig(mgr.GetConfig())
 
 	if err := (&controller.ForgejoReconciler{
 		Client:   mgr.GetClient(),

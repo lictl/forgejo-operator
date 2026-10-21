@@ -15,7 +15,6 @@ spec:
     plural: forgejos
     shortNames:
     - fj
-    - forgejo
     singular: forgejo
   scope: Namespaced
   versions:

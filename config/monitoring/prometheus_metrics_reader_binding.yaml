@@ -1,0 +1,14 @@
+# Lets Prometheus pass the manager's authn/authz-protected /metrics endpoint.
+# Adjust the subject to your Prometheus service account (kube-prometheus-stack default shown).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-metrics-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: forgejo-operator-metrics-reader
+subjects:
+- kind: ServiceAccount
+  name: kps-kube-prometheus-stack-prometheus
+  namespace: monitoring

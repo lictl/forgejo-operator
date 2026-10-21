@@ -191,7 +191,9 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 }
 
 func (r *ForgejoReconciler) patchStatus(ctx context.Context, original, instance *forgejov1.Forgejo) error {
-	return r.Status().Patch(ctx, instance, client.MergeFrom(original))
+	// The optimistic lock keeps a reconcile working from a stale cache from overwriting
+	// status written by a newer one; conflicts are requeued by the caller.
+	return r.Status().Patch(ctx, instance, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{}))
 }
 
 // SetupWithManager sets up the controller with the Manager.

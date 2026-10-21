@@ -1,0 +1,7 @@
+# Scrapes the operator's own metrics and loads its fleet-wide alerts. Requires the
+# prometheus-operator CRDs; apply after config/default:  kubectl apply -k config/monitoring
+namespace: forgejo-operator-system
+namePrefix: forgejo-operator-
+resources:
+- ../prometheus
+- prometheus_metrics_reader_binding.yaml
