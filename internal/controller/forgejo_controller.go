@@ -28,6 +28,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -139,8 +140,16 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var stepErr error
 	failedStep := ""
+	conflict := false
 	for _, s := range steps {
 		res, err := s.fn(ctx, rc)
+		if apierrors.IsConflict(err) {
+			// A child changed after our cached read; retry soon instead of reporting an error.
+			log.V(1).Info("conflict updating a child, retrying", "step", s.name, "error", err.Error())
+			conflict = true
+			rc.Requeue(time.Second)
+			break
+		}
 		if err != nil {
 			stepErr, failedStep = err, s.name
 			break
@@ -157,6 +166,9 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionTrue, "ReconcileError",
 			fmt.Sprintf("step %q: %v", failedStep, stepErr))
 		rc.Event(corev1.EventTypeWarning, "ReconcileError", "Reconcile", "step %s failed: %v", failedStep, stepErr)
+	} else if c := meta.FindStatusCondition(instance.Status.Conditions, forgejov1.ConditionDegraded); !conflict && c != nil && c.Reason == "ReconcileError" {
+		// Only clear our own Degraded; other features report Degraded with their own reasons.
+		meta.RemoveStatusCondition(&instance.Status.Conditions, forgejov1.ConditionDegraded)
 	}
 
 	if _, err := core.ReconcileStatus(ctx, rc); err != nil && stepErr == nil {
@@ -208,7 +220,8 @@ func (r *ForgejoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if _, err := mgr.GetRESTMapper().RESTMapping(forgejo.CNPGClusterGVK.GroupKind(), forgejo.CNPGClusterGVK.Version); err == nil {
 		cluster := &unstructured.Unstructured{}
 		cluster.SetGroupVersionKind(forgejo.CNPGClusterGVK)
-		b = b.Owns(cluster)
+		// Map by label rather than owner: under retainPolicy Retain the cluster has no owner reference.
+		b = b.Watches(cluster, handler.EnqueueRequestsFromMapFunc(mapByInstanceLabel), builder.WithPredicates(managedByOperator()))
 	} else {
 		mgr.GetLogger().Info("CloudNativePG CRDs not found; managed databases will be unavailable until the operator restarts")
 	}

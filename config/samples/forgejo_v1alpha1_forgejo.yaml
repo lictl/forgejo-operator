@@ -6,4 +6,31 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: forgejo-sample
 spec:
-  # TODO(user): Add fields here
+  image: codeberg.org/forgejo/forgejo:16
+  server:
+    appName: Forgejo
+    # domain: git.example.com      # public host name (DOMAIN, SSH_DOMAIN, ROOT_URL)
+  # ingress:
+  #   enabled: true
+  #   host: git.example.com
+  #   tlsSecretName: git-example-com-tls
+  database:
+    # An operator-managed CloudNativePG cluster "<name>-db".
+    cnpg:
+      instances: 1
+      storage:
+        size: 5Gi
+  storage:
+    size: 10Gi
+    # Keep the data PVC, CNPG cluster and generated secrets when this resource is deleted.
+    retainPolicy: Retain
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  # Raw app.ini overrides (section -> key -> value). Use "DEFAULT" for root-level keys.
+  config:
+    service:
+      DEFAULT_KEEP_EMAIL_PRIVATE: "true"

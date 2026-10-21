@@ -5,45 +5,98 @@ package core
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"math/big"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// ReconcileSecrets ensures "<name>-secrets" (SECRET_KEY, INTERNAL_TOKEN, JWT secrets,
-// metrics token) and the admin credentials secret exist. Never rotates existing values.
-func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-	return forgejo.StepResult{}, nil
+// +kubebuilder:rbac:groups=core,resources=secrets;services;persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+
+// setOwnership makes the instance the controller owner of obj when owned is true and
+// drops that reference otherwise (data-bearing children under retainPolicy Retain).
+func setOwnership(rc *forgejo.ReconcileContext, obj client.Object, owned bool) error {
+	if owned {
+		return controllerutil.SetControllerReference(rc.Instance, obj, rc.Scheme)
+	}
+	refs := obj.GetOwnerReferences()
+	kept := refs[:0]
+	for _, r := range refs {
+		if r.UID != rc.Instance.UID {
+			kept = append(kept, r)
+		}
+	}
+	obj.SetOwnerReferences(kept)
+	return nil
 }
 
-// ReconcileDatabase ensures the CNPG Cluster (or validates the external DB secret) and
-// sets rc.DB / rc.DatabaseReady and status.database. Stops the reconcile until ready.
-func ReconcileDatabase(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-	return forgejo.StepResult{}, nil
+// apply creates or updates obj and logs changes. Ownership is handled by the mutate
+// function (see setOwnership) so that it can also be removed.
+func apply(ctx context.Context, rc *forgejo.ReconcileContext, obj client.Object, owned bool, mutate func() error) error {
+	op, err := rc.CreateOrUpdate(ctx, obj, false, func() error {
+		if err := mutate(); err != nil {
+			return err
+		}
+		return setOwnership(rc, obj, owned)
+	})
+	if err == nil && op != controllerutil.OperationResultNone {
+		logf.FromContext(ctx).Info("reconciled child", "kind", kindOf(rc, obj), "name", obj.GetName(), "operation", op)
+	}
+	return err
 }
 
-// ReconcileStorage ensures the data PVC.
-func ReconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-	return forgejo.StepResult{}, nil
+func kindOf(rc *forgejo.ReconcileContext, obj client.Object) string {
+	if k := obj.GetObjectKind().GroupVersionKind().Kind; k != "" {
+		return k
+	}
+	if gvks, _, err := rc.Scheme.ObjectKinds(obj); err == nil && len(gvks) > 0 {
+		return gvks[0].Kind
+	}
+	return "?"
 }
 
-// ReconcileConfig renders app.ini into "<name>-config" and sets rc.ConfigSecretName,
-// rc.ConfigHash and rc.DesiredConfigHash.
-func ReconcileConfig(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-	return forgejo.StepResult{}, nil
+// mergeMaps returns a new map with the entries of all maps, later maps winning.
+func mergeMaps(maps ...map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, m := range maps {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
 }
 
-// ReconcileWorkload ensures the Forgejo Deployment.
-func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-	return forgejo.StepResult{}, nil
+// randomBase64 returns n random bytes in unpadded base64url, the format of
+// "forgejo generate secret SECRET_KEY|JWT_SECRET|LFS_JWT_SECRET".
+func randomBase64(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// ReconcileNetwork ensures the HTTP/SSH Services and the Ingress.
-func ReconcileNetwork(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-	return forgejo.StepResult{}, nil
-}
+const alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-// ReconcileStatus summarizes phase, Ready/Progressing conditions, replicas and URLs.
-// It always runs last, even when an earlier step stopped the reconcile.
-func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-	return forgejo.StepResult{}, nil
+// randomString returns n random alphanumeric characters.
+func randomString(n int) (string, error) {
+	out := make([]byte, n)
+	max := big.NewInt(int64(len(alphanumeric)))
+	for i := range out {
+		idx, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", err
+		}
+		out[i] = alphanumeric[idx.Int64()]
+	}
+	return string(out), nil
 }
