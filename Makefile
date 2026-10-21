@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= forgejo-operator:dev
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -170,6 +170,13 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
+
+.PHONY: deploy-local
+deploy-local: ## Build the image into the docker engine the local cluster runs on (set DOCKER_CONTEXT if it is not the current docker context) and deploy it; no registry needed.
+	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(MAKE) deploy IMG=${IMG}
+	$(KUBECTL) -n forgejo-operator-system rollout restart deployment/forgejo-operator-controller-manager
+	$(KUBECTL) -n forgejo-operator-system rollout status deployment/forgejo-operator-controller-manager --timeout=180s
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
