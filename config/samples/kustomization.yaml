@@ -1,0 +1,6 @@
+## Append samples of your project ##
+resources:
+- forgejo_v1alpha1_forgejo.yaml
+- forgejo_v1alpha1_forgejobackup.yaml
+- forgejo_v1alpha1_forgejorestore.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

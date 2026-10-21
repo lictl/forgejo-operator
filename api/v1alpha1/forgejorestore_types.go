@@ -1,0 +1,113 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+// RestorePhase is the lifecycle of a restore.
+// +kubebuilder:validation:Enum=Pending;ScalingDown;Restoring;ScalingUp;Completed;Failed
+type RestorePhase string
+
+const (
+	RestorePhasePending     RestorePhase = "Pending"
+	RestorePhaseScalingDown RestorePhase = "ScalingDown"
+	RestorePhaseRestoring   RestorePhase = "Restoring"
+	RestorePhaseScalingUp   RestorePhase = "ScalingUp"
+	RestorePhaseCompleted   RestorePhase = "Completed"
+	RestorePhaseFailed      RestorePhase = "Failed"
+)
+
+// ForgejoRestoreSpec restores a ForgejoBackup into a Forgejo instance. While a restore is
+// active the instance is scaled to zero (maintenance mode).
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
+type ForgejoRestoreSpec struct {
+	// forgejoRef is the instance to restore into.
+	ForgejoRef ForgejoRef `json:"forgejoRef"`
+
+	// backupName is a completed ForgejoBackup in the same namespace.
+	// +kubebuilder:validation:MinLength=1
+	BackupName string `json:"backupName"`
+
+	// restoreDatabase replaces the database with the dump. Defaults to true.
+	// +optional
+	RestoreDatabase *bool `json:"restoreDatabase,omitempty"`
+
+	// restoreData replaces the data volume with the archive (if the backup has one). Defaults to true.
+	// +optional
+	RestoreData *bool `json:"restoreData,omitempty"`
+}
+
+// ForgejoRestoreStatus defines the observed state of ForgejoRestore.
+type ForgejoRestoreStatus struct {
+	// +optional
+	Phase RestorePhase `json:"phase,omitempty"`
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// +optional
+	JobName string `json:"jobName,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=fjr,categories=forgejo
+// +kubebuilder:printcolumn:name="Forgejo",type=string,JSONPath=`.spec.forgejoRef.name`
+// +kubebuilder:printcolumn:name="Backup",type=string,JSONPath=`.spec.backupName`
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// ForgejoRestore restores a Forgejo instance from a ForgejoBackup.
+type ForgejoRestore struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// metadata is a standard object metadata
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitzero"`
+
+	// spec defines the desired state of ForgejoRestore
+	// +required
+	Spec ForgejoRestoreSpec `json:"spec"`
+
+	// status defines the observed state of ForgejoRestore
+	// +optional
+	Status ForgejoRestoreStatus `json:"status,omitzero"`
+}
+
+// +kubebuilder:object:root=true
+
+// ForgejoRestoreList contains a list of ForgejoRestore
+type ForgejoRestoreList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitzero"`
+	Items           []ForgejoRestore `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(SchemeGroupVersion, &ForgejoRestore{}, &ForgejoRestoreList{})
+		return nil
+	})
+}

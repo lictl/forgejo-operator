@@ -1,0 +1,9 @@
+apiVersion: forgejo.lucas.icu/v1alpha1
+kind: Forgejo
+metadata:
+  labels:
+    app.kubernetes.io/name: forgejo-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: forgejo-sample
+spec:
+  # TODO(user): Add fields here

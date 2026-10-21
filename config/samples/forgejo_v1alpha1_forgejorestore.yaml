@@ -1,0 +1,9 @@
+apiVersion: forgejo.lucas.icu/v1alpha1
+kind: ForgejoRestore
+metadata:
+  labels:
+    app.kubernetes.io/name: forgejo-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: forgejorestore-sample
+spec:
+  # TODO(user): Add fields here
