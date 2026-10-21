@@ -1,0 +1,1468 @@
+{
+  "uid": "__UID__",
+  "title": "__TITLE__",
+  "tags": [
+    "forgejo",
+    "forgejo-operator"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "namespace",
+        "type": "constant",
+        "query": "__NAMESPACE__",
+        "hide": 2
+      },
+      {
+        "name": "forgejo",
+        "type": "constant",
+        "query": "__NAME__",
+        "hide": 2
+      },
+      {
+        "name": "job",
+        "type": "constant",
+        "query": "__JOB__",
+        "hide": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Overview",
+      "id": 1,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Forgejo targets up",
+      "id": 2,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Forgejo pods successfully scraped by Prometheus.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(up{namespace=\"$namespace\", job=\"$job\"}) or vector(0)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Ready",
+      "id": 3,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Ready condition as reported by the operator.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(forgejo_operator_instance_ready{namespace=\"$namespace\", name=\"$forgejo\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Not ready",
+                  "index": 1
+                },
+                "1": {
+                  "text": "Ready",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Version",
+      "id": 4,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Version reported by Forgejo's gitea_build_info metric.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (version) (gitea_build_info{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "{{version}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Health check failures (1h)",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Failed /api/healthz probes performed by the operator.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(forgejo_operator_health_check_failures_total{namespace=\"$namespace\", name=\"$forgejo\"}[1h]))",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 4
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Last successful backup",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Age of the most recent successful ForgejoBackup.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "time() - max(forgejo_operator_backup_last_success_timestamp_seconds{namespace=\"$namespace\", name=\"$forgejo\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 129600
+              },
+              {
+                "color": "red",
+                "value": 172800
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Data volume used",
+      "id": 7,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Highest used/capacity ratio across the instance's PVCs.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(forgejo_operator_volume_used_ratio{namespace=\"$namespace\", name=\"$forgejo\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.8
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Forgejo statistics",
+      "id": 8,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Users",
+      "id": 9,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_users{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Repositories",
+      "id": 10,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_repositories{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Organizations",
+      "id": 11,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_organizations{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Issues",
+      "id": 12,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_issues{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Users and repositories",
+      "id": 13,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_users{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "users",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_organizations{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "organizations",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_repositories{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "repositories",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_mirrors{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "mirrors",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Issues",
+      "id": 14,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_issues_open{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "open",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_issues_closed{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "closed",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(gitea_comments{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "comments",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Operator",
+      "id": 15,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Health check failures",
+      "id": 16,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Failed /api/healthz probes (the operator skips probing while no pod is Ready).",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 19
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(forgejo_operator_health_check_failures_total{namespace=\"$namespace\", name=\"$forgejo\"}[$__rate_interval]))",
+          "legendFormat": "failures",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Autopilot actions (1h)",
+      "id": 17,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Autonomous actions (restarts, rollbacks, scaling, volume expansion) in the trailing hour.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 19
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (action) (increase(forgejo_operator_autopilot_actions_total{namespace=\"$namespace\", name=\"$forgejo\"}[1h]))",
+          "legendFormat": "{{action}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Volume usage",
+      "id": 18,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 19
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "forgejo_operator_volume_used_ratio{namespace=\"$namespace\", name=\"$forgejo\"}",
+          "legendFormat": "{{claim}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Backups",
+      "id": 19,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Finished backups in the trailing hour by reason and result.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (reason, result) (increase(forgejo_operator_backups_total{namespace=\"$namespace\", name=\"$forgejo\"}[1h]))",
+          "legendFormat": "{{reason}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Backup size",
+      "id": 20,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 27
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "forgejo_operator_backup_size_bytes{namespace=\"$namespace\", name=\"$forgejo\"}",
+          "legendFormat": "{{part}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Backup duration",
+      "id": 21,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 27
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "forgejo_operator_backup_duration_seconds{namespace=\"$namespace\", name=\"$forgejo\"}",
+          "legendFormat": "duration",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Runtime",
+      "id": 22,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory",
+      "id": 23,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 36
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "process_resident_memory_bytes{namespace=\"$namespace\", job=\"$job\"}",
+          "legendFormat": "{{pod}} rss",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "go_memstats_heap_inuse_bytes{namespace=\"$namespace\", job=\"$job\"}",
+          "legendFormat": "{{pod}} heap",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "CPU",
+      "id": 24,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "CPU cores used by each Forgejo process.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 36
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(process_cpu_seconds_total{namespace=\"$namespace\", job=\"$job\"}[$__rate_interval])",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Goroutines",
+      "id": 25,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 36
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "go_goroutines{namespace=\"$namespace\", job=\"$job\"}",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}
