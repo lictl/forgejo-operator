@@ -1,0 +1,76 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  name: forgejo-operator.v0.1.0
+  namespace: placeholder
+  annotations:
+    alm-examples: "[]"
+    capabilities: Auto Pilot
+    categories: Developer Tools
+    containerImage: forgejo-operator:dev
+    description: Runs Forgejo (official image) with CloudNativePG, from install through backups, upgrades with auto-rollback, observability and autopilot.
+    operators.operatorframework.io/builder: kubebuilder
+    repository: https://github.com/lictl/forgejo-operator
+    support: Community
+spec:
+  displayName: Forgejo Operator
+  description: |
+    The Forgejo Operator manages Forgejo software forges on Kubernetes using the official
+    `codeberg.org/forgejo/forgejo` image and CloudNativePG for PostgreSQL.
+
+    * **Basic install** – one `Forgejo` resource provisions PostgreSQL (CNPG), secrets, the
+      admin account, storage, Services and Ingress.
+    * **Seamless upgrades** – image changes are version-gated, preceded by a cold backup,
+      migrated with a single replica and verified; failures roll back automatically.
+    * **Full lifecycle** – scheduled and on-demand `ForgejoBackup`s with retention, and
+      `ForgejoRestore` with maintenance mode.
+    * **Deep insights** – operator and Forgejo metrics, ServiceMonitor, PrometheusRule alerts,
+      Grafana dashboard, health checks and statistics in status.
+    * **Auto pilot** – config rollback on crash-loops, restarts of hung instances, OOM- and
+      usage-driven vertical right-sizing, HPA with Valkey-backed HA, PVC auto-expansion and
+      resource-derived tuning.
+  keywords: [forgejo, git, forge, gitea, cloudnative-pg]
+  maturity: alpha
+  provider:
+    name: lictl
+  links:
+    - name: Forgejo
+      url: https://forgejo.org
+  installModes:
+    - type: OwnNamespace
+      supported: true
+    - type: SingleNamespace
+      supported: true
+    - type: MultiNamespace
+      supported: true
+    - type: AllNamespaces
+      supported: true
+  customresourcedefinitions:
+    owned:
+      - kind: Forgejo
+        name: forgejos.forgejo.lucas.icu
+        version: v1alpha1
+        displayName: Forgejo
+        description: A managed Forgejo instance.
+      - kind: ForgejoBackup
+        name: forgejobackups.forgejo.lucas.icu
+        version: v1alpha1
+        displayName: Forgejo Backup
+        description: A point-in-time backup of a Forgejo instance.
+      - kind: ForgejoRestore
+        name: forgejorestores.forgejo.lucas.icu
+        version: v1alpha1
+        displayName: Forgejo Restore
+        description: Restores a Forgejo instance from a backup.
+    required:
+      - kind: Cluster
+        name: clusters.postgresql.cnpg.io
+        version: v1
+        displayName: CloudNativePG Cluster
+        description: PostgreSQL cluster used as Forgejo's database.
+  install:
+    strategy: deployment
+    spec:
+      deployments: []
+  version: 0.1.0
+  minKubeVersion: 1.30.0
