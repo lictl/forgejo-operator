@@ -171,6 +171,9 @@ func TestUnreachableDoesNotFeedSelfHealing(t *testing.T) {
 	rc, rec := newHealthRC("unreachable")
 	h := rc.Instance.Status.Health
 	counter := forgejo.HealthCheckFailures.WithLabelValues("ns", "unreachable")
+	unreachableCounter := forgejo.HealthCheckUnreachable.WithLabelValues("ns", "unreachable")
+	// The counters are global: compare increments, so that -count=N works.
+	failBase, unreachableBase := counterValue(t, counter), counterValue(t, unreachableCounter)
 	now := metav1.Now()
 
 	unreachable := healthResult{unreachable: true, message: "GET /api/healthz: dial tcp: i/o timeout"}
@@ -183,8 +186,8 @@ func TestUnreachableDoesNotFeedSelfHealing(t *testing.T) {
 			t.Fatalf("after %d failures: consecutiveFailures=%d", i, h.ConsecutiveFailures)
 		}
 	}
-	if got := counterValue(t, counter); got != 3 {
-		t.Fatalf("failure counter %v, want 3", got)
+	if got := counterValue(t, counter) - failBase; got != 3 {
+		t.Fatalf("failure counter +%v, want +3", got)
 	}
 	if ev := drain(rec); len(ev) != 1 || !strings.Contains(ev[0], "HealthCheckFailed") {
 		t.Fatalf("events %v, want one HealthCheckFailed", ev)
@@ -197,8 +200,11 @@ func TestUnreachableDoesNotFeedSelfHealing(t *testing.T) {
 	if h.ConsecutiveFailures != 0 || h.Healthy || h.LastCheckTime == nil {
 		t.Fatalf("unexpected health after unreachable probes: %+v", h)
 	}
-	if got := counterValue(t, counter); got != 3 {
-		t.Fatalf("failure counter %v after unreachable probes, want 3", got)
+	if got := counterValue(t, counter) - failBase; got != 3 {
+		t.Fatalf("failure counter +%v after unreachable probes, want +3", got)
+	}
+	if got := counterValue(t, unreachableCounter) - unreachableBase; got != 10 {
+		t.Fatalf("unreachable counter +%v, want +10", got)
 	}
 	c := meta.FindStatusCondition(rc.Instance.Status.Conditions, forgejov1.ConditionHealthy)
 	if c == nil || c.Status != metav1.ConditionUnknown || c.Reason != ReasonUnreachable ||

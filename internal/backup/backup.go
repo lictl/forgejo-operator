@@ -35,6 +35,7 @@ func ReconcileMaintenance(ctx context.Context, rc *forgejo.ReconcileContext) (fo
 		return forgejo.StepResult{}, fmt.Errorf("listing restores: %w", err)
 	}
 	active, held := MaintenanceRestore(restores)
+	rc.RestoreMigrating = migratingRestore(restores) != nil
 
 	previous := ""
 	if f.Status.Backup != nil {
@@ -83,6 +84,19 @@ func MaintenanceRestore(restores []forgejov1.ForgejoRestore) (*forgejov1.Forgejo
 	return held, held != nil
 }
 
+// migratingRestore returns a restore that replaced the database and waits for Forgejo to
+// come back (ScalingUp): the restored schema may be older than the running image, so the
+// first pod migrates it and must run alone.
+func migratingRestore(restores []forgejov1.ForgejoRestore) *forgejov1.ForgejoRestore {
+	for i := range restores {
+		r := &restores[i]
+		if r.Status.Phase == forgejov1.RestorePhaseScalingUp && forgejo.BoolOr(r.Spec.RestoreDatabase, true) {
+			return r
+		}
+	}
+	return nil
+}
+
 // restoredAfter reports whether one of the (later) restores has finished restoring.
 func restoredAfter(later []forgejov1.ForgejoRestore) bool {
 	for i := range later {
@@ -111,6 +125,11 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 		return forgejo.StepResult{}, fmt.Errorf("listing backups: %w", err)
 	}
 	summarize(f, backups)
+	var succeeded *metav1.Time
+	if f.Status.Backup != nil {
+		succeeded = f.Status.Backup.LastSuccessfulBackupTime
+	}
+	ExportLastSuccess(f.Namespace, f.Name, succeeded)
 
 	if !f.Spec.Backup.Enabled {
 		meta.RemoveStatusCondition(&f.Status.Conditions, forgejov1.ConditionBackupHealthy)
@@ -134,8 +153,15 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	st := summary(f)
 	now := time.Now()
 	due := nextRun(sched, st, now)
+	var deferredSince *time.Time
 	if !now.Before(due) {
-		if busy := firstActive(backups); busy != "" {
+		if busy := firstActive(backups); upgradeInProgress(rc) {
+			// A hot dump taken while an upgrade migrates the database would be labelled with
+			// the old image. The run starts once the upgrade has settled; it is not a missed
+			// run for BackupHealthy.
+			deferredSince = &due
+			rc.Requeue(30 * time.Second)
+		} else if busy != "" {
 			// Backups never overlap; the due run starts once the other one finishes.
 			rc.Requeue(15 * time.Second)
 		} else {
@@ -157,8 +183,14 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	if err := prune(ctx, rc, scheduled); err != nil {
 		return forgejo.StepResult{}, err
 	}
-	setHealth(rc, sched, scheduled, now)
+	setHealth(rc, sched, scheduled, now, deferredSince)
 	return forgejo.StepResult{}, nil
+}
+
+// upgradeInProgress reports whether the upgrade step is changing the image, or a failed
+// upgrade still holds its new image's migration (see forgejo.UpgradeHoldsWorkload).
+func upgradeInProgress(rc *forgejo.ReconcileContext) bool {
+	return rc.Upgrading || forgejo.UpgradeHoldsWorkload(rc.Instance)
 }
 
 func summary(f *forgejov1.Forgejo) *forgejov1.BackupStatusSummary {
@@ -331,7 +363,9 @@ func finishedAt(b *forgejov1.ForgejoBackup) time.Time {
 
 // setHealth reports BackupHealthy from the newest finished scheduled backup. A successful
 // backup turns stale once two further scheduled runs have passed without a newer success.
-func setHealth(rc *forgejo.ReconcileContext, sched cron.Schedule, scheduled []*forgejov1.ForgejoBackup, now time.Time) {
+// While a due run is deferred (deferredSince), staleness is judged as of the time the run was
+// due, so the deferral itself never makes the backups stale.
+func setHealth(rc *forgejo.ReconcileContext, sched cron.Schedule, scheduled []*forgejov1.ForgejoBackup, now time.Time, deferredSince *time.Time) {
 	var latest *forgejov1.ForgejoBackup
 	running := false
 	for _, b := range scheduled {
@@ -357,11 +391,15 @@ func setHealth(rc *forgejo.ReconcileContext, sched cron.Schedule, scheduled []*f
 		n1 := sched.Next(done)
 		n2 := sched.Next(n1)
 		grace := min(n2.Sub(n1), 10*time.Minute)
-		if now.After(n2.Add(grace)) {
-			set(metav1.ConditionFalse, "BackupStale", "Last successful scheduled backup %s completed at %s; later runs did not succeed",
-				latest.Name, done.UTC().Format(time.RFC3339))
+		at, note := now, ""
+		if deferredSince != nil && deferredSince.Before(now) {
+			at, note = *deferredSince, "; the next scheduled backup waits for the upgrade to finish"
+		}
+		if at.After(n2.Add(grace)) {
+			set(metav1.ConditionFalse, "BackupStale", "Last successful scheduled backup %s completed at %s; later runs did not succeed%s",
+				latest.Name, done.UTC().Format(time.RFC3339), note)
 			return
 		}
-		set(metav1.ConditionTrue, "BackupSucceeded", "Scheduled backup %s completed at %s", latest.Name, done.UTC().Format(time.RFC3339))
+		set(metav1.ConditionTrue, "BackupSucceeded", "Scheduled backup %s completed at %s%s", latest.Name, done.UTC().Format(time.RFC3339), note)
 	}
 }

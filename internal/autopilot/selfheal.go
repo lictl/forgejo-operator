@@ -43,24 +43,14 @@ func healthCheckInterval(f *forgejov1.Forgejo) time.Duration {
 	return forgejo.DurationOr(f.Spec.AutoPilot.SelfHealing.HealthCheckInterval, defaultHealthCheckInterval)
 }
 
-// forgejoAnswered reports whether the latest health probe got a /api/healthz response from
-// Forgejo itself, with its list of checks. A transport error (timeout, refused or reset
-// connection, DNS failure) or a reply that is not Forgejo's healthz document (e.g. from a
-// mesh sidecar) leaves status.health.checks empty.
-func forgejoAnswered(h *forgejov1.HealthStatus) bool {
-	return h != nil && len(h.Checks) > 0
-}
-
-// probeUnanswered reports whether the latest health probe got no answer from Forgejo: the
-// health step reported it as Unreachable, or counted it as a failure without Forgejo's list
-// of checks (a timeout, for example).
+// probeUnanswered reports whether the latest health probe got no answer from Forgejo. The
+// health step reports such probes (DNS, dial and connection-reset errors, replies from an
+// intermediary instead of Forgejo) as Healthy=Unknown with reason Unreachable and does not
+// count them in status.health.consecutiveFailures. A Forgejo that accepted the connection
+// and then hung, or answered with an error page, is a real failure and not "unanswered".
 func probeUnanswered(f *forgejov1.Forgejo) bool {
-	if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionHealthy); c != nil &&
-		c.Status != metav1.ConditionTrue && c.Reason == healthReasonUnreachable {
-		return true
-	}
-	h := f.Status.Health
-	return h != nil && !h.Healthy && h.ConsecutiveFailures > 0 && !forgejoAnswered(h)
+	c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionHealthy)
+	return c != nil && c.Status != metav1.ConditionTrue && c.Reason == healthReasonUnreachable
 }
 
 // trackUnreachable records since when the operator's probes have gone unanswered while
@@ -102,28 +92,28 @@ func reportProbeUnreachable(rc *forgejo.ReconcileContext, st *instanceState, pod
 
 // restartUnhealthy remediates a hung Forgejo: the process is alive (the tcpSocket liveness
 // probe passes because the kernel still accepts connections) but /api/healthz fails. It only
-// acts while the database is ready, no upgrade/restore runs and the pods are not
-// crash-looping (crash loops are config rollback's or the upgrade's business).
+// acts while the database is ready, no upgrade, restore or migration holds the workload and
+// the pods are not crash-looping (crash loops are config rollback's or the upgrade's
+// business).
 //
 //   - instance level: status.health.consecutiveFailures >= failureThreshold, the latest
-//     failing probe was answered by Forgejo itself (it reported failing checks) and every
-//     server container is running → rolling restart through the restarted-at annotation.
-//     Probes that Forgejo did not answer (timeouts, refused connections) never restart: the
-//     kubelet probes the same endpoint, so a Forgejo that really hangs goes NotReady, which
-//     resets the streak and leaves it to the pod-level check; failures that persist while
-//     pods stay Ready mean the operator cannot reach Forgejo (see trackUnreachable);
+//     probe was not Unreachable and every server container is running → rolling restart
+//     through the restarted-at annotation. The health step counts only probes Forgejo
+//     answered (failing checks, error pages) or accepted and then left hanging; probes that
+//     never reached Forgejo are reported as Unreachable and reset the streak, and while they
+//     persist with pods Ready the operator cannot reach Forgejo (see trackUnreachable);
 //   - pod level: a started container whose pod stayed NotReady for failureThreshold ×
 //     healthCheckInterval while running the last known good config → that pod is deleted
 //     with a short grace period.
 func restartUnhealthy(ctx context.Context, rc *forgejo.ReconcileContext, dep *appsv1.Deployment, pods []corev1.Pod) error {
 	f := rc.Instance
-	if rc.Upgrading || rc.Maintenance || !rc.DatabaseReady || dep == nil || len(pods) == 0 ||
+	if rc.Maintenance || workloadHeld(rc) || !rc.DatabaseReady || dep == nil || len(pods) == 0 ||
 		inCooldown(f, ActionPodRestarted, restartCooldown) {
 		return nil
 	}
 	threshold := failureThreshold(f)
 
-	if h := f.Status.Health; h != nil && h.ConsecutiveFailures >= threshold && forgejoAnswered(h) && allRunning(pods) {
+	if h := f.Status.Health; h != nil && h.ConsecutiveFailures >= threshold && !probeUnanswered(f) && allRunning(pods) {
 		patch := client.MergeFrom(dep.DeepCopy())
 		if dep.Spec.Template.Annotations == nil {
 			dep.Spec.Template.Annotations = map[string]string{}
@@ -175,7 +165,7 @@ func readyPods(pods []corev1.Pod) int {
 func allRunning(pods []corev1.Pod) bool {
 	for i := range pods {
 		cs := containerStatus(&pods[i], serverContainerName)
-		if cs == nil || cs.State.Running == nil || podFailure(&pods[i]) != "" {
+		if cs == nil || cs.State.Running == nil || podFailure(&pods[i], time.Time{}) != "" {
 			return false
 		}
 	}

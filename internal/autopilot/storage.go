@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -24,20 +27,38 @@ import (
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;patch
 
 const (
+	// storageCheckInterval is how often volumes are measured and reported.
 	storageCheckInterval = time.Minute
-	// duInterval throttles the du fallback, which walks the whole volume.
+	// duInterval throttles du, which walks the whole volume.
 	duInterval = 5 * time.Minute
+	// maxMeasureBackoff caps the retry interval of a claim whose measurement keeps failing.
+	maxMeasureBackoff = time.Hour
+	// dfTimeout bounds the df exec.
+	dfTimeout = 30 * time.Second
+	// duRemoteTimeoutSeconds bounds du inside the container (timeout -s KILL), so an exec
+	// stream that is dropped cannot leave a volume walk running. duTimeout, the client-side
+	// limit, is slightly longer.
+	duRemoteTimeoutSeconds = 110
+	duTimeout              = 2 * time.Minute
+	// measureWait is how long a reconcile waits for measurements it started; slower ones
+	// (du on a large volume) finish in the background and are reported by a later reconcile.
+	measureWaitDefault = 3 * time.Second
+	// measureRequeue picks up background measurements sooner than the regular resync.
+	measureRequeue = 30 * time.Second
+	// maxConcurrentMeasurements bounds the exec sessions the operator runs at once.
+	maxConcurrentMeasurements = 4
+
 	// expansionSettle gives the CSI driver/kubelet time to report the new size.
 	expansionSettle = 5 * time.Minute
+	// expansionStallAfter reports a resize that has been pending this long as stalled.
+	expansionStallAfter = 30 * time.Minute
+	// fsResizeRestartAfter restarts Forgejo when its data volume has waited this long for a
+	// file system resize that the kubelet only performs when the volume is mounted.
+	fsResizeRestartAfter = 10 * time.Minute
 
 	cnpgClusterLabel = "cnpg.io/cluster"
 	cnpgPVCRoleLabel = "cnpg.io/pvcRole"
 )
-
-type duResult struct {
-	used int64
-	at   time.Time
-}
 
 type claimRole int
 
@@ -48,19 +69,15 @@ const (
 )
 
 // reconcileStorage measures the data and CNPG PVCs, reports status.storage, the
-// VolumeUsedRatio metric and StorageHealthy, and expands volumes above the threshold.
-func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState) error {
+// VolumeUsedRatio metric and StorageHealthy, and expands volumes above the threshold when
+// auto-expansion is enabled. Measuring and reporting continue with auto-expansion turned
+// off, so the ForgejoVolumeAlmostFull alert and StorageHealthy keep working.
+func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState, dep *appsv1.Deployment) error {
 	f := rc.Instance
-	if !forgejo.StorageAutoExpandEnabled(f) {
-		f.Status.Storage = nil
-		meta.RemoveStatusCondition(&f.Status.Conditions, forgejov1.ConditionStorageHealthy)
-		forgejo.VolumeUsedRatio.DeletePartialMatch(map[string]string{"namespace": f.Namespace, "name": f.Name})
+	m := st.measure
+	if f.Status.Storage != nil && time.Since(st.lastStorageCheck) < storageCheckInterval && !m.updatedSince(st.lastStorageCheck) {
 		return nil
 	}
-	if f.Status.Storage != nil && time.Since(st.lastStorageCheck) < storageCheckInterval {
-		return nil
-	}
-	st.lastStorageCheck = time.Now()
 
 	claims, err := instanceClaims(ctx, rc)
 	if err != nil {
@@ -70,7 +87,20 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 	if err := rc.Client.List(ctx, podList, client.InNamespace(f.Namespace)); err != nil {
 		return err
 	}
-	kubelet := kubeletStats(ctx, podList.Items, claims, f.Namespace)
+	names := make([]string, 0, len(claims))
+	var started []<-chan struct{}
+	for _, c := range claims {
+		names = append(names, c.pvc.Name)
+		if ch := m.start(logger(ctx), podList.Items, c.pvc); ch != nil {
+			started = append(started, ch)
+		}
+	}
+	m.prune(names)
+	waitFor(ctx, started, measureWait)
+	if m.anyRunning() {
+		rc.Requeue(measureRequeue)
+	}
+	st.lastStorageCheck = time.Now()
 
 	prev := map[string]forgejov1.VolumeUsage{}
 	if f.Status.Storage != nil {
@@ -79,6 +109,7 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 		}
 	}
 	ae := f.Spec.AutoPilot.StorageAutoExpand
+	autoExpand := forgejo.StorageAutoExpandEnabled(f)
 	threshold := int64(ae.ThresholdPercent)
 	if threshold <= 0 {
 		threshold = 80
@@ -89,14 +120,38 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 	var volumes []forgejov1.VolumeUsage
 	var problems []string
 	problemReason, expanding := "", false
+	addProblem := func(reason, msg string) {
+		problems = append(problems, msg)
+		if problemRank(reason) < problemRank(problemReason) {
+			problemReason = reason
+		}
+	}
 	expandedRoles := map[claimRole]bool{}
 	for _, c := range claims {
 		pvc := c.pvc
 		req := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 		vu := forgejov1.VolumeUsage{ClaimName: pvc.Name, RequestedSize: req.String(), LastExpansionTime: prev[pvc.Name].LastExpansionTime}
-		vu.ExpansionSupported = expansionSupported(ctx, pvc, scCache)
+		vu.ExpansionSupported = expansionSupported(ctx, rc, pvc, scCache)
 
-		used, capacity, ok := measureClaim(ctx, st, podList.Items, pvc, kubelet)
+		pending := resizePending(pvc)
+		if pending {
+			since := resizePendingSince(st, pvc, prev[pvc.Name], req)
+			if time.Since(since) >= expansionStallAfter {
+				msg := fmt.Sprintf("resizing %s to %s has been pending since %s%s",
+					pvc.Name, req.String(), since.UTC().Format(time.RFC3339), resizeDetail(pvc))
+				addProblem(ReasonExpansionStalled, msg)
+				warnEvery(rc, st, "storage-stalled/"+pvc.Name, time.Hour, ReasonExpansionStalled, "%s", msg)
+			}
+			if c.role == roleData && fsResizeOnly(pvc) && time.Since(since) >= fsResizeRestartAfter {
+				if err := restartForFilesystemResize(ctx, rc, st, dep, pvc, since); err != nil {
+					return err
+				}
+			}
+		} else {
+			delete(st.resizeSeen, pvc.Name)
+		}
+
+		used, capacity, ok := m.result(pvc.Name)
 		if !ok {
 			if p, found := prev[pvc.Name]; found && p.CapacityBytes > 0 {
 				used, capacity, ok = p.UsedBytes, p.CapacityBytes, true
@@ -112,19 +167,19 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 
 		if int64(vu.UsedPercent) >= threshold {
 			switch {
+			case !autoExpand:
+				addProblem(ReasonAutoExpandDisabled, fmt.Sprintf("%s is %d%% full and storage auto-expansion is disabled", pvc.Name, vu.UsedPercent))
+				warnEvery(rc, st, "storage-disabled/"+pvc.Name, time.Hour, ReasonAutoExpandDisabled,
+					"PVC %s is %d%% full (threshold %d%%) and autoPilot.storageAutoExpand is disabled; grow it manually", pvc.Name, vu.UsedPercent, threshold)
 			case !vu.ExpansionSupported:
-				problemReason = ReasonExpansionUnsupported
-				problems = append(problems, fmt.Sprintf("%s is %d%% full and its StorageClass does not allow volume expansion", pvc.Name, vu.UsedPercent))
+				addProblem(ReasonExpansionUnsupported, fmt.Sprintf("%s is %d%% full and its StorageClass does not allow volume expansion", pvc.Name, vu.UsedPercent))
 				warnEvery(rc, st, "storage-unsupported/"+pvc.Name, time.Hour, ReasonExpansionUnsupported,
 					"PVC %s is %d%% full (threshold %d%%) but its StorageClass does not allow expansion; grow it manually", pvc.Name, vu.UsedPercent, threshold)
 			case req.Cmp(maxSize) >= 0:
-				if problemReason == "" {
-					problemReason = ReasonMaxSizeReached
-				}
-				problems = append(problems, fmt.Sprintf("%s is %d%% full at the autoPilot.storageAutoExpand.maxSize %s", pvc.Name, vu.UsedPercent, maxSize.String()))
+				addProblem(ReasonMaxSizeReached, fmt.Sprintf("%s is %d%% full at the autoPilot.storageAutoExpand.maxSize %s", pvc.Name, vu.UsedPercent, maxSize.String()))
 				warnEvery(rc, st, "storage-max/"+pvc.Name, time.Hour, ReasonMaxSizeReached,
 					"PVC %s is %d%% full and already at maxSize %s", pvc.Name, vu.UsedPercent, maxSize.String())
-			case resizePending(pvc) || (vu.LastExpansionTime != nil && time.Since(vu.LastExpansionTime.Time) < expansionSettle) || expandedRoles[c.role]:
+			case pending || (vu.LastExpansionTime != nil && time.Since(vu.LastExpansionTime.Time) < expansionSettle) || expandedRoles[c.role]:
 				expanding = true
 			default:
 				newSize := grownSize(req, int64(ae.IncrementPercent), maxSize)
@@ -150,12 +205,31 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 	case expanding:
 		rc.SetCondition(forgejov1.ConditionStorageHealthy, metav1.ConditionTrue, "Expanding", "a volume above the threshold is being expanded")
 	case !anyMeasured(volumes):
-		rc.SetCondition(forgejov1.ConditionStorageHealthy, metav1.ConditionUnknown, "MeasurementUnavailable", "no volume usage could be measured yet")
+		msg := "no volume usage could be measured yet"
+		if m.isForbidden() {
+			msg += "; the operator may not exec into the pods that mount the claims (grant pods/exec in this namespace)"
+		}
+		rc.SetCondition(forgejov1.ConditionStorageHealthy, metav1.ConditionUnknown, "MeasurementUnavailable", msg)
 	default:
 		rc.SetCondition(forgejov1.ConditionStorageHealthy, metav1.ConditionTrue, "WithinThreshold",
 			fmt.Sprintf("all volumes are below %d%% used", threshold))
 	}
 	return nil
+}
+
+// problemRank orders StorageHealthy=False reasons; the most urgent one names the condition.
+func problemRank(reason string) int {
+	switch reason {
+	case ReasonExpansionStalled:
+		return 0
+	case ReasonExpansionUnsupported:
+		return 1
+	case ReasonMaxSizeReached:
+		return 2
+	case ReasonAutoExpandDisabled:
+		return 3
+	}
+	return 99
 }
 
 type instanceClaim struct {
@@ -192,71 +266,286 @@ func instanceClaims(ctx context.Context, rc *forgejo.ReconcileContext) ([]instan
 	return out, nil
 }
 
-// kubeletStats fetches kubelet volume stats from every node running a pod that mounts one
-// of the claims. Failures are logged and leave the du fallback in charge.
-func kubeletStats(ctx context.Context, pods []corev1.Pod, claims []instanceClaim, namespace string) map[string]volumeStat {
-	wanted := map[string]bool{}
-	for _, c := range claims {
-		wanted[c.pvc.Name] = true
-	}
-	nodes := map[string]bool{}
-	for i := range pods {
-		for _, v := range pods[i].Spec.Volumes {
-			if v.PersistentVolumeClaim != nil && wanted[v.PersistentVolumeClaim.ClaimName] && pods[i].Spec.NodeName != "" {
-				nodes[pods[i].Spec.NodeName] = true
-			}
-		}
-	}
-	out := map[string]volumeStat{}
-	for node := range nodes {
-		stats, err := nodeVolumeStats(ctx, node, namespace)
-		if err != nil {
-			logger(ctx).V(1).Info("kubelet volume stats unavailable", "node", node, "error", err.Error())
-			continue
-		}
-		for k, v := range stats {
-			out[k] = v
-		}
-	}
-	return out
+// --- measurement ---
+//
+// Volumes are measured with an exec into a running container that mounts the claim, in the
+// background so that a slow volume never holds the reconcile worker:
+//
+//   - df -Pk <mountPath> gives the file system's size and usage. When the size is at most
+//     125% of the claim's request, the file system is the volume itself (block volumes,
+//     most CSI drivers) and df is the measurement.
+//   - Otherwise the claim is a directory on a larger file system (local-path, hostPath, NFS
+//     exports) and du -skx walks it, compared with the requested size. du runs at most every
+//     duInterval per claim, niced and killed inside the container after 110s.
+//
+// Failed attempts are recorded as well and back off exponentially (up to an hour), so a
+// volume that cannot be measured is not retried on every reconcile.
+
+// claimMeasurement is what the operator knows about one claim's usage.
+type claimMeasurement struct {
+	used, capacity int64     // last successful measurement
+	at             time.Time // when it was taken; zero when there is none
+
+	attempt  time.Time // start of the last measurement job
+	failures int       // consecutive jobs that produced no usable measurement
+
+	duAttempt  time.Time
+	duFailures int
+
+	running bool
 }
 
-// measureClaim returns used bytes and the capacity to compare them with. Kubelet stats are
-// used when they describe a dedicated volume. Provisioners such as local-path report the
-// whole node filesystem (or nothing at all for hostPath), so then the operator runs du in a
-// container that mounts the claim, at most every duInterval, and compares the result with
-// the PVC's requested size.
-func measureClaim(ctx context.Context, st *instanceState, pods []corev1.Pod, pvc *corev1.PersistentVolumeClaim, kubelet map[string]volumeStat) (int64, int64, bool) {
-	req := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	requested := req.Value()
-	if s, ok := kubelet[pvc.Name]; ok && s.capacity > 0 && (requested == 0 || s.capacity <= requested*5/4) {
-		return s.used, s.capacity, true
+type measureState struct {
+	mu        sync.Mutex
+	claims    map[string]*claimMeasurement
+	updated   time.Time // when the last job finished
+	forbidden bool      // the last failed exec was refused by RBAC
+	logged    map[string]bool
+}
+
+func newMeasureState() *measureState {
+	return &measureState{claims: map[string]*claimMeasurement{}, logged: map[string]bool{}}
+}
+
+// measureWait is measureWaitDefault; tests shorten it.
+var measureWait = measureWaitDefault
+
+// measureSem bounds the exec sessions running at once across all instances.
+var measureSem = make(chan struct{}, maxConcurrentMeasurements)
+
+// backoff doubles base for every consecutive failure, up to maxMeasureBackoff.
+func backoff(base time.Duration, failures int) time.Duration {
+	d := base
+	for i := 0; i < failures && d < maxMeasureBackoff; i++ {
+		d *= 2
 	}
-	if requested <= 0 {
-		return 0, 0, false
+	return min(d, maxMeasureBackoff)
+}
+
+func (m *measureState) claim(name string) *claimMeasurement {
+	c, ok := m.claims[name]
+	if !ok {
+		c = &claimMeasurement{}
+		m.claims[name] = c
 	}
-	if r, ok := st.du[pvc.Name]; ok && time.Since(r.at) < duInterval {
-		return r.used, requested, true
+	return c
+}
+
+// start launches a measurement of the claim in the background when one is due and none is
+// running. It returns a channel that is closed when the measurement finishes, or nil.
+func (m *measureState) start(log logr.Logger, pods []corev1.Pod, pvc *corev1.PersistentVolumeClaim) <-chan struct{} {
+	requested := pvc.Spec.Resources.Requests.Storage().Value()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.claim(pvc.Name)
+	if c.running || time.Since(c.attempt) < backoff(storageCheckInterval, c.failures) {
+		return nil
 	}
 	pod, container, path := claimMount(pods, pvc.Name)
 	if pod == "" {
+		return nil
+	}
+	c.running, c.attempt = true, time.Now()
+	done := make(chan struct{})
+	go m.run(log, pvc.Name, pvc.Namespace, pod, container, path, requested, done)
+	return done
+}
+
+func (m *measureState) run(log logr.Logger, claim, namespace, pod, container, path string, requested int64, done chan struct{}) {
+	defer close(done)
+	measureSem <- struct{}{}
+	defer func() { <-measureSem }()
+
+	used, size, dfErr := dfUsage(namespace, pod, container, path)
+	m.mu.Lock()
+	c := m.claim(claim)
+	finish := func(ok bool, err error) {
+		if ok {
+			c.failures = 0
+			m.forbidden = false
+		} else {
+			c.failures++
+			if err != nil {
+				m.forbidden = execForbidden(err)
+				m.logFailure(log, claim, pod, err, backoff(storageCheckInterval, c.failures))
+			}
+		}
+		c.running = false
+		m.updated = time.Now()
+		m.mu.Unlock()
+	}
+	if dfErr == nil && size > 0 && (requested <= 0 || size <= requested*5/4) {
+		c.used, c.capacity, c.at = used, size, time.Now()
+		finish(true, nil)
+		return
+	}
+	if execForbidden(dfErr) || requested <= 0 {
+		finish(false, dfErr)
+		return
+	}
+	if time.Since(c.duAttempt) < backoff(duInterval, c.duFailures) {
+		// The file system is shared (or df failed): the last du result still stands.
+		finish(dfErr == nil, dfErr)
+		return
+	}
+	c.duAttempt = time.Now()
+	m.mu.Unlock()
+
+	duUsed, duErr := duUsage(namespace, pod, container, path)
+
+	m.mu.Lock()
+	c = m.claim(claim)
+	if duErr != nil {
+		c.duFailures++
+		finish(false, duErr)
+		return
+	}
+	c.duFailures = 0
+	c.used, c.capacity, c.at = duUsed, requested, time.Now()
+	finish(true, nil)
+}
+
+// logFailure logs a failed measurement at info level the first time per claim and kind of
+// error, and at debug level afterwards. Must be called with m.mu held.
+func (m *measureState) logFailure(log logr.Logger, claim, pod string, err error, retry time.Duration) {
+	key := claim + "/other"
+	if execForbidden(err) {
+		key = claim + "/forbidden"
+	}
+	if m.logged[key] {
+		log.V(1).Info("cannot measure volume usage", "claim", claim, "pod", pod, "error", err.Error(), "retryIn", retry.String())
+		return
+	}
+	m.logged[key] = true
+	if execForbidden(err) {
+		log.Info("cannot measure volume usage: the operator may not exec into the pod; grant pods/exec in this namespace to enable it",
+			"claim", claim, "pod", pod, "error", err.Error())
+		return
+	}
+	log.Info("cannot measure volume usage", "claim", claim, "pod", pod, "error", err.Error(), "retryIn", retry.String())
+}
+
+// result returns the last successful measurement of the claim.
+func (m *measureState) result(claim string) (used, capacity int64, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, found := m.claims[claim]
+	if !found || c.at.IsZero() {
 		return 0, 0, false
 	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	return c.used, c.capacity, true
+}
+
+func (m *measureState) anyRunning() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.claims {
+		if c.running {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *measureState) updatedSince(t time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.updated.After(t)
+}
+
+func (m *measureState) isForbidden() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.forbidden
+}
+
+// prune forgets claims that no longer belong to the instance.
+func (m *measureState) prune(keep []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for name, c := range m.claims {
+		found := false
+		for _, k := range keep {
+			if k == name {
+				found = true
+				break
+			}
+		}
+		if !found && !c.running {
+			delete(m.claims, name)
+		}
+	}
+}
+
+// waitFor waits until every channel is closed, d has passed or ctx is done.
+func waitFor(ctx context.Context, chans []<-chan struct{}, d time.Duration) {
+	if len(chans) == 0 {
+		return
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	for _, ch := range chans {
+		select {
+		case <-ch:
+		case <-timer.C:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// dfUsage returns the used bytes and size of the file system mounted at path.
+func dfUsage(namespace, pod, container, path string) (used, size int64, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dfTimeout)
 	defer cancel()
-	out, err := execInPod(ctx, pvc.Namespace, pod, container, []string{"du", "-skx", path})
+	out, err := execFn(ctx, namespace, pod, container, []string{"df", "-Pk", path})
+	if err != nil {
+		return 0, 0, err
+	}
+	return parseDF(out)
+}
+
+// parseDF reads POSIX df -Pk output: Filesystem, 1024-blocks, Used, Available, Capacity,
+// Mounted on. Fields are counted from the end, since a file system name may contain spaces.
+func parseDF(out string) (used, size int64, err error) {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 2 {
+		return 0, 0, fmt.Errorf("unexpected df output %q", out)
+	}
+	f := strings.Fields(lines[len(lines)-1])
+	if len(f) < 6 {
+		return 0, 0, fmt.Errorf("unexpected df output %q", out)
+	}
+	blocks, err1 := strconv.ParseInt(f[len(f)-5], 10, 64)
+	usedK, err2 := strconv.ParseInt(f[len(f)-4], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, fmt.Errorf("unexpected df output %q", out)
+	}
+	return usedK * 1024, blocks * 1024, nil
+}
+
+// duScript runs du niced and, where timeout(1) exists (busybox in the Forgejo image,
+// coreutils in the CNPG image), kills it inside the container after duRemoteTimeoutSeconds.
+var duScript = `if command -v timeout >/dev/null 2>&1; then exec timeout -s KILL ` + strconv.Itoa(duRemoteTimeoutSeconds) +
+	` nice -n 19 du -skx "$1"; else exec nice -n 19 du -skx "$1"; fi`
+
+// duUsage returns the bytes used below path on its file system.
+func duUsage(namespace, pod, container, path string) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), duTimeout)
+	defer cancel()
+	out, err := execFn(ctx, namespace, pod, container, []string{"sh", "-c", duScript, "sh", path})
 	fields := strings.Fields(out)
-	kib, perr := int64(0), fmt.Errorf("no output")
 	if len(fields) > 0 {
-		kib, perr = strconv.ParseInt(fields[0], 10, 64)
-	}
-	if perr != nil {
 		// du exits non-zero for unreadable entries but still prints the total.
-		logger(ctx).Info("cannot measure volume usage with du", "claim", pvc.Name, "pod", pod, "error", fmt.Sprint(err, perr))
-		return 0, 0, false
+		if kib, perr := strconv.ParseInt(fields[0], 10, 64); perr == nil {
+			return kib * 1024, nil
+		}
 	}
-	st.du[pvc.Name] = duResult{used: kib * 1024, at: time.Now()}
-	return kib * 1024, requested, true
+	if err == nil {
+		err = fmt.Errorf("unexpected du output %q", out)
+	}
+	return 0, err
 }
 
 // claimMount finds a running container that mounts the whole claim.
@@ -286,7 +575,7 @@ func claimMount(pods []corev1.Pod, claim string) (pod, container, path string) {
 	return "", "", ""
 }
 
-func expansionSupported(ctx context.Context, pvc *corev1.PersistentVolumeClaim, cache map[string]bool) bool {
+func expansionSupported(ctx context.Context, rc *forgejo.ReconcileContext, pvc *corev1.PersistentVolumeClaim, cache map[string]bool) bool {
 	name := ""
 	if pvc.Spec.StorageClassName != nil {
 		name = *pvc.Spec.StorageClassName
@@ -297,11 +586,8 @@ func expansionSupported(ctx context.Context, pvc *corev1.PersistentVolumeClaim, 
 	if v, ok := cache[name]; ok {
 		return v
 	}
-	cs, _, err := kube()
-	if err != nil {
-		return false
-	}
-	sc, err := cs.StorageV1().StorageClasses().Get(ctx, name, metav1.GetOptions{})
+	sc := &storagev1.StorageClass{}
+	err := rc.Client.Get(ctx, client.ObjectKey{Name: name}, sc)
 	ok := err == nil && sc.AllowVolumeExpansion != nil && *sc.AllowVolumeExpansion
 	cache[name] = ok
 	return ok
@@ -319,6 +605,93 @@ func resizePending(pvc *corev1.PersistentVolumeClaim) bool {
 		}
 	}
 	return false
+}
+
+// fsResizeOnly reports whether the controller part of a resize is done and only the
+// kubelet's file system resize is left, which some drivers only do while mounting.
+func fsResizeOnly(pvc *corev1.PersistentVolumeClaim) bool {
+	fs := false
+	for _, c := range pvc.Status.Conditions {
+		if c.Status != corev1.ConditionTrue {
+			continue
+		}
+		switch c.Type {
+		case corev1.PersistentVolumeClaimResizing:
+			return false
+		case corev1.PersistentVolumeClaimFileSystemResizePending:
+			fs = true
+		}
+	}
+	return fs
+}
+
+// resizePendingSince estimates when the claim's pending resize started: the operator's own
+// expansion request, the PVC's resize conditions, or when the operator first saw it.
+func resizePendingSince(st *instanceState, pvc *corev1.PersistentVolumeClaim, prev forgejov1.VolumeUsage, req resource.Quantity) time.Time {
+	since, ok := st.resizeSeen[pvc.Name]
+	if !ok {
+		since = time.Now()
+		st.resizeSeen[pvc.Name] = since
+	}
+	for _, c := range pvc.Status.Conditions {
+		if (c.Type == corev1.PersistentVolumeClaimResizing || c.Type == corev1.PersistentVolumeClaimFileSystemResizePending) &&
+			c.Status == corev1.ConditionTrue && !c.LastTransitionTime.IsZero() && c.LastTransitionTime.Before(&metav1.Time{Time: since}) {
+			since = c.LastTransitionTime.Time
+		}
+	}
+	if prev.LastExpansionTime != nil && prev.RequestedSize == req.String() && prev.LastExpansionTime.Time.Before(since) {
+		since = prev.LastExpansionTime.Time
+	}
+	return since
+}
+
+// resizeDetail describes why a resize is still pending, from the PVC's conditions and
+// allocated resource status.
+func resizeDetail(pvc *corev1.PersistentVolumeClaim) string {
+	var parts []string
+	for _, c := range pvc.Status.Conditions {
+		if c.Status != corev1.ConditionTrue {
+			continue
+		}
+		s := string(c.Type)
+		if c.Message != "" {
+			s += ": " + c.Message
+		}
+		parts = append(parts, s)
+	}
+	if s, ok := pvc.Status.AllocatedResourceStatuses[corev1.ResourceStorage]; ok {
+		parts = append(parts, "allocatedResourceStatus "+string(s))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "no resizer has acted on it; check that the CSI driver's external-resizer runs and the PVC's events")
+	}
+	return " (" + strings.Join(parts, "; ") + ")"
+}
+
+// restartForFilesystemResize restarts Forgejo once per pending resize of its data volume
+// when only the file system resize is left, so the kubelet resizes it while mounting.
+func restartForFilesystemResize(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState, dep *appsv1.Deployment,
+	pvc *corev1.PersistentVolumeClaim, since time.Time) error {
+	f := rc.Instance
+	if dep == nil || rc.Maintenance || workloadHeld(rc) || inCooldown(f, ActionPodRestarted, restartCooldown) {
+		return nil
+	}
+	if t, ok := st.resizeRestarted[pvc.Name]; ok && t.After(since) {
+		return nil
+	}
+	patch := client.MergeFrom(dep.DeepCopy())
+	if dep.Spec.Template.Annotations == nil {
+		dep.Spec.Template.Annotations = map[string]string{}
+	}
+	dep.Spec.Template.Annotations[forgejo.AnnotationRestartedAt] = time.Now().UTC().Format(time.RFC3339)
+	if err := rc.Client.Patch(ctx, dep, patch); err != nil {
+		return err
+	}
+	st.resizeRestarted[pvc.Name] = time.Now()
+	rc.RecordAutoPilotAction(ActionPodRestarted, fmt.Sprintf(
+		"PVC %s has waited for a file system resize since %s; restarting Deployment %s so the kubelet resizes it while mounting",
+		pvc.Name, since.UTC().Format(time.RFC3339), dep.Name))
+	return nil
 }
 
 // grownSize adds incrementPercent (rounded up to whole MiB) and caps at maxSize.

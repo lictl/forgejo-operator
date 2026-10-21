@@ -5,8 +5,16 @@ metadata:
     app.kubernetes.io/name: forgejo-operator
     app.kubernetes.io/managed-by: kustomize
   name: forgejo-sample
+  # The pod runs as uid 1000 only and passes the "restricted" Pod Security Standard. On a
+  # volume that ignores fsGroup (NFS, hostPath) and is not writable by uid 1000, this adds a
+  # root init container that chowns the top-level data directories (needs "baseline").
+  # annotations:
+  #   forgejo.lucas.icu/fix-permissions: "true"
 spec:
   image: codeberg.org/forgejo/forgejo:16
+  # More than one replica requires highAvailability.enabled (Valkey for cache, sessions and
+  # queues); without it the operator runs a single pod and reports Degraded/ReplicasRequireHA.
+  replicas: 1
   server:
     appName: Forgejo
     # domain: git.example.com      # public host name (DOMAIN, SSH_DOMAIN, ROOT_URL)

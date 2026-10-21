@@ -143,7 +143,11 @@ func TestDesiredReplicas(t *testing.T) {
 		{name: "hpa at zero during migration hold", f: hpa(2, 5), rc: forgejo.ReconcileContext{HPAManaged: true}, exists: true, current: ptr.To[int32](0), hold: true, want: 1},
 		{name: "migration hold", f: plain(3), exists: true, current: ptr.To[int32](0), hold: true, want: 1},
 		{name: "migration hold, stopped instance", f: plain(0), exists: true, current: ptr.To[int32](0), hold: true, want: 0},
-		{name: "spec replicas", f: plain(3), exists: true, current: ptr.To[int32](0), want: 3},
+		{name: "spec replicas without HA clamp to 1", f: plain(3), exists: true, current: ptr.To[int32](0), want: 1},
+		{name: "spec replicas 0", f: plain(0), exists: true, current: ptr.To[int32](1), want: 0},
+		{name: "spec replicas with HA", f: withHA(plain(3)), exists: true, current: ptr.To[int32](0), want: 3},
+		{name: "failed upgrade holds its image", f: heldUpgrade(hpa(2, 5)), rc: forgejo.ReconcileContext{HPAManaged: true},
+			exists: true, current: ptr.To[int32](3), want: 1},
 		{name: "first install", f: func() *forgejov1.Forgejo { f := plain(3); f.Status.Image = ""; return f }(), want: 1},
 	}
 	for _, tt := range tests {
@@ -157,6 +161,21 @@ func TestDesiredReplicas(t *testing.T) {
 	}
 }
 
+func withHA(f *forgejov1.Forgejo) *forgejov1.Forgejo {
+	f.Spec.HighAvailability.Enabled = true
+	return f
+}
+
+// heldUpgrade marks f with a failed upgrade whose new image is still deployed, unverified.
+func heldUpgrade(f *forgejov1.Forgejo) *forgejov1.Forgejo {
+	f.Status.Image = "codeberg.org/forgejo/forgejo:15"
+	f.Status.Upgrade = &forgejov1.UpgradeStatus{
+		Phase: forgejov1.UpgradePhaseFailed, FromImage: f.Status.Image, ToImage: "codeberg.org/forgejo/forgejo:16",
+		FailedImage: "codeberg.org/forgejo/forgejo:16", RolloutStartTime: ptr.To(metav1.Now()),
+	}
+	return f
+}
+
 func TestDeploymentStrategyDuringMigrationHold(t *testing.T) {
 	f := testInstance()
 	f.Spec.HighAvailability.Enabled = true
@@ -166,6 +185,13 @@ func TestDeploymentStrategyDuringMigrationHold(t *testing.T) {
 	}
 	if s := deploymentStrategy(rc, true); s.Type != appsv1.RecreateDeploymentStrategyType {
 		t.Fatalf("HA during migration hold: want Recreate, got %s", s.Type)
+	}
+	heldUpgrade(f)
+	if !forgejo.UpgradeHoldsWorkload(f) {
+		t.Fatal("test setup: want UpgradeHoldsWorkload")
+	}
+	if s := deploymentStrategy(rc, false); s.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Fatalf("HA while a failed upgrade holds its image: want Recreate, got %s", s.Type)
 	}
 }
 
@@ -213,6 +239,7 @@ func TestReconcileWorkloadHoldsSingleReplicaWhileRestoredDBMigrates(t *testing.T
 		Status:     forgejov1.ForgejoRestoreStatus{Phase: forgejov1.RestorePhaseScalingUp},
 	}
 	rc := testContext(t, f, restore)
+	rc.RestoreMigrating = true // set by the maintenance step while r1 is in ScalingUp
 	rc.TargetImage = f.Status.Image
 	rc.Layout = forgejo.LayoutForImage(rc.TargetImage)
 	rc.ConfigHash, rc.ConfigSecretName = "abc", "fj-config"
@@ -241,6 +268,7 @@ func TestReconcileWorkloadHoldsSingleReplicaWhileRestoredDBMigrates(t *testing.T
 	if err := rc.Client.Update(ctx, restore); err != nil {
 		t.Fatal(err)
 	}
+	rc.RestoreMigrating = false
 	if d := run(); *d.Spec.Replicas != 1 {
 		t.Fatalf("restore done, pod not available: want 1 replica, got %d", *d.Spec.Replicas)
 	}
@@ -420,7 +448,10 @@ esac
 	if err := os.WriteFile(cli, []byte(fakeCLI), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	l := forgejo.ImageLayout{CLI: cli, ConfigPath: filepath.Join(dir, "app.ini"), WorkPath: dir}
+	data := filepath.Join(dir, "data")
+	l := forgejo.ImageLayout{CLI: cli, ConfigPath: filepath.Join(dir, "app.ini"), WorkPath: filepath.Join(data, "gitea"),
+		CustomPath: filepath.Join(data, "gitea", "custom"), HomePath: filepath.Join(data, "git"),
+		RepoRoot: filepath.Join(data, "git", "repositories"), LFSPath: filepath.Join(data, "git", "lfs")}
 	run := func(password string) (string, error) {
 		_ = os.Remove(calls)
 		cmd := exec.Command("sh", "-c", bootstrapScript(l))
@@ -439,6 +470,14 @@ esac
 	got, err := run("-pw1")
 	if err != nil || !strings.Contains(got, "admin user create") {
 		t.Fatalf("first start: want create, got %q, %v", got, err)
+	}
+	for _, d := range dataDirs(l) {
+		if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
+			t.Fatalf("data directory %s not created: %v", d, err)
+		}
+	}
+	if fi, _ := os.Stat(filepath.Join(l.HomePath, ".ssh")); fi.Mode().Perm() != 0o700 {
+		t.Fatalf(".ssh mode %v, want 0700", fi.Mode().Perm())
 	}
 	if got, err = run("-pw1"); err != nil || strings.Contains(got, "change-password") {
 		t.Fatalf("unchanged Secret: want no password reset, got %q, %v", got, err)
@@ -463,5 +502,17 @@ esac
 	}
 	if _, err = run("pw3"); err == nil {
 		t.Fatal("a failed migration must fail the init container")
+	}
+	_ = os.Remove(filepath.Join(dir, "migrate-fails"))
+
+	// A data directory the Forgejo user cannot write fails before anything else runs.
+	if os.Getuid() != 0 {
+		if err := os.Chmod(l.LFSPath, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(l.LFSPath, 0o755) }()
+		if got, err := run("pw3"); err == nil || strings.Contains(got, "migrate") {
+			t.Fatalf("unwritable %s: want a failure before migrate, got %q, %v", l.LFSPath, got, err)
+		}
 	}
 }

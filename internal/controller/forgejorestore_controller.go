@@ -56,8 +56,19 @@ const (
 // ForgejoRestoreReconciler reconciles a ForgejoRestore object
 type ForgejoRestoreReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
+	// APIReader reads straight from the API server; a restore is only failed for a missing
+	// Job after a live read. nil falls back to Client.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	Recorder  events.EventRecorder
+}
+
+// reader returns the live API reader (the cache in tests that do not set one).
+func (r *ForgejoRestoreReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores,verbs=get;list;watch;create;update;patch;delete
@@ -231,6 +242,13 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 			return r.wait(ctx, rs, fmt.Sprintf("Waiting for ForgejoBackup %s to finish", backups[i].Name))
 		}
 	}
+	// Two restores must never write to the instance at once, e.g. the pods of an earlier,
+	// failed or deleted restore that are still shutting down.
+	if busy, err := r.restoreActivity(ctx, rs, f); err != nil {
+		return ctrl.Result{}, err
+	} else if busy != "" {
+		return waitDown("Waiting for " + busy + " to stop")
+	}
 
 	b, err := r.getBackup(ctx, rs)
 	if err != nil {
@@ -252,10 +270,13 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 			return ctrl.Result{}, r.fail(ctx, rs, f, "DatabaseNotReady", err.Error())
 		}
 	}
-	if restoreData {
-		if in.Affinity, err = backup.Placement(ctx, r.Client, f); err != nil {
-			return ctrl.Result{}, err
+	// A database-only restore also mounts the data volume, to reset the admin sync marker.
+	if in.Affinity, err = backup.Placement(ctx, r.Client, f, restoreData || restoreDB, b.Status.PVCName); err != nil {
+		var conflict *backup.VolumeConflictError
+		if errors.As(err, &conflict) {
+			return ctrl.Result{}, r.fail(ctx, rs, f, "BackupVolumeConflict", "Cannot run the restore (nothing was changed): "+conflict.Error())
 		}
+		return ctrl.Result{}, err
 	}
 	job, err := backup.RestoreJob(in, rs, b, restoreDB, restoreData)
 	if err != nil {
@@ -271,6 +292,10 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 	orig := rs.DeepCopy()
 	rs.Status.Phase = forgejov1.RestorePhaseRestoring
 	rs.Status.JobName = job.Name
+	if rs.Status.JobStartTime == nil {
+		now := metav1.Now()
+		rs.Status.JobStartTime = &now
+	}
 	rs.Status.Message = fmt.Sprintf("Restore job %s is running", job.Name)
 	setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionFalse, "Restoring", rs.Status.Message)
 	if err := r.Status().Patch(ctx, rs, client.MergeFrom(orig)); err != nil {
@@ -278,6 +303,47 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 	}
 	r.eventOn(rs, corev1.EventTypeNormal, "Restoring", "Restore", "Started job %s", job.Name)
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
+}
+
+// restoreActivity names a restore Job or pod of the instance other than rs's own that may
+// still be running, or returns "".
+func (r *ForgejoRestoreReconciler) restoreActivity(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo) (string, error) {
+	sel := client.MatchingLabels{forgejo.LabelInstance: f.Name, forgejo.LabelComponent: forgejo.ComponentRestore}
+	jobs := &batchv1.JobList{}
+	if err := r.List(ctx, jobs, client.InNamespace(f.Namespace), sel); err != nil {
+		return "", err
+	}
+	var ownJob types.UID
+	for i := range jobs.Items {
+		j := &jobs.Items[i]
+		if metav1.IsControlledBy(j, rs) {
+			ownJob = j.UID
+			continue
+		}
+		if state, _ := backup.StateOf(j); state == backup.JobRunning {
+			owner := "no restore"
+			if ref := metav1.GetControllerOf(j); ref != nil {
+				owner = ref.Kind + " " + ref.Name
+			}
+			return fmt.Sprintf("restore Job %s (%s)", j.Name, owner), nil
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(f.Namespace), sel); err != nil {
+		return "", err
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		// Pods of rs's own Job (it may exist after a restart) are fine; a pod of an earlier
+		// Job of the same name, whose Job is already gone, is not.
+		if ref := metav1.GetControllerOf(p); ownJob != "" && ref != nil && ref.UID == ownJob {
+			continue
+		}
+		if !backup.PodFinished(p) {
+			return "restore pod " + p.Name, nil
+		}
+	}
+	return "", nil
 }
 
 // jobConflict handles a *backup.JobConflictError from err: it waits while the Job is going
@@ -302,10 +368,20 @@ func (r *ForgejoRestoreReconciler) track(ctx context.Context, rs *forgejov1.Forg
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
-		if rs.Status.StartTime != nil && time.Since(rs.Status.StartTime.Time) < jobAppearGrace {
+		since := rs.Status.JobStartTime
+		if since == nil {
+			since = rs.Status.StartTime
+		}
+		if since != nil && time.Since(since.Time) < jobAppearGrace {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		return ctrl.Result{}, r.failModified(ctx, rs, f, "JobMissing", fmt.Sprintf("Restore job %s disappeared", rs.Status.JobName), recorded, "")
+		// The cache may still lag behind; only the API server can tell that the Job is gone.
+		if err := r.reader().Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Status.JobName}, job); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, r.failModified(ctx, rs, f, "JobMissing", fmt.Sprintf("Restore job %s disappeared", rs.Status.JobName), recorded, "")
+		}
 	}
 	// Never read the state of a Job this restore does not control: a foreign Job that
 	// succeeded would otherwise report a restore that never ran.
@@ -379,9 +455,15 @@ func (r *ForgejoRestoreReconciler) scaleUp(ctx context.Context, rs *forgejov1.Fo
 	if f.Status.Backup != nil && f.Status.Backup.ActiveRestore != "" && f.Status.Backup.ActiveRestore != rs.Name {
 		return ctrl.Result{}, r.complete(ctx, rs, f, fmt.Sprintf("Backup restored; ForgejoRestore %s keeps Forgejo in maintenance", f.Status.Backup.ActiveRestore))
 	}
+	// spec.replicas does not stop an instance whose HPA owns the replica count; the HPA
+	// keeps at least its minimum.
+	desired := forgejo.DesiredReplicas(f)
+	if forgejo.HorizontalAutoscalingEnabled(f) {
+		desired = forgejo.HPAMinReplicas(f)
+	}
 	dep := &appsv1.Deployment{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep)
-	if apierrors.IsNotFound(err) || forgejo.DesiredReplicas(f) == 0 {
+	if apierrors.IsNotFound(err) || desired == 0 {
 		return ctrl.Result{}, r.complete(ctx, rs, f, "Backup restored")
 	}
 	if err != nil {

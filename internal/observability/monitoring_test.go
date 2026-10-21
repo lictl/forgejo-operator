@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -234,5 +235,87 @@ func TestMonitoringKeepsOtherDegradedReasons(t *testing.T) {
 	}
 	if c := degraded(rc); c.Reason != ReasonMonitoringFailed {
 		t.Fatalf("Degraded %+v", c)
+	}
+}
+
+func findRule(spec *ruleSpec, alert string) *rule {
+	for i := range spec.Groups[0].Rules {
+		if r := &spec.Groups[0].Rules[i]; r.Alert == alert {
+			return r
+		}
+	}
+	return nil
+}
+
+func TestNotReadyAlertFollowsDesiredReplicas(t *testing.T) {
+	hpa := func(f *forgejov1.Forgejo) {
+		f.Spec.HighAvailability.Enabled = true
+		f.Spec.Autoscaling.Horizontal = &forgejov1.HorizontalAutoscalingSpec{Enabled: true, MinReplicas: 0, MaxReplicas: 3}
+	}
+	for _, tt := range []struct {
+		name     string
+		replicas *int32
+		hpa      bool
+		want     bool
+	}{
+		{name: "default replicas", want: true},
+		{name: "two replicas", replicas: new(int32(2)), want: true},
+		{name: "scaled to zero", replicas: new(int32(0)), want: false},
+		{name: "zero replicas with HPA", replicas: new(int32(0)), hpa: true, want: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := testInstance("replicas")
+			f.Spec.Replicas = tt.replicas
+			if tt.hpa {
+				hpa(f)
+			}
+			spec := prometheusRuleSpec(f, true)
+			if got := findRule(spec, "ForgejoNotReady") != nil; got != tt.want {
+				t.Fatalf("ForgejoNotReady rendered=%v, want %v", got, tt.want)
+			}
+			if got := findRule(spec, "ForgejoDown") != nil; got != tt.want {
+				t.Fatalf("ForgejoDown rendered=%v, want %v", got, tt.want)
+			}
+			// The guard and the unreachable alert do not depend on the replica count.
+			if findRule(spec, "ForgejoOperatorMetricsMissing") == nil || findRule(spec, "ForgejoHealthProbeUnreachable") == nil {
+				t.Fatal("ForgejoOperatorMetricsMissing/ForgejoHealthProbeUnreachable missing")
+			}
+		})
+	}
+}
+
+func TestOperatorMetricsGuard(t *testing.T) {
+	f := testInstance("guard")
+	f.Spec.Backup.Enabled = true
+	f.Spec.Backup.Schedule = "0 3 * * *"
+	spec := prometheusRuleSpec(f, false)
+
+	guard := findRule(spec, "ForgejoOperatorMetricsMissing")
+	if guard == nil || guard.Expr != `absent(forgejo_operator_instance_ready{namespace="ns", name="guard"})` || guard.For != "15m" {
+		t.Fatalf("guard %+v", guard)
+	}
+	if !strings.Contains(guard.Annotations["description"], "honorLabels") {
+		t.Fatalf("guard description %q", guard.Annotations["description"])
+	}
+	// A missing backup is only reported while the instance's operator metrics are scraped.
+	missing := findRule(spec, "ForgejoBackupMissing")
+	want := `absent(forgejo_operator_backup_last_success_timestamp_seconds{namespace="ns", name="guard"}) and on() ` +
+		`count(forgejo_operator_instance_ready{namespace="ns", name="guard"}) > 0`
+	if missing == nil || missing.Expr != want || missing.For != "1d12h" {
+		t.Fatalf("ForgejoBackupMissing %+v", missing)
+	}
+
+	unreachable := findRule(spec, "ForgejoHealthProbeUnreachable")
+	if unreachable == nil || unreachable.For != "15m" || unreachable.Expr !=
+		`increase(forgejo_operator_health_check_unreachable_total{namespace="ns", name="guard"}[5m]) > 0` {
+		t.Fatalf("ForgejoHealthProbeUnreachable %+v", unreachable)
+	}
+	if d := unreachable.Annotations["description"]; !strings.Contains(d, "guard-http port 3000") {
+		t.Fatalf("ForgejoHealthProbeUnreachable description %q", d)
+	}
+	// A slow probe interval widens the window so that it always contains a probe.
+	f.Spec.AutoPilot.SelfHealing.HealthCheckInterval = &metav1.Duration{Duration: 10 * time.Minute}
+	if r := findRule(prometheusRuleSpec(f, false), "ForgejoHealthProbeUnreachable"); !strings.Contains(r.Expr, "[20m]") {
+		t.Fatalf("expr %q", r.Expr)
 	}
 }

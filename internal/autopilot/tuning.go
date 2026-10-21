@@ -29,7 +29,7 @@ const (
 // rc.HPAManaged here because the workload step, which honors it, runs before the scaling step.
 func ReconcileTuning(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
-	planVertical(rc)
+	planVertical(ctx, rc)
 	rc.HPAManaged = hpaWanted(rc)
 
 	if !forgejo.AutoTuningEnabled(f) {

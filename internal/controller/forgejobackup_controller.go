@@ -31,9 +31,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/backup"
@@ -58,8 +62,12 @@ const (
 // ForgejoBackupReconciler reconciles a ForgejoBackup object
 type ForgejoBackupReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
+	// APIReader reads straight from the API server for decisions a stale cache must not make
+	// (whether a Job really disappeared, whether the owning Forgejo is gone). nil falls back
+	// to Client.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	Recorder  events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch;create;update;patch;delete
@@ -86,9 +94,6 @@ func (r *ForgejoBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if updated, err := r.ensureMetadata(ctx, b); err != nil || updated {
 		return ctrl.Result{}, err
 	}
-	if !backup.IsBackupActive(b) {
-		return r.removeFailedFiles(ctx, b)
-	}
 
 	f := &forgejov1.Forgejo{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.ForgejoRef.Name}, f); err != nil {
@@ -97,10 +102,45 @@ func (r *ForgejoBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		f = nil
 	}
+	if f != nil && f.DeletionTimestamp.IsZero() {
+		// retainPolicy may have changed since the backup was created; see backup.ReconcileOwnership.
+		if err := r.syncOwnership(ctx, f, b); err != nil {
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
+	}
+
+	if !backup.IsBackupActive(b) {
+		if f != nil && f.DeletionTimestamp.IsZero() && b.Status.Phase == forgejov1.BackupPhaseCompleted && b.Status.CompletionTime != nil {
+			// Re-exported after an operator restart even when the Forgejo pipeline is blocked.
+			backup.RecordLastSuccess(b.Namespace, f.Name, b.Status.CompletionTime.Time)
+		}
+		return r.removeFailedFiles(ctx, b)
+	}
 	if b.Status.Phase == forgejov1.BackupPhaseRunning {
 		return r.track(ctx, b, f)
 	}
 	return r.start(ctx, b, f)
+}
+
+// syncOwnership applies the instance's current retain policy to the backup's owner
+// references and to the backup PVC (see backup.ReconcileOwnership).
+func (r *ForgejoBackupReconciler) syncOwnership(ctx context.Context, f *forgejov1.Forgejo, b *forgejov1.ForgejoBackup) error {
+	if _, err := backup.SyncBackupOwnership(ctx, r.Client, r.Scheme, f, b); err != nil {
+		return err
+	}
+	_, err := backup.SyncBackupPVCOwnership(ctx, r.Client, r.Scheme, f)
+	return err
+}
+
+// reader returns the live API reader (the cache in tests that do not set one).
+func (r *ForgejoBackupReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 func (r *ForgejoBackupReconciler) ensureMetadata(ctx context.Context, b *forgejov1.ForgejoBackup) (bool, error) {
@@ -153,11 +193,14 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	}
 
 	includeData := backup.IncludeData(b, f)
-	var affinity *corev1.Affinity
-	if includeData {
-		if affinity, err = backup.Placement(ctx, r.Client, f); err != nil {
-			return ctrl.Result{}, err
+	// Also a database-only Job: the first one decides where a node-local backup volume lands.
+	affinity, err := backup.Placement(ctx, r.Client, f, includeData, pvc)
+	if err != nil {
+		var conflict *backup.VolumeConflictError
+		if errors.As(err, &conflict) {
+			return ctrl.Result{}, r.fail(ctx, b, "BackupVolumeConflict", "Cannot run the backup: "+conflict.Error())
 		}
+		return ctrl.Result{}, err
 	}
 	image := backup.CurrentImage(f)
 	now := metav1.Now()
@@ -212,7 +255,13 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 		if b.Status.StartTime != nil && time.Since(b.Status.StartTime.Time) < jobAppearGrace {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		return ctrl.Result{}, r.fail(ctx, b, "JobMissing", fmt.Sprintf("Backup job %s disappeared", b.Status.JobName))
+		// The cache may still lag behind; only the API server can tell that the Job is gone.
+		if err := r.reader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.JobName}, job); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, r.fail(ctx, b, "JobMissing", fmt.Sprintf("Backup job %s disappeared", b.Status.JobName))
+		}
 	}
 	// Never read the state of a Job this backup does not control: a foreign Job that
 	// succeeded would otherwise report a backup that wrote nothing.
@@ -277,7 +326,7 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 
 	ns, inst := b.Namespace, b.Spec.ForgejoRef.Name
 	forgejo.BackupTotal.WithLabelValues(ns, inst, string(backup.Reason(b)), "succeeded").Inc()
-	forgejo.BackupLastSuccess.WithLabelValues(ns, inst).Set(float64(done.Unix()))
+	backup.RecordLastSuccess(ns, inst, done.Time)
 	forgejo.BackupSize.WithLabelValues(ns, inst, "database").Set(float64(res.DatabaseSizeBytes))
 	forgejo.BackupSize.WithLabelValues(ns, inst, "data").Set(float64(res.DataSizeBytes))
 	if b.Status.StartTime != nil {
@@ -393,6 +442,13 @@ func (r *ForgejoBackupReconciler) cleanup(ctx context.Context, b *forgejov1.Forg
 	job := &batchv1.Job{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: backup.CleanupJobName(b)}, job)
 	if apierrors.IsNotFound(err) {
+		if kept, err := r.instanceGoneButRetained(ctx, b, pvc); err != nil {
+			return false, err
+		} else if kept {
+			r.event(b, corev1.EventTypeNormal, "BackupFilesKept", "Delete",
+				"Forgejo %s is gone and its backup volume is retained; kept %s:%s", b.Spec.ForgejoRef.Name, b.Status.PVCName, b.Status.Path)
+			return true, nil
+		}
 		err = r.createCleanupJob(ctx, b)
 	} else if err == nil {
 		err = backup.CheckOwned(job, b)
@@ -422,6 +478,33 @@ func (r *ForgejoBackupReconciler) cleanup(ctx context.Context, b *forgejov1.Forg
 	return false, nil
 }
 
+// instanceGoneButRetained reports whether the backup is being deleted only because the Forgejo
+// that owned it is gone (garbage collection) while the backup volume outlives it: the
+// instance's retainPolicy was switched to Retain after the backup was created and nothing has
+// removed the owner reference yet. The files then stay. An explicit delete (the owner is
+// alive, or the backup has no owner reference) and a consistent Delete policy (the backup
+// volume is garbage-collected anyway) still remove them. The owner is read live: a stale
+// cache must not decide that backups are kept or destroyed.
+func (r *ForgejoBackupReconciler) instanceGoneButRetained(ctx context.Context, b *forgejov1.ForgejoBackup, pvc *corev1.PersistentVolumeClaim) (bool, error) {
+	ref := backup.ForgejoOwner(b)
+	if ref == nil {
+		return false, nil
+	}
+	f := &forgejov1.Forgejo{}
+	err := r.reader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: ref.Name}, f)
+	switch {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		return false, err
+	case f.UID != ref.UID: // replaced by a new instance of the same name
+	case f.DeletionTimestamp.IsZero():
+		return false, nil
+	case !forgejo.RetainData(f):
+		return false, nil
+	}
+	return !backup.ControlledByUID(pvc, ref.UID), nil
+}
+
 func (r *ForgejoBackupReconciler) createCleanupJob(ctx context.Context, b *forgejov1.ForgejoBackup) error {
 	in := backup.JobInput{
 		Scheme:       r.Scheme,
@@ -433,8 +516,9 @@ func (r *ForgejoBackupReconciler) createCleanupJob(ctx context.Context, b *forge
 	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.ForgejoRef.Name}, f); err == nil {
 		in.Instance = f
 		in.ForgejoImage = backup.CurrentImage(f)
-		// Keep every user of the RWO backup volume on the node that holds the data volume.
-		if in.Affinity, err = backup.Placement(ctx, r.Client, f); err != nil {
+		// A bound backup volume constrains the pod by itself; before its first bind, keep it
+		// next to the data volume.
+		if in.Affinity, err = backup.Placement(ctx, r.Client, f, false, b.Status.PVCName); err != nil {
 			return err
 		}
 	} else if !apierrors.IsNotFound(err) {
@@ -541,6 +625,23 @@ func (r *ForgejoBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&forgejov1.ForgejoBackup{}).
 		Owns(&batchv1.Job{}).
+		// A spec change (retainPolicy) re-applies ownership to every backup of the instance,
+		// independently of how far the Forgejo pipeline gets.
+		Watches(&forgejov1.Forgejo{}, handler.EnqueueRequestsFromMapFunc(r.mapForgejoToBackups),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("forgejobackup").
 		Complete(r)
+}
+
+// mapForgejoToBackups enqueues every backup of a Forgejo.
+func (r *ForgejoBackupReconciler) mapForgejoToBackups(ctx context.Context, obj client.Object) []reconcile.Request {
+	backups, err := backup.ListBackups(ctx, r.Client, obj.GetNamespace(), obj.GetName())
+	if err != nil {
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0, len(backups))
+	for i := range backups {
+		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&backups[i])})
+	}
+	return reqs
 }

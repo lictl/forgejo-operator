@@ -1,0 +1,21 @@
+# Lets Prometheus scrape the operator's metrics endpoint, which authorizes every request
+# with a SubjectAccessReview for GET on the non-resource URL /metrics.
+# kube-prometheus-stack already grants that in its Prometheus ClusterRole; other installs
+# enable this file in kustomization.yaml and name their Prometheus ServiceAccount below.
+# Without it the operator's forgejo_operator_* metrics are not scraped, and every
+# per-instance alert except ForgejoDown stays inactive (ForgejoOperatorMetricsMissing fires).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: forgejo-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: metrics-reader-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-k8s # TODO(user): your Prometheus ServiceAccount
+    namespace: monitoring # TODO(user): its namespace

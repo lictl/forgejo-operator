@@ -8,10 +8,11 @@ import (
 	"maps"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -262,16 +263,10 @@ func EnsureBackupPVC(ctx context.Context, c client.Client, scheme *runtime.Schem
 			pvc.Spec.Resources.Requests = corev1.ResourceList{
 				corev1.ResourceStorage: BackupClaimSize(f),
 			}
-		} else if want, grow := needsGrowth(pvc, BackupClaimSize(f)); grow && expansionAllowed(ctx, c, pvc, warn) {
+		} else if want, grow := needsGrowth(pvc, BackupClaimSize(f)); grow && expansionAllowed(ctx, c, pvc, want, warn) {
 			pvc.Spec.Resources.Requests[corev1.ResourceStorage] = want
 		}
-		if forgejo.RetainData(f) {
-			if metav1.IsControlledBy(pvc, f) {
-				return controllerutil.RemoveControllerReference(f, pvc, scheme)
-			}
-			return nil
-		}
-		return controllerutil.SetControllerReference(f, pvc, scheme)
+		return setBackupPVCOwnership(pvc, f, scheme)
 	})
 	if err != nil {
 		return "", fmt.Errorf("backup claim %q: %w", name, err)
@@ -301,7 +296,7 @@ func GrowBackupPVC(ctx context.Context, c client.Client, f *forgejov1.Forgejo, w
 		return false, client.IgnoreNotFound(err)
 	}
 	want, grow := needsGrowth(pvc, BackupClaimSize(f))
-	if !grow || !pvc.DeletionTimestamp.IsZero() || !expansionAllowed(ctx, c, pvc, warn) {
+	if !grow || !pvc.DeletionTimestamp.IsZero() || !expansionAllowed(ctx, c, pvc, want, warn) {
 		return false, nil
 	}
 	orig := pvc.DeepCopy()
@@ -321,68 +316,67 @@ func needsGrowth(pvc *corev1.PersistentVolumeClaim, want resource.Quantity) (res
 	return want, ok && want.Cmp(cur) > 0
 }
 
-// expansionAllowed reports whether the claim's StorageClass supports resizing.
-func expansionAllowed(ctx context.Context, c client.Client, pvc *corev1.PersistentVolumeClaim, warn Warner) bool {
-	if warn == nil {
-		warn = func(string, string) {}
-	}
+// expansionAllowed reports whether the claim's StorageClass supports resizing. The reason it
+// does not is reported through warn at most once per resizeWarnInterval for the same claim
+// and size, because GrowBackupPVC asks on every reconcile.
+func expansionAllowed(ctx context.Context, c client.Client, pvc *corev1.PersistentVolumeClaim, want resource.Quantity, warn Warner) bool {
+	warn = rateLimited(warn, pvc.Namespace+"/"+pvc.Name)
 	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
-		warn("StorageResizeUnsupported", fmt.Sprintf("cannot grow backup PVC %s: it has no StorageClass", pvc.Name))
+		warn("StorageResizeUnsupported", fmt.Sprintf("cannot grow backup PVC %s to %s: it has no StorageClass", pvc.Name, want.String()))
 		return false
 	}
 	sc := &storagev1.StorageClass{}
 	if err := c.Get(ctx, types.NamespacedName{Name: *pvc.Spec.StorageClassName}, sc); err != nil {
-		warn("StorageResizeUnsupported", fmt.Sprintf("cannot grow backup PVC %s: StorageClass %s: %v", pvc.Name, *pvc.Spec.StorageClassName, err))
+		warn("StorageResizeUnsupported", fmt.Sprintf("cannot grow backup PVC %s to %s: StorageClass %s: %v", pvc.Name, want.String(), *pvc.Spec.StorageClassName, err))
 		return false
 	}
 	if sc.AllowVolumeExpansion == nil || !*sc.AllowVolumeExpansion {
-		warn("StorageResizeUnsupported", fmt.Sprintf("cannot grow backup PVC %s: StorageClass %s does not allow volume expansion", pvc.Name, sc.Name))
+		warn("StorageResizeUnsupported", fmt.Sprintf("cannot grow backup PVC %s to %s: StorageClass %s does not allow volume expansion", pvc.Name, want.String(), sc.Name))
 		return false
 	}
 	return true
 }
 
-// Placement returns the affinity that lets a job mount the data volume: next to running
-// Forgejo pods (an RWO volume is attached to their node), otherwise on a node the data
-// volume's PV allows. nil means no constraint.
-func Placement(ctx context.Context, c client.Client, f *forgejov1.Forgejo) (*corev1.Affinity, error) {
-	pods := &corev1.PodList{}
-	if err := c.List(ctx, pods, client.InNamespace(f.Namespace), client.MatchingLabels(forgejo.SelectorLabels(f))); err != nil {
-		return nil, err
-	}
-	for _, p := range pods.Items {
-		if p.Spec.NodeName == "" || p.DeletionTimestamp != nil ||
-			p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		return &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
-			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
-				LabelSelector: &metav1.LabelSelector{MatchLabels: forgejo.SelectorLabels(f)},
-				TopologyKey:   corev1.LabelHostname,
-			}},
-		}}, nil
-	}
+// resizeWarnInterval is how often the same resize warning is repeated for a claim.
+const resizeWarnInterval = time.Hour
 
-	pvc := &corev1.PersistentVolumeClaim{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: DataClaimName(f)}, pvc); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil
+type warnRecord struct {
+	msg string
+	at  time.Time
+}
+
+// resizeWarnings remembers the last resize warning per claim ("namespace/name").
+var resizeWarnings sync.Map
+
+// rateLimited wraps warn so that an unchanged message for key is passed on at most once per
+// resizeWarnInterval. A different message (another size or cause) is passed on right away.
+func rateLimited(warn Warner, key string) Warner {
+	if warn == nil {
+		return func(string, string) {}
+	}
+	return func(reason, msg string) {
+		now := time.Now()
+		if v, ok := resizeWarnings.Load(key); ok {
+			if last := v.(warnRecord); last.msg == msg && now.Sub(last.at) < resizeWarnInterval {
+				return
+			}
 		}
-		return nil, err
+		resizeWarnings.Store(key, warnRecord{msg: msg, at: now})
+		warn(reason, msg)
 	}
-	if pvc.Spec.VolumeName == "" {
-		return nil, nil
+}
+
+// setBackupPVCOwnership makes the instance the controller of the backup PVC under the Delete
+// policy and removes that reference under Retain, so the claim is garbage-collected with the
+// instance exactly when the policy says so.
+func setBackupPVCOwnership(pvc *corev1.PersistentVolumeClaim, f *forgejov1.Forgejo, scheme *runtime.Scheme) error {
+	if forgejo.RetainData(f) {
+		if metav1.IsControlledBy(pvc, f) {
+			return controllerutil.RemoveControllerReference(f, pvc, scheme)
+		}
+		return nil
 	}
-	pv := &corev1.PersistentVolume{}
-	if err := c.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, pv); err != nil {
-		return nil, client.IgnoreNotFound(err)
-	}
-	if pv.Spec.NodeAffinity == nil || pv.Spec.NodeAffinity.Required == nil {
-		return nil, nil
-	}
-	return &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
-		RequiredDuringSchedulingIgnoredDuringExecution: pv.Spec.NodeAffinity.Required.DeepCopy(),
-	}}, nil
+	return controllerutil.SetControllerReference(f, pvc, scheme)
 }
 
 // ServerPodsRunning counts Forgejo server pods that still exist (including terminating ones).

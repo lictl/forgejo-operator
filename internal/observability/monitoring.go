@@ -98,6 +98,11 @@ func serviceMonitorSpec(f *forgejov1.Forgejo) (*smSpec, error) {
 // instance as {namespace, name} (the operator must be scraped with honorLabels: true);
 // Forgejo's own metrics are selected by the scrape job, which prometheus-operator names
 // after the HTTP Service.
+//
+// Every alert except ForgejoDown is computed from operator metrics, which the default
+// install does not scrape. ForgejoOperatorMetricsMissing reports that, and absent()-based
+// alerts only fire while the instance's operator metrics are present, so a scrape gap is
+// not mistaken for a missing backup.
 func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 	op := fmt.Sprintf(`namespace=%q, name=%q`, f.Namespace, f.Name)
 	job := fmt.Sprintf(`namespace=%q, job=%q`, f.Namespace, forgejo.HTTPServiceName(f))
@@ -132,11 +137,28 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 				forgejo.HTTPServiceName(f), kc, f.Name, f.Name, kc))
 	}
 
-	add("ForgejoNotReady", "warning", "10m",
-		fmt.Sprintf(`max(forgejo_operator_instance_ready{%s}) == 0 unless on() %s`, op, expectedDown),
-		fmt.Sprintf("Forgejo %s has not been Ready for 10 minutes", ref),
-		fmt.Sprintf("The operator reports the instance as not Ready. Run `kubectl describe fj %s %s` and "+
-			"look at status.conditions (DatabaseReady, Progressing, Degraded) and recent events.", f.Name, kc))
+	// instance_ready is exported on every reconcile and, unlike instance_info, never
+	// deleted and re-created, so its absence means the operator's metrics are not scraped.
+	ready := fmt.Sprintf(`forgejo_operator_instance_ready{%s}`, op)
+	add("ForgejoOperatorMetricsMissing", "warning", "15m",
+		fmt.Sprintf(`absent(%s)`, ready),
+		fmt.Sprintf("Operator metrics of Forgejo %s are missing", ref),
+		fmt.Sprintf("Prometheus has no forgejo_operator_instance_ready series for this instance, so every other "+
+			"alert of %s except ForgejoDown is inactive (backup, health, volume, upgrade and autopilot alerts). "+
+			"Either the operator is not running, or it is not scraped: enable config/prometheus in "+
+			"config/default/kustomization.yaml (its ServiceMonitor sets honorLabels: true, which these alerts "+
+			"need) and allow Prometheus's ServiceAccount to GET the /metrics non-resource URL (the operator's "+
+			"metrics-reader ClusterRole). See docs/observability.md, \"Scraping the operator\".", ref))
+
+	// An instance intentionally scaled to zero is never Ready; with an HPA the floor is at
+	// least one replica, so it must be Ready again.
+	if forgejo.DesiredReplicas(f) > 0 || forgejo.HorizontalAutoscalingEnabled(f) {
+		add("ForgejoNotReady", "warning", "10m",
+			fmt.Sprintf(`max(%s) == 0 unless on() %s`, ready, expectedDown),
+			fmt.Sprintf("Forgejo %s has not been Ready for 10 minutes", ref),
+			fmt.Sprintf("The operator reports the instance as not Ready. Run `kubectl describe fj %s %s` and "+
+				"look at status.conditions (DatabaseReady, Progressing, Degraded) and recent events.", f.Name, kc))
+	}
 
 	add("ForgejoHealthCheckFailing", "warning", "",
 		fmt.Sprintf(`increase(forgejo_operator_health_check_failures_total{%s}[10m]) > 3`, op),
@@ -145,6 +167,19 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 			"({{ $value | printf \"%%.0f\" }}). `kubectl get fj %s %s -o jsonpath='{.status.health}'` shows "+
 			"the failing checks (database:ping, cache:ping). With self-healing enabled the operator restarts pods "+
 			"after spec.autoPilot.selfHealing.failureThreshold consecutive failures.", f.Name, kc))
+
+	probeWindow := model.Duration(max(5*time.Minute,
+		2*forgejo.DurationOr(f.Spec.AutoPilot.SelfHealing.HealthCheckInterval, defaultHealthInterval)))
+	add("ForgejoHealthProbeUnreachable", "warning", "15m",
+		fmt.Sprintf(`increase(forgejo_operator_health_check_unreachable_total{%s}[%s]) > 0`, op, probeWindow),
+		fmt.Sprintf("The operator cannot reach Forgejo %s", ref),
+		fmt.Sprintf("For 15 minutes the operator's probes of /api/healthz have not reached Forgejo (DNS, dial or "+
+			"connection errors, or a proxy answering instead). Health checks, self-healing, status.version and "+
+			"status.stats are blind until it can: a NetworkPolicy or service mesh must allow the operator's pods "+
+			"to connect to Service %s port %d in namespace %s (Istio STRICT mTLS: PERMISSIVE for that port, or "+
+			"a sidecar for the operator). The Healthy condition of `kubectl describe fj %s %s` (reason "+
+			"Unreachable) names the error.",
+			forgejo.HTTPServiceName(f), forgejo.HTTPServicePort(f), f.Namespace, f.Name, kc))
 
 	add("ForgejoBackupFailed", "warning", "",
 		recentlyIncreased(fmt.Sprintf(`forgejo_operator_backups_total{%s, result="failed"}`, op), "1h"),
@@ -162,9 +197,11 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 		add("ForgejoBackupTooOld", "warning", "10m",
 			fmt.Sprintf(`time() - max(%s) > %d`, last, int64(maxAge.Seconds())),
 			fmt.Sprintf("The last successful backup of Forgejo %s is too old", ref), desc)
-		// No success recorded at all: only alert once a full period has passed without data.
+		// No success recorded at all: only alert once a full period has passed without data,
+		// and only while the instance's operator metrics are scraped at all (otherwise
+		// ForgejoOperatorMetricsMissing fires).
 		add("ForgejoBackupMissing", "warning", model.Duration(maxAge).String(),
-			fmt.Sprintf(`absent(%s)`, last),
+			fmt.Sprintf(`absent(%s) and on() count(%s) > 0`, last, ready),
 			fmt.Sprintf("Forgejo %s has no successful backup", ref), desc)
 	}
 

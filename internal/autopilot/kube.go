@@ -3,11 +3,12 @@ package autopilot
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/client-go/kubernetes"
@@ -17,11 +18,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-// +kubebuilder:rbac:groups=core,resources=nodes/proxy,verbs=get
+// pods/exec is used only to measure volume usage (df, du) in containers that mount an
+// instance's claims. Kubelet stats (nodes/proxy) are deliberately not used: that permission
+// opens the whole kubelet API of every node, including exec into any pod.
 // +kubebuilder:rbac:groups=core,resources=pods/exec,verbs=get;create
 
-// The manager's cached client cannot proxy to kubelets, exec into pods or read aggregated
-// APIs, so this package keeps an uncached clientset for those calls.
+// The manager's cached client cannot exec into pods or read aggregated APIs, so this package
+// keeps an uncached clientset for those calls.
 var (
 	kubeMu     sync.Mutex
 	kubeConfig *rest.Config
@@ -57,6 +60,11 @@ func kube() (kubernetes.Interface, *rest.Config, error) {
 	return kubeClient, kubeConfig, nil
 }
 
+// execFunc runs a command in a container and returns its stdout. Tests replace execInPod.
+type execFunc func(ctx context.Context, namespace, pod, container string, command []string) (string, error)
+
+var execFn execFunc = execInPod
+
 // execInPod runs a command in a container and returns its stdout. A non-zero exit status is
 // returned as an error together with whatever was written to stdout.
 func execInPod(ctx context.Context, namespace, pod, container string, command []string) (string, error) {
@@ -85,76 +93,51 @@ func execInPod(ctx context.Context, namespace, pod, container string, command []
 	return stdout.String(), err
 }
 
-// kubeletSummary is the subset of the kubelet /stats/summary response the operator reads.
-type kubeletSummary struct {
-	Pods []struct {
-		Volume []struct {
-			Name   string `json:"name"`
-			PVCRef *struct {
-				Name      string `json:"name"`
-				Namespace string `json:"namespace"`
-			} `json:"pvcRef"`
-			CapacityBytes *uint64 `json:"capacityBytes"`
-			UsedBytes     *uint64 `json:"usedBytes"`
-		} `json:"volume"`
-	} `json:"pods"`
+// execForbidden reports whether an exec failed because the operator may not exec into the
+// pod (pods/exec not granted in that namespace).
+func execForbidden(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apierrors.IsForbidden(err) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "forbidden")
 }
 
-// volumeStat is a kubelet-reported PVC usage.
-type volumeStat struct {
-	capacity, used int64
-}
-
-// nodeVolumeStats returns kubelet volume stats of the PVCs in namespace mounted on node.
-func nodeVolumeStats(ctx context.Context, node, namespace string) (map[string]volumeStat, error) {
-	cs, _, err := kube()
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	raw, err := cs.CoreV1().RESTClient().Get().Resource("nodes").Name(node).SubResource("proxy").Suffix("stats/summary").DoRaw(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var sum kubeletSummary
-	if err := json.Unmarshal(raw, &sum); err != nil {
-		return nil, err
-	}
-	out := map[string]volumeStat{}
-	for _, p := range sum.Pods {
-		for _, v := range p.Volume {
-			if v.PVCRef == nil || v.PVCRef.Namespace != namespace || v.CapacityBytes == nil || v.UsedBytes == nil {
-				continue
-			}
-			out[v.PVCRef.Name] = volumeStat{capacity: int64(*v.CapacityBytes), used: int64(*v.UsedBytes)}
-		}
-	}
-	return out, nil
-}
-
-var nodeCount struct {
+var nodeInfo struct {
 	sync.Mutex
-	at    time.Time
-	count int
+	at     time.Time
+	count  int
+	maxMem int64 // largest allocatable memory of a Ready, schedulable node (bytes)
 }
 
 // schedulableNodes counts Ready, schedulable nodes (cached for 10 minutes).
 func schedulableNodes(ctx context.Context) (int, error) {
-	nodeCount.Lock()
-	defer nodeCount.Unlock()
-	if !nodeCount.at.IsZero() && time.Since(nodeCount.at) < 10*time.Minute {
-		return nodeCount.count, nil
+	n, _, err := nodeCapacity(ctx)
+	return n, err
+}
+
+// nodeCapacityFn is nodeCapacity; tests replace it.
+var nodeCapacityFn = nodeCapacity
+
+// nodeCapacity returns the number of Ready, schedulable nodes and the largest allocatable
+// memory among them, cached for 10 minutes.
+func nodeCapacity(ctx context.Context) (int, int64, error) {
+	nodeInfo.Lock()
+	defer nodeInfo.Unlock()
+	if !nodeInfo.at.IsZero() && time.Since(nodeInfo.at) < 10*time.Minute {
+		return nodeInfo.count, nodeInfo.maxMem, nil
 	}
 	cs, _, err := kube()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	list, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	n := 0
+	n, maxMem := 0, int64(0)
 	for _, node := range list.Items {
 		if node.Spec.Unschedulable {
 			continue
@@ -162,9 +145,10 @@ func schedulableNodes(ctx context.Context) (int, error) {
 		for _, c := range node.Status.Conditions {
 			if c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue {
 				n++
+				maxMem = max(maxMem, node.Status.Allocatable.Memory().Value())
 			}
 		}
 	}
-	nodeCount.at, nodeCount.count = time.Now(), n
-	return n, nil
+	nodeInfo.at, nodeInfo.count, nodeInfo.maxMem = time.Now(), n, maxMem
+	return n, maxMem, nil
 }

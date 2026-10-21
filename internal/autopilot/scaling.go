@@ -3,17 +3,20 @@ package autopilot
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
@@ -22,10 +25,14 @@ import (
 
 const scaleDownStabilization = 300
 
-// hpaWanted reports whether an HPA should own the replica count. Upgrades (single replica,
-// Recreate) and restores (scaled to zero) take the replica count back from the HPA.
+// hpaWanted reports whether an HPA should own the replica count. Until the first rollout
+// has completed (status.image is empty), and while an upgrade, a failed upgrade's unverified
+// image or a restored database is being migrated, the workload runs a single pod: "forgejo
+// migrate" takes no lock and must never run in two pods at once. Restores scale to zero.
+// An HPA would raise the Deployment to minReplicas in each of these states.
 func hpaWanted(rc *forgejo.ReconcileContext) bool {
-	return forgejo.HorizontalAutoscalingEnabled(rc.Instance) && !rc.Upgrading && !rc.Maintenance
+	return forgejo.HorizontalAutoscalingEnabled(rc.Instance) && rc.Instance.Status.Image != "" &&
+		!rc.Maintenance && !workloadHeld(rc)
 }
 
 // ReconcileScaling ensures the HPA and PodDisruptionBudget.
@@ -49,8 +56,14 @@ func ReconcileScaling(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		if err := ensureHPA(ctx, rc); err != nil {
 			return forgejo.StepResult{}, err
 		}
-	} else if _, err := deleteOwned(ctx, rc, key, &autoscalingv2.HorizontalPodAutoscaler{}); err != nil {
-		return forgejo.StepResult{}, err
+		if err := checkHPARequests(ctx, rc, st); err != nil {
+			return forgejo.StepResult{}, err
+		}
+	} else {
+		clearDegraded(rc, ReasonHPAMissingResourceRequests)
+		if _, err := deleteOwned(ctx, rc, key, &autoscalingv2.HorizontalPodAutoscaler{}); err != nil {
+			return forgejo.StepResult{}, err
+		}
 	}
 
 	pdbKey := client.ObjectKey{Namespace: f.Namespace, Name: forgejo.PDBName(f)}
@@ -70,21 +83,72 @@ func minPods(rc *forgejo.ReconcileContext) int32 {
 	switch {
 	case rc.Maintenance:
 		return 0
-	case rc.Upgrading:
+	case workloadHeld(rc) || f.Status.Image == "":
 		return 1
 	case rc.HPAManaged:
-		h := f.Spec.Autoscaling.Horizontal
-		return min(max(h.MinReplicas, 1), max(h.MaxReplicas, 1))
+		return forgejo.HPAMinReplicas(f)
 	default:
 		return forgejo.DesiredReplicas(f)
 	}
+}
+
+// checkHPARequests reports when the HPA cannot compute utilization because the Forgejo
+// container has no CPU request (or no memory request with a memory target): the HPA then
+// only enforces min/maxReplicas. Live pods are checked, so that LimitRange defaults count;
+// without pods the effective resources are, where a limit stands in for its request.
+func checkHPARequests(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState) error {
+	f := rc.Instance
+	_, wantMem := hpaScalesOn(f)
+	names := []corev1.ResourceName{corev1.ResourceCPU}
+	if wantMem {
+		names = append(names, corev1.ResourceMemory)
+	}
+	eff := effectiveResources(rc)
+	pods, err := serverPods(ctx, rc)
+	if err != nil {
+		return err
+	}
+	var missing []string
+	for _, n := range names {
+		_, req := eff.Requests[n]
+		_, lim := eff.Limits[n]
+		if req || lim {
+			continue
+		}
+		// A LimitRange may still give the pods a request: missing only when no pod has one.
+		podHas := false
+		for i := range pods {
+			if c := podContainer(&pods[i], serverContainerName); c != nil {
+				if _, ok := c.Resources.Requests[n]; ok {
+					podHas = true
+					break
+				}
+			}
+		}
+		if !podHas {
+			missing = append(missing, string(n))
+		}
+	}
+	if len(missing) == 0 {
+		clearDegraded(rc, ReasonHPAMissingResourceRequests)
+		return nil
+	}
+	msg := fmt.Sprintf("the HPA scales on utilization of the Forgejo container's requests, but it has no %s request; "+
+		"set spec.resources.requests (or a namespace LimitRange default). Until then the HPA only keeps %d-%d replicas",
+		strings.Join(missing, " or "), forgejo.HPAMinReplicas(f), max(f.Spec.Autoscaling.Horizontal.MaxReplicas, 1))
+	if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionDegraded); c == nil ||
+		c.Status != metav1.ConditionTrue || c.Reason == ReasonHPAMissingResourceRequests {
+		setDegraded(rc, ReasonHPAMissingResourceRequests, msg)
+	}
+	warnEvery(rc, st, "hpa-requests", time.Hour, ReasonHPAMissingResourceRequests, "%s", msg)
+	return nil
 }
 
 func ensureHPA(ctx context.Context, rc *forgejo.ReconcileContext) error {
 	f := rc.Instance
 	h := f.Spec.Autoscaling.Horizontal
 	maxR := max(h.MaxReplicas, 1)
-	minR := min(max(h.MinReplicas, 1), maxR)
+	minR := forgejo.HPAMinReplicas(f)
 	cpuTarget := h.TargetCPUUtilizationPercentage
 	if cpuTarget <= 0 {
 		cpuTarget = 75

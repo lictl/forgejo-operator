@@ -3,6 +3,8 @@ package forgejo
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 )
 
 // Operator metrics, served on the manager's /metrics endpoint. Feature packages update
@@ -91,4 +93,15 @@ func DeleteInstanceMetrics(namespace, name string) {
 	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, BackupTotal, RestoreTotal, UpgradeTotal, AutoPilotActions} {
 		v.DeletePartialMatch(l)
 	}
+}
+
+// SetInstanceInfo exports forgejo_operator_instance_info for the instance's current
+// status.phase, replacing the series of its previous phase/image/version. image is used
+// when status.image is not known yet.
+func SetInstanceInfo(f *forgejov1.Forgejo, image string) {
+	if f.Status.Image != "" {
+		image = f.Status.Image
+	}
+	InstanceInfo.DeletePartialMatch(prometheus.Labels{"namespace": f.Namespace, "name": f.Name})
+	InstanceInfo.WithLabelValues(f.Namespace, f.Name, image, f.Status.Version, string(f.Status.Phase)).Set(1)
 }

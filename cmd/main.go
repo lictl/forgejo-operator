@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,6 +46,7 @@ import (
 	forgejov1alpha1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/autopilot"
 	"github.com/lictl/forgejo-operator/internal/controller"
+	"github.com/lictl/forgejo-operator/internal/forgejo"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -171,6 +173,7 @@ func main() {
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		Cache:                  cacheOptions(watchNamespaces),
+		NewClient:              newClient,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "8780ea83.lucas.icu",
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
@@ -193,26 +196,29 @@ func main() {
 	autopilot.SetRESTConfig(mgr.GetConfig())
 
 	if err := (&controller.ForgejoReconciler{
-		Client:    mgr.GetClient(),
-		APIReader: mgr.GetAPIReader(),
-		Scheme:    mgr.GetScheme(),
-		Recorder:  mgr.GetEventRecorder("forgejo-controller"),
+		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
+		Scheme:          mgr.GetScheme(),
+		Recorder:        mgr.GetEventRecorder("forgejo-controller"),
+		WatchNamespaces: splitNamespaces(watchNamespaces),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "forgejo")
 		os.Exit(1)
 	}
 	if err := (&controller.ForgejoBackupReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("forgejobackup-controller"),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("forgejobackup-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "forgejobackup")
 		os.Exit(1)
 	}
 	if err := (&controller.ForgejoRestoreReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("forgejorestore-controller"),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("forgejorestore-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "forgejorestore")
 		os.Exit(1)
@@ -245,12 +251,7 @@ func main() {
 func reportUndecodableForgejos(ctx context.Context, r client.Reader, namespaces string) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	nss := []string{}
-	for _, ns := range strings.Split(namespaces, ",") {
-		if ns = strings.TrimSpace(ns); ns != "" {
-			nss = append(nss, ns)
-		}
-	}
+	nss := splitNamespaces(namespaces)
 	if len(nss) == 0 {
 		nss = []string{""} // all namespaces
 	}
@@ -275,16 +276,54 @@ func reportUndecodableForgejos(ctx context.Context, r client.Reader, namespaces 
 	}
 }
 
-// cacheOptions restricts the manager cache to the given comma-separated namespaces.
+// cacheOptions restricts the manager cache to the given comma-separated namespaces and,
+// for high-volume kinds, to objects carrying the operator's labels (forgejo.CacheScopes).
+// managedFields are dropped from every cached object; nothing reads them.
 func cacheOptions(namespaces string) cache.Options {
-	opts := cache.Options{}
-	for _, ns := range strings.Split(namespaces, ",") {
-		if ns = strings.TrimSpace(ns); ns != "" {
-			if opts.DefaultNamespaces == nil {
-				opts.DefaultNamespaces = map[string]cache.Config{}
-			}
-			opts.DefaultNamespaces[ns] = cache.Config{}
+	opts := cache.Options{
+		ByObject:         forgejo.CacheByObject(forgejo.CacheScopes()),
+		DefaultTransform: cache.TransformStripManagedFields(),
+	}
+	for _, ns := range splitNamespaces(namespaces) {
+		if opts.DefaultNamespaces == nil {
+			opts.DefaultNamespaces = map[string]cache.Config{}
 		}
+		opts.DefaultNamespaces[ns] = cache.Config{}
 	}
 	return opts
+}
+
+// newClient builds the manager's client with a reader that keeps the label-restricted
+// cache transparent to callers: reads the cache cannot answer (an unlabelled Secret or Pod,
+// a List whose selector is broader than the cache's) go to the API server instead of
+// returning NotFound or a partial list.
+func newClient(config *rest.Config, options client.Options) (client.Client, error) {
+	live, err := client.New(config, client.Options{
+		HTTPClient: options.HTTPClient,
+		Scheme:     options.Scheme,
+		Mapper:     options.Mapper,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if options.Cache != nil && options.Cache.Reader != nil {
+		reader, err := forgejo.NewScopedReader(options.Cache.Reader, live, options.Scheme, forgejo.CacheScopes())
+		if err != nil {
+			return nil, err
+		}
+		cacheOpts := *options.Cache
+		cacheOpts.Reader = reader
+		options.Cache = &cacheOpts
+	}
+	return client.New(config, options)
+}
+
+func splitNamespaces(namespaces string) []string {
+	var out []string
+	for _, ns := range strings.Split(namespaces, ",") {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			out = append(out, ns)
+		}
+	}
+	return out
 }

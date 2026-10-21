@@ -260,17 +260,68 @@ func pullPolicy(f *forgejov1.Forgejo, image string) corev1.PullPolicy {
 	return corev1.PullIfNotPresent
 }
 
-// cleanupValkey removes Valkey once HA is disabled and every Forgejo pod runs the
-// non-redis app.ini, so no pod loses its cache/session/queue backend mid-flight.
-func cleanupValkey(ctx context.Context, rc *forgejo.ReconcileContext, dep *appsv1.Deployment) error {
+// cleanupValkey removes Valkey once HA is disabled and nothing can bring a redis app.ini
+// back: the desired (non-redis) config is deployed, not a rolled-back one, every Forgejo pod
+// runs it, and the last known good config a future rollback would deploy no longer uses
+// Valkey. Until recordLastKnownGood has stored the non-HA config, Valkey stays.
+func cleanupValkey(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState, dep *appsv1.Deployment, pods []corev1.Pod) error {
 	f := rc.Instance
 	if f.Spec.HighAvailability.Enabled {
 		return nil
 	}
-	if dep != nil && !fullyRolledOut(dep, rc.ConfigHash) && ptr.Deref(dep.Spec.Replicas, 1) > 0 {
+	key := client.ObjectKey{Namespace: f.Namespace, Name: forgejo.ValkeyName(f)}
+	valkey := &appsv1.Deployment{}
+	if err := rc.Client.Get(ctx, key, valkey); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		valkey = nil
+	}
+	svc := &corev1.Service{}
+	if err := rc.Client.Get(ctx, key, svc); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		svc = nil
+	}
+	if (valkey == nil || !metav1.IsControlledBy(valkey, f)) && (svc == nil || !metav1.IsControlledBy(svc, f)) {
 		return nil
 	}
-	key := client.ObjectKey{Namespace: f.Namespace, Name: forgejo.ValkeyName(f)}
+
+	keep, why := "", ""
+	switch {
+	case rc.ConfigHash == "" || rc.ConfigHash != rc.DesiredConfigHash:
+		keep, why = "rollback", "the pods run a rolled-back app.ini that may still use it"
+	case f.Status.AutoPilot != nil && f.Status.AutoPilot.RejectedConfigHash != "":
+		keep, why = "rejected", "a config rollback is pending"
+	case dep != nil && !fullyRolledOut(dep, rc.ConfigHash) && ptr.Deref(dep.Spec.Replicas, 1) > 0:
+		keep, why = "rollout", "the non-HA app.ini is still rolling out"
+	}
+	if keep == "" {
+		for i := range pods {
+			if pods[i].Annotations[forgejo.AnnotationConfigHash] != rc.DesiredConfigHash {
+				keep, why = "rollout", fmt.Sprintf("pod %s still runs an earlier app.ini", pods[i].Name)
+				break
+			}
+		}
+	}
+	if keep == "" && configRollbackEnabled(f) {
+		lkg, err := currentLKG(ctx, rc)
+		if err != nil {
+			return err
+		}
+		if lkg != nil && lkgUsesValkey(f, lkg) {
+			keep, why = "lkg", "the last known good app.ini, which a config rollback would deploy, still uses it; it is replaced once the non-HA app.ini has run healthy"
+		}
+	}
+	if keep != "" {
+		if st.allow("valkey-kept/"+keep, time.Hour) {
+			rc.Event(corev1.EventTypeNormal, "ValkeyRetained", "HighAvailability",
+				"highAvailability is disabled but Valkey %s is kept: %s", key.Name, why)
+		}
+		return nil
+	}
+
 	deleted := false
 	for _, obj := range []client.Object{&appsv1.Deployment{}, &corev1.Service{}} {
 		ok, err := deleteOwned(ctx, rc, key, obj)

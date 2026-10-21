@@ -26,7 +26,24 @@ const (
 	revisionHistory   = 5
 	progressDeadline  = 600
 	terminationPeriod = 60
+	// startupFailureThreshold x 10s is how long Forgejo may take to start serving: one hour.
+	// The first start of an adopted instance (another AppPath or app.ini location than the
+	// last start) re-syncs every repository's hooks before the listener opens, and a killed
+	// start does it all over again. Liveness only applies once the startup probe passed.
+	startupFailureThreshold = 360
 )
+
+// AnnotationFixPermissions on a Forgejo ("true") adds a root init container that creates the
+// top-level data directories and chowns them to the Forgejo user. It is only needed on
+// volumes that ignore fsGroup (NFS, hostPath, CSI drivers with fsGroupPolicy None) whose
+// directories are not writable by uid 1000, e.g. an adopted volume written by another user.
+// Without it the pod runs entirely as non-root and passes the restricted Pod Security
+// Standard.
+const AnnotationFixPermissions = "forgejo.lucas.icu/fix-permissions"
+
+// ReasonReplicasRequireHA is the Degraded reason while spec.replicas > 1 is clamped to one
+// pod because highAvailability is disabled.
+const ReasonReplicasRequireHA = "ReplicasRequireHA"
 
 // ReconcileWorkload ensures the Forgejo Deployment.
 func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
@@ -34,6 +51,7 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	if rc.ConfigHash == "" {
 		return forgejo.StepResult{Stop: true, RequeueAfter: dbNotReadyRequeue}, nil
 	}
+	reportReplicasRequireHA(rc)
 	restore, err := migratingRestore(ctx, rc)
 	if err != nil {
 		return forgejo.StepResult{}, err
@@ -76,16 +94,18 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	return forgejo.StepResult{}, nil
 }
 
-// desiredReplicas: 0 in maintenance, an explicit override, 1 while upgrading, before the
-// first successful rollout or while a restored database is migrated (migrations run with a
-// single pod), the HPA's choice when it owns scaling, else spec.replicas.
+// desiredReplicas: 0 in maintenance, an explicit override, 1 while upgrading (or while a
+// failed upgrade's unverified image is held), before the first successful rollout or while a
+// restored database is migrated (migrations run with a single pod), the HPA's choice when it
+// owns scaling, else spec.replicas (at most 1 without highAvailability).
 func desiredReplicas(rc *forgejo.ReconcileContext, exists bool, current *int32, migrationHold bool) int32 {
+	f := rc.Instance
 	switch {
 	case rc.Maintenance:
 		return 0
 	case rc.ReplicasOverride != nil:
 		return *rc.ReplicasOverride
-	case rc.Upgrading || rc.Instance.Status.Image == "":
+	case rc.Upgrading || forgejo.UpgradeHoldsWorkload(f) || f.Status.Image == "":
 		return 1
 	case rc.HPAManaged:
 		if exists && current != nil && *current > 0 {
@@ -97,27 +117,44 @@ func desiredReplicas(rc *forgejo.ReconcileContext, exists bool, current *int32, 
 		if migrationHold {
 			return 1
 		}
-		return hpaMinReplicas(rc.Instance)
+		return forgejo.HPAMinReplicas(f)
 	case migrationHold:
-		return min(forgejo.DesiredReplicas(rc.Instance), 1)
+		return min(specReplicas(f), 1)
 	}
-	return forgejo.DesiredReplicas(rc.Instance)
+	return specReplicas(f)
 }
 
-// hpaMinReplicas is the HPA's replica floor, clamped exactly like autopilot.ensureHPA.
-func hpaMinReplicas(f *forgejov1.Forgejo) int32 {
-	h := f.Spec.Autoscaling.Horizontal
-	if h == nil {
+// specReplicas is spec.replicas, clamped to 1 without highAvailability: without Valkey
+// every pod would open the same LevelDB queues and bleve indexes on the shared volume, and
+// all but one crash-loop on their file locks.
+func specReplicas(f *forgejov1.Forgejo) int32 {
+	n := forgejo.DesiredReplicas(f)
+	if n > 1 && !f.Spec.HighAvailability.Enabled {
 		return 1
 	}
-	maxR := max(h.MaxReplicas, 1)
-	return min(max(h.MinReplicas, 1), maxR)
+	return n
+}
+
+// reportReplicasRequireHA keeps Degraded/ReplicasRequireHA (and an hourly Warning) while
+// specReplicas clamps spec.replicas.
+func reportReplicasRequireHA(rc *forgejo.ReconcileContext) {
+	f := rc.Instance
+	n := forgejo.DesiredReplicas(f)
+	if n <= 1 || f.Spec.HighAvailability.Enabled {
+		clearDegraded(rc, ReasonReplicasRequireHA)
+		return
+	}
+	msg := fmt.Sprintf("spec.replicas=%d requires highAvailability.enabled (shared queues, cache and indexers); running 1 replica", n)
+	setDegraded(rc, ReasonReplicasRequireHA, msg)
+	warnEvery(rc, fmt.Sprintf("replicas-require-ha/%d", n), warnInterval, ReasonReplicasRequireHA, "Scale", "%s", msg)
 }
 
 // deploymentStrategy rolls HA instances without downtime, except while a migration must run
-// in a single pod (upgrade or restored database), where no surge pod may start next to it.
+// in a single pod (upgrade, a failed upgrade's held image, or a restored database), where no
+// surge pod may start next to it.
 func deploymentStrategy(rc *forgejo.ReconcileContext, migrationHold bool) appsv1.DeploymentStrategy {
-	if rc.Instance.Spec.HighAvailability.Enabled && !rc.Upgrading && !migrationHold {
+	f := rc.Instance
+	if f.Spec.HighAvailability.Enabled && !rc.Upgrading && !forgejo.UpgradeHoldsWorkload(f) && !migrationHold {
 		zero, one := intstr.FromInt32(0), intstr.FromInt32(1)
 		return appsv1.DeploymentStrategy{
 			Type:          appsv1.RollingUpdateDeploymentStrategyType,
@@ -132,22 +169,25 @@ func deploymentStrategy(rc *forgejo.ReconcileContext, migrationHold bool) appsv1
 // "forgejo migrate" (which takes no lock) never runs in several pods at once.
 const annotationMigrationHold = "forgejo.lucas.icu/migration-hold"
 
-// migratingRestore returns the name of a ForgejoRestore of this instance that restored the
-// database and is now waiting for Forgejo to come back (phase ScalingUp). The restored
-// schema may be older than the running image, so the first pod migrates it.
+// migratingRestore names the ForgejoRestore whose restored database the first pod must
+// migrate alone, while the maintenance step reports one (rc.RestoreMigrating: a restore of
+// the database in phase ScalingUp; the restored schema may be older than the running image).
+// The name only labels the hold annotation.
 func migratingRestore(ctx context.Context, rc *forgejo.ReconcileContext) (string, error) {
+	if !rc.RestoreMigrating {
+		return "", nil
+	}
 	f := rc.Instance
 	list := &forgejov1.ForgejoRestoreList{}
 	if err := rc.Client.List(ctx, list, client.InNamespace(f.Namespace)); err != nil {
 		return "", fmt.Errorf("listing restores: %w", err)
 	}
 	for _, r := range list.Items {
-		if r.Spec.ForgejoRef.Name == f.Name && r.Status.Phase == forgejov1.RestorePhaseScalingUp &&
-			forgejo.BoolOr(r.Spec.RestoreDatabase, true) {
+		if r.Spec.ForgejoRef.Name == f.Name && r.Status.Phase == forgejov1.RestorePhaseScalingUp {
 			return r.Name, nil
 		}
 	}
-	return "", nil
+	return "restore", nil
 }
 
 // migrationHold decides the hold for the live Deployment: set while a restore is migrating,
@@ -223,7 +263,7 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		Resources:       resources,
 		VolumeMounts:    mounts,
 		StartupProbe: &corev1.Probe{
-			ProbeHandler: healthz, PeriodSeconds: 10, TimeoutSeconds: 5, SuccessThreshold: 1, FailureThreshold: 30,
+			ProbeHandler: healthz, PeriodSeconds: 10, TimeoutSeconds: 5, SuccessThreshold: 1, FailureThreshold: startupFailureThreshold,
 		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: healthz, PeriodSeconds: 10, TimeoutSeconds: 5, SuccessThreshold: 1, FailureThreshold: 3,
@@ -240,7 +280,7 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 	}
 
 	initPerms := corev1.Container{
-		Name:            "init-permissions",
+		Name:            initPermissionsContainer,
 		Image:           rc.TargetImage,
 		ImagePullPolicy: pullPolicy,
 		Command:         []string{"/bin/sh", "-c", initPermissionsScript(l)},
@@ -291,8 +331,12 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 	if claim == "" {
 		claim = forgejo.DataPVCName(f)
 	}
+	initContainers := []corev1.Container{bootstrap}
+	if fixPermissions(f) {
+		initContainers = []corev1.Container{initPerms, bootstrap}
+	}
 	return corev1.PodSpec{
-		InitContainers: []corev1.Container{initPerms, bootstrap},
+		InitContainers: initContainers,
 		Containers:     []corev1.Container{main},
 		Volumes: []corev1.Volume{
 			{Name: dataVolume, VolumeSource: corev1.VolumeSource{
@@ -343,32 +387,67 @@ func nonRootSecurityContext(l forgejo.ImageLayout) *corev1.SecurityContext {
 	}
 }
 
-// initPermissionsScript creates the top-level data directories owned by the Forgejo
-// user. It is not recursive, so it stays fast on large volumes.
+// initPermissionsContainer is the optional root init container (AnnotationFixPermissions).
+const initPermissionsContainer = "init-permissions"
+
+func fixPermissions(f *forgejov1.Forgejo) bool {
+	return f.Annotations[AnnotationFixPermissions] == "true"
+}
+
+// dataDirs are the top-level directories Forgejo writes on the data volume.
+func dataDirs(l forgejo.ImageLayout) []string {
+	return []string{l.WorkPath, l.CustomPath, l.HomePath, l.HomePath + "/.ssh", l.RepoRoot, l.LFSPath}
+}
+
+// initPermissionsScript (root, opt-in) creates the top-level data directories and chowns
+// those not yet owned by the Forgejo user. It is not recursive, so it stays fast on large
+// volumes. A chown the volume refuses (NFS root_squash, CIFS) is only a warning: the
+// bootstrap container reports a directory that is still not writable.
 func initPermissionsScript(l forgejo.ImageLayout) string {
 	ssh := l.HomePath + "/.ssh"
-	dirs := []string{l.DataMountPath, l.WorkPath, l.CustomPath, l.HomePath, ssh, l.RepoRoot, l.LFSPath}
-	return fmt.Sprintf(`set -eu
-for d in %s; do
-  mkdir -p "$d"
-  chown %d:%d "$d"
+	owner := fmt.Sprintf("%d:%d", l.UID, l.GID)
+	return fmt.Sprintf(`set -u
+for d in %s %s; do
+  mkdir -p "$d" || { echo "WARNING: cannot create $d" >&2; continue; }
+  if [ "$(stat -c %%u:%%g "$d")" != "%s" ]; then
+    chown %s "$d" || echo "WARNING: cannot chown $d to %s" >&2
+  fi
 done
-chmod 0700 %s
-`, strings.Join(dirs, " "), l.UID, l.GID, ssh)
+chmod 0700 %s || echo "WARNING: cannot chmod %s" >&2
+exit 0
+`, l.DataMountPath, strings.Join(dataDirs(l), " "), owner, owner, owner, ssh, ssh)
+}
+
+// prepareDirsScript runs first in the (non-root) bootstrap container: it creates the
+// top-level data directories and fails clearly when one is not writable. The pod's fsGroup
+// makes fsGroup-aware volumes group-writable, so no root container is needed by default.
+func prepareDirsScript(l forgejo.ImageLayout) string {
+	ssh := l.HomePath + "/.ssh"
+	return fmt.Sprintf(`for d in %s; do
+  mkdir -p "$d" 2>/dev/null || true
+  if [ ! -d "$d" ] || [ ! -w "$d" ]; then
+    echo "ERROR: $d is missing or not writable by uid $(id -u) gid $(id -g)." >&2
+    echo "The volume ignores fsGroup or holds directories of another user: fix their ownership," >&2
+    echo "or annotate the Forgejo resource with %s=true (root init container)." >&2
+    exit 1
+  fi
+done
+chmod 0700 %s 2>/dev/null || true
+`, strings.Join(dataDirs(l), " "), AnnotationFixPermissions, ssh)
 }
 
 // adminSyncMarker (on the data volume) holds a salted digest of the admin credentials last
 // written to Forgejo, so the password is only reset when the admin Secret changes.
 const adminSyncMarker = ".admin-password-sync"
 
-// bootstrapScript migrates the database, then creates the admin or, when the admin Secret
+// bootstrapScript prepares the data directories (prepareDirsScript), migrates the
+// database, then creates the admin or, when the admin Secret
 // changed since the last sync, resets its password so that the Secret stays authoritative.
 // The password only travels through the env. A failed migration is fatal; a failed admin
 // sync (e.g. a password that does not meet PASSWORD_COMPLEXITY / MIN_PASSWORD_LENGTH /
 // PASSWORD_CHECK_PWN) only logs a warning, so it can never keep Forgejo from starting.
 func bootstrapScript(l forgejo.ImageLayout) string {
-	return fmt.Sprintf(`set -eu
-F=%s
+	return "set -eu\n" + prepareDirsScript(l) + fmt.Sprintf(`F=%s
 C=%s
 M=%s
 "$F" migrate --config "$C"

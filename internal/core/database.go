@@ -50,6 +50,11 @@ func dbNotReady(rc *forgejo.ReconcileContext, reason, msg string, requeue time.D
 	return forgejo.StepResult{Stop: true, RequeueAfter: requeue}, nil
 }
 
+// reasonUnreachableFromOperator: the operator could not dial the external database. The
+// pipeline continues, because Forgejo pods may well reach a database that the operator's
+// pod cannot (NetworkPolicies, egress firewalls, a proxy on the pod's loopback).
+const reasonUnreachableFromOperator = "UnreachableFromOperator"
+
 func reconcileExternalDB(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	st := &forgejov1.DatabaseStatus{Type: forgejov1.DatabaseTypeExternal}
@@ -63,6 +68,10 @@ func reconcileExternalDB(ctx context.Context, rc *forgejo.ReconcileContext) (for
 	if err != nil {
 		return dbNotReady(rc, "CredentialsUnavailable", err.Error(), 30*time.Second)
 	}
+	// With the credentials known, app.ini can be rendered and the workload deployed whatever
+	// the reachability check below finds.
+	rc.DB = db
+
 	// Forgejo resolves the host from its own namespace; the operator may run elsewhere.
 	// db.Host itself goes into app.ini and the backup jobs unchanged.
 	port := strconv.Itoa(int(db.Port))
@@ -84,13 +93,19 @@ func reconcileExternalDB(ctx context.Context, rc *forgejo.ReconcileContext) (for
 		break
 	}
 	if addr == "" {
-		st.Phase = "Unreachable"
-		return dbNotReady(rc, "Unreachable", fmt.Sprintf("cannot connect to %s: %s",
-			net.JoinHostPort(db.Host, port), strings.Join(errs, "; ")), 30*time.Second)
+		// Advisory only: DatabaseReady=False keeps self-healing, config rollback and scheduled
+		// backups waiting, but Forgejo is deployed and keeps running.
+		st.Phase = reasonUnreachableFromOperator
+		rc.DatabaseReady = false
+		msg := fmt.Sprintf("The operator cannot connect to %s (%s). The check dials from the operator's pod: "+
+			"if Forgejo pods can reach the database, allow the operator's namespace in the database's "+
+			"NetworkPolicy or firewall as well", net.JoinHostPort(db.Host, port), strings.Join(errs, "; "))
+		rc.SetCondition(forgejov1.ConditionDatabaseReady, metav1.ConditionFalse, reasonUnreachableFromOperator, msg)
+		warnEvery(rc, "external-db-unreachable", warnInterval, "DatabaseUnreachable", "Database", "%s", msg)
+		return forgejo.StepResult{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	st.Phase = "Reachable"
-	rc.DB = db
 	rc.DatabaseReady = true
 	rc.SetCondition(forgejov1.ConditionDatabaseReady, metav1.ConditionTrue, "Reachable", "External PostgreSQL at "+addr+" is reachable")
 	return forgejo.StepResult{}, nil
@@ -99,14 +114,13 @@ func reconcileExternalDB(ctx context.Context, rc *forgejo.ReconcileContext) (for
 // probeHosts lists the names to probe for an external database host, in the order a pod in
 // namespace resolves them: a single-label name is a Service in that namespace first
 // ("<host>.<ns>.svc" resolves through the pod's search path whatever the cluster domain;
-// the cluster.local form serves an operator running outside the cluster), then the name as
-// given (node or corporate search domains).
+// the fully qualified form serves an operator running outside the cluster), then the name
+// as given (node or corporate search domains).
 func probeHosts(host, namespace string) []string {
 	if net.ParseIP(host) != nil || strings.Contains(host, ".") || strings.EqualFold(host, "localhost") {
 		return []string{host}
 	}
-	svc := host + "." + namespace + ".svc"
-	return []string{svc, svc + ".cluster.local", host}
+	return []string{host + "." + namespace + ".svc", serviceHost(host, namespace), host}
 }
 
 func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
@@ -115,7 +129,7 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 	st := &forgejov1.DatabaseStatus{
 		Type:        forgejov1.DatabaseTypeCNPG,
 		ClusterName: name,
-		Host:        forgejo.CNPGReadWriteService(f) + "." + f.Namespace + ".svc.cluster.local",
+		Host:        serviceHost(forgejo.CNPGReadWriteService(f), f.Namespace),
 		SecretName:  forgejo.CNPGAppSecretName(f),
 		Instances:   cnpgInstances(f),
 	}
@@ -166,6 +180,9 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 	if err != nil {
 		return dbNotReady(rc, "CredentialsUnavailable", err.Error(), dbNotReadyRequeue)
 	}
+	// The read-write Service in the cluster's own DNS domain (identical to ResolveDB's
+	// name on cluster.local clusters).
+	db.Host = st.Host
 	rc.DB = db
 	rc.DatabaseReady = true
 	if healthy {

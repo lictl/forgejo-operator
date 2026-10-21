@@ -21,28 +21,60 @@ See `api/v1alpha1/*_types.go` for every field and default.
 `Forgejo`. Each step is a `forgejo.Step` (`func(ctx, *forgejo.ReconcileContext) (StepResult, error)`)
 owned by one feature package. Steps communicate through `ReconcileContext`
 (`internal/forgejo/context.go`); status is mutated in memory and patched once at the end.
-A step may return `Stop: true` (e.g. waiting for the database), after which only
-`core.ReconcileStatus` runs.
 
-| # | Step | Package | Outputs |
-|---|------|---------|---------|
-| 1 | secrets | core | `<name>-secrets`, `<name>-admin` |
-| 2 | database | core | CNPG `Cluster <name>-db`; `rc.DB`, `rc.DatabaseReady`, `status.database`, `DatabaseReady` |
-| 3 | high-availability | autopilot | Valkey `<name>-valkey`; `rc.ValkeyURL` |
-| 4 | storage | core | PVC `<name>-data` |
-| 5 | maintenance | backup | `rc.Maintenance` while a restore is active |
-| 6 | upgrade | upgrade | `rc.TargetImage`, `rc.Layout`, `rc.Upgrading`, `status.upgrade`, `Upgrading` |
-| 7 | tuning | autopilot | `rc.Tuning`, `rc.TuningEnv`, `rc.ResourcesOverride`, `status.autoPilot.tuning` |
-| 8 | config | core | Secret `<name>-config` (`app.ini`); `rc.ConfigSecretName`, `rc.ConfigHash`, `rc.DesiredConfigHash` |
-| 9 | config-guard | autopilot | may switch to `<name>-config-lkg` |
-| 10 | workload | core | Deployment `<name>` |
-| 11 | network | core | Services `<name>-http`, `<name>-ssh`; Ingress `<name>` |
-| 12 | scaling | autopilot | HPA `<name>`, PDB `<name>` |
-| 13 | monitoring | observability | ServiceMonitor, PrometheusRule, dashboard ConfigMap |
-| 14 | backup-schedule | backup | scheduled `ForgejoBackup`s, retention, `status.backup`, `BackupHealthy` |
-| 15 | health | observability | `/api/healthz`, version, stats → `status.health`, `status.version`, `status.stats`, `Healthy` |
-| 16 | autopilot | autopilot | storage expansion, vertical scaling, self-healing, LKG bookkeeping |
-| — | status | core | `phase`, `Ready`, `Progressing`, `Degraded`, replicas, URLs (always runs) |
+Each step names the earlier steps it **needs** (whose outputs it consumes). A step runs only
+when all of them *completed* in this pass, i.e. returned neither an error nor `Stop: true`;
+otherwise it is skipped. A step that fails or stops (e.g. waiting for the database) therefore
+skips only its dependants, and the remaining steps still run, so a rejected Ingress or a
+Valkey outage does not also stop scheduled backups, health checks or a restore. Steps 1–11
+form a chain (each needs the previous one); the others need only what is listed. Step errors
+are joined into `Degraded=ReconcileError` (one event per failed step) and returned, and the
+controller's backoff is capped at the 60s resync so time-based work keeps going. An
+optimistic-lock conflict ends the pass and retries after 1s. When backups are enabled but
+`backup-schedule` did not complete, `BackupHealthy` becomes `Unknown/ReconcileBlocked`
+naming the root cause instead of keeping its last value. When `upgrade` is skipped,
+`rc.Upgrading` is taken from `status.upgrade` (`forgejo.UpgradeInFlight`), so independent
+steps never mistake an upgrade in flight for an idle instance. While `spec.paused` is set no
+step runs; only `phase: Paused` is written and exported in `forgejo_operator_instance_info`.
+
+| # | Step | Package | Needs | Outputs |
+|---|------|---------|-------|---------|
+| 1 | maintenance | backup | – | `rc.Maintenance`, `rc.RestoreMigrating` while a restore is active; `status.backup.activeRestore` |
+| 2 | restore-guard | controller | 1 | `rc.Maintenance` while a restore Job still runs |
+| 3 | secrets | core | 2 | `<name>-secrets`, `<name>-admin` |
+| 4 | database | core | 3 | CNPG `Cluster <name>-db`; `rc.DB`, `rc.DatabaseReady`, `status.database`, `DatabaseReady` (Stop until ready) |
+| 5 | high-availability | autopilot | 4 | Valkey `<name>-valkey`; `rc.ValkeyURL` (Stop until ready) |
+| 6 | storage | core | 5 | PVC `<name>-data` |
+| 7 | upgrade | upgrade | 6 | `rc.TargetImage`, `rc.Layout`, `rc.Upgrading`, `status.upgrade`, `Upgrading` |
+| 8 | tuning | autopilot | 7 | `rc.Tuning`, `rc.TuningEnv`, `rc.ResourcesOverride`, `rc.HPAManaged`, `status.autoPilot.tuning` |
+| 9 | config | core | 8 | Secret `<name>-config` (`app.ini`); `rc.ConfigSecretName`, `rc.ConfigHash`, `rc.DesiredConfigHash` |
+| 10 | config-guard | autopilot | 9 | may switch to `<name>-config-lkg` |
+| 11 | workload | core | 10 | Deployment `<name>` |
+| 12 | network | core | – | Services `<name>-http`, `<name>-ssh`; Ingress `<name>` |
+| 13 | scaling | autopilot | 8 | HPA `<name>`, PDB `<name>` |
+| 14 | monitoring | observability | – | ServiceMonitor, PrometheusRule, dashboard ConfigMap |
+| 15 | backup-schedule | backup | 2 | scheduled `ForgejoBackup`s, retention, `status.backup`, `BackupHealthy` |
+| 16 | health | observability | 2 | `/api/healthz`, version, stats → `status.health`, `status.version`, `status.stats`, `Healthy` |
+| 17 | autopilot | autopilot | 11, 16 | storage expansion, vertical scaling, self-healing, LKG bookkeeping |
+| — | status | core | always | `phase`, `Ready`, `Progressing`, `Degraded`, replicas, URLs, instance metrics |
+
+## Informer cache and reads
+
+The manager caches Secrets and ConfigMaps only with `app.kubernetes.io/managed-by=forgejo-operator`,
+and Pods, Jobs, Deployments and Services only with `app.kubernetes.io/name=forgejo`
+(`forgejo.CacheScopes`, applied in `cmd/main.go`); every object the operator creates of these
+kinds carries `forgejo.Labels`. `managedFields` are stripped from all cached objects. Without
+this the operator would hold every Secret (Helm releases included), ConfigMap and Pod of the
+cluster in memory. The manager's client wraps the cache (`forgejo.NewScopedReader`) so that
+callers need not know about the selectors: a `Get` that misses the cache is confirmed with a
+live read (user-referenced Secrets such as `configFrom`, `admin.existingSecret`, external DB
+credentials, the CNPG `-app` Secret, CNPG pods), and a `List` whose label selector does not
+imply the cache's selector (e.g. all pods of a namespace, CNPG pods by `cnpg.io/cluster`, Job
+pods by `job-name`) is served live. Prefer selectors that include `app.kubernetes.io/name` for
+frequent lists. CNPG credential Secret rotations are watched through a separate,
+metadata-only cache of Secrets labelled `cnpg.io/cluster`. `--watch-namespace` /
+`WATCH_NAMESPACE` restricts all of these to the given namespaces. The manager runs with
+`GOMEMLIMIT` at ~90% of its memory limit (`config/manager/manager.yaml`).
 
 `ForgejoBackup` and `ForgejoRestore` have their own controllers
 (`internal/controller/forgejobackup_controller.go`, `forgejorestore_controller.go`)

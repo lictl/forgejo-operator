@@ -18,10 +18,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
+	"golang.org/x/time/rate"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
@@ -32,16 +35,22 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/autopilot"
@@ -72,32 +81,166 @@ type ForgejoReconciler struct {
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Recorder  events.EventRecorder
+	// WatchNamespaces restricts the informers this controller starts outside the manager's
+	// cache (CNPG credential Secrets) like the manager's --watch-namespace; empty means all.
+	WatchNamespaces []string
 }
 
+// namedStep is one pipeline step and the earlier steps it depends on.
 type namedStep struct {
 	name string
 	fn   forgejo.Step
+	// needs names the earlier steps whose outputs (on the ReconcileContext or in the
+	// cluster) this step consumes. The step runs only when all of them completed in this
+	// pass, i.e. returned neither an error nor Stop; otherwise it is skipped. A step without
+	// needs runs on every pass, so a failure elsewhere cannot starve it.
+	needs []string
 }
 
-// steps run in order. Later steps read the outputs earlier steps put on the context.
+// Step names referenced by the orchestrator itself.
+const (
+	stepMaintenance    = "maintenance"
+	stepRestoreGuard   = "restore-guard"
+	stepUpgrade        = "upgrade"
+	stepBackupSchedule = "backup-schedule"
+)
+
+// steps run in order. The first eleven form a chain: each produces outputs the next ones
+// consume, so a failure or Stop skips the rest of the chain (e.g. no app.ini without the
+// database, no rollout onto an unready Valkey). The steps after it only need part of the
+// chain and keep running when an unrelated step fails, so that one rejected Ingress or a
+// Valkey outage does not also stop scheduled backups, health checks or the restore
+// handshake.
 var steps = []namedStep{
-	{"secrets", core.ReconcileSecrets},
-	{"database", core.ReconcileDatabase},
-	{"high-availability", autopilot.ReconcileHA},
-	{"storage", core.ReconcileStorage},
-	{"maintenance", backup.ReconcileMaintenance},
-	{"restore-guard", reconcileRestoreGuard},
-	{"upgrade", upgrade.Reconcile},
-	{"tuning", autopilot.ReconcileTuning},
-	{"config", core.ReconcileConfig},
-	{"config-guard", autopilot.ReconcileConfigGuard},
-	{"workload", core.ReconcileWorkload},
-	{"network", core.ReconcileNetwork},
-	{"scaling", autopilot.ReconcileScaling},
-	{"monitoring", observability.ReconcileMonitoring},
-	{"backup-schedule", backup.ReconcileSchedule},
-	{"health", observability.ReconcileHealth},
-	{"autopilot", autopilot.Reconcile},
+	// Maintenance comes first: it only reads ForgejoRestores, and a restore must be able to
+	// take the instance down while the database or Valkey is unavailable.
+	{name: stepMaintenance, fn: backup.ReconcileMaintenance},
+	{name: stepRestoreGuard, fn: reconcileRestoreGuard, needs: []string{stepMaintenance}},
+	{name: "secrets", fn: core.ReconcileSecrets, needs: []string{stepRestoreGuard}},
+	{name: "database", fn: core.ReconcileDatabase, needs: []string{"secrets"}},
+	{name: "high-availability", fn: autopilot.ReconcileHA, needs: []string{"database"}},
+	{name: "storage", fn: core.ReconcileStorage, needs: []string{"high-availability"}},
+	{name: stepUpgrade, fn: upgrade.Reconcile, needs: []string{"storage"}},
+	{name: "tuning", fn: autopilot.ReconcileTuning, needs: []string{stepUpgrade}},
+	{name: "config", fn: core.ReconcileConfig, needs: []string{"tuning"}},
+	{name: "config-guard", fn: autopilot.ReconcileConfigGuard, needs: []string{"config"}},
+	{name: "workload", fn: core.ReconcileWorkload, needs: []string{"config-guard"}},
+	// Spec-only objects.
+	{name: "network", fn: core.ReconcileNetwork},
+	// rc.Maintenance, rc.Upgrading, rc.HPAManaged and rc.ResourcesOverride.
+	{name: "scaling", fn: autopilot.ReconcileScaling, needs: []string{"tuning"}},
+	{name: "monitoring", fn: observability.ReconcileMonitoring},
+	// Creates and prunes ForgejoBackup objects; the backup controller itself waits for the
+	// database. rc.Maintenance comes from the guard; rc.Upgrading from the upgrade step, or
+	// from status.upgrade when that step was skipped.
+	{name: stepBackupSchedule, fn: backup.ReconcileSchedule, needs: []string{stepRestoreGuard}},
+	// rc.Maintenance suspends probing during a restore.
+	{name: "health", fn: observability.ReconcileHealth, needs: []string{stepRestoreGuard}},
+	// Self-healing, LKG bookkeeping and right-sizing must never act on a partial pass.
+	{name: "autopilot", fn: autopilot.Reconcile, needs: []string{"workload", "health"}},
+}
+
+// pipelineResult is the outcome of one pass over the steps.
+type pipelineResult struct {
+	// failed maps each step that returned an error to it, in step order in failedOrder.
+	failed      map[string]error
+	failedOrder []string
+	// stopped names the steps that returned Stop.
+	stopped []string
+	// completed holds the steps that returned neither an error nor Stop.
+	completed map[string]bool
+	// skipped maps each skipped step to the prerequisite that did not complete.
+	skipped map[string]string
+	// conflict is set when a step hit an optimistic-lock conflict; the pass was cut short.
+	conflict bool
+}
+
+// err joins the step errors, naming each step.
+func (p *pipelineResult) err() error {
+	errs := make([]error, 0, len(p.failedOrder))
+	for _, name := range p.failedOrder {
+		errs = append(errs, fmt.Errorf("step %q: %w", name, p.failed[name]))
+	}
+	return errors.Join(errs...)
+}
+
+// blockedBy explains why a step did not complete: its own error, or the earliest
+// prerequisite (transitively) that failed or stopped.
+func (p *pipelineResult) blockedBy(name string) string {
+	for seen := 0; seen < len(steps); seen++ {
+		if err, ok := p.failed[name]; ok {
+			return fmt.Sprintf("step %q failed: %v", name, err)
+		}
+		if slices.Contains(p.stopped, name) {
+			return fmt.Sprintf("step %q is waiting (see its condition)", name)
+		}
+		dep, ok := p.skipped[name]
+		if !ok {
+			break
+		}
+		name = dep
+	}
+	return fmt.Sprintf("step %q did not run", name)
+}
+
+// runPipeline runs steps in order, skipping those whose prerequisites did not complete. A
+// conflict ends the pass: the next one, a second later, starts from fresh reads.
+func runPipeline(ctx context.Context, rc *forgejo.ReconcileContext, steps []namedStep) *pipelineResult {
+	log := logf.FromContext(ctx)
+	p := &pipelineResult{failed: map[string]error{}, completed: map[string]bool{}, skipped: map[string]string{}}
+	for _, s := range steps {
+		if missing := firstMissing(s.needs, p.completed); missing != "" {
+			p.skipped[s.name] = missing
+			if s.name == stepUpgrade {
+				inferUpgrading(rc)
+			}
+			continue
+		}
+		res, err := s.fn(ctx, rc)
+		if apierrors.IsConflict(err) {
+			// A child changed after our cached read; retry soon instead of reporting an error.
+			log.V(1).Info("conflict updating a child, retrying", "step", s.name, "error", err.Error())
+			p.conflict = true
+			rc.Requeue(time.Second)
+			return p
+		}
+		if err != nil {
+			p.failed[s.name] = err
+			p.failedOrder = append(p.failedOrder, s.name)
+			log.Error(err, "reconcile step failed", "step", s.name)
+			if s.name == stepUpgrade {
+				inferUpgrading(rc)
+			}
+			continue
+		}
+		rc.Requeue(res.RequeueAfter)
+		if res.Stop {
+			log.V(1).Info("step is waiting; the steps that depend on it are skipped", "step", s.name)
+			p.stopped = append(p.stopped, s.name)
+			continue
+		}
+		p.completed[s.name] = true
+	}
+	if len(p.skipped) > 0 {
+		log.V(1).Info("steps skipped because a prerequisite did not complete", "skipped", p.skipped)
+	}
+	return p
+}
+
+// inferUpgrading stands in for the upgrade step when it did not run (or failed): the
+// independent steps after it (backup schedule, status) must not take an instance with an
+// upgrade in flight for an idle one, e.g. start a scheduled backup in the middle of it.
+func inferUpgrading(rc *forgejo.ReconcileContext) {
+	rc.Upgrading = rc.Upgrading || forgejo.UpgradeInFlight(rc.Instance)
+}
+
+func firstMissing(needs []string, completed map[string]bool) string {
+	for _, n := range needs {
+		if !completed[n] {
+			return n
+		}
+	}
+	return ""
 }
 
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejos,verbs=get;list;watch;create;update;patch;delete
@@ -153,44 +296,35 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if instance.Spec.Paused {
 		instance.Status.Phase = forgejov1.PhasePaused
 		rc.SetCondition(forgejov1.ConditionProgressing, metav1.ConditionFalse, "Paused", "Reconciliation is paused by spec.paused")
+		// The alerts' expected-down selector matches phase="Paused"; ReconcileStatus, which
+		// normally exports the phase, does not run while paused.
+		forgejo.SetInstanceInfo(instance, rc.TargetImage)
 		return ctrl.Result{}, r.patchStatus(ctx, original, instance)
 	}
 
-	var stepErr error
-	failedStep := ""
-	conflict := false
-	for _, s := range steps {
-		res, err := s.fn(ctx, rc)
-		if apierrors.IsConflict(err) {
-			// A child changed after our cached read; retry soon instead of reporting an error.
-			log.V(1).Info("conflict updating a child, retrying", "step", s.name, "error", err.Error())
-			conflict = true
-			rc.Requeue(time.Second)
-			break
-		}
-		if err != nil {
-			stepErr, failedStep = err, s.name
-			break
-		}
-		rc.Requeue(res.RequeueAfter)
-		if res.Stop {
-			log.V(1).Info("step stopped reconciliation", "step", s.name)
-			break
-		}
-	}
-
+	p := runPipeline(ctx, rc, steps)
+	stepErr := p.err()
 	if stepErr != nil {
-		log.Error(stepErr, "reconcile step failed", "step", failedStep)
-		rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionTrue, "ReconcileError",
-			fmt.Sprintf("step %q: %v", failedStep, stepErr))
-		rc.Event(corev1.EventTypeWarning, "ReconcileError", "Reconcile", "step %s failed: %v", failedStep, stepErr)
-	} else if c := meta.FindStatusCondition(instance.Status.Conditions, forgejov1.ConditionDegraded); !conflict && c != nil && c.Reason == "ReconcileError" {
+		msg := make([]string, 0, len(p.failedOrder))
+		for _, name := range p.failedOrder {
+			msg = append(msg, fmt.Sprintf("step %q: %v", name, p.failed[name]))
+			rc.Event(corev1.EventTypeWarning, "ReconcileError", "Reconcile", "step %s failed: %v", name, p.failed[name])
+		}
+		rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionTrue, "ReconcileError", strings.Join(msg, "; "))
+	} else if c := meta.FindStatusCondition(instance.Status.Conditions, forgejov1.ConditionDegraded); !p.conflict && c != nil && c.Reason == "ReconcileError" {
 		// Only clear our own Degraded; other features report Degraded with their own reasons.
 		meta.RemoveStatusCondition(&instance.Status.Conditions, forgejov1.ConditionDegraded)
 	}
+	if !p.conflict && !p.completed[stepBackupSchedule] && instance.Spec.Backup.Enabled {
+		// Without this, BackupHealthy would keep its last value (often True) while no
+		// scheduled backup is created and retention does not run.
+		rc.SetCondition(forgejov1.ConditionBackupHealthy, metav1.ConditionUnknown, "ReconcileBlocked",
+			"Scheduled backups are not being created: "+p.blockedBy(stepBackupSchedule))
+	}
 
-	if _, err := core.ReconcileStatus(ctx, rc); err != nil && stepErr == nil {
-		stepErr = err
+	if _, err := core.ReconcileStatus(ctx, rc); err != nil {
+		log.Error(err, "status step failed")
+		stepErr = errors.Join(stepErr, fmt.Errorf("status: %w", err))
 	}
 	instance.Status.ObservedGeneration = instance.Generation
 
@@ -309,6 +443,10 @@ func restoreFailedRecently(ctx context.Context, c client.Client, f *forgejov1.Fo
 }
 
 // SetupWithManager sets up the controller with the Manager.
+//
+// Secrets, ConfigMaps, Pods, Jobs, Deployments and Services are cached only when they carry
+// the operator's labels (forgejo.CacheScopes, see cmd/main.go), so the watches below see
+// only the operator's own objects of these kinds.
 func (r *ForgejoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&forgejov1.Forgejo{}, builder.WithPredicates(predicate.Or(
@@ -328,6 +466,7 @@ func (r *ForgejoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&forgejov1.ForgejoRestore{}, handler.EnqueueRequestsFromMapFunc(mapRestoreToForgejo)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapByInstanceLabel),
 			builder.WithPredicates(managedByOperator())).
+		WithOptions(controller.Options{RateLimiter: rateLimiter()}).
 		Named("forgejo")
 
 	// CloudNativePG is optional at startup; watch its Clusters and app secrets when installed.
@@ -339,10 +478,65 @@ func (r *ForgejoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	} else {
 		mgr.GetLogger().Info("CloudNativePG CRDs not found; managed databases will be unavailable until the operator restarts")
 	}
-	// CNPG-generated credential secrets are owned by the CNPG Cluster, not by us.
-	b = b.Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(mapCNPGSecretToForgejo))
+
+	// CNPG-generated credential secrets are owned by the CNPG Cluster and carry none of our
+	// labels, so the manager's cache never holds them. A separate cache keeps just the
+	// metadata of Secrets labelled cnpg.io/cluster, enough to map a password rotation back
+	// to its instance.
+	secrets, err := r.newCNPGSecretCache(mgr)
+	if err != nil {
+		return err
+	}
+	if err := mgr.Add(secrets); err != nil {
+		return err
+	}
+	secret := &metav1.PartialObjectMetadata{}
+	secret.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
+	b = b.WatchesRawSource(source.Kind(secrets.Cache, client.Object(secret),
+		handler.EnqueueRequestsFromMapFunc(mapCNPGSecretToForgejo)))
 
 	return b.Complete(r)
+}
+
+// rateLimiter is controller-runtime's default with the per-instance backoff capped at
+// defaultResync: a step that keeps failing must not push time-based work (scheduled backups,
+// health checks, storage expansion) out by up to the default 1000s.
+func rateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
+	return workqueue.NewTypedMaxOfRateLimiter(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](5*time.Millisecond, defaultResync),
+		&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+	)
+}
+
+// cacheRunnable lets the manager start a cache with its own caches, before leader election,
+// and wait for it to sync.
+type cacheRunnable struct{ cache.Cache }
+
+func (c cacheRunnable) GetCache() cache.Cache { return c.Cache }
+
+func (r *ForgejoReconciler) newCNPGSecretCache(mgr ctrl.Manager) (cacheRunnable, error) {
+	hasCluster, err := labels.NewRequirement("cnpg.io/cluster", selection.Exists, nil)
+	if err != nil {
+		return cacheRunnable{}, err
+	}
+	opts := cache.Options{
+		HTTPClient:           mgr.GetHTTPClient(),
+		Scheme:               mgr.GetScheme(),
+		Mapper:               mgr.GetRESTMapper(),
+		DefaultLabelSelector: labels.NewSelector().Add(*hasCluster),
+		DefaultTransform:     cache.TransformStripManagedFields(),
+	}
+	for _, ns := range r.WatchNamespaces {
+		if opts.DefaultNamespaces == nil {
+			opts.DefaultNamespaces = map[string]cache.Config{}
+		}
+		opts.DefaultNamespaces[ns] = cache.Config{}
+	}
+	c, err := cache.New(mgr.GetConfig(), opts)
+	if err != nil {
+		return cacheRunnable{}, fmt.Errorf("creating the CNPG secret cache: %w", err)
+	}
+	return cacheRunnable{c}, nil
 }
 
 func mapBackupToForgejo(_ context.Context, obj client.Object) []reconcile.Request {

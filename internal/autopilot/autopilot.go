@@ -47,6 +47,9 @@ const (
 	ReasonExpansionUnsupported        = "ExpansionUnsupported"
 	ReasonMaxSizeReached              = "MaxSizeReached"
 	ReasonHealthProbeUnreachable      = "HealthProbeUnreachable"
+	ReasonHPAMissingResourceRequests  = "HPAMissingResourceRequests"
+	ReasonAutoExpandDisabled          = "AutoExpandDisabled"
+	ReasonExpansionStalled            = "ExpansionStalled"
 )
 
 // serverContainerName is the Forgejo container in the server pods.
@@ -73,20 +76,36 @@ func Reconcile(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepR
 	}
 
 	var errs []error
-	errs = append(errs, cleanupValkey(ctx, rc, dep))
 	unreachable := trackUnreachable(st, f, pods)
+	// The LKG is recorded before Valkey cleanup looks at it: a non-HA config that just
+	// became last known good lets Valkey go in the same pass.
 	errs = append(errs, recordLastKnownGood(ctx, rc, dep, pods, unreachable))
+	errs = append(errs, cleanupValkey(ctx, rc, st, dep, pods))
 	reportProbeUnreachable(rc, st, pods, unreachable)
 	if forgejo.SelfHealingEnabled(f) {
 		errs = append(errs, rollbackFailingConfig(ctx, rc, st, pods))
 		errs = append(errs, restartUnhealthy(ctx, rc, dep, pods))
 	}
-	if forgejo.VerticalAutoscalingEnabled(f) {
-		oom := handleOOM(rc, st, pods)
-		rightSize(ctx, rc, st, pods, oom)
+	if forgejo.VerticalAutoscalingEnabled(f) && !rc.Maintenance && !workloadHeld(rc) {
+		reverted := revertUnschedulable(rc, st, pods)
+		oomSeen, oomScaled := false, false
+		if !reverted {
+			oomSeen, oomScaled = handleOOM(ctx, rc, st, pods)
+		}
+		rsScaled := rightSize(ctx, rc, st, pods, oomSeen || reverted)
+		errs = append(errs, recordVerticalBase(ctx, rc, dep, reverted || oomScaled || rsScaled))
 	}
-	errs = append(errs, reconcileStorage(ctx, rc, st))
+	errs = append(errs, reconcileStorage(ctx, rc, st, dep))
 	return forgejo.StepResult{}, errors.Join(errs...)
+}
+
+// workloadHeld reports whether a migration owns the workload: an upgrade in progress, a
+// failed upgrade whose new image is still deployed and unverified, or a restored database
+// waiting for its first pod. The workload then runs a single pod that must not be rolled,
+// restarted or joined by others, so autonomous actions that would change the pod template
+// or the replica count wait.
+func workloadHeld(rc *forgejo.ReconcileContext) bool {
+	return rc.Upgrading || rc.RestoreMigrating || forgejo.UpgradeHoldsWorkload(rc.Instance)
 }
 
 // serverPods lists the Forgejo server pods of the instance that are neither terminating nor
@@ -181,7 +200,18 @@ type instanceState struct {
 	limits   map[string]time.Time // rate-limit key -> last time allowed
 
 	lastStorageCheck time.Time
-	du               map[string]duResult // claim -> last du measurement
+	measure          *measureState        // volume measurements, updated in the background
+	resizeSeen       map[string]time.Time // claim -> when a pending resize was first seen
+	resizeRestarted  map[string]time.Time // claim -> last restart for a file system resize
+
+	// prevApplied is status.autoPilot.appliedResources before the last ResourcesScaled of
+	// this process (nil: spec.resources), used to revert a change that left a pod
+	// unschedulable; prevKnown says whether it was recorded.
+	prevApplied *corev1.ResourceRequirements
+	prevKnown   bool
+	// memRequestCap stops OOM growth of the memory request after a larger one could not be
+	// scheduled; zero when unset.
+	memRequestCap int64
 
 	unansweredSince time.Time // start of the current run of unanswered health probes
 }
@@ -211,9 +241,11 @@ func stateFor(f *forgejov1.Forgejo) *instanceState {
 	s, ok := states[f.UID]
 	if !ok {
 		s = &instanceState{
-			lastSeen: map[string]time.Time{},
-			limits:   map[string]time.Time{},
-			du:       map[string]duResult{},
+			lastSeen:        map[string]time.Time{},
+			limits:          map[string]time.Time{},
+			measure:         newMeasureState(),
+			resizeSeen:      map[string]time.Time{},
+			resizeRestarted: map[string]time.Time{},
 		}
 		states[f.UID] = s
 	}

@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,17 +9,18 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/prometheus/common/expfmt"
-	"github.com/prometheus/common/model"
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,6 +42,25 @@ const (
 	// connection is established.
 	probeTimeout = 5 * time.Second
 	maxBody      = 8 << 20
+	// endpointSettle is how long a pod must have been Ready before it is probed through
+	// the Service: the EndpointSlice and kube-proxy rules follow the Ready condition with
+	// a delay.
+	endpointSettle = 5 * time.Second
+
+	// Forgejo's /metrics runs a COUNT(*) query per statistic before it sends the
+	// headers, which takes seconds on a large instance. Sampling runs in the background
+	// (see statsSampler), so it may wait much longer than a health probe.
+	statsHeaderTimeout = 20 * time.Second
+	// maxStatsBody bounds how much of /metrics is read. The body is scanned as a stream
+	// and not kept, so this only guards against a runaway response; the high-cardinality
+	// gitea_issues_by_* families sort before gitea_organizations, gitea_repositories and
+	// gitea_users.
+	maxStatsBody = 64 << 20
+	// minStatsRetry is the earliest retry after a first failed sampling attempt; later
+	// failures wait a full statsInterval.
+	minStatsRetry = time.Minute
+	// statsWarnEvery rate-limits StatsSamplingFailed events while sampling keeps failing.
+	statsWarnEvery = time.Hour
 )
 
 // Healthy condition reasons.
@@ -57,9 +78,12 @@ const (
 // cluster-internal URLs, and every probe opens a fresh connection.
 var httpClient = newProbeClient(dialTimeout, probeTimeout)
 
+// statsClient fetches /metrics for status.stats, with a longer header timeout.
+var statsClient = newProbeClient(dialTimeout, statsHeaderTimeout)
+
 func newProbeClient(dial, header time.Duration) *http.Client {
 	return &http.Client{
-		// Covers dial + headers + reading a /metrics body; the specific timeouts fire first.
+		// Covers dial + headers + reading the body; the specific timeouts fire first.
 		Timeout: dial + header + 5*time.Second,
 		Transport: &http.Transport{
 			Proxy:                 nil,
@@ -79,7 +103,8 @@ var statsMetrics = map[string]string{
 }
 
 // ReconcileHealth probes /api/healthz and /api/v1/version and samples statistics into
-// status.health, status.version, status.stats and the Healthy condition.
+// status.health, status.version, status.stats and the Healthy condition. Statistics are
+// sampled in the background (see statsSampler) and copied into status by a later reconcile.
 //
 // Probes go through the HTTP Service and only count while at least one pod is Ready and
 // no restore is running: status.health.consecutiveFailures drives self-healing restarts,
@@ -93,24 +118,35 @@ func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		f.Status.Health = &forgejov1.HealthStatus{}
 	}
 	h := f.Status.Health
-	// Export the failure counter from the start so increase() also sees the first failure.
+	// Export the counters from the start so increase() also sees the first increment.
 	forgejo.HealthCheckFailures.WithLabelValues(f.Namespace, f.Name).Add(0)
+	forgejo.HealthCheckUnreachable.WithLabelValues(f.Namespace, f.Name).Add(0)
+	if forgejo.MonitoringEnabled(f) {
+		collectStats(rc)
+	}
 	publishStats(f)
 
 	if rc.Maintenance {
 		skipHealth(rc, ReasonMaintenance, "Health checks are suspended during maintenance: "+rc.MaintenanceReason)
 		return forgejo.StepResult{}, nil
 	}
-	ready, err := servingPods(ctx, rc)
+	now := time.Now()
+	ready, settling, err := servingPods(ctx, rc, now)
 	if err != nil {
 		return forgejo.StepResult{}, err
+	}
+	if ready == 0 && settling > 0 {
+		// A pod just became Ready, but the Service may not route to it yet (kube-proxy
+		// rejects connections to a Service without endpoints): probing now would report a
+		// spurious Unreachable. Keep the previous result until the pod has settled.
+		rc.Requeue(settling)
+		return forgejo.StepResult{}, nil
 	}
 	if ready == 0 {
 		skipHealth(rc, ReasonNoReadyReplicas, "No Forgejo pod is Ready; health checks resume once one is")
 		return forgejo.StepResult{}, nil
 	}
 
-	now := time.Now()
 	interval := forgejo.DurationOr(f.Spec.AutoPilot.SelfHealing.HealthCheckInterval, defaultHealthInterval)
 	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
 	var last time.Time
@@ -147,12 +183,7 @@ func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	}
 
 	if forgejo.MonitoringEnabled(f) {
-		statsInterval := forgejo.DurationOr(f.Spec.Monitoring.StatsInterval, defaultStatsInterval)
-		if s := f.Status.Stats; s == nil || s.LastUpdated == nil || now.Sub(s.LastUpdated.Time)+time.Second >= statsInterval {
-			if err := sampleStats(ctx, rc, base); err != nil {
-				logf.FromContext(ctx).Info("sampling Forgejo statistics failed", "error", err.Error())
-			}
-		}
+		startStatsSample(ctx, rc, base, now)
 	}
 	return forgejo.StepResult{}, nil
 }
@@ -162,27 +193,48 @@ func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 // patch, so status.health.lastCheckTime alone would let back-to-back reconciles probe twice.
 var lastProbe sync.Map // types.NamespacedName -> time.Time
 
+// ForgetInstance drops the in-memory bookkeeping of a deleted instance (probe and
+// sampling times, rate-limited warnings). The controller calls it next to
+// forgejo.DeleteInstanceMetrics; state is also keyed by UID where a stale entry would
+// matter, so a re-created instance of the same name starts afresh either way.
+func ForgetInstance(namespace, name string) {
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+	lastProbe.Delete(key)
+	statsSamplers.Delete(key)
+	monitoringWarned.Delete(key)
+}
+
 // servingPods counts the instance's Ready pods that are not terminating, i.e. the pods
-// the HTTP Service routes to. Deployment status lags behind during rollouts.
-func servingPods(ctx context.Context, rc *forgejo.ReconcileContext) (int, error) {
+// the HTTP Service routes to. Deployment status lags behind during rollouts. A pod counts
+// once it has been Ready for endpointSettle; settling is how long until the first pod
+// that is Ready but not yet counted will be.
+func servingPods(ctx context.Context, rc *forgejo.ReconcileContext, now time.Time) (
+	ready int, settling time.Duration, err error) {
 	pods := &corev1.PodList{}
 	if err := rc.Client.List(ctx, pods, client.InNamespace(rc.Instance.Namespace),
 		client.MatchingLabels(forgejo.SelectorLabels(rc.Instance))); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	n := 0
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.DeletionTimestamp != nil {
 			continue
 		}
 		for _, c := range p.Status.Conditions {
-			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-				n++
+			if c.Type != corev1.PodReady || c.Status != corev1.ConditionTrue {
+				continue
 			}
+			// lastTransitionTime has second precision: allow one second more.
+			if wait := c.LastTransitionTime.Add(endpointSettle + time.Second).Sub(now); wait > 0 {
+				if settling == 0 || wait < settling {
+					settling = wait
+				}
+				continue
+			}
+			ready++
 		}
 	}
-	return n, nil
+	return ready, settling, nil
 }
 
 // skipHealth reports that no probe could be made. The failure streak is reset so that
@@ -257,6 +309,7 @@ func recordUnreachable(rc *forgejo.ReconcileContext, res healthResult, now metav
 	h.ConsecutiveFailures = 0
 	h.Message = res.message
 	h.Checks = nil
+	forgejo.HealthCheckUnreachable.WithLabelValues(f.Namespace, f.Name).Inc()
 	msg := fmt.Sprintf("The operator cannot reach Forgejo (%s). It must be allowed to connect to "+
 		"Service %s.%s port %d: check NetworkPolicies and service-mesh mTLS (PERMISSIVE, or a sidecar for "+
 		"the operator). Unreachable probes do not count towards self-healing.",
@@ -340,7 +393,7 @@ func snippet(body []byte) string {
 // answer other than 200 pass/warn, and a connection Forgejo accepted but never answered
 // (a hung process), count as failures; everything else is unreachable.
 func probeHealthz(ctx context.Context, base string) healthResult {
-	body, code, err := get(ctx, base+"/api/healthz", "")
+	body, code, err := get(ctx, base+"/api/healthz")
 	if err != nil {
 		var pe *probeError
 		if errors.As(err, &pe) && pe.hung {
@@ -403,7 +456,7 @@ func probeHealthz(ctx context.Context, base string) healthResult {
 }
 
 func fetchVersion(ctx context.Context, base string) (string, error) {
-	body, code, err := get(ctx, base+"/api/v1/version", "")
+	body, code, err := get(ctx, base+"/api/v1/version")
 	if err != nil {
 		return "", err
 	}
@@ -422,66 +475,237 @@ func fetchVersion(ctx context.Context, base string) (string, error) {
 	return v.Version, nil
 }
 
-// sampleStats scrapes Forgejo's /metrics with the generated bearer token.
-func sampleStats(ctx context.Context, rc *forgejo.ReconcileContext, base string) error {
+// statsSampler is the background sampling state of one instance. Sampling runs in a
+// goroutine, so a slow /metrics never holds the reconcile worker, which the forgejo
+// controller shares between all instances. The next reconcile copies a finished sample
+// into status.stats.
+type statsSampler struct {
+	uid types.UID
+
+	mu      sync.Mutex
+	running bool
+	// lastAttempt is when the last attempt started, successful or not.
+	lastAttempt time.Time
+	// failures counts consecutive failed attempts; lastErr is the error of the last one.
+	failures int
+	lastErr  string
+	// result is the last successful sample.
+	result *forgejov1.ForgejoStats
+	// warnedAt is when StatsSamplingFailed was last emitted; zero when not warned.
+	warnedAt time.Time
+}
+
+var statsSamplers sync.Map // types.NamespacedName -> *statsSampler
+
+// samplerFor returns the sampler of the instance, a fresh one for a re-created instance.
+// Reconciles of one instance never run concurrently, so Load and Store do not race.
+func samplerFor(f *forgejov1.Forgejo) *statsSampler {
+	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
+	if v, ok := statsSamplers.Load(key); ok && v.(*statsSampler).uid == f.UID {
+		return v.(*statsSampler)
+	}
+	s := &statsSampler{uid: f.UID}
+	statsSamplers.Store(key, s)
+	return s
+}
+
+func (s *statsSampler) failed(log logr.Logger, err error) {
+	s.failures++
+	s.lastErr = err.Error()
+	log.Info("Sampling Forgejo statistics failed", "error", s.lastErr, "consecutiveFailures", s.failures)
+}
+
+// collectStats copies the last background sample into status.stats (again, if the status
+// patch that carried it was lost) and reports sampling that keeps failing: a Warning event
+// once the retry after a first failure fails too, repeated at most hourly, and a Normal
+// event when it works again.
+func collectStats(rc *forgejo.ReconcileContext) {
+	f := rc.Instance
+	s := samplerFor(f)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r := s.result; r != nil {
+		if cur := f.Status.Stats; cur == nil || cur.LastUpdated == nil || cur.LastUpdated.Before(r.LastUpdated) {
+			f.Status.Stats = r.DeepCopy()
+		}
+	}
+	now := time.Now()
+	switch {
+	case s.lastErr != "" && s.failures >= 2 && (s.warnedAt.IsZero() || now.Sub(s.warnedAt) >= statsWarnEvery):
+		s.warnedAt = now
+		interval := forgejo.DurationOr(f.Spec.Monitoring.StatsInterval, defaultStatsInterval)
+		rc.Event(corev1.EventTypeWarning, "StatsSamplingFailed", "Stats",
+			"Sampling status.stats from Forgejo's /metrics failed %d times in a row (retried every %s): %s",
+			s.failures, interval, s.lastErr)
+	case s.lastErr == "" && !s.warnedAt.IsZero():
+		s.warnedAt = time.Time{}
+		rc.Event(corev1.EventTypeNormal, "StatsSamplingRecovered", "Stats",
+			"Sampling status.stats from Forgejo's /metrics works again")
+	}
+}
+
+// startStatsSample starts a background sample of Forgejo's /metrics when one is due:
+// statsInterval after the later of status.stats.lastUpdated and this process's last
+// attempt, so failed attempts back off as well. Only the first failure in a row is retried
+// sooner, after half the interval (at least a minute).
+func startStatsSample(ctx context.Context, rc *forgejo.ReconcileContext, base string, now time.Time) {
+	f := rc.Instance
+	interval := forgejo.DurationOr(f.Spec.Monitoring.StatsInterval, defaultStatsInterval)
+	s := samplerFor(f)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		return
+	}
+	last := s.lastAttempt
+	if st := f.Status.Stats; st != nil && st.LastUpdated != nil && st.LastUpdated.After(last) {
+		last = st.LastUpdated.Time
+	}
+	wait := interval
+	if s.failures == 1 {
+		wait = min(interval, max(interval/2, minStatsRetry))
+	}
+	// One second of tolerance for the second-precision lastUpdated and timer jitter.
+	if !last.IsZero() && now.Sub(last) < wait-time.Second {
+		return
+	}
+	s.lastAttempt = now
+	log := logf.FromContext(ctx)
+	token, err := metricsToken(ctx, rc)
+	if err != nil {
+		s.failed(log, err)
+		return
+	}
+	s.running = true
+	// Detached from the reconcile, which may end (and cancel its context) first.
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), statsClient.Timeout)
+	go func() {
+		defer cancel()
+		values, err := fetchStats(sctx, base, token)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.running = false
+		if err != nil {
+			s.failed(log, err)
+			return
+		}
+		s.failures, s.lastErr = 0, ""
+		done := metav1.NewTime(time.Now().Truncate(time.Second))
+		s.result = &forgejov1.ForgejoStats{
+			Users:         values["users"],
+			Organizations: values["organizations"],
+			Repositories:  values["repositories"],
+			Issues:        values["issues"],
+			LastUpdated:   &done,
+		}
+	}()
+}
+
+// metricsToken reads the generated bearer token that protects Forgejo's /metrics.
+func metricsToken(ctx context.Context, rc *forgejo.ReconcileContext) (string, error) {
 	f := rc.Instance
 	sec := &corev1.Secret{}
-	if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err != nil {
-		return err
+	key := types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}
+	if err := rc.Client.Get(ctx, key, sec); err != nil {
+		return "", fmt.Errorf("reading the metrics token: %w", err)
 	}
 	token := string(sec.Data[forgejo.SecretKeyMetricsToken])
 	if token == "" {
-		return fmt.Errorf("secret %s has no %q", sec.Name, forgejo.SecretKeyMetricsToken)
+		return "", fmt.Errorf("secret %s has no %q", sec.Name, forgejo.SecretKeyMetricsToken)
 	}
-	body, code, err := get(ctx, base+"/metrics", token)
-	if err != nil {
-		return err
-	}
-	if code != http.StatusOK {
-		return fmt.Errorf("GET /metrics: HTTP %d", code)
-	}
-	values, err := parseStats(body)
-	if err != nil {
-		return err
-	}
-	now := metav1.Now()
-	f.Status.Stats = &forgejov1.ForgejoStats{
-		Users:         values["users"],
-		Organizations: values["organizations"],
-		Repositories:  values["repositories"],
-		Issues:        values["issues"],
-		LastUpdated:   &now,
-	}
-	publishStats(f)
-	return nil
+	return token, nil
 }
 
-func parseStats(body []byte) (map[string]int64, error) {
-	parser := expfmt.NewTextParser(model.UTF8Validation)
-	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))
+// fetchStats reads the gitea_* statistics from Forgejo's /metrics.
+func fetchStats(ctx context.Context, base, token string) (map[string]int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/metrics", nil)
 	if err != nil {
-		return nil, fmt.Errorf("parsing /metrics: %w", err)
+		return nil, err
 	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := statsClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET /metrics: HTTP %d", resp.StatusCode)
+	}
+	return scanStats(resp.Body, maxStatsBody)
+}
+
+// scanStats reads the gitea_* statistics from a Prometheus text exposition. It reads the
+// body as a stream, stops once every statistic is found and fails instead of returning
+// partial values when the body is longer than limit bytes.
+func scanStats(r io.Reader, limit int64) (map[string]int64, error) {
+	lr := &io.LimitedReader{R: r, N: limit + 1}
+	br := bufio.NewReaderSize(lr, 64<<10)
 	values := map[string]int64{}
-	for name, kind := range statsMetrics {
-		mf := families[name]
-		if mf == nil || len(mf.GetMetric()) == 0 {
-			continue
+	for len(values) < len(statsMetrics) {
+		line, err := br.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			// An overlong line (long label values) is not one of the plain gitea_* gauges.
+			for errors.Is(err, bufio.ErrBufferFull) {
+				_, err = br.ReadSlice('\n')
+			}
+			line = nil
 		}
-		m := mf.GetMetric()[0]
-		switch {
-		case m.GetGauge() != nil:
-			values[kind] = int64(m.GetGauge().GetValue())
-		case m.GetCounter() != nil:
-			values[kind] = int64(m.GetCounter().GetValue())
-		case m.GetUntyped() != nil:
-			values[kind] = int64(m.GetUntyped().GetValue())
+		if kind, v, ok := parseStatsLine(line); ok {
+			if _, seen := values[kind]; !seen {
+				values[kind] = v
+			}
 		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading /metrics: %w", err)
+		}
+	}
+	if len(values) < len(statsMetrics) && lr.N <= 0 {
+		return nil, fmt.Errorf("/metrics is larger than %d MiB and ends before all of %s were found "+
+			"(high-cardinality [metrics] ENABLED_ISSUE_BY_* families?)", limit>>20,
+			strings.Join(slices.Sorted(maps.Keys(statsMetrics)), ", "))
 	}
 	if len(values) == 0 {
 		return nil, errors.New("/metrics has none of the gitea_* statistics")
 	}
 	return values, nil
+}
+
+var giteaPrefix = []byte("gitea_")
+
+// parseStatsLine parses one sample line ("name value", "name{labels} value", optionally
+// followed by a timestamp) of a statistic in statsMetrics.
+func parseStatsLine(line []byte) (kind string, value int64, ok bool) {
+	if !bytes.HasPrefix(line, giteaPrefix) {
+		return "", 0, false
+	}
+	end := bytes.IndexAny(line, "{ \t")
+	if end < 0 {
+		return "", 0, false
+	}
+	kind, ok = statsMetrics[string(line[:end])]
+	if !ok {
+		return "", 0, false
+	}
+	rest := line[end:]
+	if rest[0] == '{' {
+		i := bytes.LastIndexByte(rest, '}')
+		if i < 0 {
+			return "", 0, false
+		}
+		rest = rest[i+1:]
+	}
+	fields := bytes.Fields(rest)
+	if len(fields) == 0 {
+		return "", 0, false
+	}
+	v, err := strconv.ParseFloat(string(fields[0]), 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return "", 0, false
+	}
+	return kind, int64(v), true
 }
 
 // publishStats exports status.stats as forgejo_operator_stats (also after an operator
@@ -520,15 +744,12 @@ func (e *probeError) Unwrap() error { return e.err }
 
 // get performs a GET. A non-zero status code means Forgejo answered, even if reading the
 // body then failed; transport failures are returned as *probeError.
-func get(ctx context.Context, url, bearer string) ([]byte, int, error) {
+func get(ctx context.Context, url string) ([]byte, int, error) {
 	var connected atomic.Bool
 	trace := &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { connected.Store(true) }}
 	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, err
-	}
-	if bearer != "" {
-		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {

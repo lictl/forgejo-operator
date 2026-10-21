@@ -242,13 +242,38 @@ func unreachableHealth(f *forgejov1.Forgejo, asFailures bool) {
 	})
 }
 
+// A probe that Forgejo accepted and then left hanging (or answered with an error page) has no
+// checks but is a real failure: the health step counts it, and the instance-level restart
+// must not mistake it for an unreachable Forgejo.
+func TestHungProbeWithoutChecksRestarts(t *testing.T) {
+	f := testInstance()
+	unreachableHealth(f, true)
+	dep := testDeployment(f, 1)
+	env := newTestEnv(t, f, dep, readyPod(f, "fj-live", testHash, time.Hour))
+	ctx := context.Background()
+	if probeUnanswered(f) {
+		t.Fatal("counted failures without checks classified as unanswered")
+	}
+	pods, _ := serverPods(ctx, env.rc)
+	if err := restartUnhealthy(ctx, env.rc, dep, pods); err != nil {
+		t.Fatal(err)
+	}
+	got := &appsv1.Deployment{}
+	if err := env.rc.Client.Get(ctx, client.ObjectKeyFromObject(dep), got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Spec.Template.Annotations[forgejo.AnnotationRestartedAt]; !ok {
+		t.Fatal("no restart for a Forgejo that accepted the probes and hung")
+	}
+}
+
 // The operator cannot reach the Service (NetworkPolicy, mesh) while the kubelet's readiness
 // probe on the same endpoint passes: no restart, Degraded explains it, LKG is still recorded.
 func TestUnreachableProbeDoesNotRestart(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		asFailures bool
-	}{{"reported as Unreachable", false}, {"counted as failures", true}} {
+	}{{"reported as Unreachable", false}} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := testInstance()
 			unreachableHealth(f, tc.asFailures)

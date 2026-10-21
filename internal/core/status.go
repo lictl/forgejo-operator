@@ -6,6 +6,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,11 +39,17 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	}
 
 	ro := observeRollout(dep, found)
-	if ro.complete && ro.image == rc.TargetImage {
+	// status.image is the image verified running: every pod of the current template is
+	// available, and there is at least one. A Deployment at 0 replicas (spec.replicas 0,
+	// maintenance, a cold backup) proves nothing about its template's image.
+	if ro.complete && ro.desired > 0 && ro.image == rc.TargetImage && !rc.Maintenance {
 		st.Image = rc.TargetImage
 	}
 	// Ready: at least one pod serves the current template and no old pods remain.
 	ready := ro.upToDate && ro.desired > 0 && dep.Status.ReadyReplicas > 0
+	// replicaFailure: the ReplicaSet cannot create pods (e.g. rejected by Pod Security
+	// admission, a quota or a webhook); without it the reason only shows in its events.
+	replicaFailure := !ready && !rc.Maintenance && ro.replicaFailure != ""
 
 	switch {
 	case ready:
@@ -52,6 +59,9 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		rc.SetCondition(forgejov1.ConditionReady, metav1.ConditionFalse, "Maintenance", "Scaled down: "+rc.MaintenanceReason)
 	case !found:
 		rc.SetCondition(forgejov1.ConditionReady, metav1.ConditionFalse, "NotDeployed", notDeployedMessage(rc))
+	case replicaFailure:
+		rc.SetCondition(forgejov1.ConditionReady, metav1.ConditionFalse, reasonReplicaFailure,
+			"Pods cannot be created: "+ro.replicaFailure)
 	default:
 		rc.SetCondition(forgejov1.ConditionReady, metav1.ConditionFalse, "NotAvailable",
 			fmt.Sprintf("%d/%d replicas ready", dep.Status.ReadyReplicas, ro.desired))
@@ -60,8 +70,10 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	switch {
 	case rc.Maintenance:
 		rc.SetCondition(forgejov1.ConditionProgressing, metav1.ConditionTrue, "Maintenance", rc.MaintenanceReason)
+	case replicaFailure:
+		rc.SetCondition(forgejov1.ConditionProgressing, metav1.ConditionFalse, reasonReplicaFailure, ro.replicaFailure)
 	case rc.Upgrading:
-		rc.SetCondition(forgejov1.ConditionProgressing, metav1.ConditionTrue, "Upgrading", "Upgrading to "+rc.TargetImage)
+		rc.SetCondition(forgejov1.ConditionProgressing, metav1.ConditionTrue, "Upgrading", upgradingMessage(rc))
 	case ro.deadlineExceeded:
 		rc.SetCondition(forgejov1.ConditionProgressing, metav1.ConditionFalse, "ProgressDeadlineExceeded", ro.message)
 	case !found:
@@ -80,6 +92,10 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		st.Phase = forgejov1.PhaseUpgrading
 	case ready:
 		st.Phase = forgejov1.PhaseRunning
+	case forgejo.UpgradeHoldsWorkload(f) || replicaFailure:
+		// A failed upgrade's image that never became available, or pods that cannot be
+		// created: not a rollout that will finish by itself.
+		st.Phase = forgejov1.PhaseDegraded
 	case ro.inFlight && st.ReadyReplicas > 0:
 		// A rolling update that is still serving traffic.
 		st.Phase = forgejov1.PhaseRunning
@@ -94,9 +110,14 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	return forgejo.StepResult{}, nil
 }
 
+// reasonReplicaFailure reports the Deployment's ReplicaFailure condition.
+const reasonReplicaFailure = "ReplicaFailure"
+
 type rollout struct {
 	// complete: every pod runs the current template and is available.
 	complete bool
+	// replicaFailure is the message of a true ReplicaFailure condition (FailedCreate).
+	replicaFailure string
 	// upToDate: the current template is observed and no pods of older templates remain.
 	upToDate bool
 	// inFlight: the Deployment is still replacing pods (not merely missing ready ones).
@@ -126,7 +147,16 @@ func observeRollout(dep *appsv1.Deployment, found bool) rollout {
 		s.UpdatedReplicas == ro.desired && s.Replicas == ro.desired && s.AvailableReplicas == ro.desired
 	ro.upToDate = s.ObservedGeneration >= dep.Generation && s.Replicas == s.UpdatedReplicas
 	ro.inFlight = !ro.complete && s.ObservedGeneration < dep.Generation
+	// Pods of an older template remain: with Recreate the Progressing condition keeps its
+	// NewReplicaSetAvailable reason until they are gone and the new ReplicaSet scales up.
+	oldPods := s.ObservedGeneration >= dep.Generation && s.Replicas != s.UpdatedReplicas
 	for _, c := range s.Conditions {
+		if c.Type == appsv1.DeploymentReplicaFailure && c.Status == corev1.ConditionTrue {
+			ro.replicaFailure = c.Message
+			if ro.replicaFailure == "" {
+				ro.replicaFailure = c.Reason
+			}
+		}
 		if c.Type != appsv1.DeploymentProgressing {
 			continue
 		}
@@ -138,7 +168,28 @@ func observeRollout(dep *appsv1.Deployment, found bool) rollout {
 			ro.inFlight = ro.inFlight || !ro.complete
 		}
 	}
+	if oldPods && !ro.complete && !ro.deadlineExceeded {
+		ro.inFlight = true
+	}
 	return ro
+}
+
+// upgradingMessage names the images of the upgrade in flight. rc.TargetImage alone would
+// name the old image while the pre-upgrade backup or the rollback runs.
+func upgradingMessage(rc *forgejo.ReconcileContext) string {
+	u := rc.Instance.Status.Upgrade
+	if u == nil || u.ToImage == "" || u.FromImage == "" {
+		return "Upgrading to " + rc.TargetImage
+	}
+	switch u.Phase {
+	case forgejov1.UpgradePhasePending:
+		return fmt.Sprintf("Upgrade from %s to %s is pending", u.FromImage, u.ToImage)
+	case forgejov1.UpgradePhaseBackingUp:
+		return fmt.Sprintf("Backing up %s before upgrading to %s", u.FromImage, u.ToImage)
+	case forgejov1.UpgradePhaseRollingBack:
+		return fmt.Sprintf("Rolling back from %s to %s", u.ToImage, u.FromImage)
+	}
+	return fmt.Sprintf("Upgrading from %s to %s", u.FromImage, u.ToImage)
 }
 
 func notDeployedMessage(rc *forgejo.ReconcileContext) string {

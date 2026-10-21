@@ -31,7 +31,13 @@ const (
 	ContainerVerify      = "verify"
 	ContainerRestoreDB   = "restore-database"
 	ContainerRestoreData = "restore-data"
-	ContainerCleanup     = "cleanup"
+	// ContainerResetAdminSync ends a database-only restore (see RestoreJob).
+	ContainerResetAdminSync = "reset-admin-sync"
+	ContainerCleanup        = "cleanup"
+
+	// AdminSyncMarker is the file under the work path where Forgejo's bootstrap init
+	// container records which admin credentials it last applied (internal/core).
+	AdminSyncMarker = ".admin-password-sync"
 
 	jobBackoffLimit   = 1
 	jobActiveDeadline = 24 * time.Hour
@@ -92,7 +98,7 @@ func BackupJob(in JobInput, b *forgejov1.ForgejoBackup, includeData bool, starte
 			corev1.VolumeMount{Name: volData, MountPath: "/data", ReadOnly: true})
 		volumes = append(volumes, dataVolume(in.Instance, true))
 	}
-	archive := container(ContainerArchive, in.ForgejoImage, archiveScript(), archiveMounts, archiveEnv)
+	archive := container(ContainerArchive, in.ForgejoImage, archiveScript(forgejo.LayoutForImage(in.ForgejoImage)), archiveMounts, archiveEnv)
 
 	job := newJob(in, b.Namespace, BackupJobName(b), forgejo.ComponentBackup, in.Affinity, volumes,
 		[]corev1.Container{dump}, archive)
@@ -129,19 +135,28 @@ func RestoreJob(in JobInput, r *forgejov1.ForgejoRestore, b *forgejov1.ForgejoBa
 		steps = append(steps, container(ContainerRestoreDB, in.PostgresImage, restoreDBScript, roBackups,
 			append(append([]corev1.EnvVar{}, env...), dbEnv(in.DB)...)))
 	}
-	if restoreData {
+	layout := forgejo.LayoutForImage(in.ForgejoImage)
+	switch {
+	case restoreData:
 		volumes = append(volumes, dataVolume(in.Instance, false))
-		uid := forgejo.LayoutForImage(in.ForgejoImage).UID
-		gid := forgejo.LayoutForImage(in.ForgejoImage).GID
 		c := container(ContainerRestoreData, in.ForgejoImage, restoreDataScript,
 			append(append([]corev1.VolumeMount{}, roBackups...), corev1.VolumeMount{Name: volData, MountPath: "/data"}),
-			append(append([]corev1.EnvVar{}, env...), corev1.EnvVar{Name: "OWNER", Value: fmt.Sprintf("%d:%d", uid, gid)}))
+			append(append([]corev1.EnvVar{}, env...), corev1.EnvVar{Name: "OWNER", Value: fmt.Sprintf("%d:%d", layout.UID, layout.GID)}))
 		c.SecurityContext.RunAsUser = ptr.To[int64](0)
 		c.SecurityContext.RunAsGroup = ptr.To[int64](0)
 		c.SecurityContext.RunAsNonRoot = ptr.To(false)
 		// FSETID keeps setgid directory bits (set by fsGroup) when tar restores modes.
 		c.SecurityContext.Capabilities.Add = []corev1.Capability{"CHOWN", "FOWNER", "DAC_OVERRIDE", "FSETID"}
 		steps = append(steps, c)
+	case restoreDB:
+		// The data volume keeps the admin sync marker of the database that was replaced, so
+		// Forgejo would trust that the restored database already holds the Secret's admin
+		// password. Removing the marker makes the next pod apply the Secret again. A data
+		// restore brings back the marker that belongs to the restored database instead.
+		volumes = append(volumes, dataVolume(in.Instance, false))
+		steps = append(steps, container(ContainerResetAdminSync, in.ForgejoImage, resetAdminSyncScript,
+			[]corev1.VolumeMount{{Name: volData, MountPath: layout.DataMountPath}},
+			[]corev1.EnvVar{{Name: "ADMIN_SYNC_MARKER", Value: layout.WorkPath + "/" + AdminSyncMarker}}))
 	}
 
 	last := len(steps) - 1
@@ -271,10 +286,29 @@ const shellFail = `fail() { echo "$*" >&2; printf '%s' "$*" | head -c 3000 > /de
 const removePartials = `trap 'rm -f "$BACKUP_DIR"/*.partial' EXIT
 `
 
+// pgSSLRoot chooses what libpq verifies the server certificate against for sslMode verify-ca
+// and verify-full when nothing is configured (PGSSLROOTCERT or ~/.postgresql/root.crt, without
+// which libpq refuses to connect): the image's CA bundle, which matches Forgejo's own fallback
+// to the system roots, otherwise libpq's "system" (PostgreSQL 16+, verify-full only).
+const pgSSLRoot = `case "${PGSSLMODE:-}" in
+verify-ca|verify-full)
+  if [ -z "${PGSSLROOTCERT:-}" ] && [ ! -s "${HOME:-/tmp}/.postgresql/root.crt" ]; then
+    for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+      if [ -s "$ca" ]; then export PGSSLROOTCERT="$ca"; break; fi
+    done
+    if [ -z "${PGSSLROOTCERT:-}" ]; then
+      [ "$PGSSLMODE" = verify-full ] || fail "sslMode verify-ca needs a CA certificate, but the PostgreSQL image has no CA bundle"
+      export PGSSLROOTCERT=system
+    fi
+    echo "verifying the certificate of $PGHOST against $PGSSLROOTCERT"
+  fi ;;
+esac
+`
+
 // dumpScript runs in the PostgreSQL image. The dump is a single transactionally consistent
 // snapshot; it is written under a temporary name so a partial file is never mistaken for a dump.
 const dumpScript = `set -eu
-` + shellFail + removePartials + `umask 077
+` + shellFail + removePartials + pgSSLRoot + `umask 077
 mkdir -p "$BACKUP_DIR"
 rm -f "$BACKUP_DIR/db.dump.partial"
 pg_dump --version > "$BACKUP_DIR/.pg_dump_version"
@@ -287,13 +321,59 @@ echo "database dump written: $(stat -c %s "$BACKUP_DIR/db.dump") bytes"
 // archived (busybox and GNU wording). tar exits 1 for them; any other message is fatal.
 const benignTarErrors = `No such file or directory|file changed as we read it|File removed before we read it|socket ignored|error exit delayed from previous errors`
 
-func archiveScript() string {
+// repoExcludes keeps transient git files out of the archive (paths below a repository): push
+// quarantine directories and packs still being written. "objects/pack" is only left out of
+// the pass over "objects"; it is archived afterwards as "objects/./pack" (see archiveScript).
+var repoExcludes = []string{
+	"objects/pack",
+	"objects/tmp_objdir-*",
+	"objects/incoming-*",
+	"objects/./pack/tmp_*",
+	"objects/./pack/.tmp-*",
+}
+
+// archiveScript archives the data volume live, in an order that keeps git repositories
+// usable while Forgejo keeps serving. In each repository the refs come first (loose refs,
+// then packed-refs), then the other files, then the loose objects, and the packs last. Git
+// writes objects before it moves a ref and never changes an object afterwards, so every ref
+// in the archive points to objects that tar reads later. tar lists each directory when it
+// gets to it, so objects that arrive in the meantime are included. A pack that vanishes
+// before tar reads it (a concurrent repack) could leave refs without their objects, so it
+// fails the run, and the Job's retry takes a fresh archive.
+func archiveScript(l forgejo.ImageLayout) string {
+	// Paths in the archive are relative to the data volume ("./git/repositories").
+	repos := "." + strings.TrimPrefix(l.RepoRoot, l.DataMountPath)
 	var excludes strings.Builder
 	for _, e := range DataExcludes {
 		excludes.WriteString(" --exclude ./" + e)
 	}
+	for _, e := range repoExcludes {
+		excludes.WriteString(" --exclude '" + repos + "/*/*.git/" + e + "'")
+	}
+	reposRE := strings.ReplaceAll(repos, ".", `\.`)
 	return `set -eu
 ` + shellFail + removePartials + `umask 077
+REPOS='` + repos + `'
+# entries lists what tar archives, relative to /data. Repositories at <owner>/<name>.git are
+# archived in git-safe order; everything else as tar finds it.
+entries() {
+  find . -mindepth 1 -maxdepth 1 ! -path "${REPOS%/*}"
+  [ -d "${REPOS%/*}" ] || return 0
+  find "${REPOS%/*}" -mindepth 1 -maxdepth 1 ! -path "$REPOS"
+  [ -d "$REPOS" ] || return 0
+  find "$REPOS" -mindepth 1 -maxdepth 1 ! -type d
+  find "$REPOS" -mindepth 2 -maxdepth 2 ! \( -type d -name '*.git' \)
+  find "$REPOS" -mindepth 2 -maxdepth 2 -type d -name '*.git' | while IFS= read -r r; do
+    for e in refs packed-refs; do
+      if [ -e "$r/$e" ]; then echo "$r/$e"; fi
+    done
+    find "$r" -mindepth 1 -maxdepth 1 ! -name refs ! -name packed-refs ! -name objects
+    if [ -d "$r/objects" ]; then
+      echo "$r/objects"
+      if [ -d "$r/objects/pack" ]; then echo "$r/objects/./pack"; fi
+    fi
+  done
+}
 dump="$BACKUP_DIR/db.dump"
 [ -s "$dump" ] || fail "database dump $dump is missing or empty"
 db_size=$(stat -c %s "$dump")
@@ -303,19 +383,28 @@ data_file=""
 if [ "$INCLUDE_DATA" = true ]; then
   out="$BACKUP_DIR/data.tar.gz"
   rm -f "$out" "$out.partial"
+  (cd /data && entries) > /tmp/archive.list 2> /tmp/find.err || true
+  [ -s /tmp/archive.list ] || echo . > /tmp/archive.list
   set +e
-  { tar -C /data -cf -` + excludes.String() + ` . 2>/tmp/tar.err; echo $? > /tmp/tar.rc; } | gzip -6 > "$out.partial"
+  { tar -C /data -cf -` + excludes.String() + ` -T /tmp/archive.list 2>/tmp/tar.err; echo $? > /tmp/tar.rc; } | gzip -6 > "$out.partial"
   gzip_rc=$?
   set -e
   tar_rc=$(cat /tmp/tar.rc)
-  cat /tmp/tar.err >&2
+  cat /tmp/find.err /tmp/tar.err >&2
   [ "$gzip_rc" -eq 0 ] || fail "gzip failed with exit code $gzip_rc (backup volume full?)"
+  bad=$(grep -vE '` + benignTarErrors + `' /tmp/find.err || true)
+  [ -z "$bad" ] || fail "listing the data volume failed: $bad"
   if [ "$tar_rc" -ne 0 ]; then
     bad=$(grep -vE '` + benignTarErrors + `' /tmp/tar.err || true)
     if [ "$tar_rc" -ne 1 ] || [ -n "$bad" ] || [ ! -s /tmp/tar.err ]; then
       fail "tar failed with exit code $tar_rc: $bad"
     fi
-    warnings=$(grep -cv 'error exit delayed' /tmp/tar.err || true)
+    torn=$(sed -nE "s#^tar: (can't open ')?(` + reposRE + `/[^/]+/[^/]+\.git)/(objects/\./pack/[^/']+|packed-refs)'?: No such file or directory\$#\2#p" /tmp/tar.err |
+      sort -u | while IFS= read -r r; do if [ -d "/data/$r" ]; then echo "$r"; fi; done)
+    [ -z "$torn" ] || fail "repositories were repacked while they were archived, so their refs could point to objects missing from the archive: $(echo $torn)"
+  fi
+  warnings=$(cat /tmp/find.err /tmp/tar.err | grep -cv 'error exit delayed' || true)
+  if [ "$warnings" -gt 0 ]; then
     echo "tar: $warnings file(s) changed or vanished while archiving; continuing" >&2
   fi
   tar -tzf "$out.partial" > /dev/null || fail "verification of the data archive failed"
@@ -351,6 +440,17 @@ rm -rf "$BACKUP_DIR"
 echo "removed $BACKUP_DIR"
 `
 
+// resetAdminSyncScript removes the admin sync marker after a database-only restore. A failure
+// only warns: the database is already restored, and the Secret is applied again as soon as
+// it changes.
+const resetAdminSyncScript = `set -eu
+if rm -f "$ADMIN_SYNC_MARKER"; then
+  echo "removed $ADMIN_SYNC_MARKER; Forgejo sets the admin password from the admin Secret when it starts"
+else
+  echo "warning: could not remove $ADMIN_SYNC_MARKER; the admin password is set from the Secret only after the Secret changes" >&2
+fi
+`
+
 // verifyScript checks the backup files before anything is modified.
 const verifyScript = `set -eu
 ` + shellFail + `if [ "$RESTORE_DATABASE" = true ]; then
@@ -370,7 +470,7 @@ echo "backup files verified"
 // gone too. Otherwise only the objects contained in the dump are dropped (--clean). COMMIT is
 // only sent when pg_restore succeeded, so a failure leaves the database untouched.
 const restoreDBScript = `set -eu
-` + shellFail + `dump="$BACKUP_DIR/db.dump"
+` + shellFail + pgSSLRoot + `dump="$BACKUP_DIR/db.dump"
 pg_restore --list "$dump" > /dev/null || fail "cannot read $dump"
 mode=$(psql -X -At -v ON_ERROR_STOP=1 -c "SELECT CASE
   WHEN NOT has_database_privilege(current_database(), 'CREATE') THEN 'clean'

@@ -59,16 +59,35 @@ must be allowed to open that connection:
 
 If the operator cannot reach Forgejo, the Healthy condition is `Unknown` with reason
 `Unreachable`, and a `HealthCheckUnreachable` event names the error. Unreachable probes never
-count as health failures, so they never trigger self-healing restarts. Health, version and
-statistics are not updated until the operator can reach Forgejo again.
+count as health failures, so they never trigger self-healing restarts. They are counted in
+`forgejo_operator_health_check_unreachable_total`, and the `ForgejoHealthProbeUnreachable` alert
+fires when they go on for 15 minutes. Health, version and statistics are not updated until the
+operator can reach Forgejo again.
 
 ### Scraping the operator
+
+**The per-instance alerts need this.** Every alert in the generated PrometheusRule except
+`ForgejoDown` is computed from the operator's `forgejo_operator_*` metrics, and the default
+install (`make deploy`, `make build-installer`) does not scrape them. Until Prometheus scrapes the
+operator, those alerts can never fire. Each instance's `ForgejoOperatorMetricsMissing` alert
+reports this after 15 minutes (see [Alerts](#alerts)).
 
 Enable `../prometheus` in `config/default/kustomization.yaml` (the `[PROMETHEUS]` sections).
 This deploys two objects:
 
 - `config/prometheus/monitor.yaml`, a ServiceMonitor for the operator's HTTPS metrics endpoint.
 - `config/prometheus/rules.yaml`, the operator-level alerts.
+
+The metrics endpoint authenticates and authorizes every scrape (`TokenReview` and
+`SubjectAccessReview`). Prometheus's ServiceAccount needs `get` on the non-resource URL
+`/metrics`:
+
+- kube-prometheus-stack already grants it in its Prometheus ClusterRole.
+- For other installs, uncomment `metrics_reader_binding.yaml` in
+  `config/prometheus/kustomization.yaml` and set the ServiceAccount there. It binds the operator's
+  `metrics-reader` ClusterRole.
+
+If the scrape is denied, the target shows `server returned HTTP status 403 Forbidden`.
 
 The ServiceMonitor sets **`honorLabels: true`**, and this is required. Operator metrics
 identify an instance by their own `namespace` and `name` labels. Without `honorLabels`,
@@ -179,6 +198,7 @@ all of an instance's series when the instance is deleted.
 | `forgejo_operator_instance_ready` | gauge | | 1 when the Ready condition is True |
 | `forgejo_operator_instance_info` | gauge | `image`, `version`, `phase` | Always 1 |
 | `forgejo_operator_health_check_failures_total` | counter | | Failed `/api/healthz` probes made by the operator. Exported at 0 from the first reconcile |
+| `forgejo_operator_health_check_unreachable_total` | counter | | Probes that never reached Forgejo (DNS, dial or connection errors, a proxy answering). Not health failures. Exported at 0 from the first reconcile |
 | `forgejo_operator_stats` | gauge | `kind` (users, organizations, repositories, issues) | Same values as `status.stats` |
 | `forgejo_operator_backup_last_success_timestamp_seconds` | gauge | | Unix time of the last successful backup |
 | `forgejo_operator_backups_total` | counter | `reason`, `result` | Finished backups |
@@ -205,14 +225,21 @@ The endpoint also serves the standard controller-runtime metrics:
 All alerts carry the labels `severity`, `namespace` and `forgejo: <name>`. Their descriptions
 include the `kubectl` commands to start investigating with.
 
+Only `ForgejoDown` uses Forgejo's own metrics. All the other alerts read operator metrics, so
+they work only when the operator is scraped with `honorLabels: true` (see
+[Scraping the operator](#scraping-the-operator)). `ForgejoOperatorMetricsMissing` reports when
+those metrics are missing.
+
 | Alert | Severity | Expression (simplified) | For |
 |-------|----------|-------------------------|-----|
-| `ForgejoDown` | critical | `max(up{job="<name>-http"}) == 0` or the target is absent; suppressed while the phase is Restoring or Paused. Only rendered when the ServiceMonitor is enabled and replicas > 0 | 5m |
-| `ForgejoNotReady` | warning | `forgejo_operator_instance_ready == 0`; suppressed while Restoring or Paused | 10m |
+| `ForgejoDown` | critical | `max(up{job="<name>-http"}) == 0` or the target is absent; suppressed while the phase is Restoring or Paused. Only rendered when the ServiceMonitor is enabled and replicas > 0 or HPA is enabled | 5m |
+| `ForgejoOperatorMetricsMissing` | warning | `absent(forgejo_operator_instance_ready)` for the instance: the operator is not running, or not scraped (or scraped without `honorLabels`). All other alerts except `ForgejoDown` are inactive meanwhile | 15m |
+| `ForgejoNotReady` | warning | `forgejo_operator_instance_ready == 0`; suppressed while Restoring or Paused. Only rendered when replicas > 0 or HPA is enabled, so an instance intentionally scaled to `spec.replicas: 0` does not alert | 10m |
 | `ForgejoHealthCheckFailing` | warning | `increase(forgejo_operator_health_check_failures_total[10m]) > 3` | – |
+| `ForgejoHealthProbeUnreachable` | warning | `increase(forgejo_operator_health_check_unreachable_total[W]) > 0`, where W is 5m or twice `healthCheckInterval`, whichever is longer: the operator's probes do not reach Forgejo. A NetworkPolicy or service mesh must let the operator connect to `<name>-http` on the HTTP port (3000 by default) | 15m |
 | `ForgejoBackupFailed` | warning | A `result="failed"` backup in the last hour | – |
 | `ForgejoBackupTooOld` | warning | `time() - backup_last_success_timestamp > maxAge`. Only rendered when `spec.backup.enabled` | 10m |
-| `ForgejoBackupMissing` | warning | No successful backup recorded at all. Only rendered when `spec.backup.enabled` | maxAge |
+| `ForgejoBackupMissing` | warning | No successful backup recorded at all, while the instance's operator metrics are present (`absent(last_success) and on() count(instance_ready) > 0`), so a scrape gap is not reported as a missing backup. Only rendered when `spec.backup.enabled` | maxAge |
 | `ForgejoVolumeAlmostFull` | warning | `forgejo_operator_volume_used_ratio > 0.9` | 10m |
 | `ForgejoUpgradeFailed` | warning | An upgrade with `result!="succeeded"` (failed or rolled back) in the last hour | – |
 | `ForgejoAutoPilotActive` | warning | At least 5 autopilot actions in the last hour | – |
@@ -228,7 +255,13 @@ and the slack is at least 1h. For example:
 
 A counter series appears with value 1 on its first increment, and `increase()` cannot see that
 first step. The backup and upgrade alerts therefore also fire when a failure series appeared
-within the window.
+within the window. The two health-check counters do not need this, because they are exported at
+0 from the first reconcile.
+
+`forgejo_operator_backup_last_success_timestamp_seconds` is set when a backup completes in the
+running operator process, so it is absent after an operator restart until the next backup
+succeeds. During that time `ForgejoBackupTooOld` cannot fire. `ForgejoBackupMissing` fires only
+if no backup succeeds within maxAge.
 
 ### Operator (`config/prometheus/rules.yaml`)
 
@@ -262,7 +295,7 @@ Each probe has one of three outcomes:
 |---------|------|--------|
 | Passed | HTTP 200 with `status` pass or warn | Healthy `True`, streak reset |
 | Failed | Forgejo answered with anything else (424 `fail`, another status, a body that is not a health document), or accepted the connection and sent no response headers within 5s (a hung process) | Healthy `False` (`HealthCheckFailed`), `consecutiveFailures` and `forgejo_operator_health_check_failures_total` increase |
-| Unreachable | No answer from Forgejo: DNS error, dial timeout, connection refused, or the connection reset or closed before a response (a NetworkPolicy or mesh mTLS shutting the operator out). An HTTP 401, 403, 502, 503 or 504 that is not a health document also counts here, because Forgejo always answers `/api/healthz` with one, so it came from a proxy in between. | Healthy `Unknown` (`Unreachable`), streak reset, nothing counted, `HealthCheckUnreachable` event |
+| Unreachable | No answer from Forgejo: DNS error, dial timeout, connection refused, or the connection reset or closed before a response (a NetworkPolicy or mesh mTLS shutting the operator out). An HTTP 401, 403, 502, 503 or 504 that is not a health document also counts here, because Forgejo always answers `/api/healthz` with one, so it came from a proxy in between. | Healthy `Unknown` (`Unreachable`), streak reset, not counted as a failure, `forgejo_operator_health_check_unreachable_total` increases, `HealthCheckUnreachable` event |
 
 Only Failed probes feed self-healing. A hung Forgejo whose accept backlog is full may look like a
 dial timeout and be reported as Unreachable. Its pod also fails its readiness probe, and
@@ -291,9 +324,30 @@ The version comes from `GET /api/v1/version` after each successful probe, for ex
 ### `status.stats`
 
 `users`, `organizations`, `repositories`, `issues` and `lastUpdated` are sampled from
-Forgejo's `/metrics` with the bearer token. Sampling happens at most every
-`spec.monitoring.statsInterval` (default 5m), only after a successful probe, and only while
-monitoring is enabled. The values are also exported as `forgejo_operator_stats`.
+Forgejo's `/metrics` with the bearer token. The values are also exported as
+`forgejo_operator_stats`.
+
+When sampling happens:
+
+- **Preconditions:** only after a successful probe, and only while monitoring is enabled.
+- **Rate:** at most once per `spec.monitoring.statsInterval` (default 5m). The interval is counted
+  from the later of `lastUpdated` and the last attempt, so failed attempts wait as well. Only the
+  first failure in a row is retried sooner, after half the interval (at least 1m).
+- **In the background:** Forgejo runs a `COUNT(*)` query per statistic before it answers, which
+  can take seconds on a large instance. The operator fetches `/metrics` in the background, so a
+  slow answer never holds up the reconciles of other instances. A later reconcile (within one
+  `healthCheckInterval`) copies the result into `status.stats`.
+- **Timeouts:** the connection must be made within 2s, the response headers must arrive within
+  20s, and the whole request must finish within 27s.
+- **Size:** the body is read as a stream and reading stops once all four statistics are found. If
+  they are not found within the first 64 MiB, the attempt fails and no partial values are
+  stored. The high-cardinality `ENABLED_ISSUE_BY_LABEL` and `ENABLED_ISSUE_BY_REPOSITORY`
+  families come before `gitea_users` in the output.
+
+A failed attempt is logged. If the retry fails too, a `StatsSamplingFailed` Warning event names
+the error (for example `GET /metrics: HTTP 401`, or `timeout awaiting response headers`). The
+event repeats at most once an hour while sampling keeps failing. `StatsSamplingRecovered` follows
+once sampling works again. `status.stats` keeps the last good values in the meantime.
 
 ## Conditions
 
@@ -318,6 +372,8 @@ The observability steps emit these events on the `Forgejo` object:
 | `HealthCheckUnreachable` | Warning | The probe outcome changes to unreachable. The message names the error and the network requirement |
 | `HealthCheckRecovered` | Normal | The probe outcome changes from failing or unreachable to passing |
 | `MonitoringFailed` | Warning | A ServiceMonitor, PrometheusRule or dashboard ConfigMap could not be applied (once per distinct error, then at most hourly) |
+| `StatsSamplingFailed` | Warning | Sampling `status.stats` from `/metrics` failed twice or more in a row (then at most hourly) |
+| `StatsSamplingRecovered` | Normal | Sampling works again after `StatsSamplingFailed` |
 | `VersionDetected` | Normal | `/api/v1/version` reports a different version than `status.version` |
 
 Other packages emit their own events:

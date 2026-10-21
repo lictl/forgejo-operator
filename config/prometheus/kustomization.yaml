@@ -1,6 +1,10 @@
 resources:
 - monitor.yaml
 - rules.yaml
+# [PROMETHEUS-RBAC] Grants Prometheus's ServiceAccount the operator's metrics-reader ClusterRole.
+# Not needed with kube-prometheus-stack; for other installs, set the ServiceAccount in the file
+# and uncomment it. Every per-instance alert except ForgejoDown needs the operator scraped.
+#- metrics_reader_binding.yaml
 
 # [PROMETHEUS-WITH-CERTS] The following patch configures the ServiceMonitor in ../prometheus
 # to securely reference certificates created and managed by cert-manager.

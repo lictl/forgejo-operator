@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
+	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -366,7 +367,7 @@ func TestBackupPVCGrowsButNeverShrinks(t *testing.T) {
 }
 
 func TestBackupScriptsRemovePartialFiles(t *testing.T) {
-	for name, script := range map[string]string{"dump": dumpScript, "archive": archiveScript()} {
+	for name, script := range map[string]string{"dump": dumpScript, "archive": archiveScript(forgejo.LayoutForImage(forgejov1.DefaultImage))} {
 		if !strings.Contains(script, removePartials) {
 			t.Errorf("%s script does not remove its partial files on exit", name)
 		}

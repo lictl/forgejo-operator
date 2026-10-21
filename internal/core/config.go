@@ -262,7 +262,7 @@ func ingressEnabled(f *forgejov1.Forgejo) bool {
 }
 
 func httpServiceFQDN(f *forgejov1.Forgejo) string {
-	return forgejo.HTTPServiceName(f) + "." + f.Namespace + ".svc.cluster.local"
+	return serviceHost(forgejo.HTTPServiceName(f), f.Namespace)
 }
 
 // sshDomain is SSH_DOMAIN: the public domain when one is configured, else the SSH
@@ -271,7 +271,7 @@ func sshDomain(f *forgejov1.Forgejo) string {
 	if d := Domain(f); d != httpServiceFQDN(f) {
 		return d
 	}
-	return forgejo.SSHServiceName(f) + "." + f.Namespace + ".svc.cluster.local"
+	return serviceHost(forgejo.SSHServiceName(f), f.Namespace)
 }
 
 // Domain is DOMAIN: spec.server.domain, else the ingress host, else the

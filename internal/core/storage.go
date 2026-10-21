@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -38,7 +39,7 @@ func ReconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		}
 		// Only grow: autopilot may already have expanded the claim beyond the spec.
 		cur := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-		if want.Cmp(cur) > 0 && expansionAllowed(ctx, rc, pvc) {
+		if want.Cmp(cur) > 0 && expansionAllowed(ctx, rc, pvc, want) {
 			pvc.Spec.Resources.Requests[corev1.ResourceStorage] = want
 		}
 		return nil
@@ -50,8 +51,9 @@ func ReconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 }
 
 // expansionAllowed reports whether the claim's StorageClass supports resizing, and
-// records a warning event when it does not.
-func expansionAllowed(ctx context.Context, rc *forgejo.ReconcileContext, pvc *corev1.PersistentVolumeClaim) bool {
+// records a warning event when it does not: once per requested size, repeated hourly while
+// the spec asks for more than the claim can get.
+func expansionAllowed(ctx context.Context, rc *forgejo.ReconcileContext, pvc *corev1.PersistentVolumeClaim, want resource.Quantity) bool {
 	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
 		return false
 	}
@@ -60,8 +62,8 @@ func expansionAllowed(ctx context.Context, rc *forgejo.ReconcileContext, pvc *co
 		return false
 	}
 	if sc.AllowVolumeExpansion == nil || !*sc.AllowVolumeExpansion {
-		rc.Event(corev1.EventTypeWarning, "StorageResizeUnsupported", "ResizeVolume",
-			"cannot grow PVC %s: StorageClass %s does not allow volume expansion", pvc.Name, sc.Name)
+		warnEvery(rc, "resize-unsupported/"+pvc.Name+"/"+want.String(), warnInterval, "StorageResizeUnsupported", "ResizeVolume",
+			"cannot grow PVC %s to %s: StorageClass %s does not allow volume expansion", pvc.Name, want.String(), sc.Name)
 		return false
 	}
 	return true

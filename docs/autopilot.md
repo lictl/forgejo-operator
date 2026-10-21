@@ -12,8 +12,16 @@ Action types: `ConfigRolledBack`, `PodRestarted`, `ResourcesScaled`, `StorageExp
 (`UpgradeRolledBack` belongs to the upgrade feature).
 
 Cooldowns are derived from `recentActions`, so they survive operator restarts. Sample
-windows, du caches and event rate limits are kept in memory and simply start over after a
-restart.
+windows, volume measurements and event rate limits are kept in memory and simply start over
+after a restart.
+
+**Migration holds.** While a migration owns the workload, the autopilot leaves the pod
+template and replica count alone: during an upgrade, while a failed upgrade's new image is
+still deployed and unverified (its `bootstrap` init container may still be running
+`forgejo migrate`, which takes no lock), and while a restored database waits for its first
+pod to migrate it. Then there is no HPA or PDB, no config rollback or last-known-good
+bookkeeping, no health-based restart and no vertical scaling. Restores (scaled to zero) are
+treated the same way.
 
 | Feature | Spec | Default |
 |---|---|---|
@@ -52,8 +60,18 @@ because bleve indexes cannot be shared between pods.
 - **Ordering.** Forgejo is only given the redis configuration once Valkey is ready.
   Reconciliation pauses, with a `WaitingForValkey` event and requeues every 5s, while
   Valkey is not ready.
-- **Disabling HA.** Valkey is deleted only after every Forgejo pod runs the non-redis
-  configuration.
+- **Disabling HA.** Valkey is deleted only when nothing can bring a redis app.ini back:
+  - the desired (non-redis) app.ini is deployed, not a rolled-back last known good one, and
+    no rollback is pending;
+  - the Deployment is fully rolled out and every Forgejo pod runs that app.ini;
+  - with config rollback on, the last known good app.ini no longer uses Valkey. The LKG
+    Secret is annotated `forgejo.lucas.icu/uses-valkey: "true"` when it was rendered
+    for HA (older ones are recognised by their content). Valkey therefore stays until the
+    non-HA app.ini has run healthy for a minute and replaced the LKG.
+
+  Until then a `ValkeyRetained` event (at most hourly) says why. If Valkey is gone anyway
+  (for example config rollback was off at the time), a rollback to an LKG that needs it is
+  declined with `ConfigRollbackUnavailable`.
 - **Shared storage warning.** Several replicas sharing a `ReadWriteOnce` data volume work on
   a single node, but not across nodes. When the replica count (or HPA maximum) is greater
   than 1, the data PVC is not `ReadWriteMany`, and the cluster has more than one schedulable
@@ -61,7 +79,7 @@ because bleve indexes cannot be shared between pods.
   Warning event at most hourly.
 
 Observe: `kubectl get deploy,svc <name>-valkey`, `Degraded` condition, events
-`ValkeyPasswordGenerated`, `WaitingForValkey`, `ValkeyDeleted`.
+`ValkeyPasswordGenerated`, `WaitingForValkey`, `ValkeyRetained`, `ValkeyDeleted`.
 
 ## Horizontal scaling and disruption budget
 
@@ -72,10 +90,19 @@ Observe: `kubectl get deploy,svc <name>-valkey`, `Degraded` condition, events
   - Scale-down is stabilized over 300s.
   - The workload step then keeps the replica count the HPA chose.
   - Requires metrics-server (`metrics.k8s.io`).
+  - The HPA computes utilization against the Forgejo container's requests. Without a CPU
+    request (or a memory request with a memory target) it cannot scale and only enforces
+    min/max. The operator then sets `Degraded=True` with reason
+    `HPAMissingResourceRequests` (unless `Degraded` is held by another reason) and emits an
+    hourly Warning. A limit counts, since the API server copies it into the request, and so
+    does a request a namespace LimitRange gives the pods.
+- **First install.** The HPA is created only after the first rollout has completed
+  (`status.image` is set). Until then the Deployment runs one pod, because the first pod's
+  `bootstrap` init container migrates the empty database and must not run twice at once.
 - **Horizontal scaling without HA.** The HPA is not created. `Degraded=True` with reason
   `HorizontalScalingRequiresHA` and an hourly Warning event explain why.
-- **Upgrades and restores.** The HPA is removed while an upgrade or restore is running,
-  because those run with one or zero replicas, and re-created afterwards.
+- **Upgrades and restores.** The HPA is removed during [migration holds](#auto-pilot-capability-level-v)
+  and restores, because those run with one or zero replicas, and re-created afterwards.
 - **PDB.** PDB `<name>` (`minAvailable: 1`, `unhealthyPodEvictionPolicy: AlwaysAllow`)
   exists while the minimum replica count is greater than 1. A PDB on a single replica would
   block node drains.
@@ -120,11 +147,15 @@ The operator renders `app.ini` into `<name>-config`. Its hash is
      [Health-based restarts](#health-based-restarts)), pod readiness stands in for
      `status.health.healthy`. The kubelet's readiness probe calls the same `/api/healthz`.
 2. **Detection.** A pod running a config that differs from the LKG counts as failing when
-   any of its containers, init containers included (the `bootstrap` init container runs
-   `forgejo migrate` with the same app.ini), meets one of these:
-   - has 3 or more restarts,
-   - is in `CrashLoopBackOff` after at least 2 restarts,
-   - has its `forgejo` container running for more than 5 minutes without becoming Ready.
+   it is not Ready and one of its containers, init containers included (the `bootstrap`
+   init container runs `forgejo migrate` with the same app.ini), is failing now:
+   - it has 3 or more restarts, or is in `CrashLoopBackOff` after at least 2, and its last
+     exit was after the database last became ready (`DatabaseReady` turned True). Restart
+     counts never reset, so a completed init container or a Ready container is never
+     counted, and restarts during a database outage (for example CNPG restarting the
+     primary after a `max_connections` change) are put down to the outage;
+   - its `forgejo` container has been running for more than 5 minutes, counted from the
+     later of its start and the database becoming ready, without becoming Ready.
 
    OOM kills are excluded; they are vertical scaling's job. When a failing pod is found,
    the operator sets `status.autoPilot.rejectedConfigHash` to the desired hash and records
@@ -140,8 +171,10 @@ The operator renders `app.ini` into `<name>-config`. Its hash is
 
 Safeguards:
 - Nothing happens without an LKG, for example on a first install that never became healthy.
-- Nothing happens while an upgrade or restore runs: image failures belong to the upgrade's
-  auto-rollback.
+- Nothing happens during upgrades, restores and other migration holds: image failures
+  belong to the upgrade's auto-rollback. An active rollback stays in place through them.
+- With `highAvailability` off, an LKG that uses Valkey is only rolled back to while Valkey
+  still exists; otherwise the rejection is dropped (`ConfigRollbackUnavailable`).
 - Nothing happens while the database is not ready.
 - A config is rejected at most once per 5 minutes.
 - Set `selfHealing.configRollback: false` (or `selfHealing.enabled: false`) to always deploy
@@ -166,11 +199,12 @@ two ways:
   instance) that its replacement needs. Records `PodRestarted`.
 - **Instance level.** `status.health.consecutiveFailures ≥ failureThreshold` while at least
   one pod is Ready and every server container is running and not crash-looping, and the
-  latest failing probe was answered by Forgejo itself: `/api/healthz` returned its list of
-  checks with at least one failing (`status.health.checks`). Health is probed through the
-  Service by the observability feature and only counts while a pod is Ready. The response
-  is a rolling restart: annotation `forgejo.lucas.icu/restarted-at` on the pod
-  template. Records `PodRestarted`.
+  latest probe was not `Unreachable`. Health is probed through the Service by the
+  observability feature and only counts while a pod is Ready. It counts probes Forgejo
+  answered with failing checks or an error page, and probes Forgejo accepted and then left
+  hanging; probes that never reached Forgejo are not counted. The response is a rolling
+  restart: annotation `forgejo.lucas.icu/restarted-at` on the pod template. Records
+  `PodRestarted`.
   - In practice this covers a healthz that flaps: it fails at every operator probe but
     never three kubelet probes in a row. When Forgejo fails healthz steadily, the kubelet's
     readiness probe on the same endpoint marks the pods NotReady within about 30s. That
@@ -179,8 +213,8 @@ two ways:
   - a timeout, a refused or reset connection, or a DNS failure;
   - a reply that is not Forgejo's healthz document, for example from a mesh sidecar.
 
-  The health step reports these as `Healthy=Unknown` with reason `Unreachable`, or, for a
-  connection that was accepted and then hung, as a failure without `checks`. When they
+  The health step reports these as `Healthy=Unknown` with reason `Unreachable` and does not
+  count them as failures; that reason is the only signal the autopilot uses. When they
   continue for 1 minute while pods keep passing their readiness probe, the operator cannot
   reach Forgejo, but Forgejo is serving. Restarting would only cause outages, so the
   operator instead:
@@ -203,7 +237,7 @@ relies on the kubelet's readiness probe and an LKG recorded from pod readiness.
 Safeguards:
 - Only while the database is ready. With HA, Valkey must also be ready, otherwise the
   pipeline is paused.
-- Never during upgrades or restores.
+- Never during upgrades, restores or other migration holds.
 - At most one restart per 10 minutes.
 
 ## Vertical scaling
@@ -211,19 +245,35 @@ Safeguards:
 Enabled with `spec.autoscaling.vertical.enabled`. Resources the operator chooses are
 stored in `status.autoPilot.appliedResources` and replace `spec.resources` on the Forgejo
 containers (main and init) from the next reconcile, which rolls the pods. Disabling vertical
-scaling clears them and returns to `spec.resources`. To reset to the spec, toggle it off
-and on.
+scaling clears them and returns to `spec.resources`.
 
+- **Spec changes win.** The Deployment's annotation `forgejo.lucas.icu/vertical-base`
+  records which `spec.resources` the applied resources were derived from. When
+  `spec.resources` changes, the applied resources are dropped (event `VerticalRebased`):
+  the new spec takes effect and later scaling starts from it.
+- **Bounds are re-applied.** Applied resources are kept within `minAllowed`/`maxAllowed` on
+  every reconcile, also after the bounds change: requests within both, limits at most
+  `maxAllowed`, requests at most limits (event `VerticalClamped`).
 - **OOM.** A container (init containers included) that ran with the current memory limit
   and has `OOMKilled` as its last termination reason triggers the following:
-  - Memory limit and request are raised by 50%, rounded up to MiB and capped at
-    `maxAllowed.memory`.
+  - Memory limit and request are raised by 50%, rounded up to MiB. They are never lowered:
+    a value already at or above its cap stays.
+  - Caps: `maxAllowed.memory`, or without it max(4 × the spec's memory, 1Gi). Limits also
+    stop at the largest schedulable node's allocatable memory and requests at 90% of it, so
+    the pod still fits a node. A limit without a request counts as a request, since the API
+    server copies it. Setting `maxAllowed` is recommended.
   - Without a limit, only the request is raised.
   - Records `ResourcesScaled`. Pods still running an older, smaller limit are ignored, and
     so is an OOM older than the last `ResourcesScaled` action.
-  - At the cap, a Warning `OOMAtMaxAllowed` is emitted at most hourly.
+  - At a cap, a Warning `OOMAtMaxAllowed` (spec bound or default ceiling) or
+    `OOMAtNodeCapacity` is emitted at most hourly.
   - In testing, a 48Mi limit grew to 72Mi and then 108Mi within a minute, after which the
     pod ran healthy.
+- **Unschedulable pods.** When a server pod requesting the current memory has been
+  unschedulable with `Insufficient memory` for 2 minutes, the last change is reverted (to
+  the previous applied resources, or `spec.resources` after an operator restart), recorded
+  as `ResourcesScaled`, and a `ResourcesUnschedulable` Warning is emitted. Until the operator
+  restarts, OOM growth no longer raises the memory request above the reverted value.
 - **Usage-based right-sizing.** Needs metrics-server.
   - Every reconcile samples `metrics.k8s.io` PodMetrics of Ready server pods (the `forgejo`
     container), keeping up to 120 samples (about 2h) per instance.
@@ -235,25 +285,40 @@ and on.
     reconcile that saw an OOM.
   - Limits are only ever raised, to fit a larger request. Lowering limits is left to the
     user, so right-sizing can never cause an OOM loop.
-- Neither runs during upgrades or restores.
+  - **With the HPA.** The HPA scales on CPU utilization of the requests (and memory with
+    `targetMemoryUtilizationPercentage`). Right-sizing leaves those requests alone, since
+    raising a request lowers utilization and makes the HPA scale in, and the other way round.
+    The recommendation is still published, a Normal `VerticalLimitedByHPA` event says so at
+    most hourly, and OOM-driven memory growth still applies.
+- None of this runs during upgrades, restores or other migration holds; spec rebasing and
+  clamping wait for them to end, because they roll the pods.
 
 ## Storage
 
-Enabled by default (`spec.autoPilot.storageAutoExpand`). Turning it off removes
-`status.storage` and the `StorageHealthy` condition.
+Volumes are always measured and reported. `spec.autoPilot.storageAutoExpand.enabled`
+(default on) only decides whether they are also grown: with it off, `status.storage`, the
+`StorageHealthy` condition and the `forgejo_operator_volume_used_ratio` metric (and so the
+`ForgejoVolumeAlmostFull` alert) stay.
 
 - **Volumes.** The data PVC (`<name>-data` or `storage.existingClaim`) and the CNPG PVCs
   (label `cnpg.io/cluster=<name>-db`, data and WAL).
-- **Measurement.** At most once a minute.
-  - Kubelet volume stats (`/api/v1/nodes/<node>/proxy/stats/summary`) are used when they
-    describe a dedicated volume, meaning the reported capacity is at most 125% of the
-    request.
-  - Some provisioners report something else. `local-path` reports the whole node
-    filesystem (verified on k3s and a local cluster: 1Gi PVCs reported as about 420GB), and hostPath
-    volumes report nothing. In those cases the operator runs `du -skx <mountPath>` through
-    `pods/exec` in a running container that mounts the claim (the `forgejo` container, or
-    CNPG's `postgres`), at most every 5 minutes per claim, and compares the result with the
-    PVC's requested size.
+- **Measurement.** Through `pods/exec` in a running container that mounts the claim (the
+  `forgejo` container, or CNPG's `postgres`), at most once a minute per claim.
+  - `df -Pk <mountPath>` gives the file system's size and usage. When the size is at most
+    125% of the claim's request, the file system is the volume itself and df is the
+    measurement.
+  - Otherwise the claim is a directory on a larger file system. `local-path` volumes, for
+    example, live on the node's file system (verified on k3s and a local cluster: 1Gi PVCs on
+    about 420GB), as do hostPath volumes and many NFS exports. The operator then runs
+    `du -skx <mountPath>` at most every 5 minutes per claim, with `nice -n 19` and killed
+    inside the container after 110s, and compares the result with the PVC's requested size.
+  - Measurements run in the background, at most four at a time, so a slow volume never
+    holds up reconciliation; a reconcile waits up to 3s for them, and slower results are
+    reported by a later one (requeued after 30s). Failed attempts back off exponentially
+    (df from 1 minute, du from 5 minutes, both up to 1 hour). Until a new measurement
+    succeeds, the last one is reported.
+  - Without `pods/exec` permission in the namespace, nothing can be measured:
+    `StorageHealthy=Unknown`/`MeasurementUnavailable` says so and the operator logs it once.
 - **Report.** `status.storage.volumes[]` (`usedBytes`, `capacityBytes`, `usedPercent`,
   `requestedSize`, `expansionSupported`, `lastExpansionTime`), the metric
   `forgejo_operator_volume_used_ratio{namespace,name,claim}`, and the `StorageHealthy`
@@ -263,10 +328,13 @@ Enabled by default (`spec.autoPilot.storageAutoExpand`). Turning it off removes
   |---|---|
   | True `WithinThreshold` | every volume is below `thresholdPercent` |
   | True `Expanding` | a volume above the threshold is being expanded |
+  | False `ExpansionStalled` | a resize has been pending for 30 minutes; the message lists the PVC's resize conditions (`ControllerResizeError`, `NodeResizeError`, `FileSystemResizePending`, …) and `allocatedResourceStatuses` (e.g. `ControllerResizeInfeasible`). Warning event at most hourly per claim |
   | False `ExpansionUnsupported` | above the threshold, StorageClass without `allowVolumeExpansion`; Warning event at most hourly per claim |
   | False `MaxSizeReached` | above the threshold and already at `maxSize` |
+  | False `AutoExpandDisabled` | above the threshold with `storageAutoExpand.enabled: false`; Warning event at most hourly per claim |
   | Unknown `MeasurementUnavailable` | nothing could be measured yet |
-- **Expansion.** At or above `thresholdPercent`, when the StorageClass allows it:
+- **Expansion.** At or above `thresholdPercent`, when auto-expansion is on and the
+  StorageClass allows it:
   - The new size is the current request plus `incrementPercent`, rounded up to MiB and
     capped at `maxSize`.
   - The data PVC is patched directly. CNPG volumes are grown through the Cluster's
@@ -276,6 +344,11 @@ Enabled by default (`spec.autoPilot.storageAutoExpand`). Turning it off removes
   - Records `StorageExpanded`.
   - No new expansion of a claim while a resize is pending, within 5 minutes of the last
     one, or more than once per volume role per check.
+- **Offline file system resize.** Some drivers grow the file system only while mounting
+  the volume (`FileSystemResizePending`). When the data PVC has waited for that for 10
+  minutes, the operator restarts Forgejo once per pending resize through the
+  `restarted-at` annotation (not during migration holds or restores, at most once per 10
+  minutes) and records `PodRestarted`. CNPG volumes are only reported.
 - **Upgrades and restores.** Measurement and expansion continue during them, since growing
   a volume is safe online. While a restore has scaled Forgejo to zero, the data PVC keeps
   its last measurement.
@@ -283,9 +356,10 @@ Enabled by default (`spec.autoPilot.storageAutoExpand`). Turning it off removes
 ## RBAC
 
 On top of the core permissions, the autopilot needs:
-- `nodes` get/list, to count schedulable nodes.
-- `nodes/proxy` get, for kubelet stats.
-- `pods/exec` create/get, for the du fallback.
+- `nodes` get/list, to count schedulable nodes and find the largest allocatable memory.
+- `pods/exec` create/get, to measure volumes with df and du. This is the only use; without
+  it storage reporting degrades to `MeasurementUnavailable`. The operator does not use
+  `nodes/proxy` (kubelet stats), which would open every node's kubelet API.
 - `metrics.k8s.io` pods get/list.
 - `storageclasses` get/list/watch.
 - `persistentvolumeclaims` patch.
