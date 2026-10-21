@@ -9,3 +9,8 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Embedded assets (dashboards, scripts)
+!internal/**/*.json
+!internal/**/*.sh
+!internal/**/*.tmpl
