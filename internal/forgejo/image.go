@@ -5,64 +5,63 @@ import (
 	"strings"
 )
 
-// ImageLayout describes where the official Forgejo image flavors keep their files.
-// The root image runs s6 (sshd + forgejo as uid 1000); the rootless image runs forgejo
-// directly as uid 1000 with the built-in SSH server.
+// ImageLayout describes how the operator runs the official Forgejo images. Both the root
+// image (codeberg.org/forgejo/forgejo:<v>) and the "-rootless" flavor ship the same binary
+// at /app/gitea/gitea, so the operator bypasses the image entrypoints (s6 / docker-setup.sh)
+// and runs "forgejo web --config <ConfigPath>" directly as uid 1000 with Forgejo's built-in
+// SSH server. That gives one non-root layout for both flavors.
 type ImageLayout struct {
 	Rootless bool
 	// DataMountPath is where the data PVC is mounted.
 	DataMountPath string
-	// ConfigPath is the app.ini location Forgejo reads.
+	// ConfigDir is where the "<name>-config" Secret is mounted read-only.
+	ConfigDir string
+	// ConfigPath is the app.ini location passed with --config.
 	ConfigPath string
-	// WorkPath is APP_DATA_PATH / GITEA_WORK_DIR.
+	// WorkPath is WORK_PATH / APP_DATA_PATH / GITEA_WORK_DIR.
 	WorkPath string
-	// CustomPath is GITEA_CUSTOM.
+	// CustomPath is GITEA_CUSTOM (templates, public assets).
 	CustomPath string
+	// HomePath is $HOME of the git user (gitconfig, .ssh).
+	HomePath string
 	// RepoRoot is [repository] ROOT.
 	RepoRoot string
 	// LFSPath is [lfs] PATH.
 	LFSPath string
-	// SSHContainerPort is the port sshd / the built-in SSH server listens on.
+	// TmpPath is an emptyDir for temporary files.
+	TmpPath string
+	// SSHContainerPort is the built-in SSH server's SSH_LISTEN_PORT.
 	SSHContainerPort int32
 	// HTTPContainerPort is HTTP_PORT.
 	HTTPContainerPort int32
-	// UID/GID Forgejo runs as.
+	// UID/GID Forgejo runs as (user "git" in both images).
 	UID int64
 	GID int64
-	// CLI is the Forgejo binary to call for admin commands.
+	// RunUser is RUN_USER; must match the uid's passwd entry.
+	RunUser string
+	// CLI is the Forgejo binary.
 	CLI string
 }
 
-// LayoutForImage returns the file layout of the given official image reference.
+// LayoutForImage returns the runtime layout for the given official image reference.
 func LayoutForImage(image string) ImageLayout {
-	if IsRootless(image) {
-		return ImageLayout{
-			Rootless:          true,
-			DataMountPath:     "/var/lib/gitea",
-			ConfigPath:        "/etc/gitea/app.ini",
-			WorkPath:          "/var/lib/gitea",
-			CustomPath:        "/var/lib/gitea/custom",
-			RepoRoot:          "/var/lib/gitea/git/repositories",
-			LFSPath:           "/var/lib/gitea/git/lfs",
-			SSHContainerPort:  2222,
-			HTTPContainerPort: 3000,
-			UID:               1000,
-			GID:               1000,
-			CLI:               "/usr/local/bin/forgejo",
-		}
-	}
 	return ImageLayout{
+		Rootless:          IsRootless(image),
 		DataMountPath:     "/data",
-		ConfigPath:        "/data/gitea/conf/app.ini",
+		ConfigDir:         "/etc/forgejo",
+		ConfigPath:        "/etc/forgejo/app.ini",
 		WorkPath:          "/data/gitea",
-		CustomPath:        "/data/gitea",
+		CustomPath:        "/data/gitea/custom",
+		HomePath:          "/data/git",
 		RepoRoot:          "/data/git/repositories",
 		LFSPath:           "/data/git/lfs",
-		SSHContainerPort:  22,
+		TmpPath:           "/tmp",
+		SSHContainerPort:  2222,
 		HTTPContainerPort: 3000,
 		UID:               1000,
 		GID:               1000,
-		CLI:               "/usr/local/bin/forgejo",
+		RunUser:           "git",
+		CLI:               "/app/gitea/gitea",
 	}
 }
 

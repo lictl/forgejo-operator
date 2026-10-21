@@ -48,24 +48,33 @@ A step may return `Stop: true` (e.g. waiting for the database), after which only
 (`internal/controller/forgejobackup_controller.go`, `forgejorestore_controller.go`)
 backed by `internal/backup`.
 
-## Pod layout (official root image)
+## Pod layout
 
-The root image runs s6 as root and starts `sshd` (port 22) and `forgejo web` as `git`
-(uid 1000). It reads `/data/gitea/conf/app.ini` (`GITEA_CUSTOM=/data/gitea`), and
-`/etc/s6/gitea/setup` only generates app.ini when missing, then runs
-`environment-to-ini`. So the operator:
+The official root image normally runs s6 as root, which starts OpenSSH and `forgejo web`
+as `git` (uid 1000). The `-rootless` image uses a different entrypoint and different paths.
+Both ship the same binary at `/app/gitea/gitea`. Like the Canonical charm, the operator
+bypasses both entrypoints and runs Forgejo directly as non-root, with one layout
+(`forgejo.LayoutForImage`):
 
-1. Renders the whole `app.ini` (including secrets and DB credentials) into the Secret
-   `<name>-config`, and puts its hash on the pod template (`forgejo.lucas.icu/config-hash`)
-   so that config changes roll the pods.
-2. Init container `init-config` (root): creates `/data/gitea/conf`, `/data/git`, copies
-   app.ini in place, and fixes ownership (non-recursive) to 1000:1000.
-3. Init container `bootstrap` (uid 1000): `forgejo migrate`, then creates or updates the
+| Item | Value |
+|------|-------|
+| Command | `/app/gitea/gitea web --config /etc/forgejo/app.ini` |
+| User | uid/gid 1000 (`git` in both images), `RUN_USER=git` |
+| Data PVC | `/data` (`WORK_PATH`/`APP_DATA_PATH=/data/gitea`, repos `/data/git/repositories`, LFS `/data/git/lfs`, `HOME=/data/git`) |
+| app.ini | Secret `<name>-config` mounted read-only at `/etc/forgejo` |
+| HTTP | 3000 (`/api/healthz` for startup/readiness; tcpSocket liveness) |
+| SSH | built-in server, `START_SSH_SERVER=true`, `SSH_LISTEN_PORT=2222`, Service port 22 |
+| Temp | emptyDir at `/tmp` |
+
+1. The operator renders the complete `app.ini` into `<name>-config`, including every secret
+   (`SECRET_KEY`, `INTERNAL_TOKEN`, `JWT_SECRET`, `LFS_JWT_SECRET`) and the DB credentials, so
+   Forgejo never needs to write it. Its hash goes on the pod template
+   (`forgejo.lucas.icu/config-hash`), so config changes roll the pods.
+2. Init container `init-permissions` (root, `CHOWN`/`FOWNER`/`DAC_OVERRIDE` only) creates
+   the top-level directories on the PVC and chowns them to 1000:1000 (non-recursive).
+3. Init container `bootstrap` (uid 1000) runs `forgejo migrate`, then creates or updates the
    admin user idempotently from `<name>-admin`.
-4. Main container: the image's default entrypoint (s6) — no command override.
-
-The `-rootless` flavor is supported through `forgejo.LayoutForImage` (paths under
-`/var/lib/gitea`, config at `/etc/gitea/app.ini`, SSH on 2222, everything as uid 1000).
+4. Main container (uid 1000, `runAsNonRoot`, no privilege escalation, all capabilities dropped).
 
 ## Naming and labels
 
