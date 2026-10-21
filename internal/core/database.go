@@ -120,7 +120,7 @@ func probeHosts(host, namespace string) []string {
 	if net.ParseIP(host) != nil || strings.Contains(host, ".") || strings.EqualFold(host, "localhost") {
 		return []string{host}
 	}
-	return []string{host + "." + namespace + ".svc", serviceHost(host, namespace), host}
+	return []string{host + "." + namespace + ".svc", forgejo.ServiceHost(host, namespace), host}
 }
 
 func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
@@ -129,7 +129,7 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 	st := &forgejov1.DatabaseStatus{
 		Type:        forgejov1.DatabaseTypeCNPG,
 		ClusterName: name,
-		Host:        serviceHost(forgejo.CNPGReadWriteService(f), f.Namespace),
+		Host:        forgejo.ServiceHost(forgejo.CNPGReadWriteService(f), f.Namespace),
 		SecretName:  forgejo.CNPGAppSecretName(f),
 		Instances:   cnpgInstances(f),
 	}

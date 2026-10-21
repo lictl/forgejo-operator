@@ -51,7 +51,7 @@ func ResolveDB(ctx context.Context, c client.Client, f *forgejov1.Forgejo) (*DBC
 		db.UsernameKey = ext.CredentialsSecret.UsernameKey
 		db.PasswordKey = ext.CredentialsSecret.PasswordKey
 	default:
-		db.Host = CNPGReadWriteService(f) + "." + f.Namespace + ".svc.cluster.local"
+		db.Host = ServiceHost(CNPGReadWriteService(f), f.Namespace)
 		db.Port = 5432
 		db.Name = CNPGDatabaseName
 		db.SSLMode = "disable"

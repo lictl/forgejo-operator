@@ -76,6 +76,8 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.StringVar(&forgejo.ClusterDomain, "cluster-domain", forgejo.ClusterDomain,
+		"DNS domain of the cluster used for in-cluster Service names (default: CLUSTER_DOMAIN, the pod's resolv.conf, or cluster.local).")
 	flag.StringVar(&watchNamespaces, "watch-namespace", os.Getenv("WATCH_NAMESPACE"),
 		"Comma-separated namespaces to watch. Empty watches all namespaces.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,

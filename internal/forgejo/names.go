@@ -90,7 +90,7 @@ func Labels(f *forgejov1.Forgejo, component string) map[string]string {
 
 // InternalHTTPURL is the in-cluster base URL of the HTTP service (no trailing slash).
 func InternalHTTPURL(f *forgejov1.Forgejo) string {
-	return "http://" + HTTPServiceName(f) + "." + f.Namespace + ".svc.cluster.local:" + itoa(HTTPServicePort(f))
+	return "http://" + ServiceHost(HTTPServiceName(f), f.Namespace) + ":" + itoa(HTTPServicePort(f))
 }
 
 // HTTPServicePort returns the HTTP Service port (defaults to 3000).

@@ -82,7 +82,7 @@ func ReconcileHA(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.Ste
 		}
 		return forgejo.StepResult{Stop: true, RequeueAfter: 5 * time.Second}, nil
 	}
-	rc.ValkeyURL = fmt.Sprintf("redis://:%s@%s.%s.svc.cluster.local:%d", password, forgejo.ValkeyName(f), f.Namespace, valkeyPort)
+	rc.ValkeyURL = fmt.Sprintf("redis://:%s@%s:%d", password, forgejo.ServiceHost(forgejo.ValkeyName(f), f.Namespace), valkeyPort)
 	return forgejo.StepResult{}, nil
 }
 

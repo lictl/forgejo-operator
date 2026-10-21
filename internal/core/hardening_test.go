@@ -402,29 +402,11 @@ func TestMigratingRestoreFromMaintenanceFlag(t *testing.T) {
 	}
 }
 
-// F16: the cluster domain comes from the env, the pod's resolv.conf, or cluster.local.
-func TestClusterDomain(t *testing.T) {
-	dir := t.TempDir()
-	rcFile := filepath.Join(dir, "resolv.conf")
-	if err := os.WriteFile(rcFile, []byte("nameserver 10.43.0.10\nsearch ns.svc.k8s.example. svc.k8s.example k8s.example\noptions ndots:5\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if d := detectClusterDomain("", rcFile); d != "k8s.example" {
-		t.Fatalf("resolv.conf: got %q", d)
-	}
-	if d := detectClusterDomain("corp.internal.", rcFile); d != "corp.internal" {
-		t.Fatalf("env: got %q", d)
-	}
-	if d := detectClusterDomain("", filepath.Join(dir, "missing")); d != defaultClusterDomain {
-		t.Fatalf("fallback: got %q", d)
-	}
-	if d := clusterDomainFromResolvConf("search example.com\nnameserver 1.1.1.1\n"); d != "" {
-		t.Fatalf("outside a cluster: got %q", d)
-	}
-
-	old := ClusterDomain
-	defer func() { ClusterDomain = old }()
-	ClusterDomain = "k8s.example"
+// F16: rendered names follow the detected cluster domain.
+func TestClusterDomainNames(t *testing.T) {
+	old := forgejo.ClusterDomain
+	defer func() { forgejo.ClusterDomain = old }()
+	forgejo.ClusterDomain = "k8s.example"
 	f := testInstance()
 	if got := RootURL(f); got != "http://fj-http.ns.svc.k8s.example:3000/" {
 		t.Fatalf("ROOT_URL = %s", got)

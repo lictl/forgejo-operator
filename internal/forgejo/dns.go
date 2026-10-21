@@ -1,4 +1,4 @@
-package core
+package forgejo
 
 import (
 	"os"
@@ -12,8 +12,7 @@ const defaultClusterDomain = "cluster.local"
 // operator renders (app.ini DOMAIN/SSH_DOMAIN/ROOT_URL defaults, the CNPG host) and probes.
 // It comes from the CLUSTER_DOMAIN environment variable, else from the "svc.<domain>" search
 // entry of the operator pod's /etc/resolv.conf, else "cluster.local" (e.g. an operator
-// running outside the cluster). cmd/main.go may override it (e.g. from a flag) before the
-// manager starts.
+// running outside the cluster). cmd/main.go overrides it with --cluster-domain when set.
 var ClusterDomain = detectClusterDomain(os.Getenv("CLUSTER_DOMAIN"), "/etc/resolv.conf")
 
 func detectClusterDomain(env, resolvConf string) string {
@@ -45,7 +44,7 @@ func clusterDomainFromResolvConf(content string) string {
 	return ""
 }
 
-// serviceHost is the fully qualified in-cluster DNS name of a Service.
-func serviceHost(name, namespace string) string {
+// ServiceHost is the fully qualified in-cluster DNS name of a Service.
+func ServiceHost(name, namespace string) string {
 	return name + "." + namespace + ".svc." + ClusterDomain
 }
