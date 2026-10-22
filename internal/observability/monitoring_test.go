@@ -177,6 +177,23 @@ func TestMonitoringAPIErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("terminating namespace ends the pass", func(t *testing.T) {
+		rc, rec := monitoringRC(t, testInstance("terminating"), interceptor.Funcs{
+			Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
+				return forgejo.NewNamespaceTerminatingError("x", obj.GetName(), "ns")
+			},
+		})
+		if _, err := ReconcileMonitoring(ctx, rc); !forgejo.IsNamespaceTerminating(err) {
+			t.Fatalf("got %v, want the namespace-terminating error", err)
+		}
+		if c := degraded(rc); c != nil {
+			t.Fatalf("Degraded %+v", c)
+		}
+		if ev := drain(rec); len(ev) != 0 {
+			t.Fatalf("events %v", ev)
+		}
+	})
+
 	t.Run("owned by someone else", func(t *testing.T) {
 		f := testInstance("taken")
 		rc, _ := monitoringRC(t, f, interceptor.Funcs{})

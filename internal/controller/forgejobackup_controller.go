@@ -87,8 +87,20 @@ type ForgejoBackupReconciler struct {
 // overwrite what a newer pass recorded, so a conflict just retries.
 func (r *ForgejoBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	res, err := r.reconcile(ctx, req)
-	if apierrors.IsConflict(err) {
+	return settle(ctx, res, err)
+}
+
+// settle maps the outcome of a ForgejoBackup or ForgejoRestore pass to the controller's
+// result. A conflict retries a second later. A create refused because the namespace is being
+// deleted drops the request without an error or a requeue: every later create would fail the
+// same way, and the namespace's deletion removes the object (see forgejo.IsNamespaceTerminating).
+func settle(ctx context.Context, res ctrl.Result, err error) (ctrl.Result, error) {
+	switch {
+	case apierrors.IsConflict(err):
 		return ctrl.Result{RequeueAfter: time.Second}, nil
+	case forgejo.IsNamespaceTerminating(err):
+		logf.FromContext(ctx).V(1).Info("Dropped reconcile because the namespace is terminating", "error", err.Error())
+		return ctrl.Result{}, nil
 	}
 	return res, err
 }
@@ -223,6 +235,9 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	}
 	warn := func(reason, msg string) { r.eventOn(f, corev1.EventTypeWarning, reason, "ResizeVolume", "%s", msg) }
 	pvc, err := backup.EnsureBackupPVC(ctx, r.Client, r.Scheme, f, warn)
+	if forgejo.IsNamespaceTerminating(err) {
+		return ctrl.Result{}, err // not a storage problem to wait for (see settle)
+	}
 	if err != nil {
 		return r.waitForDependency(ctx, b, "BackupStorageUnavailable", err.Error())
 	}
@@ -426,7 +441,8 @@ func (r *ForgejoBackupReconciler) fail(ctx context.Context, b *forgejov1.Forgejo
 }
 
 // finalize deletes the backup files with a cleanup Job before releasing the object. It gives
-// up (with a warning event) when the PVC is gone or the cleanup cannot finish in time.
+// up (with a warning event) when the PVC is gone or the cleanup cannot finish in time, and
+// right away when the namespace is being deleted (with the backup volume in it).
 func (r *ForgejoBackupReconciler) finalize(ctx context.Context, b *forgejov1.ForgejoBackup) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(b, forgejo.FinalizerName) {
 		return ctrl.Result{}, nil
@@ -502,6 +518,15 @@ func (r *ForgejoBackupReconciler) cleanup(ctx context.Context, b *forgejov1.Forg
 			return true, nil
 		}
 		err = r.createCleanupJob(ctx, b)
+		if forgejo.IsNamespaceTerminating(err) {
+			// No Job can be created in a namespace that is being deleted, and the backup
+			// volume is in that namespace too, so it goes with it (the files remain only when
+			// its PersistentVolume is retained). Waiting for cleanupTimeout would only hold up
+			// the namespace deletion; no event either, the API server would reject it.
+			logf.FromContext(ctx).Info("Released ForgejoBackup without removing its files because the namespace is terminating",
+				"pvc", b.Status.PVCName, "path", b.Status.Path)
+			return true, nil
+		}
 	} else if err == nil {
 		err = backup.CheckOwned(job, b)
 	}

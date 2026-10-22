@@ -100,7 +100,9 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	// Events rejected because their namespace is being deleted are logged at V(1), not as
+	// errors (see forgejo.QuietTerminatingNamespaces).
+	ctrl.SetLogger(forgejo.QuietTerminatingNamespaces(zap.New(zap.UseFlagOptions(&opts))))
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will

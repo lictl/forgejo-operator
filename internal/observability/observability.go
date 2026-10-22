@@ -88,8 +88,9 @@ func monitoringResult(ctx context.Context, rc *forgejo.ReconcileContext, errs []
 		}
 		return forgejo.StepResult{}, nil
 	}
+	// Both end the pass (see runPipeline) rather than being reported as MonitoringFailed.
 	for _, err := range errs {
-		if apierrors.IsConflict(err) {
+		if apierrors.IsConflict(err) || forgejo.IsNamespaceTerminating(err) {
 			return forgejo.StepResult{}, err
 		}
 	}

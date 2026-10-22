@@ -112,10 +112,7 @@ func (r *ForgejoRestoreReconciler) reader() client.Reader {
 // a newer pass recorded, so a conflict just retries.
 func (r *ForgejoRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	res, err := r.reconcile(ctx, req)
-	if apierrors.IsConflict(err) {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
-	}
-	return res, err
+	return settle(ctx, res, err)
 }
 
 func (r *ForgejoRestoreReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

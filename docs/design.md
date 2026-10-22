@@ -38,6 +38,12 @@ checks, the restore handshake or volume expansion. Around the table:
 - **Errors:** joined into `Degraded=ReconcileError` (one Warning event per failed step) and
   returned; the per-instance backoff is capped at the 60s resync, so time-based work keeps
   going. An optimistic-lock conflict ends the pass and retries after 1s.
+- **Terminating namespace:** a create the API server refuses because the namespace is being
+  deleted (`forgejo.IsNamespaceTerminating`) ends the pass without an error, event, status
+  write or requeue, as kube-controller-manager's controllers do; the backup and restore
+  controllers drop such a request too. Events the API server rejects for that reason are
+  logged at V(1), not as errors (`forgejo.QuietTerminatingNamespaces` wraps the manager's
+  logger, which the events.k8s.io broadcaster logs through).
 - **Skipped steps:** when backups are enabled but `backup-schedule` did not complete,
   `BackupHealthy` becomes `Unknown/ReconcileBlocked` naming the root cause. When `upgrade` did
   not complete, `rc.Upgrading` is taken from `status.upgrade` (`forgejo.UpgradeInFlight`), so

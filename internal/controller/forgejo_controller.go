@@ -165,6 +165,9 @@ type pipelineResult struct {
 	skipped map[string]string
 	// conflict is set when a step hit an optimistic-lock conflict; the pass was cut short.
 	conflict bool
+	// terminating is set when a step could not create an object because the namespace is
+	// being deleted; the pass was cut short.
+	terminating bool
 }
 
 // err joins the step errors, naming each step.
@@ -196,7 +199,9 @@ func (p *pipelineResult) blockedBy(name string) string {
 }
 
 // runPipeline runs steps in order, skipping those whose prerequisites did not complete. A
-// conflict ends the pass: the next one, a second later, starts from fresh reads.
+// conflict ends the pass: the next one, a second later, starts from fresh reads. So does a
+// create refused because the namespace is being deleted: every later create would fail the
+// same way (see forgejo.IsNamespaceTerminating).
 func runPipeline(ctx context.Context, rc *forgejo.ReconcileContext, steps []namedStep) *pipelineResult {
 	log := logf.FromContext(ctx)
 	p := &pipelineResult{failed: map[string]error{}, completed: map[string]bool{}, skipped: map[string]string{}}
@@ -214,6 +219,11 @@ func runPipeline(ctx context.Context, rc *forgejo.ReconcileContext, steps []name
 			log.V(1).Info("conflict updating a child, retrying", "step", s.name, "error", err.Error())
 			p.conflict = true
 			rc.Requeue(time.Second)
+			return p
+		}
+		if forgejo.IsNamespaceTerminating(err) {
+			log.V(1).Info("Stopped reconcile pass because the namespace is terminating", "step", s.name, "error", err.Error())
+			p.terminating = true
 			return p
 		}
 		if err != nil {
@@ -322,6 +332,16 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	p := runPipeline(ctx, rc, steps)
+	if p.terminating {
+		// The namespace is being deleted, and the instance with it. As kube-controller-manager
+		// does, this is not an error: no Degraded condition, Warning event (the API server
+		// would reject it anyway), status write or backoff, and no requeue, since the
+		// namespace never becomes active again. The operator does not look the Namespace up
+		// before a pass: that would take a cluster-wide Namespace watch (or a read per pass)
+		// and RBAC on namespaces, also under --watch-namespace, and a cached Terminating
+		// phase can lag behind, so the refused create is the signal it relies on anyway.
+		return ctrl.Result{}, nil
+	}
 	stepErr := p.err()
 	if stepErr != nil {
 		msg := make([]string, 0, len(p.failedOrder))

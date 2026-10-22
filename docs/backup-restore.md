@@ -168,7 +168,10 @@ removes `<pvc>/<backup-name>/`. If the files of a failed backup were already rem
 done, and the cleanup Job goes with the object. Cleanup waits
 while an unfinished `ForgejoRestore` is reading the backup. The finalizer is also released
 when the PVC no longer exists, when cleanup fails, or after 10 minutes; a Warning event tells
-you to remove the directory by hand.
+you to remove the directory by hand. When the namespace is being deleted, no cleanup Job can
+be created there, and the backup PVC is deleted with the namespace anyway, so the finalizer
+is released right away and the namespace deletion is not held up (the files remain only if
+the PersistentVolume's reclaim policy is `Retain`).
 
 A backup that is deleted only because the `Forgejo` that owned it is gone keeps its files
 when the backup PVC outlives that instance (it is not controlled by it). This covers
