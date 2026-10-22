@@ -23,15 +23,15 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
 
 | Level | What the operator does |
 |-------|------------------------|
-| **I Basic install** | One `Forgejo` resource provisions a CNPG cluster (or uses an external database), generated secrets, the admin account, the data volume, the Deployment, HTTP/SSH Services and an optional Ingress. It renders the whole `app.ini` and rolls pods when it changes. |
+| **I Basic install** | One `Forgejo` resource provisions a CNPG cluster (or uses an external database), generated secrets, the admin account, the data volume, the Deployment, HTTP/SSH Services, and optionally an Ingress or Gateway API routes (HTTPRoute, TCPRoute for SSH) with a cert-manager certificate. It renders the whole `app.ini` and rolls pods when it changes. |
 | **II Seamless upgrades** | Changing `spec.image` to a newer version is version-gated and preceded by a cold backup. Forgejo is migrated with a single pod and verified. Downgrades are refused, and upgrades can be cancelled or retried. |
 | **III Full lifecycle** | On-demand and cron-scheduled backups with retention, and restores with maintenance mode. Data is retained on deletion by default (`retainPolicy`), and CNPG handles database failover. |
 | **IV Deep insights** | Health, version and statistics in status. Conditions and events, operator metrics, Forgejo `/metrics` through a ServiceMonitor, a PrometheusRule with per-instance alerts, and a Grafana dashboard. |
 | **V Auto pilot** | Automatic rollback of failed upgrades and of configs that make Forgejo crash. Restarts hung pods. Vertical right-sizing from OOM kills and usage. HPA with Valkey-backed HA. PVC auto-expansion. Tuning derived from resources (GOMEMLIMIT, DB pool). |
 
 Details are in [docs/design.md](docs/design.md), [docs/versions.md](docs/versions.md), [docs/upgrades.md](docs/upgrades.md),
-[docs/backup-restore.md](docs/backup-restore.md), [docs/observability.md](docs/observability.md)
-and [docs/autopilot.md](docs/autopilot.md).
+[docs/backup-restore.md](docs/backup-restore.md), [docs/observability.md](docs/observability.md),
+[docs/autopilot.md](docs/autopilot.md), [docs/networking.md](docs/networking.md) and [docs/ssh.md](docs/ssh.md).
 
 ## Quick start (local or any other cluster)
 
@@ -45,6 +45,8 @@ helm upgrade --install cnpg cnpg/cloudnative-pg -n cnpg-system --create-namespac
 Optional:
 - kube-prometheus-stack, for ServiceMonitor, PrometheusRule and dashboards.
 - metrics-server, for the HPA and vertical right-sizing.
+- Gateway API CRDs and a Gateway controller (Envoy Gateway is the tested reference), for
+  HTTPRoute/TCPRoute; cert-manager, for certificates. See [docs/networking.md](docs/networking.md).
 
 Build and deploy the operator. On a local cluster the image goes straight into the cluster's image
 store, so no registry is needed:
@@ -95,6 +97,45 @@ kubectl get fj forgejo-sample -n forgejo -o jsonpath='{.status.upgrade}'
 # Change app.ini; the pods roll, and a config that crash-loops is rolled back
 kubectl patch fj forgejo-sample -n forgejo --type merge \
   -p '{"spec":{"config":{"ui":{"DEFAULT_THEME":"forgejo-dark"}}}}'
+```
+
+### Exposing Forgejo
+
+Besides the Services `<name>-http` and `<name>-ssh`, an instance can get an Ingress
+(`spec.ingress`) or Gateway API routes on a Gateway you already run (`spec.gateway`), and a
+certificate from cert-manager (`spec.tls.certManager`). `DOMAIN`, `ROOT_URL` (https with
+`spec.tls`) and the SSH clone port follow from them. The routes carry no request timeout (Envoy
+Gateway would cut clones and pushes after 15 s) and drop a client's `X-Real-IP`. `RoutesReady` and
+`TLSReady` report what the Gateway controller and cert-manager say. See
+[docs/networking.md](docs/networking.md), which also has an Envoy Gateway reference setup and
+notes on Traefik.
+
+```yaml
+spec:
+  server:
+    domain: git.example.com
+    ssh: {externalPort: 2222}       # the Gateway's TCP listener
+  gateway:
+    parentRefs: [{name: eg, namespace: envoy-gateway-system, sectionName: https}]  # the HTTPS listener only
+    ssh:
+      parentRefs: [{name: eg, namespace: envoy-gateway-system, sectionName: ssh}]
+  tls:
+    certManager:
+      issuerRef: {name: letsencrypt, kind: ClusterIssuer}
+    gatewayNamespaces: [envoy-gateway-system]   # ReferenceGrant for the Gateway's HTTPS listener
+```
+
+### SSH host keys
+
+The SSH server's host keys live in the Secret `<name>-ssh-host-keys`, not on the data volume, so
+a rebuilt volume, or an instance recreated with the same name, keeps the fingerprints clients pinned.
+The operator generates ed25519, ECDSA and RSA keys once and never rotates them. Publish the
+fingerprints from the status, or bring your own keys with `spec.server.ssh.hostKeys.existingSecret`
+(see [docs/ssh.md](docs/ssh.md)):
+
+```bash
+kubectl get fj forgejo-sample -n forgejo \
+  -o jsonpath='{range .status.ssh.hostKeys[*]}{.type} {.fingerprint}{"\n"}{end}'
 ```
 
 A minimal high-availability instance with autoscaling:

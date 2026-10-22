@@ -222,7 +222,7 @@ func rollbackFailingConfig(ctx context.Context, rc *forgejo.ReconcileContext, st
 	f := rc.Instance
 	ap := f.Status.AutoPilot
 	desired := rc.DesiredConfigHash
-	if !configRollbackEnabled(f) || rc.Maintenance || workloadHeld(rc) || !rc.DatabaseReady || ap == nil ||
+	if !configRollbackEnabled(f) || rc.Maintenance || replacementsHeld(rc) || !rc.DatabaseReady || ap == nil ||
 		ap.LastKnownGoodConfigHash == "" || desired == "" || desired == ap.LastKnownGoodConfigHash ||
 		rc.ConfigHash != desired || ap.RejectedConfigHash == desired {
 		return nil

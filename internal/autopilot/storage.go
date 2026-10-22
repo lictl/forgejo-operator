@@ -774,7 +774,7 @@ func restartForFilesystemResize(ctx context.Context, rc *forgejo.ReconcileContex
 	pvc *corev1.PersistentVolumeClaim, since time.Time) error {
 	f := rc.Instance
 	restoring := f.Status.Backup != nil && f.Status.Backup.ActiveRestore != ""
-	if dep == nil || ptr.Deref(dep.Spec.Replicas, 1) == 0 || rc.Maintenance || restoring || workloadHeld(rc) ||
+	if dep == nil || ptr.Deref(dep.Spec.Replicas, 1) == 0 || rc.Maintenance || restoring || replacementsHeld(rc) ||
 		forgejo.UpgradeInFlight(f) || inCooldown(f, ActionPodRestarted, restartCooldown) {
 		return nil
 	}

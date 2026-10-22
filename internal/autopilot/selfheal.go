@@ -107,7 +107,7 @@ func reportProbeUnreachable(rc *forgejo.ReconcileContext, st *instanceState, pod
 //     with a short grace period.
 func restartUnhealthy(ctx context.Context, rc *forgejo.ReconcileContext, dep *appsv1.Deployment, pods []corev1.Pod) error {
 	f := rc.Instance
-	if rc.Maintenance || workloadHeld(rc) || !rc.DatabaseReady || dep == nil || len(pods) == 0 ||
+	if rc.Maintenance || replacementsHeld(rc) || !rc.DatabaseReady || dep == nil || len(pods) == 0 ||
 		inCooldown(f, ActionPodRestarted, restartCooldown) {
 		return nil
 	}

@@ -32,6 +32,8 @@ type ImageLayout struct {
 	TmpPath string
 	// SSHContainerPort is the built-in SSH server's SSH_LISTEN_PORT.
 	SSHContainerPort int32
+	// SSHHostKeysDir is where the Secret of SSH host keys is mounted read-only.
+	SSHHostKeysDir string
 	// HTTPContainerPort is HTTP_PORT.
 	HTTPContainerPort int32
 	// UID/GID Forgejo runs as (user "git" in both images).
@@ -63,6 +65,7 @@ func LayoutForImage(image string) ImageLayout {
 		LFSPath:           "/data/git/lfs",
 		TmpPath:           "/tmp",
 		SSHContainerPort:  2222,
+		SSHHostKeysDir:    "/etc/forgejo-ssh",
 		HTTPContainerPort: 3000,
 		UID:               1000,
 		GID:               1000,

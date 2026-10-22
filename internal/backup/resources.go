@@ -31,6 +31,8 @@ const (
 	DBDumpFile      = "db.dump"
 	DataArchiveFile = "data.tar.gz"
 	ManifestFile    = "manifest.json"
+	// SSHHostKeysDir holds a copy of the instance's SSH host keys (the files of its Secret).
+	SSHHostKeysDir = "ssh-host-keys"
 )
 
 // DataExcludes are paths (relative to the data volume) left out of data archives: temp files,

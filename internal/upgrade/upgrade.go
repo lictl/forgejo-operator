@@ -149,6 +149,11 @@ func idle(rc *forgejo.ReconcileContext, desired, current string, retry bool) {
 		// A restore owns the instance; the upgrade starts once it is done.
 		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, "WaitingForRestore",
 			fmt.Sprintf("The upgrade to %s starts after the running restore: %s", desired, rc.MaintenanceReason))
+	case rc.SSHHostKeysUnavailable:
+		// The pods of the new image could not start (docs/ssh.md): the cold backup would
+		// scale Forgejo down for nothing.
+		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, "WaitingForSSHHostKeys",
+			fmt.Sprintf("The upgrade to %s starts once the Secret of SSH host keys is usable again (Degraded/SSHHostKeysUnavailable)", desired))
 	default:
 		start(rc, current, desired, c)
 	}

@@ -383,10 +383,24 @@ func TestAnsweredFailuresRestart(t *testing.T) {
 	if probeUnanswered(f) {
 		t.Fatal("answered failures classified as unanswered")
 	}
+	got := &appsv1.Deployment{}
+
+	// While the Secret of SSH host keys is unusable, a restarted pod could not start.
+	env.rc.SSHHostKeysUnavailable = true
 	if err := restartUnhealthy(ctx, env.rc, dep, pods); err != nil {
 		t.Fatal(err)
 	}
-	got := &appsv1.Deployment{}
+	if err := env.rc.Client.Get(ctx, client.ObjectKeyFromObject(dep), got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Spec.Template.Annotations[forgejo.AnnotationRestartedAt]; ok {
+		t.Fatal("restarted while new pods could not start")
+	}
+
+	env.rc.SSHHostKeysUnavailable = false
+	if err := restartUnhealthy(ctx, env.rc, dep, pods); err != nil {
+		t.Fatal(err)
+	}
 	if err := env.rc.Client.Get(ctx, client.ObjectKeyFromObject(dep), got); err != nil {
 		t.Fatal(err)
 	}

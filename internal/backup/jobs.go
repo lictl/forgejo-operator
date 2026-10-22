@@ -20,9 +20,12 @@ import (
 )
 
 const (
-	volBackups = "backups"
-	volData    = "data"
-	volTmp     = "tmp"
+	volBackups     = "backups"
+	volData        = "data"
+	volTmp         = "tmp"
+	volSSHHostKeys = "ssh-host-keys"
+
+	sshHostKeysMountPath = "/ssh-host-keys"
 
 	// Container names. The main container of a backup Job reports its result through the
 	// termination message.
@@ -97,6 +100,19 @@ func BackupJob(in JobInput, b *forgejov1.ForgejoBackup, includeData bool, starte
 		archiveMounts = append(append([]corev1.VolumeMount{}, mounts...),
 			corev1.VolumeMount{Name: volData, MountPath: "/data", ReadOnly: true})
 		volumes = append(volumes, dataVolume(in.Instance, true))
+	}
+	// A copy of the SSH host keys, so that off-cluster copies of a backup keep the instance's
+	// identity (docs/backup-restore.md). The Secret is optional: it may not exist yet.
+	if f := in.Instance; f != nil && forgejo.SSHHostKeysManaged(f) {
+		secret := forgejo.SSHHostKeysSecret(f)
+		volumes = append(volumes, corev1.Volume{Name: volSSHHostKeys, VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: secret, Optional: ptr.To(true), DefaultMode: ptr.To[int32](0o440)},
+		}})
+		archiveMounts = append(append([]corev1.VolumeMount{}, archiveMounts...),
+			corev1.VolumeMount{Name: volSSHHostKeys, MountPath: sshHostKeysMountPath, ReadOnly: true})
+		archiveEnv = append(archiveEnv,
+			corev1.EnvVar{Name: "SSH_HOST_KEYS_DIR", Value: sshHostKeysMountPath},
+			corev1.EnvVar{Name: "SSH_HOST_KEYS_SECRET", Value: secret})
 	}
 	archive := container(ContainerArchive, in.ForgejoImage, archiveScript(forgejo.LayoutForImage(in.ForgejoImage)), archiveMounts, archiveEnv)
 
@@ -413,6 +429,17 @@ if [ "$INCLUDE_DATA" = true ]; then
   data_file="data.tar.gz"
   echo "data archive written: $data_size bytes"
 fi
+ssh_keys=""
+rm -rf "$BACKUP_DIR/` + SSHHostKeysDir + `"
+if [ -n "${SSH_HOST_KEYS_DIR:-}" ]; then
+  for k in "$SSH_HOST_KEYS_DIR"/ssh_host_*_key; do
+    [ -f "$k" ] || continue
+    mkdir -p "$BACKUP_DIR/` + SSHHostKeysDir + `"
+    cp "$k" "$BACKUP_DIR/` + SSHHostKeysDir + `/" || fail "copying the SSH host keys failed"
+    ssh_keys="$ssh_keys${ssh_keys:+, }\"$(basename "$k")\""
+  done
+  [ -z "$ssh_keys" ] || echo "SSH host keys copied from Secret $SSH_HOST_KEYS_SECRET"
+fi
 pg_dump_version=$(cat "$BACKUP_DIR/.pg_dump_version" 2>/dev/null | tr -d '"\\' || true)
 rm -f "$BACKUP_DIR/.pg_dump_version"
 cat > "$BACKUP_DIR/manifest.json.partial" <<EOF
@@ -427,7 +454,8 @@ cat > "$BACKUP_DIR/manifest.json.partial" <<EOF
   "startedAt": "$STARTED_AT",
   "completedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "database": {"file": "db.dump", "format": "pg_dump-custom", "name": "$DATABASE_NAME", "pgDumpVersion": "$pg_dump_version", "sizeBytes": $db_size},
-  "data": {"included": $INCLUDE_DATA, "file": "$data_file", "sizeBytes": $data_size, "excludes": $DATA_EXCLUDES_JSON, "warnings": $warnings}
+  "data": {"included": $INCLUDE_DATA, "file": "$data_file", "sizeBytes": $data_size, "excludes": $DATA_EXCLUDES_JSON, "warnings": $warnings},
+  "sshHostKeys": {"directory": "` + SSHHostKeysDir + `", "secret": "${SSH_HOST_KEYS_SECRET:-}", "files": [$ssh_keys]}
 }
 EOF
 mv "$BACKUP_DIR/manifest.json.partial" "$BACKUP_DIR/manifest.json"

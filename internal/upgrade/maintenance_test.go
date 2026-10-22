@@ -8,6 +8,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -262,4 +263,23 @@ func restores(t *testing.T, c client.Client) int {
 		t.Fatal(err)
 	}
 	return len(l.Items)
+}
+
+// An upgrade does not start while the Secret of SSH host keys the pods serve is unusable: the
+// new image's pods could not start, and the cold backup would stop Forgejo for nothing.
+func TestUpgradeWaitsForSSHHostKeys(t *testing.T) {
+	f := fixture(nil)
+	c := newClient(t)
+	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image,
+		SSHHostKeysUnavailable: true}
+	if _, err := Reconcile(context.Background(), rc); err != nil {
+		t.Fatal(err)
+	}
+	cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionUpgrading)
+	if f.Status.Upgrade != nil || rc.Upgrading || rc.TargetImage != imgA || cond == nil || cond.Reason != "WaitingForSSHHostKeys" {
+		t.Fatalf("upgrade %+v, upgrading %v, target %s, condition %+v", f.Status.Upgrade, rc.Upgrading, rc.TargetImage, cond)
+	}
+	if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade == nil || !inFlight(f.Status.Upgrade.Phase) {
+		t.Fatalf("once the keys are back the upgrade starts: %+v", f.Status.Upgrade)
+	}
 }

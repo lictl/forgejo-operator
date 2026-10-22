@@ -21,7 +21,10 @@ still deployed and unverified (its `bootstrap` init container may still be runni
 `forgejo migrate`, which takes no lock), and while a restored database waits for its first
 pod to migrate it. Then there is no HPA or PDB, no config rollback or last-known-good
 bookkeeping, no health-based restart and no vertical scaling. Restores (scaled to zero) are
-treated the same way.
+treated the same way. While the Secret of SSH host keys is missing or unusable
+(`Degraded=SSHHostKeysUnavailable`), new pods could not start, so there is no health-based
+restart, no config rollback, no vertical scaling and no restart for a file system resize
+either; see [ssh.md](ssh.md#when-something-is-wrong).
 
 | Feature | Spec | Default |
 |---|---|---|

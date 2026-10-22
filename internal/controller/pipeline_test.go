@@ -104,7 +104,7 @@ func TestPipelineValkeyStop(t *testing.T) {
 	rc := newRC()
 	p := runPipeline(context.Background(), rc, st)
 	want := []string{stepMaintenance, stepRestoreGuard, "secrets", stepBackupOwnership, "database", "high-availability",
-		"network", "monitoring", stepBackupSchedule, "health", stepStorageAutopilot}
+		"ssh-host-keys", "network", "gateway", "tls", "monitoring", stepBackupSchedule, "health", stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
 		t.Errorf("ran %v, want %v", *ran, want)
 	}
@@ -208,7 +208,7 @@ func TestPipelineStepsWithoutNeedsRunAfterMaintenanceError(t *testing.T) {
 		return forgejo.StepResult{}, nil
 	})
 	runPipeline(context.Background(), newRC(), st)
-	want := []string{stepMaintenance, stepBackupOwnership, "network", "monitoring", stepStorageAutopilot}
+	want := []string{stepMaintenance, stepBackupOwnership, "network", "gateway", "tls", "monitoring", stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
 		t.Errorf("ran %v, want %v", *ran, want)
 	}
@@ -223,7 +223,7 @@ func TestStepTableWiring(t *testing.T) {
 		byName[s.name] = s
 		order[s.name] = i
 	}
-	for _, name := range []string{stepBackupOwnership, stepStorageAutopilot, "network", "monitoring", stepMaintenance} {
+	for _, name := range []string{stepBackupOwnership, stepStorageAutopilot, "network", "gateway", "tls", "monitoring", stepMaintenance} {
 		s, ok := byName[name]
 		if !ok {
 			t.Fatalf("step %q missing", name)

@@ -27,6 +27,9 @@ const (
 	AnnotationConfigProfile = "forgejo.lucas.icu/config-profile"
 	// AnnotationRestartedAt on the pod template forces a restart (self-healing).
 	AnnotationRestartedAt = "forgejo.lucas.icu/restarted-at"
+	// AnnotationSSHHostKeys on the pod template is a digest of the SSH host keys the pods
+	// serve from their Secret, so that changed keys roll the pods.
+	AnnotationSSHHostKeys = "forgejo.lucas.icu/ssh-host-keys"
 
 	ManagedBy = "forgejo-operator"
 	AppName   = "forgejo"
@@ -60,6 +63,16 @@ func PDBName(f *forgejov1.Forgejo) string             { return f.Name }
 func ServiceMonitorName(f *forgejov1.Forgejo) string  { return f.Name }
 func PrometheusRuleName(f *forgejov1.Forgejo) string  { return f.Name }
 func DashboardName(f *forgejov1.Forgejo) string       { return f.Name + "-dashboard" }
+func HTTPRouteName(f *forgejov1.Forgejo) string       { return f.Name }
+func SSHRouteName(f *forgejov1.Forgejo) string        { return f.Name + "-ssh" }
+
+// TLSSecretName is the Secret that cert-manager keeps the certificate of spec.tls.certManager
+// in ("<name>-tls"). The Certificate and the ReferenceGrant of spec.tls.gatewayNamespaces
+// have the same name.
+func TLSSecretName(f *forgejov1.Forgejo) string { return f.Name + "-tls" }
+
+// SSHHostKeysSecretName is the operator's Secret of SSH host keys ("<name>-ssh-host-keys").
+func SSHHostKeysSecretName(f *forgejov1.Forgejo) string { return f.Name + "-ssh-host-keys" }
 
 // Keys inside the generated "<name>-secrets" Secret.
 const (

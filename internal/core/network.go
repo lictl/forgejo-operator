@@ -118,8 +118,8 @@ func reconcileIngress(ctx context.Context, rc *forgejo.ReconcileContext) error {
 				}},
 			}},
 		}
-		if spec.TLSSecretName != "" {
-			tls := networkingv1.IngressTLS{SecretName: spec.TLSSecretName}
+		if secret := ingressTLSSecret(f); secret != "" {
+			tls := networkingv1.IngressTLS{SecretName: secret}
 			if spec.Host != "" {
 				tls.Hosts = []string{spec.Host}
 			}

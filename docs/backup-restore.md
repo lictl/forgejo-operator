@@ -4,7 +4,9 @@ The operator backs Forgejo up as two artifacts:
 
 1. A **PostgreSQL logical dump** (`pg_dump --format=custom`) of the Forgejo database.
 2. A **gzip-compressed tar archive of the data volume**: repositories, LFS objects,
-   attachments, avatars, packages, the JWT signing key and SSH host keys.
+   attachments, avatars, packages and the JWT signing key.
+
+It also keeps a copy of the SSH host keys from their Secret (see [ssh.md](ssh.md)).
 
 Both go to a PVC in the instance's namespace. Backups are described by `ForgejoBackup`
 objects and restored with `ForgejoRestore` objects. Scheduled backups and retention are
@@ -71,7 +73,9 @@ What happens:
     setting); use `sslMode: require` for such a server.
   * Container `archive` uses the Forgejo image that is currently deployed. It mounts the
     data volume read-only, writes `data.tar.gz` and `manifest.json`, and reports the sizes
-    through its termination message, from which the controller fills `status`.
+    through its termination message, from which the controller fills `status`. It also mounts
+    the Secret of SSH host keys read-only (optional: it may not exist yet) and copies the keys
+    into `ssh-host-keys/`, also for database-only backups.
   * Both containers run as uid/gid 1000 with no capabilities, a read-only root filesystem
     and `umask 077`, so backup files are readable only by uid 1000.
   * Placement. A `ReadWriteOnce` data volume is attached to the node of the running Forgejo
@@ -97,8 +101,9 @@ What happens:
 └── <backup-name>/
     ├── db.dump         # pg_dump custom format (compressed); restore with pg_restore
     ├── data.tar.gz     # tar of the data volume, paths relative to /data (./git, ./gitea, ...)
+    ├── ssh-host-keys/  # ssh_host_{ed25519,ecdsa,rsa}_key: the SSH host keys from their Secret
     └── manifest.json   # backup name, instance, reason, images, pg_dump version,
-                        # timestamps, sizes, excluded paths, tar warnings
+                        # timestamps, sizes, excluded paths, tar warnings, host key files
 ```
 
 Every file is first written under a temporary name (`*.partial`) and renamed when complete.
@@ -259,7 +264,7 @@ spec:
 
 | Phase | What happens |
 |-------|--------------|
-| `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance. Fails otherwise. Waits for another restore of the instance to finish. |
+| `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance. Fails otherwise. Waits for another restore of the instance to finish, and while the Secret of SSH host keys is missing or unusable (`status.ssh.message` of the instance; Forgejo could not start again, see [ssh.md](ssh.md#when-something-is-wrong)). |
 | `ScalingDown` | The Forgejo pipeline turns on maintenance mode: `status.backup.activeRestore` is set, the Deployment is scaled to 0, the phase becomes `Restoring` and health checks and autopilot actions are suspended. The restore waits until no Forgejo pod exists, no backup of the instance is running and no Job or pod of another restore of the instance is still running. It fails after 15 minutes if that does not happen, for example because `spec.paused` is set or the reconcile is blocked earlier. |
 | `Restoring` | Job `<restore>-restore` runs (see below); `status.jobStartTime` records when it was created. If its newest pod cannot start within 10 minutes, the Job is stopped and the restore fails. It reports "nothing was changed" only when no earlier pod got past `verify`. Otherwise the failure counts as one that may have changed the instance (see below). A Job that is not found a minute after `jobStartTime` fails the restore with `JobMissing` only after the operator has confirmed with the API server that it is gone. |
 | `ScalingUp` | Maintenance ends and Forgejo is scaled back up. The bootstrap init container runs `forgejo migrate` against the restored database, in a single pod until that pod is available. The restore waits up to 15 minutes for the Deployment to be available. It completes right away when the instance wants no pods (`spec.replicas: 0` without horizontal autoscaling; with an HPA, `minReplicas` applies). |
@@ -393,9 +398,15 @@ A backup belongs to the instance named in its `spec.forgejoRef`. To recover afte
 instance was deleted (`retainPolicy: Retain` keeps the backup PVC and the `ForgejoBackup`
 objects, also when it was switched from `Delete` shortly before):
 
-1. Recreate the `Forgejo` with the same name. It reuses `<name>-backups`.
+1. Recreate the `Forgejo` with the same name. It reuses `<name>-backups`, and the retained
+   Secrets `<name>-secrets` and `<name>-ssh-host-keys`, so it keeps its SSH host key
+   fingerprints.
 2. Wait until it is `Running`.
 3. Create a `ForgejoRestore` for the backup.
+
+A restore never changes the SSH host keys: they belong to the instance, not to the backup. When
+the instance is recreated in another cluster, create `<name>-ssh-host-keys` from the backup's
+`ssh-host-keys/` before the `Forgejo` (see [ssh.md](ssh.md#backups-and-disaster-recovery)).
 
 If the `ForgejoBackup` object is gone but its files remain, the operator cannot restore
 them, because a new `ForgejoBackup` always takes a fresh backup. Restore such files by hand,

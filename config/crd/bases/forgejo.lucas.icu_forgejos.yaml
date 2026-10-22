@@ -641,6 +641,183 @@ spec:
                   - name
                   type: object
                 type: array
+              gateway:
+                description: |-
+                  gateway exposes Forgejo through Gateway API routes attached to Gateways that already
+                  exist: HTTPRoute "<name>" for HTTP and, optionally, TCPRoute "<name>-ssh" for SSH. The
+                  operator never creates a Gateway. Requires the Gateway API CRDs; see docs/networking.md.
+                properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    description: annotations are added to the routes.
+                    type: object
+                  hostnames:
+                    description: |-
+                      hostnames the HTTPRoute matches. Defaults to the public host names that are DNS names:
+                      the hosts of ROOT_URL and DOMAIN (spec.server.domain, ingress.host or the host of
+                      spec.server.rootURL). Without any, no HTTPRoute is created (RoutesReady=False,
+                      NoHostnames): a route without host names would take every host name of its listeners.
+                      Unless spec.server.domain or an Ingress host is set, the first one that is not a
+                      wildcard is the public host name (DOMAIN, ROOT_URL).
+                    items:
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^(\*\.)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  parentRefs:
+                    description: |-
+                      parentRefs are the Gateways, or their listeners (sectionName), that HTTPRoute "<name>"
+                      attaches to. Their listeners must allow routes from the instance's namespace. A
+                      reference without sectionName or port attaches to every listener that matches the host
+                      names, plain HTTP ones included: with spec.tls, name the HTTPS listeners.
+                    items:
+                      description: |-
+                        GatewayParentReference identifies a Gateway, or some of its listeners, that a route
+                        attaches to (a Gateway API ParentReference).
+                      properties:
+                        group:
+                          description: group of the parent resource. Defaults to gateway.networking.k8s.io.
+                          maxLength: 253
+                          pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
+                        kind:
+                          description: kind of the parent resource. Defaults to Gateway.
+                          maxLength: 63
+                          pattern: ^$|^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                          type: string
+                        name:
+                          description: name of the parent.
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description: namespace of the parent. Defaults to the instance's
+                            namespace.
+                          maxLength: 63
+                          pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                        port:
+                          description: port selects the Gateway's listeners on this
+                            port (Gateway API extended support).
+                          format: int32
+                          maximum: 65535
+                          minimum: 1
+                          type: integer
+                        sectionName:
+                          description: sectionName selects one listener of the Gateway
+                            by its name.
+                          maxLength: 253
+                          pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    maxItems: 32
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  path:
+                    default: /
+                    description: |-
+                      path is the path prefix Forgejo is served under, "/" by default. Another prefix becomes
+                      part of ROOT_URL, and the HTTPRoute removes it before requests reach Forgejo (URLRewrite,
+                      Gateway API extended support).
+                    maxLength: 256
+                    pattern: ^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$
+                    type: string
+                  removeRequestHeaders:
+                    description: |-
+                      removeRequestHeaders are request headers the HTTPRoute removes before requests reach
+                      Forgejo (a RequestHeaderModifier filter), besides X-Real-IP, which it always removes:
+                      Forgejo prefers it to X-Forwarded-For, and Gateways such as Envoy Gateway pass a
+                      client's own X-Real-IP through, which would let any client choose the address Forgejo
+                      logs and rate-limits.
+                    items:
+                      maxLength: 256
+                      minLength: 1
+                      pattern: ^[A-Za-z0-9!#$%&'*+\-.^_|~]+$
+                      type: string
+                    maxItems: 15
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  requestTimeout:
+                    default: 0s
+                    description: |-
+                      requestTimeout is the HTTPRoute's rules[].timeouts.request, a Gateway API duration such
+                      as "0s" (no timeout), "30m" or "1h". Defaults to "0s": Gateways otherwise end requests
+                      after their own default (15s with Envoy Gateway), which cuts long clones, pushes and
+                      downloads. An empty string leaves timeouts out of the route, for implementations that
+                      do not support them.
+                    pattern: ^(([0-9]{1,5}(h|m|s|ms)){1,4})?$
+                    type: string
+                  ssh:
+                    description: |-
+                      ssh adds TCPRoute "<name>-ssh" for Git over SSH through a TCP listener of a Gateway.
+                      Without it, SSH is served by Service "<name>-ssh" only (spec.server.ssh.service). Set
+                      spec.server.ssh.externalPort to the listener's port, which clone URLs show.
+                    properties:
+                      parentRefs:
+                        description: |-
+                          parentRefs are the Gateways, usually one TCP listener of each (sectionName), that
+                          TCPRoute "<name>-ssh" attaches to.
+                        items:
+                          description: |-
+                            GatewayParentReference identifies a Gateway, or some of its listeners, that a route
+                            attaches to (a Gateway API ParentReference).
+                          properties:
+                            group:
+                              description: group of the parent resource. Defaults
+                                to gateway.networking.k8s.io.
+                              maxLength: 253
+                              pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                              type: string
+                            kind:
+                              description: kind of the parent resource. Defaults to
+                                Gateway.
+                              maxLength: 63
+                              pattern: ^$|^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                              type: string
+                            name:
+                              description: name of the parent.
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                            namespace:
+                              description: namespace of the parent. Defaults to the
+                                instance's namespace.
+                              maxLength: 63
+                              pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                              type: string
+                            port:
+                              description: port selects the Gateway's listeners on
+                                this port (Gateway API extended support).
+                              format: int32
+                              maximum: 65535
+                              minimum: 1
+                              type: integer
+                            sectionName:
+                              description: sectionName selects one listener of the
+                                Gateway by its name.
+                              maxLength: 253
+                              pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        maxItems: 32
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    required:
+                    - parentRefs
+                    type: object
+                required:
+                - parentRefs
+                type: object
               highAvailability:
                 default: {}
                 description: |-
@@ -770,7 +947,9 @@ spec:
                     default: /
                     type: string
                   tlsSecretName:
-                    description: tlsSecretName enables TLS using this Secret.
+                    description: |-
+                      tlsSecretName enables TLS using this Secret. Defaults to "<name>-tls", the Secret of
+                      the certificate, when spec.tls.certManager is set.
                     type: string
                 type: object
               monitoring:
@@ -2082,8 +2261,9 @@ spec:
                     type: boolean
                   domain:
                     description: |-
-                      domain is the public host name (DOMAIN / SSH_DOMAIN). Defaults to ingress.host, or the
-                      in-cluster HTTP service DNS name.
+                      domain is the public host name (DOMAIN / SSH_DOMAIN). Defaults to ingress.host, the
+                      first gateway.hostnames entry that is not a wildcard, or the in-cluster HTTP service DNS
+                      name.
                     type: string
                   http:
                     default: {}
@@ -2117,8 +2297,10 @@ spec:
                     description: requireSignInView forces login to browse anything.
                     type: boolean
                   rootURL:
-                    description: rootURL overrides ROOT_URL. Defaults to http(s)://<domain>/
-                      (https when ingress TLS is set).
+                    description: |-
+                      rootURL overrides ROOT_URL. Defaults to http(s)://<host><path>/ from the Ingress or the
+                      HTTPRoute, else http(s)://<domain>/; https when the Ingress has a TLS Secret or spec.tls
+                      is set.
                     type: string
                   ssh:
                     default: {}
@@ -2128,10 +2310,24 @@ spec:
                         description: enabled exposes SSH. Defaults to true.
                         type: boolean
                       externalPort:
-                        description: externalPort is the port shown in clone URLs
-                          (SSH_PORT). Defaults to the service port.
+                        description: |-
+                          externalPort is the port shown in clone URLs (SSH_PORT). Defaults to the service port.
+                          With spec.gateway.ssh, set it to the port of the Gateway's TCP listener.
                         format: int32
                         type: integer
+                      hostKeys:
+                        description: |-
+                          hostKeys configures the SSH server's host keys. By default the operator generates them
+                          once into the Secret "<name>-ssh-host-keys" and never rotates them.
+                        properties:
+                          existingSecret:
+                            description: |-
+                              existingSecret names a Secret with your own host keys, in OpenSSH or PEM format, under
+                              one or more of the keys "ssh_host_ed25519_key", "ssh_host_ecdsa_key" and
+                              "ssh_host_rsa_key" (the files "ssh-keygen -A" writes). The operator neither generates
+                              nor changes keys then.
+                            type: string
+                        type: object
                       service:
                         default: {}
                         description: service configures the SSH Service. Port defaults
@@ -2162,6 +2358,23 @@ spec:
                             type: string
                         type: object
                     type: object
+                  trustedProxies:
+                    description: |-
+                      trustedProxies are the networks (CIDRs, or "*" for every peer) whose X-Forwarded-For and
+                      X-Real-IP headers Forgejo trusts to tell the client's address ([security]
+                      REVERSE_PROXY_TRUSTED_PROXIES). Defaults to the loopback and private ranges
+                      (127.0.0.0/8, ::1/128, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10,
+                      fc00::/7), where a cluster's ingress controllers and gateways run; to loopback only
+                      (127.0.0.0/8, ::1/128) when http.type is LoadBalancer or NodePort, whose clients
+                      kube-proxy shows with a node's private address. Narrow it to the proxies' pod network
+                      when other workloads in those ranges could reach Forgejo directly.
+                    items:
+                      maxLength: 64
+                      pattern: ^(\*|[0-9A-Fa-f.:]+/[0-9]{1,3})$
+                      type: string
+                    maxItems: 64
+                    type: array
+                    x-kubernetes-list-type: atomic
                 type: object
               storage:
                 default: {}
@@ -2196,6 +2409,73 @@ spec:
                     x-kubernetes-int-or-string: true
                   storageClassName:
                     type: string
+                type: object
+              tls:
+                description: |-
+                  tls says that Forgejo is served over HTTPS (ROOT_URL becomes https) and can request the
+                  certificate from cert-manager. See docs/networking.md.
+                properties:
+                  certManager:
+                    description: |-
+                      certManager requests the certificate from cert-manager: the operator creates Certificate
+                      "<name>-tls", which cert-manager keeps in Secret "<name>-tls". An Ingress uses that
+                      Secret by default; a Gateway's HTTPS listener references it in its certificateRefs.
+                      Without certManager, the Ingress's tlsSecretName or the Gateway's own certificate
+                      serves TLS. Requires cert-manager.
+                    properties:
+                      dnsNames:
+                        description: |-
+                          dnsNames of the certificate. Defaults to the public host names that are DNS names: the
+                          hosts of ROOT_URL and DOMAIN, ingress.host and the HTTPRoute's host names.
+                        items:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        maxItems: 32
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      issuerRef:
+                        description: |-
+                          issuerRef is the Issuer (in the instance's namespace) or ClusterIssuer that signs the
+                          certificate.
+                        properties:
+                          group:
+                            description: group of the issuer. Defaults to cert-manager.io;
+                              set it for external issuers.
+                            maxLength: 253
+                            type: string
+                          kind:
+                            default: Issuer
+                            description: |-
+                              kind of the issuer: Issuer (the default) or ClusterIssuer, or the kind of an external
+                              issuer.
+                            maxLength: 63
+                            type: string
+                          name:
+                            description: name of the issuer.
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        type: object
+                    required:
+                    - issuerRef
+                    type: object
+                  gatewayNamespaces:
+                    description: |-
+                      gatewayNamespaces are the namespaces of Gateways whose HTTPS listeners reference Secret
+                      "<name>-tls". The operator creates ReferenceGrant "<name>-tls" in the instance's
+                      namespace, which lets Gateways in these namespaces read that Secret and nothing else.
+                      A Gateway in the instance's namespace needs none. Requires the Gateway API CRDs.
+                    items:
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-type: atomic
                 type: object
               upgrade:
                 default: {}
@@ -2546,6 +2826,47 @@ spec:
               selector:
                 description: selector for the scale subresource.
                 type: string
+              ssh:
+                description: ssh reports the SSH server's host keys.
+                properties:
+                  hostKeys:
+                    description: |-
+                      hostKeys are the public host keys and their SHA256 fingerprints, to publish to users
+                      (e.g. in known_hosts).
+                    items:
+                      description: SSHHostKey is one public host key.
+                      properties:
+                        fingerprint:
+                          description: fingerprint is the SHA256 fingerprint as ssh-keygen
+                            -l prints it ("SHA256:...").
+                          type: string
+                        publicKey:
+                          description: publicKey in authorized_keys format ("<type>
+                            <base64>").
+                          type: string
+                        type:
+                          description: type is the key algorithm, e.g. ssh-ed25519.
+                          type: string
+                      required:
+                      - fingerprint
+                      - publicKey
+                      - type
+                      type: object
+                    type: array
+                  hostKeysSecretName:
+                    description: hostKeysSecretName is the Secret that holds the host
+                      keys.
+                    type: string
+                  hostKeysSource:
+                    description: hostKeysSource tells where the keys came from.
+                    enum:
+                    - Generated
+                    - ExistingSecret
+                    type: string
+                  message:
+                    description: message explains a problem with the keys.
+                    type: string
+                type: object
               stats:
                 description: ForgejoStats are sampled from Forgejo's metrics endpoint.
                 properties:

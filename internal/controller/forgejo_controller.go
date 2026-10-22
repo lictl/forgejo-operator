@@ -113,8 +113,9 @@ const (
 )
 
 // steps run in order. maintenance → restore-guard → secrets → database → high-availability
-// → storage → upgrade → tuning → config → config-guard → workload form a chain: each
-// produces outputs the next ones consume, so a failure or Stop skips the rest of the chain
+// → storage → upgrade → tuning → config → config-guard → workload form a chain (which
+// ssh-host-keys joins at config): each produces outputs the next ones consume, so a failure or
+// Stop skips the rest of the chain
 // (e.g. no app.ini without the database, no rollout onto an unready Valkey). The other steps
 // only need part of the chain, or nothing, and keep running when an unrelated step fails, so
 // that one rejected Ingress or a Valkey outage does not also stop scheduled backups, health
@@ -132,13 +133,21 @@ var steps = []namedStep{
 	{name: "database", fn: core.ReconcileDatabase, needs: []string{"secrets"}},
 	{name: "high-availability", fn: autopilot.ReconcileHA, needs: []string{"database"}},
 	{name: "storage", fn: core.ReconcileStorage, needs: []string{"high-availability"}},
+	// The SSH host keys are identity, like the secrets: independent of the database, Valkey
+	// and storage. The config step consumes them; the upgrade step waits while they are
+	// unavailable (rc.SSHHostKeysUnavailable), so it runs first.
+	{name: "ssh-host-keys", fn: core.ReconcileSSHHostKeys, needs: []string{"secrets"}},
 	{name: stepUpgrade, fn: upgrade.Reconcile, needs: []string{"storage"}},
 	{name: "tuning", fn: autopilot.ReconcileTuning, needs: []string{stepUpgrade}},
-	{name: "config", fn: core.ReconcileConfig, needs: []string{"tuning"}},
+	{name: "config", fn: core.ReconcileConfig, needs: []string{"tuning", "ssh-host-keys"}},
 	{name: "config-guard", fn: autopilot.ReconcileConfigGuard, needs: []string{"config"}},
 	{name: "workload", fn: core.ReconcileWorkload, needs: []string{"config-guard"}},
 	// Spec-only objects.
 	{name: "network", fn: core.ReconcileNetwork},
+	// Optional integrations (Gateway API, cert-manager): created only when their CRDs exist;
+	// their status becomes RoutesReady and TLSReady. Independent of everything else.
+	{name: "gateway", fn: core.ReconcileGateway},
+	{name: "tls", fn: core.ReconcileTLS},
 	// rc.Maintenance, rc.Upgrading, rc.HPAManaged and rc.ResourcesOverride.
 	{name: "scaling", fn: autopilot.ReconcileScaling, needs: []string{"tuning"}},
 	{name: "monitoring", fn: observability.ReconcileMonitoring},
@@ -452,6 +461,7 @@ func forgetInstance(namespace, name string) {
 	forgejo.DeleteInstanceMetrics(namespace, name)
 	backup.ForgetLastSuccess(namespace, name)
 	observability.ForgetInstance(namespace, name)
+	core.ForgetInstance(namespace, name)
 }
 
 // exportInstanceReady sets forgejo_operator_instance_ready from the Ready condition, as

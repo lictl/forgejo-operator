@@ -23,8 +23,15 @@ import (
 // rootSection is the name used in spec.config for app.ini keys outside any section.
 const rootSection = "DEFAULT"
 
-// trustedProxies are the private ranges a cluster's ingress controllers live in.
-const trustedProxies = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,fc00::/7"
+// defaultTrustedProxies are the private ranges a cluster's ingress controllers and gateways
+// live in (spec.server.trustedProxies overrides them).
+const defaultTrustedProxies = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,fc00::/7"
+
+// loopbackTrustedProxies are trusted by default when the HTTP Service is a LoadBalancer or a
+// NodePort: with externalTrafficPolicy Cluster, kube-proxy replaces the address of a client
+// on the internet with a node's, which is in the private ranges, so trusting those would let
+// any client choose the address Forgejo logs.
+const loopbackTrustedProxies = "127.0.0.0/8,::1/128"
 
 // iniFile maps section -> key -> value; the root section is "".
 type iniFile map[string]map[string]string
@@ -126,10 +133,39 @@ func ReconcileConfig(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		}
 	}
 
+	if hk := rc.SSHHostKeys; hk != nil {
+		cfg.set("server", "SSH_SERVER_HOST_KEYS", hostKeyPaths(rc.Layout, hk))
+	}
 	content := cfg.render()
-	sum := sha256.Sum256([]byte(content))
-	hash := hex.EncodeToString(sum[:])[:16]
+	hash := configHash(content)
 
+	// While the Deployment is held for missing SSH host keys (rc.SSHHostKeysUnavailable), the
+	// pods keep the app.ini they run: it is mounted without subPath, so a change would reach
+	// them at their next container restart, without the rollout that the config guard watches.
+	// It is then rendered for the hashes only.
+	if !rc.SSHHostKeysUnavailable {
+		if err := writeConfig(ctx, rc, content, hash); err != nil {
+			return forgejo.StepResult{}, err
+		}
+	}
+
+	rc.ConfigHash = hash
+	rc.DesiredConfigHash = hash
+	if rc.ConfigSecretName == "" {
+		rc.ConfigSecretName = forgejo.ConfigSecretName(f)
+	}
+	return forgejo.StepResult{}, nil
+}
+
+// configHash identifies a rendered app.ini (the pod template's config-hash annotation).
+func configHash(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// writeConfig stores the rendered app.ini in "<name>-config".
+func writeConfig(ctx context.Context, rc *forgejo.ReconcileContext, content, hash string) error {
+	f := rc.Instance
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.ConfigSecretName(f), Namespace: f.Namespace}}
 	if err := apply(ctx, rc, sec, true, func() error {
 		sec.Labels = mergeMaps(sec.Labels, forgejo.Labels(f, forgejo.ComponentServer))
@@ -141,15 +177,9 @@ func ReconcileConfig(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		sec.Data = map[string][]byte{forgejo.ConfigSecretKey: []byte(content)}
 		return nil
 	}); err != nil {
-		return forgejo.StepResult{}, fmt.Errorf("config secret: %w", err)
+		return fmt.Errorf("config secret: %w", err)
 	}
-
-	rc.ConfigHash = hash
-	rc.DesiredConfigHash = hash
-	if rc.ConfigSecretName == "" {
-		rc.ConfigSecretName = forgejo.ConfigSecretName(f)
-	}
-	return forgejo.StepResult{}, nil
+	return nil
 }
 
 // secretValue reads one configFrom value; ok is false for a missing optional reference.
@@ -221,7 +251,7 @@ func defaultConfig(rc *forgejo.ReconcileContext, secrets map[string][]byte) iniF
 	if l.Traits.InternalSocket {
 		set("server", "INTERNAL_LISTENER_PATH", l.InternalSocketPath)
 	}
-	set("security", "REVERSE_PROXY_TRUSTED_PROXIES", trustedProxies)
+	set("security", "REVERSE_PROXY_TRUSTED_PROXIES", trustedProxies(f))
 	set("oauth2", "JWT_SECRET", string(secrets[forgejo.SecretKeyJWTSecret]))
 
 	set("service", "DISABLE_REGISTRATION", strconv.FormatBool(f.Spec.Server.DisableRegistration))
@@ -275,8 +305,48 @@ func sshExternalPort(f *forgejov1.Forgejo) int32 {
 	return forgejo.SSHServicePort(f)
 }
 
+// trustedProxies is REVERSE_PROXY_TRUSTED_PROXIES: spec.server.trustedProxies, else only
+// loopback when clients reach the HTTP Service directly (LoadBalancer, NodePort), else the
+// private ranges.
+func trustedProxies(f *forgejov1.Forgejo) string {
+	if len(f.Spec.Server.TrustedProxies) > 0 {
+		return strings.Join(f.Spec.Server.TrustedProxies, ",")
+	}
+	switch f.Spec.Server.HTTP.Type {
+	case corev1.ServiceTypeLoadBalancer, corev1.ServiceTypeNodePort:
+		return loopbackTrustedProxies
+	}
+	return defaultTrustedProxies
+}
+
 func ingressEnabled(f *forgejov1.Forgejo) bool {
 	return f.Spec.Ingress != nil && f.Spec.Ingress.Enabled
+}
+
+// ingressTLSSecret is the Secret the Ingress serves TLS with: ingress.tlsSecretName, else the
+// certificate's Secret when spec.tls.certManager is set.
+func ingressTLSSecret(f *forgejov1.Forgejo) string {
+	if f.Spec.Ingress != nil && f.Spec.Ingress.TLSSecretName != "" {
+		return f.Spec.Ingress.TLSSecretName
+	}
+	if forgejo.CertManagerEnabled(f) {
+		return forgejo.TLSSecretName(f)
+	}
+	return ""
+}
+
+const (
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
+// publicScheme is the scheme of ROOT_URL for a public host name: https when spec.tls says
+// that Forgejo is served over HTTPS.
+func publicScheme(f *forgejov1.Forgejo) string {
+	if forgejo.TLSEnabled(f) {
+		return schemeHTTPS
+	}
+	return schemeHTTP
 }
 
 func httpServiceFQDN(f *forgejov1.Forgejo) string {
@@ -292,14 +362,18 @@ func sshDomain(f *forgejov1.Forgejo) string {
 	return forgejo.ServiceHost(forgejo.SSHServiceName(f), f.Namespace)
 }
 
-// Domain is DOMAIN: spec.server.domain, else the ingress host, else the
-// host of spec.server.rootURL, else the HTTP Service DNS name.
+// Domain is DOMAIN: spec.server.domain, else the ingress host, else the first HTTPRoute
+// host name that is not a wildcard, else the host of spec.server.rootURL, else the HTTP
+// Service DNS name.
 func Domain(f *forgejov1.Forgejo) string {
 	if f.Spec.Server.Domain != "" {
 		return f.Spec.Server.Domain
 	}
 	if ingressEnabled(f) && f.Spec.Ingress.Host != "" {
 		return f.Spec.Ingress.Host
+	}
+	if h := gatewayHost(f); h != "" {
+		return h
 	}
 	if u, err := url.Parse(f.Spec.Server.RootURL); err == nil && u.Hostname() != "" {
 		return u.Hostname()
@@ -325,14 +399,17 @@ func RootURL(f *forgejov1.Forgejo) string {
 			return f.Spec.Server.RootURL
 		}
 		if ingressEnabled(f) && f.Spec.Ingress.Host != "" {
-			scheme := "http"
-			if f.Spec.Ingress.TLSSecretName != "" {
-				scheme = "https"
+			scheme := publicScheme(f)
+			if ingressTLSSecret(f) != "" {
+				scheme = schemeHTTPS
 			}
 			return scheme + "://" + f.Spec.Ingress.Host + ingressPath(f)
 		}
+		if h := gatewayHost(f); h != "" {
+			return publicScheme(f) + "://" + h + gatewayPath(f)
+		}
 		if f.Spec.Server.Domain != "" {
-			return "http://" + f.Spec.Server.Domain + "/"
+			return publicScheme(f) + "://" + f.Spec.Server.Domain + "/"
 		}
 		return "http://" + httpServiceFQDN(f) + ":" + strconv.Itoa(int(forgejo.HTTPServicePort(f))) + "/"
 	}()

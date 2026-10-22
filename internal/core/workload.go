@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -23,6 +24,7 @@ const (
 	configVolume      = "config"
 	tmpVolume         = "tmp"
 	healthzPath       = "/api/healthz"
+	shell             = "/bin/sh"
 	revisionHistory   = 5
 	progressDeadline  = 600
 	terminationPeriod = 60
@@ -50,6 +52,13 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	f := rc.Instance
 	if rc.ConfigHash == "" {
 		return forgejo.StepResult{Stop: true, RequeueAfter: dbNotReadyRequeue}, nil
+	}
+	if rc.SSHHostKeysUnavailable {
+		// The Secret the pods serve their SSH host keys from is missing or unusable, so a new
+		// pod could not start: a rollout (with Recreate) or a scale-down to zero for
+		// maintenance would take Forgejo down, and added pods would not start. The Deployment
+		// stays as it is; Degraded/SSHHostKeysUnavailable says so.
+		return forgejo.StepResult{}, nil
 	}
 	reportReplicasRequireHA(rc)
 	restore, err := migratingRestore(ctx, rc)
@@ -79,6 +88,9 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 		annotations := mergeMaps(f.Spec.PodTemplate.Annotations, map[string]string{forgejo.AnnotationConfigHash: rc.ConfigHash})
 		if restartedAt != "" {
 			annotations[forgejo.AnnotationRestartedAt] = restartedAt
+		}
+		if servingHostKeys(rc) {
+			annotations[forgejo.AnnotationSSHHostKeys] = rc.SSHHostKeys.Digest
 		}
 		dep.Spec.Template.ObjectMeta = metav1.ObjectMeta{
 			Labels:      podLabels(rc, f.Spec.PodTemplate.Labels),
@@ -253,6 +265,21 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		Path: healthzPath, Port: intstr.FromString("http"), Scheme: corev1.URISchemeHTTP,
 	}}
 
+	volumes := []corev1.Volume{
+		{Name: dataVolume, VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName(f)},
+		}},
+		{Name: configVolume, VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: rc.ConfigSecretName, DefaultMode: ptr.To[int32](0o440)},
+		}},
+		{Name: tmpVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+	}
+	mainMounts := mounts
+	if servingHostKeys(rc) {
+		volumes = append(volumes, hostKeysVolumes(rc.SSHHostKeys)...)
+		mainMounts = append(slices.Clone(mounts), corev1.VolumeMount{Name: sshHostKeysCopyVolume, MountPath: l.SSHHostKeysDir, ReadOnly: true})
+	}
+
 	main := corev1.Container{
 		Name:            containerName,
 		Image:           rc.TargetImage,
@@ -261,7 +288,7 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		Env:             dedupeEnv(baseEnv, rc.TuningEnv, f.Spec.Env),
 		Ports:           ports,
 		Resources:       resources,
-		VolumeMounts:    mounts,
+		VolumeMounts:    mainMounts,
 		StartupProbe: &corev1.Probe{
 			ProbeHandler: healthz, PeriodSeconds: 10, TimeoutSeconds: 5, SuccessThreshold: 1, FailureThreshold: startupFailureThreshold,
 		},
@@ -283,7 +310,7 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		Name:            initPermissionsContainer,
 		Image:           rc.TargetImage,
 		ImagePullPolicy: pullPolicy,
-		Command:         []string{"/bin/sh", "-c", initPermissionsScript(l)},
+		Command:         []string{shell, "-c", initPermissionsScript(l)},
 		Resources:       resources,
 		VolumeMounts:    []corev1.VolumeMount{{Name: dataVolume, MountPath: l.DataMountPath}},
 		SecurityContext: &corev1.SecurityContext{
@@ -318,7 +345,7 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		Name:                     "bootstrap",
 		Image:                    rc.TargetImage,
 		ImagePullPolicy:          pullPolicy,
-		Command:                  []string{"/bin/sh", "-c", bootstrapScript(l)},
+		Command:                  []string{shell, "-c", bootstrapScript(l)},
 		Env:                      bootstrapEnv,
 		Resources:                resources,
 		VolumeMounts:             mounts,
@@ -327,26 +354,18 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 	}
 
-	claim := f.Spec.Storage.ExistingClaim
-	if claim == "" {
-		claim = forgejo.DataPVCName(f)
+	var initContainers []corev1.Container
+	if servingHostKeys(rc) {
+		initContainers = append(initContainers, hostKeysInitContainer(rc, resources, pullPolicy))
 	}
-	initContainers := []corev1.Container{bootstrap}
 	if fixPermissions(f) {
-		initContainers = []corev1.Container{initPerms, bootstrap}
+		initContainers = append(initContainers, initPerms)
 	}
+	initContainers = append(initContainers, bootstrap)
 	return corev1.PodSpec{
 		InitContainers: initContainers,
 		Containers:     []corev1.Container{main},
-		Volumes: []corev1.Volume{
-			{Name: dataVolume, VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim},
-			}},
-			{Name: configVolume, VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: rc.ConfigSecretName, DefaultMode: ptr.To[int32](0o440)},
-			}},
-			{Name: tmpVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		},
+		Volumes:        volumes,
 		SecurityContext: &corev1.PodSecurityContext{
 			FSGroup:             ptr.To(l.GID),
 			FSGroupChangePolicy: ptr.To(corev1.FSGroupChangeOnRootMismatch),
@@ -367,6 +386,14 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		SchedulerName:                 corev1.DefaultSchedulerName,
 		TerminationGracePeriodSeconds: ptr.To[int64](terminationPeriod),
 	}
+}
+
+// claimName is the data PVC the pods mount.
+func claimName(f *forgejov1.Forgejo) string {
+	if f.Spec.Storage.ExistingClaim != "" {
+		return f.Spec.Storage.ExistingClaim
+	}
+	return forgejo.DataPVCName(f)
 }
 
 func adminSecretName(f *forgejov1.Forgejo) string {

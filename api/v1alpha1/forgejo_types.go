@@ -57,6 +57,14 @@ const (
 	// operator's support policy (the current LTS and the latest release). The reason is
 	// Supported, Deprecated, EndOfLife, Future or Unknown; see docs/versions.md.
 	ConditionVersionSupported = "VersionSupported"
+	// ConditionRoutesReady is True when every Gateway API route of spec.gateway is accepted
+	// by each of its parent Gateways and its backend references resolve. Only reported
+	// while spec.gateway is set; see docs/networking.md.
+	ConditionRoutesReady = "RoutesReady"
+	// ConditionTLSReady is True when the cert-manager Certificate of spec.tls.certManager is
+	// ready (and the ReferenceGrant of spec.tls.gatewayNamespaces exists). Only reported
+	// while spec.tls is set; see docs/networking.md.
+	ConditionTLSReady = "TLSReady"
 )
 
 // ForgejoPhase is a coarse, human-readable summary of the instance state.
@@ -109,6 +117,17 @@ type ForgejoSpec struct {
 	// ingress exposes the HTTP service through an Ingress.
 	// +optional
 	Ingress *IngressSpec `json:"ingress,omitempty"`
+
+	// gateway exposes Forgejo through Gateway API routes attached to Gateways that already
+	// exist: HTTPRoute "<name>" for HTTP and, optionally, TCPRoute "<name>-ssh" for SSH. The
+	// operator never creates a Gateway. Requires the Gateway API CRDs; see docs/networking.md.
+	// +optional
+	Gateway *GatewaySpec `json:"gateway,omitempty"`
+
+	// tls says that Forgejo is served over HTTPS (ROOT_URL becomes https) and can request the
+	// certificate from cert-manager. See docs/networking.md.
+	// +optional
+	TLS *TLSSpec `json:"tls,omitempty"`
 
 	// database selects the PostgreSQL backend. Defaults to an operator-managed CloudNativePG cluster.
 	// +kubebuilder:default={}
@@ -186,14 +205,32 @@ type ServerSpec struct {
 	// +optional
 	AppName string `json:"appName,omitempty"`
 
-	// domain is the public host name (DOMAIN / SSH_DOMAIN). Defaults to ingress.host, or the
-	// in-cluster HTTP service DNS name.
+	// domain is the public host name (DOMAIN / SSH_DOMAIN). Defaults to ingress.host, the
+	// first gateway.hostnames entry that is not a wildcard, or the in-cluster HTTP service DNS
+	// name.
 	// +optional
 	Domain string `json:"domain,omitempty"`
 
-	// rootURL overrides ROOT_URL. Defaults to http(s)://<domain>/ (https when ingress TLS is set).
+	// rootURL overrides ROOT_URL. Defaults to http(s)://<host><path>/ from the Ingress or the
+	// HTTPRoute, else http(s)://<domain>/; https when the Ingress has a TLS Secret or spec.tls
+	// is set.
 	// +optional
 	RootURL string `json:"rootURL,omitempty"`
+
+	// trustedProxies are the networks (CIDRs, or "*" for every peer) whose X-Forwarded-For and
+	// X-Real-IP headers Forgejo trusts to tell the client's address ([security]
+	// REVERSE_PROXY_TRUSTED_PROXIES). Defaults to the loopback and private ranges
+	// (127.0.0.0/8, ::1/128, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10,
+	// fc00::/7), where a cluster's ingress controllers and gateways run; to loopback only
+	// (127.0.0.0/8, ::1/128) when http.type is LoadBalancer or NodePort, whose clients
+	// kube-proxy shows with a node's private address. Narrow it to the proxies' pod network
+	// when other workloads in those ranges could reach Forgejo directly.
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MaxLength=64
+	// +kubebuilder:validation:items:Pattern=`^(\*|[0-9A-Fa-f.:]+/[0-9]{1,3})$`
+	// +listType=atomic
+	// +optional
+	TrustedProxies []string `json:"trustedProxies,omitempty"`
 
 	// disableRegistration turns off self sign-up.
 	// +optional
@@ -243,6 +280,7 @@ type SSHSpec struct {
 	Enabled *bool `json:"enabled,omitempty"`
 
 	// externalPort is the port shown in clone URLs (SSH_PORT). Defaults to the service port.
+	// With spec.gateway.ssh, set it to the port of the Gateway's TCP listener.
 	// +optional
 	ExternalPort int32 `json:"externalPort,omitempty"`
 
@@ -250,6 +288,21 @@ type SSHSpec struct {
 	// +kubebuilder:default={}
 	// +optional
 	Service ServiceSpec `json:"service,omitempty"`
+
+	// hostKeys configures the SSH server's host keys. By default the operator generates them
+	// once into the Secret "<name>-ssh-host-keys" and never rotates them.
+	// +optional
+	HostKeys *SSHHostKeysSpec `json:"hostKeys,omitempty"`
+}
+
+// SSHHostKeysSpec configures the SSH host keys.
+type SSHHostKeysSpec struct {
+	// existingSecret names a Secret with your own host keys, in OpenSSH or PEM format, under
+	// one or more of the keys "ssh_host_ed25519_key", "ssh_host_ecdsa_key" and
+	// "ssh_host_rsa_key" (the files "ssh-keygen -A" writes). The operator neither generates
+	// nor changes keys then.
+	// +optional
+	ExistingSecret string `json:"existingSecret,omitempty"`
 }
 
 // IngressSpec exposes Forgejo over HTTP(S).
@@ -273,9 +326,186 @@ type IngressSpec struct {
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
 
-	// tlsSecretName enables TLS using this Secret.
+	// tlsSecretName enables TLS using this Secret. Defaults to "<name>-tls", the Secret of
+	// the certificate, when spec.tls.certManager is set.
 	// +optional
 	TLSSecretName string `json:"tlsSecretName,omitempty"`
+}
+
+// GatewaySpec attaches Forgejo to existing Gateways through Gateway API routes.
+type GatewaySpec struct {
+	// parentRefs are the Gateways, or their listeners (sectionName), that HTTPRoute "<name>"
+	// attaches to. Their listeners must allow routes from the instance's namespace. A
+	// reference without sectionName or port attaches to every listener that matches the host
+	// names, plain HTTP ones included: with spec.tls, name the HTTPS listeners.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
+	// +listType=atomic
+	ParentRefs []GatewayParentReference `json:"parentRefs"`
+
+	// hostnames the HTTPRoute matches. Defaults to the public host names that are DNS names:
+	// the hosts of ROOT_URL and DOMAIN (spec.server.domain, ingress.host or the host of
+	// spec.server.rootURL). Without any, no HTTPRoute is created (RoutesReady=False,
+	// NoHostnames): a route without host names would take every host name of its listeners.
+	// Unless spec.server.domain or an Ingress host is set, the first one that is not a
+	// wildcard is the public host name (DOMAIN, ROOT_URL).
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^(\*\.)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +listType=atomic
+	// +optional
+	Hostnames []string `json:"hostnames,omitempty"`
+
+	// path is the path prefix Forgejo is served under, "/" by default. Another prefix becomes
+	// part of ROOT_URL, and the HTTPRoute removes it before requests reach Forgejo (URLRewrite,
+	// Gateway API extended support).
+	// +kubebuilder:default="/"
+	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:Pattern=`^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$`
+	// +optional
+	Path string `json:"path,omitempty"`
+
+	// requestTimeout is the HTTPRoute's rules[].timeouts.request, a Gateway API duration such
+	// as "0s" (no timeout), "30m" or "1h". Defaults to "0s": Gateways otherwise end requests
+	// after their own default (15s with Envoy Gateway), which cuts long clones, pushes and
+	// downloads. An empty string leaves timeouts out of the route, for implementations that
+	// do not support them.
+	// +kubebuilder:default="0s"
+	// +kubebuilder:validation:Pattern=`^(([0-9]{1,5}(h|m|s|ms)){1,4})?$`
+	// +optional
+	RequestTimeout *string `json:"requestTimeout,omitempty"`
+
+	// removeRequestHeaders are request headers the HTTPRoute removes before requests reach
+	// Forgejo (a RequestHeaderModifier filter), besides X-Real-IP, which it always removes:
+	// Forgejo prefers it to X-Forwarded-For, and Gateways such as Envoy Gateway pass a
+	// client's own X-Real-IP through, which would let any client choose the address Forgejo
+	// logs and rate-limits.
+	// +kubebuilder:validation:MaxItems=15
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z0-9!#$%&'*+\-.^_|~]+$`
+	// +listType=atomic
+	// +optional
+	RemoveRequestHeaders []string `json:"removeRequestHeaders,omitempty"`
+
+	// annotations are added to the routes.
+	// +optional
+	Annotations map[string]string `json:"annotations,omitempty"`
+
+	// ssh adds TCPRoute "<name>-ssh" for Git over SSH through a TCP listener of a Gateway.
+	// Without it, SSH is served by Service "<name>-ssh" only (spec.server.ssh.service). Set
+	// spec.server.ssh.externalPort to the listener's port, which clone URLs show.
+	// +optional
+	SSH *GatewaySSHSpec `json:"ssh,omitempty"`
+}
+
+// GatewaySSHSpec routes Git over SSH through a TCP listener of a Gateway.
+type GatewaySSHSpec struct {
+	// parentRefs are the Gateways, usually one TCP listener of each (sectionName), that
+	// TCPRoute "<name>-ssh" attaches to.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
+	// +listType=atomic
+	ParentRefs []GatewayParentReference `json:"parentRefs"`
+}
+
+// GatewayParentReference identifies a Gateway, or some of its listeners, that a route
+// attaches to (a Gateway API ParentReference).
+type GatewayParentReference struct {
+	// group of the parent resource. Defaults to gateway.networking.k8s.io.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +optional
+	Group string `json:"group,omitempty"`
+
+	// kind of the parent resource. Defaults to Gateway.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^$|^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$`
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// namespace of the parent. Defaults to the instance's namespace.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// name of the parent.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+
+	// sectionName selects one listener of the Gateway by its name.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +optional
+	SectionName string `json:"sectionName,omitempty"`
+
+	// port selects the Gateway's listeners on this port (Gateway API extended support).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	Port *int32 `json:"port,omitempty"`
+}
+
+// TLSSpec says that Forgejo is served over HTTPS.
+type TLSSpec struct {
+	// certManager requests the certificate from cert-manager: the operator creates Certificate
+	// "<name>-tls", which cert-manager keeps in Secret "<name>-tls". An Ingress uses that
+	// Secret by default; a Gateway's HTTPS listener references it in its certificateRefs.
+	// Without certManager, the Ingress's tlsSecretName or the Gateway's own certificate
+	// serves TLS. Requires cert-manager.
+	// +optional
+	CertManager *CertManagerTLSSpec `json:"certManager,omitempty"`
+
+	// gatewayNamespaces are the namespaces of Gateways whose HTTPS listeners reference Secret
+	// "<name>-tls". The operator creates ReferenceGrant "<name>-tls" in the instance's
+	// namespace, which lets Gateways in these namespaces read that Secret and nothing else.
+	// A Gateway in the instance's namespace needs none. Requires the Gateway API CRDs.
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +listType=atomic
+	// +optional
+	GatewayNamespaces []string `json:"gatewayNamespaces,omitempty"`
+}
+
+// CertManagerTLSSpec requests a certificate from cert-manager.
+type CertManagerTLSSpec struct {
+	// issuerRef is the Issuer (in the instance's namespace) or ClusterIssuer that signs the
+	// certificate.
+	IssuerRef CertManagerIssuerRef `json:"issuerRef"`
+
+	// dnsNames of the certificate. Defaults to the public host names that are DNS names: the
+	// hosts of ROOT_URL and DOMAIN, ingress.host and the HTTPRoute's host names.
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
+	// +listType=atomic
+	// +optional
+	DNSNames []string `json:"dnsNames,omitempty"`
+}
+
+// CertManagerIssuerRef references a cert-manager issuer.
+type CertManagerIssuerRef struct {
+	// name of the issuer.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+
+	// kind of the issuer: Issuer (the default) or ClusterIssuer, or the kind of an external
+	// issuer.
+	// +kubebuilder:default=Issuer
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// group of the issuer. Defaults to cert-manager.io; set it for external issuers.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	Group string `json:"group,omitempty"`
 }
 
 // DatabaseType selects the PostgreSQL provider.
@@ -787,6 +1017,49 @@ type ForgejoStatus struct {
 
 	// +optional
 	AutoPilot *AutoPilotStatus `json:"autoPilot,omitempty"`
+
+	// ssh reports the SSH server's host keys.
+	// +optional
+	SSH *SSHStatus `json:"ssh,omitempty"`
+}
+
+// SSHHostKeysSource tells where an instance's SSH host keys came from.
+// +kubebuilder:validation:Enum=Generated;ExistingSecret
+type SSHHostKeysSource string
+
+const (
+	// SSHHostKeysGenerated: the operator generated the keys.
+	SSHHostKeysGenerated SSHHostKeysSource = "Generated"
+	// SSHHostKeysExistingSecret: spec.server.ssh.hostKeys.existingSecret, or a
+	// "<name>-ssh-host-keys" Secret the user created.
+	SSHHostKeysExistingSecret SSHHostKeysSource = "ExistingSecret"
+)
+
+// SSHStatus reports the host keys of Forgejo's SSH server.
+type SSHStatus struct {
+	// hostKeysSecretName is the Secret that holds the host keys.
+	// +optional
+	HostKeysSecretName string `json:"hostKeysSecretName,omitempty"`
+	// hostKeysSource tells where the keys came from.
+	// +optional
+	HostKeysSource SSHHostKeysSource `json:"hostKeysSource,omitempty"`
+	// hostKeys are the public host keys and their SHA256 fingerprints, to publish to users
+	// (e.g. in known_hosts).
+	// +optional
+	HostKeys []SSHHostKey `json:"hostKeys,omitempty"`
+	// message explains a problem with the keys.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// SSHHostKey is one public host key.
+type SSHHostKey struct {
+	// type is the key algorithm, e.g. ssh-ed25519.
+	Type string `json:"type"`
+	// fingerprint is the SHA256 fingerprint as ssh-keygen -l prints it ("SHA256:...").
+	Fingerprint string `json:"fingerprint"`
+	// publicKey in authorized_keys format ("<type> <base64>").
+	PublicKey string `json:"publicKey"`
 }
 
 // DatabaseStatus reports the PostgreSQL backend.

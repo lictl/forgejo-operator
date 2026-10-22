@@ -210,6 +210,11 @@ func (r *ForgejoRestoreReconciler) validate(ctx context.Context, rs *forgejov1.F
 			return r.wait(ctx, rs, fmt.Sprintf("Waiting for ForgejoRestore %s to finish", o.Name))
 		}
 	}
+	// While the Secret of SSH host keys is missing or unusable, Forgejo could not start again
+	// after the restore, and the Forgejo pipeline holds its Deployment (no scale-down).
+	if ssh := f.Status.SSH; ssh != nil && ssh.Message != "" {
+		return r.wait(ctx, rs, "Waiting for the SSH host keys: "+ssh.Message)
+	}
 
 	// Refuse a Job name taken by something else before maintenance mode is turned on.
 	existing := &batchv1.Job{}

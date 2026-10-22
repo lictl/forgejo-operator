@@ -99,7 +99,9 @@ unparseable tag.
 
 An orchestrated upgrade does not start while a `ForgejoRestore` holds the instance in
 maintenance mode (`Upgrading=False`, reason `WaitingForRestore`); it starts once the restore
-has finished.
+has finished. Nor does it start while the Secret of SSH host keys is missing or unusable
+(`Upgrading=False`, reason `WaitingForSSHHostKeys`): the new image's pods could not start (see
+[ssh.md](ssh.md#when-something-is-wrong)).
 
 ## Restores during an upgrade
 

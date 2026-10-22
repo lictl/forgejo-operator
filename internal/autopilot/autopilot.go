@@ -86,7 +86,7 @@ func Reconcile(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepR
 		errs = append(errs, rollbackFailingConfig(ctx, rc, st, pods))
 		errs = append(errs, restartUnhealthy(ctx, rc, dep, pods))
 	}
-	if forgejo.VerticalAutoscalingEnabled(f) && !rc.Maintenance && !workloadHeld(rc) {
+	if forgejo.VerticalAutoscalingEnabled(f) && !rc.Maintenance && !replacementsHeld(rc) {
 		reverted := revertUnschedulable(rc, st, pods)
 		oomSeen, oomScaled := false, false
 		if !reverted {
@@ -118,6 +118,15 @@ func serverDeployment(ctx context.Context, rc *forgejo.ReconcileContext) (*appsv
 // or the replica count wait.
 func workloadHeld(rc *forgejo.ReconcileContext) bool {
 	return rc.Upgrading || rc.RestoreMigrating || forgejo.UpgradeHoldsWorkload(rc.Instance)
+}
+
+// replacementsHeld reports whether autonomous actions that replace pods (restarts, resizes,
+// config rollbacks) must wait: a migration owns the workload, or the Secret of SSH host keys
+// the pods serve is missing or unusable, so that a replacement pod could not start (the
+// workload step leaves the Deployment as it is meanwhile). The HPA is left alone: pods it
+// adds just do not start, and the running ones keep serving.
+func replacementsHeld(rc *forgejo.ReconcileContext) bool {
+	return workloadHeld(rc) || rc.SSHHostKeysUnavailable
 }
 
 // serverPods lists the Forgejo server pods of the instance that are neither terminating nor

@@ -5,6 +5,7 @@ package backup_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -214,5 +215,32 @@ func TestRestoreScaleUpWaitsForHPAManagedInstance(t *testing.T) {
 	got := reconcileRestore(t, c, s, rs.Name, 1)
 	if got.Status.Phase != forgejov1.RestorePhaseScalingUp {
 		t.Errorf("phase %s (%s), want ScalingUp until the HPA-managed instance is available", got.Status.Phase, got.Status.Message)
+	}
+}
+
+// A restore does not scale Forgejo down while the Secret of SSH host keys the pods serve is
+// missing or unusable: Forgejo could not start again afterwards.
+func TestRestoreWaitsForSSHHostKeys(t *testing.T) {
+	s := scheme(t)
+	b := completedBackup("b1")
+	rs := newRestore("r1", "")
+	rs.Finalizers = []string{forgejo.FinalizerName}
+	rs.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
+	rs.Spec.BackupName = "b1"
+	f := instance("")
+	f.Status.SSH = &forgejov1.SSHStatus{HostKeysSecretName: "fb-ssh-host-keys", Message: "Secret fb-ssh-host-keys with the SSH host keys the pods serve is missing"}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, b, rs).WithStatusSubresource(rs).Build()
+
+	got := reconcileRestore(t, c, s, rs.Name, 1)
+	if got.Status.Phase != forgejov1.RestorePhasePending || !strings.Contains(got.Status.Message, "Waiting for the SSH host keys: Secret fb-ssh-host-keys") {
+		t.Fatalf("phase %s (%s), want Pending, waiting for the keys", got.Status.Phase, got.Status.Message)
+	}
+
+	f.Status.SSH.Message = ""
+	if err := c.Update(context.Background(), f); err != nil {
+		t.Fatal(err)
+	}
+	if got = reconcileRestore(t, c, s, rs.Name, 1); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
+		t.Fatalf("phase %s (%s), want ScalingDown once the keys are back", got.Status.Phase, got.Status.Message)
 	}
 }

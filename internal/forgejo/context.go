@@ -85,6 +85,15 @@ type ReconcileContext struct {
 	// DesiredConfigHash is the hash rendered from the current spec (may differ from
 	// ConfigHash while a rollback is active).
 	DesiredConfigHash string
+	// SSHHostKeys are the host keys the SSH server serves from a Secret, set by the
+	// ssh-host-keys step; nil while they are not managed (SSH disabled, or
+	// SSH_SERVER_HOST_KEYS in spec.config). app.ini and the workload serve them.
+	SSHHostKeys *SSHHostKeys
+	// SSHHostKeysUnavailable is set by the ssh-host-keys step while the Secret the running
+	// pods serve their host keys from is missing or unusable (SSHHostKeys then holds the live
+	// Deployment's keys). A new pod could not start, so the workload step leaves the
+	// Deployment as it is, and restarts, resizes, config rollbacks and upgrades wait.
+	SSHHostKeysUnavailable bool
 	// ReplicasOverride, when set, replaces the computed replica count.
 	ReplicasOverride *int32
 	// HPAManaged is true when an HPA owns the replica count.
@@ -92,6 +101,19 @@ type ReconcileContext struct {
 
 	// RequeueAfter is the shortest requeue any step asked for.
 	RequeueAfter time.Duration
+}
+
+// SSHHostKeys are the SSH host keys of an instance, kept in a Secret.
+type SSHHostKeys struct {
+	// SecretName holds the keys.
+	SecretName string
+	// Files are the keys of the Secret (and the file names under ImageLayout.SSHHostKeysDir)
+	// in the order app.ini lists them.
+	Files []string
+	// Digest identifies the file names and contents (the pod template's ssh-host-keys
+	// annotation): it changes whenever a key changes, and the pod's ssh-host-keys init
+	// container refuses a Secret whose files do not match it.
+	Digest string
 }
 
 // StepResult tells the orchestrator how to continue.
