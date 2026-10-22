@@ -220,6 +220,15 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 			"`kubectl get fj %s %s -o yaml` names the failed image; it is not retried until spec.image "+
 			"changes. Check the logs of the failed pods for migration errors.", f.Name, kc))
 
+	add("ForgejoVersionUnsupported", "warning", "1h",
+		fmt.Sprintf(`max by (namespace, name, major, support) (forgejo_operator_version_supported{%s}) == 0`, op),
+		fmt.Sprintf("Forgejo %s runs a version outside the operator's support policy ({{ $labels.support }})", ref),
+		fmt.Sprintf("Forgejo major {{ $labels.major }} is {{ $labels.support }}: the operator supports the current "+
+			"LTS release and the latest release (Deprecated: still maintained upstream but outside that policy; "+
+			"EndOfLife: no more security fixes; Future: newer than the operator's version table; Unknown: the "+
+			"version cannot be determined). The VersionSupported condition of `kubectl describe fj %s %s` says "+
+			"what to upgrade to and by when; see docs/versions.md.", f.Name, kc))
+
 	add("ForgejoAutoPilotActive", "warning", "",
 		fmt.Sprintf(`sum by (namespace, name) (increase(forgejo_operator_autopilot_actions_total{%s}[1h])) >= 5`, op),
 		fmt.Sprintf("The operator keeps intervening on Forgejo %s", ref),

@@ -285,12 +285,7 @@ func termMatches(t corev1.NodeSelectorTerm, node *corev1.Node) bool {
 
 func requirementMatches(r corev1.NodeSelectorRequirement, value string, present bool) bool {
 	in := func() bool {
-		for _, v := range r.Values {
-			if v == value {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(r.Values, value)
 	}
 	compare := func(want func(have, limit int64) bool) bool {
 		if !present || len(r.Values) != 1 {

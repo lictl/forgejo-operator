@@ -443,10 +443,17 @@ const adminSyncMarker = ".admin-password-sync"
 // bootstrapScript prepares the data directories (prepareDirsScript), migrates the
 // database, then creates the admin or, when the admin Secret
 // changed since the last sync, resets its password so that the Secret stays authoritative.
-// The password only travels through the env. A failed migration is fatal; a failed admin
+// The password only travels through the env, and, on majors whose change-password reads it
+// from stdin (forgejo.Traits.PasswordFromStdin), through a pipe from the shell's printf
+// builtin instead of the command line. A failed migration is fatal; a failed admin
 // sync (e.g. a password that does not meet PASSWORD_COMPLEXITY / MIN_PASSWORD_LENGTH /
 // PASSWORD_CHECK_PWN) only logs a warning, so it can never keep Forgejo from starting.
 func bootstrapScript(l forgejo.ImageLayout) string {
+	changePassword := `"$F" admin user change-password --config "$C" --username "$ADMIN_USERNAME" --password="$ADMIN_PASSWORD" --must-change-password=false`
+	if l.Traits.PasswordFromStdin {
+		// The password and its confirmation.
+		changePassword = `printf '%%s\n%%s\n' "$ADMIN_PASSWORD" "$ADMIN_PASSWORD" | "$F" admin user change-password --config "$C" --username "$ADMIN_USERNAME" --must-change-password=false`
+	}
 	return "set -eu\n" + prepareDirsScript(l) + fmt.Sprintf(`F=%s
 C=%s
 M=%s
@@ -462,7 +469,7 @@ users=$("$F" admin user list --config "$C")
 if printf '%%s\n' "$users" | awk -v u="$ADMIN_USERNAME" 'NR > 1 && tolower($2) == tolower(u) { found = 1 } END { exit !found }'; then
   if [ -n "$want" ] && [ -f "$M" ] && [ "$(cat "$M")" = "$want" ]; then
     echo "admin password is in sync with the Secret"
-  elif "$F" admin user change-password --config "$C" --username "$ADMIN_USERNAME" --password="$ADMIN_PASSWORD" --must-change-password=false; then
+  elif `+changePassword+`; then
     mark
   else
     echo "WARNING: could not set the admin password from the Secret (password policy?); keeping the current password" >&2

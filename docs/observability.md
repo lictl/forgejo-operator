@@ -184,7 +184,7 @@ Forgejo 16 keeps the `gitea_` prefix.
 | `gitea_mirrors`, `gitea_releases`, `gitea_stars`, `gitea_watches`, `gitea_follows`, `gitea_webhooks`, `gitea_hooktasks`, `gitea_publickeys`, `gitea_oauths`, `gitea_loginsources`, `gitea_projects`, `gitea_projects_boards`, `gitea_attachments`, `gitea_accesses`, `gitea_updatetasks` | Other counts |
 | `go_*`, `process_*` | Go runtime and process metrics |
 
-Forgejo 16 exports no pull-request count, so `status.stats.pullRequests` stays 0. The
+Forgejo (15 to 17) exports no pull-request count, so `status.stats.pullRequests` stays 0. The
 high-cardinality `gitea_issues_by_label` and `gitea_issues_by_repository` are only exported when
 you enable `[metrics] ENABLED_ISSUE_BY_LABEL` / `ENABLED_ISSUE_BY_REPOSITORY` through `spec.config`.
 
@@ -208,6 +208,8 @@ all of an instance's series when the instance is deleted.
 | `forgejo_operator_upgrades_total` | counter | `result` (succeeded/failed/rolledback) | Finished upgrades |
 | `forgejo_operator_autopilot_actions_total` | counter | `action` | Autonomous actions, by type |
 | `forgejo_operator_volume_used_ratio` | gauge | `claim` | Used/capacity of each PVC |
+| `forgejo_operator_version_supported` | gauge | `major`, `support` | 1 when the running Forgejo major is within the support policy, else 0; `support` is `Supported`, `Deprecated`, `EndOfLife`, `Future` or `Unknown` ([versions.md](versions.md)) |
+| `forgejo_operator_version_end_of_life_timestamp_seconds` | gauge | `major` | Upstream end of life of the running major, when it is in the version table |
 
 The endpoint also serves the standard controller-runtime metrics:
 
@@ -242,6 +244,7 @@ those metrics are missing.
 | `ForgejoBackupMissing` | warning | No successful backup recorded at all, while the instance's operator metrics are present (`absent(last_success) and on() count(instance_ready) > 0`), so a scrape gap is not reported as a missing backup. Only rendered when `spec.backup.enabled` | maxAge |
 | `ForgejoVolumeAlmostFull` | warning | `forgejo_operator_volume_used_ratio > 0.9` | 10m |
 | `ForgejoUpgradeFailed` | warning | An upgrade with `result!="succeeded"` (failed or rolled back) in the last hour | – |
+| `ForgejoVersionUnsupported` | warning | `forgejo_operator_version_supported == 0`: the running major is `Deprecated`, `EndOfLife`, `Future` or `Unknown`; the `VersionSupported` condition says what to upgrade to and by when | 1h |
 | `ForgejoAutoPilotActive` | warning | At least 5 autopilot actions in the last hour | – |
 
 `maxAge` is the longest gap between two runs of `spec.backup.schedule` plus half of that gap,

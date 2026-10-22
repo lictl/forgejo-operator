@@ -12,6 +12,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,9 +39,10 @@ const (
 	AnnotationRetry = "forgejo.lucas.icu/retry-upgrade"
 
 	// Degraded reasons owned by this package.
-	ReasonDowngradeRefused = "DowngradeRefused"
-	ReasonRolledBack       = "UpgradeRolledBack"
-	ReasonFailed           = "UpgradeFailed"
+	ReasonDowngradeRefused       = "DowngradeRefused"
+	ReasonUpgradePathUnsupported = "UpgradePathUnsupported"
+	ReasonRolledBack             = "UpgradeRolledBack"
+	ReasonFailed                 = "UpgradeFailed"
 
 	reasonSucceeded = "UpgradeSucceeded"
 	reasonCancelled = "UpgradeCancelled"
@@ -123,7 +126,7 @@ func idle(rc *forgejo.ReconcileContext, desired, current string, retry bool) {
 		return
 	}
 
-	switch c := compare(current, desired); {
+	switch c := compare(current, f.Status.Version, desired, f.Spec.Upgrade.AllowDowngrade); {
 	case c.kind == downgrade && !f.Spec.Upgrade.AllowDowngrade:
 		refuse(rc, current, desired, c)
 	case c.kind == sameVersion:
@@ -140,6 +143,8 @@ func idle(rc *forgejo.ReconcileContext, desired, current string, retry bool) {
 			rc.Event(corev1.EventTypeWarning, "Downgrade", eventAction, "%s", msg)
 		}
 		rollout(rc, desired, "Downgrade", msg)
+	case c.kind == upgradeVersion && !directUpgrade(c):
+		refusePath(rc, current, desired, c)
 	case rc.Maintenance:
 		// A restore owns the instance; the upgrade starts once it is done.
 		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, "WaitingForRestore",
@@ -225,6 +230,48 @@ func refuse(rc *forgejo.ReconcileContext, current, desired string, c comparison)
 	rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, ReasonDowngradeRefused, msg)
 }
 
+// directUpgrade reports whether the version table allows upgrading between the majors of c
+// in one step (forgejo.VersionTable.DirectUpgrade).
+func directUpgrade(c comparison) bool {
+	ok, _ := forgejo.Versions.DirectUpgrade(c.from.Major, c.to.Major)
+	return ok
+}
+
+// refusePath blocks an upgrade that skips more majors than the version table allows, like
+// a downgrade: the current image keeps running and one Warning event is emitted.
+func refusePath(rc *forgejo.ReconcileContext, current, desired string, c comparison) {
+	_, via := forgejo.Versions.DirectUpgrade(c.from.Major, c.to.Major)
+	msg := fmt.Sprintf("Refusing to upgrade from %s (%s) to %s (%s) in one step: the operator upgrades to Forgejo %d "+
+		"only from %d or newer. Upgrade to Forgejo %d first (its latest patch release), then to %s. See docs/versions.md.",
+		current, c.from, desired, c.to, c.to.Major, via, via, desired)
+	if prev := meta.FindStatusCondition(rc.Instance.Status.Conditions, forgejov1.ConditionUpgrading); prev == nil ||
+		prev.Reason != ReasonUpgradePathUnsupported || prev.Message != msg {
+		rc.Event(corev1.EventTypeWarning, ReasonUpgradePathUnsupported, eventAction, "%s", msg)
+	}
+	rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionTrue, ReasonUpgradePathUnsupported, msg)
+	rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, ReasonUpgradePathUnsupported, msg)
+}
+
+// warnTarget emits Warning events about the version an upgrade goes to: one outside the
+// support policy (the upgrade still proceeds), and app.ini values that the new major refuses
+// to start with (forgejo.Traits.StrictDurations), which would make the upgrade fail.
+func warnTarget(rc *forgejo.ReconcileContext, to string, c comparison) {
+	switch s := forgejo.Versions.Classify(c.to, c.toOK, time.Now()); s.Level {
+	case forgejo.SupportDeprecated, forgejo.SupportEndOfLife, forgejo.SupportFuture:
+		rc.Event(corev1.EventTypeWarning, reasonUnsupportedVersion, eventAction, "Upgrading to %s anyway: %s", to, s.Message)
+	}
+	if forgejo.Versions.Traits(c.to, c.toOK).StrictDurations && !forgejo.Versions.Traits(c.from, c.fromOK).StrictDurations {
+		if bad := forgejo.InvalidDurations(rc.Instance.Spec.Config); len(bad) > 0 {
+			rc.Event(corev1.EventTypeWarning, reasonConfigIncompatible, eventAction,
+				"%s refuses to start with %s in spec.config: these must be durations with a unit (e.g. 30s, -1s). "+
+					"Fix them, or the upgrade fails and is rolled back.", to, strings.Join(bad, ", "))
+		}
+	}
+}
+
+// reasonConfigIncompatible: spec.config has values the target version refuses.
+const reasonConfigIncompatible = "ConfigIncompatible"
+
 // start records a new upgrade in phase Pending. Nothing changes in the cluster until the
 // Pending phase has been persisted: the next reconcile stops Forgejo for the backup or, without
 // a backup, deploys the new image together with rolloutStartTime.
@@ -233,14 +280,30 @@ func start(rc *forgejo.ReconcileContext, from, to string, c comparison) {
 
 	switch c.kind {
 	case unknownVersion:
-		rc.Event(corev1.EventTypeWarning, "UnverifiedVersion", eventAction,
-			"Cannot compare the versions of %s and %s (digest or non-version tag); upgrading without the downgrade check", from, to)
+		if c.fromReported && c.toOK {
+			rc.Event(corev1.EventTypeWarning, "UnverifiedVersion", eventAction,
+				"The version of %s is only known from what Forgejo reports (%s), which can lag behind an image change; "+
+					"upgrading to %s (%s) with orchestration instead of a plain rollout", from, c.from, to, c.to)
+		} else {
+			rc.Event(corev1.EventTypeWarning, "UnverifiedVersion", eventAction,
+				"Cannot compare the versions of %s and %s (digest or non-version tag); upgrading without the downgrade check", from, to)
+		}
 	case upgradeVersion:
-		if c.to.Major > c.from.Major {
+		switch {
+		case c.to.Major > c.from.Major+1:
+			skipped := strconv.Itoa(c.from.Major + 1)
+			if c.to.Major > c.from.Major+2 {
+				skipped += "-" + strconv.Itoa(c.to.Major-1)
+			}
+			rc.Event(corev1.EventTypeNormal, "MajorUpgrade", eventAction,
+				"Upgrading across major versions from %d to %d, skipping %s; Forgejo migrates the database forward "+
+					"through every version in one step", c.from.Major, c.to.Major, skipped)
+		case c.to.Major > c.from.Major:
 			rc.Event(corev1.EventTypeNormal, "MajorUpgrade", eventAction,
 				"Upgrading across major versions from %d to %d; Forgejo migrates the database forward", c.from.Major, c.to.Major)
 		}
 	}
+	warnTarget(rc, to, c)
 	rc.Event(corev1.EventTypeNormal, "UpgradeStarted", eventAction, "Upgrading from %s to %s", from, to)
 	(&machine{rc: rc, u: u}).apply(to)
 }
@@ -324,7 +387,7 @@ func clearDegraded(rc *forgejo.ReconcileContext) {
 		return
 	}
 	switch c.Reason {
-	case ReasonDowngradeRefused, ReasonRolledBack, ReasonFailed:
+	case ReasonDowngradeRefused, ReasonUpgradePathUnsupported, ReasonRolledBack, ReasonFailed:
 		rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionFalse, "AsExpected", "")
 	}
 }
@@ -355,14 +418,32 @@ const (
 type comparison struct {
 	kind     changeKind
 	from, to forgejo.Version
+	// fromOK and toOK report whether from and to are known.
+	fromOK, toOK bool
+	// fromReported: from is the version Forgejo reports (status.version), since the running
+	// image's reference carries none (a digest or a custom tag).
+	fromReported bool
 }
 
-// compare classifies an image change by the versions in the tags. Floating tags compare
-// equal to every version they cover ("16" == "16.0.6").
-func compare(from, to string) comparison {
+// compare classifies an image change by version. Floating tags compare equal to every
+// version they cover ("16" == "16.0.6"). The target's version comes from its tag. The running
+// one comes from the tag of status.image, or, when that carries no version (a digest or a
+// custom tag such as "prod"), from the version Forgejo reports (status.version), so that the
+// downgrade and upgrade-path checks also apply to such images.
+//
+// A reported version can lag behind an image change until the next health check reads it
+// again, so it only ever refuses: a change that it alone would let through without
+// orchestration (the same version, or an allowed downgrade) is orchestrated like an
+// unknown version, as it was before Forgejo reported anything.
+func compare(from, reported, to string, allowDowngrade bool) comparison {
 	fv, okFrom := forgejo.ImageVersion(from)
+	fromReported := false
+	if !okFrom {
+		fv, okFrom = forgejo.InstanceVersion(from, reported)
+		fromReported = okFrom
+	}
 	tv, okTo := forgejo.ImageVersion(to)
-	c := comparison{from: fv, to: tv}
+	c := comparison{from: fv, to: tv, fromOK: okFrom, toOK: okTo, fromReported: fromReported}
 	switch {
 	case !okFrom || !okTo:
 		c.kind = unknownVersion
@@ -372,6 +453,9 @@ func compare(from, to string) comparison {
 		c.kind = sameVersion
 	default:
 		c.kind = upgradeVersion
+	}
+	if fromReported && (c.kind == sameVersion || c.kind == downgrade && allowDowngrade) {
+		c.kind = unknownVersion
 	}
 	return c
 }

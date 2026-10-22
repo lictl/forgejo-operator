@@ -30,7 +30,7 @@ func detectClusterDomain(env, resolvConf string) string {
 // clusterDomainFromResolvConf returns <domain> of the "svc.<domain>" search entry that the
 // kubelet writes into every ClusterFirst pod, or "".
 func clusterDomainFromResolvConf(content string) string {
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 || fields[0] != "search" {
 			continue

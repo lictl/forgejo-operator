@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -84,6 +85,10 @@ type ForgejoReconciler struct {
 	// WatchNamespaces restricts the informers this controller starts outside the manager's
 	// cache (CNPG credential Secrets) like the manager's --watch-namespace; empty means all.
 	WatchNamespaces []string
+
+	// statusWrites maps an instance (types.NamespacedName) to the resourceVersion of this
+	// controller's last status write, until the cache has caught up with it (see getInstance).
+	statusWrites sync.Map
 }
 
 // namedStep is one pipeline step and the earlier steps it depends on.
@@ -182,7 +187,7 @@ func (p *pipelineResult) err() error {
 // blockedBy explains why a step did not complete: its own error, or the earliest
 // prerequisite (transitively) that failed or stopped.
 func (p *pipelineResult) blockedBy(name string) string {
-	for seen := 0; seen < len(steps); seen++ {
+	for range steps {
 		if err, ok := p.failed[name]; ok {
 			return fmt.Sprintf("step %q failed: %v", name, err)
 		}
@@ -283,9 +288,10 @@ func firstMissing(needs []string, completed map[string]bool) string {
 func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	instance := &forgejov1.Forgejo{}
-	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
+	instance, err := r.getInstance(ctx, req.NamespacedName)
+	if err != nil {
 		if apierrors.IsNotFound(err) {
+			r.statusWrites.Delete(req.NamespacedName)
 			forgetInstance(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
@@ -300,13 +306,9 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	backup.ExportLastSuccess(instance)
 
 	original := instance.DeepCopy()
-	apiReader := r.APIReader
-	if apiReader == nil {
-		apiReader = r.Client
-	}
 	rc := &forgejo.ReconcileContext{
 		Client:     r.Client,
-		APIReader:  apiReader,
+		APIReader:  r.reader(),
 		Scheme:     r.Scheme,
 		Recorder:   r.Recorder,
 		RESTMapper: r.RESTMapper(),
@@ -328,6 +330,7 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// ForgejoOperatorMetricsMissing.
 		forgejo.SetInstanceInfo(instance, rc.TargetImage)
 		exportInstanceReady(instance)
+		upgrade.ExportVersionSupport(instance, time.Now())
 		return r.finish(ctx, original, instance, ctrl.Result{}, nil)
 	}
 
@@ -365,6 +368,8 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Error(err, "status step failed")
 		stepErr = errors.Join(stepErr, fmt.Errorf("status: %w", err))
 	}
+	// After the status step, which verifies status.image.
+	upgrade.ReportVersionSupport(rc, time.Now())
 	instance.Status.ObservedGeneration = instance.Generation
 
 	rc.Requeue(defaultResync)
@@ -388,10 +393,51 @@ func (r *ForgejoReconciler) finish(ctx context.Context, original, instance *forg
 		}
 		return ctrl.Result{}, err
 	}
+	r.statusWrites.Store(client.ObjectKeyFromObject(instance), instance.ResourceVersion)
 	if stepErr != nil {
 		return ctrl.Result{}, stepErr
 	}
 	return res, nil
+}
+
+// reader returns the live API reader (the cache in tests that do not set one).
+func (r *ForgejoReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// getInstance reads the instance from the cache, or live while the cache has not caught up
+// with this controller's last status write. A pass usually follows the previous one within
+// milliseconds (the children that pass changed queue it), before the watch delivers that
+// write. Starting from the older status, it would repeat the previous pass's decisions: the
+// optimistic lock refuses its status patch, but the events it emitted for a status change
+// (UnsupportedVersion, PreUpgradeBackupCompleted, UpgradeRollingOut, ...) would go out a
+// second time. The cache is used once it holds that write, or whatever is live now.
+func (r *ForgejoReconciler) getInstance(ctx context.Context, key types.NamespacedName) (*forgejov1.Forgejo, error) {
+	cached := &forgejov1.Forgejo{}
+	if err := r.Get(ctx, key, cached); err != nil {
+		return nil, err
+	}
+	written, ok := r.statusWrites.Load(key)
+	if !ok {
+		return cached, nil
+	}
+	if written == cached.ResourceVersion {
+		r.statusWrites.Delete(key)
+		return cached, nil
+	}
+	live := &forgejov1.Forgejo{}
+	if err := r.reader().Get(ctx, key, live); err != nil {
+		return nil, err
+	}
+	if live.ResourceVersion == cached.ResourceVersion {
+		// Written again by someone else since, and the cache already has that.
+		r.statusWrites.Delete(key)
+		return cached, nil
+	}
+	return live, nil
 }
 
 func (r *ForgejoReconciler) patchStatus(ctx context.Context, original, instance *forgejov1.Forgejo) error {

@@ -31,6 +31,10 @@ spec:
     - jsonPath: .status.readyReplicas
       name: Replicas
       type: integer
+    - jsonPath: .status.conditions[?(@.type=="VersionSupported")].reason
+      name: Support
+      priority: 1
+      type: string
     - jsonPath: .status.url
       name: URL
       priority: 1
@@ -716,11 +720,12 @@ spec:
                     type: object
                 type: object
               image:
-                default: codeberg.org/forgejo/forgejo:16
+                default: codeberg.org/forgejo/forgejo:15
                 description: |-
                   image is the Forgejo container image. The official root image
                   (codeberg.org/forgejo/forgejo:<version>) and the "-rootless" variant are supported.
                   Changing it triggers an orchestrated upgrade (backup, migrate, verify, auto-rollback).
+                  The default is the current LTS release when the object is created.
                 type: string
               imagePullPolicy:
                 description: PullPolicy describes a policy for if/when to pull a container

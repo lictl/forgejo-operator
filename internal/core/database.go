@@ -324,7 +324,7 @@ func mergePGParameters(c *unstructured.Unstructured, want map[string]string) err
 		params = map[string]string{}
 	}
 	annotations := c.GetAnnotations()
-	for _, k := range strings.Split(annotations[annotationManagedPGParams], ",") {
+	for k := range strings.SplitSeq(annotations[annotationManagedPGParams], ",") {
 		if _, keep := want[k]; k != "" && !keep {
 			delete(params, k)
 		}

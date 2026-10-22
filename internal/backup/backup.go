@@ -5,6 +5,7 @@ package backup
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -239,7 +240,7 @@ func nextRun(sched cron.Schedule, st *forgejov1.BackupStatusSummary, now time.Ti
 // latestRun is the most recent scheduled time at or before now, starting from due <= now.
 func latestRun(sched cron.Schedule, due, now time.Time) time.Time {
 	t := due
-	for i := 0; i < 100000; i++ {
+	for range 100000 {
 		n := sched.Next(t)
 		if n.After(now) {
 			return t
@@ -293,8 +294,8 @@ func createScheduled(ctx context.Context, rc *forgejo.ReconcileContext, runAt ti
 // scheduledBackups returns scheduled backups that are not being deleted, newest first.
 func scheduledBackups(backups []forgejov1.ForgejoBackup) []*forgejov1.ForgejoBackup {
 	var out []*forgejov1.ForgejoBackup
-	for i := len(backups) - 1; i >= 0; i-- {
-		b := &backups[i]
+	for _, v := range slices.Backward(backups) {
+		b := &v
 		if Reason(b) == forgejov1.BackupReasonScheduled && b.DeletionTimestamp == nil {
 			out = append(out, b)
 		}

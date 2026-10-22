@@ -11,7 +11,8 @@ metadata:
   # annotations:
   #   forgejo.lucas.icu/fix-permissions: "true"
 spec:
-  image: codeberg.org/forgejo/forgejo:16
+  # The current Forgejo LTS release (the default); docs/versions.md lists the supported ones.
+  image: codeberg.org/forgejo/forgejo:15
   # More than one replica requires highAvailability.enabled (Valkey for cache, sessions and
   # queues); without it the operator runs a single pod and reports Degraded/ReplicasRequireHA.
   replicas: 1

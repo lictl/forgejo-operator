@@ -7,6 +7,9 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
 - It runs the official image `codeberg.org/forgejo/forgejo:<version>`, or the `-rootless`
   flavor, unchanged. It starts `forgejo web` directly as uid 1000, with the built-in SSH server,
   so pods pass the `restricted` Pod Security Standard.
+- It supports the current Forgejo LTS release and the latest release, today **15 (LTS)** and
+  **17**; new instances get the LTS. Older and newer versions still run and are reported as
+  unsupported. See [docs/versions.md](docs/versions.md).
 - It uses [CloudNativePG](https://cloudnative-pg.io) for PostgreSQL, or an existing database.
 - Everything is driven by three resources in `forgejo.lucas.icu/v1alpha1`:
 
@@ -26,7 +29,7 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
 | **IV Deep insights** | Health, version and statistics in status. Conditions and events, operator metrics, Forgejo `/metrics` through a ServiceMonitor, a PrometheusRule with per-instance alerts, and a Grafana dashboard. |
 | **V Auto pilot** | Automatic rollback of failed upgrades and of configs that make Forgejo crash. Restarts hung pods. Vertical right-sizing from OOM kills and usage. HPA with Valkey-backed HA. PVC auto-expansion. Tuning derived from resources (GOMEMLIMIT, DB pool). |
 
-Details are in [docs/design.md](docs/design.md), [docs/upgrades.md](docs/upgrades.md),
+Details are in [docs/design.md](docs/design.md), [docs/versions.md](docs/versions.md), [docs/upgrades.md](docs/upgrades.md),
 [docs/backup-restore.md](docs/backup-restore.md), [docs/observability.md](docs/observability.md)
 and [docs/autopilot.md](docs/autopilot.md).
 
@@ -66,7 +69,7 @@ kubectl get fj -n forgejo -w
 
 ```
 NAME             PHASE     VERSION               READY   REPLICAS   AGE
-forgejo-sample   Running   16.0.6+gitea-1.22.0   True    1          70s
+forgejo-sample   Running   15.0.10+gitea-1.22.0  True    1          70s
 ```
 
 The admin credentials are in the Secret `<name>-admin`:
@@ -137,6 +140,7 @@ go build -o bin/manager ./cmd
 bin/manager --watch-namespace=dev     # run against your kubeconfig, scoped to one namespace
 make manifests generate               # after changing API types or RBAC markers
 go test ./internal/...                # unit tests (the envtest suite needs `make setup-envtest`)
+make forgejo-versions                 # compare the Forgejo version table with upstream releases
 ```
 
 The reconcile pipeline is a table of steps in `internal/controller/forgejo_controller.go`. Each

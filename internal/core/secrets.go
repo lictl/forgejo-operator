@@ -121,8 +121,10 @@ func adminEmail(f *forgejov1.Forgejo) string {
 	return forgejov1.DefaultAdminEmail
 }
 
-// newInternalToken mimics "forgejo generate secret INTERNAL_TOKEN": an HS256 JWT with
-// an nbf claim, signed with a throwaway random key. Forgejo only compares it verbatim.
+// newInternalToken mimics "forgejo generate secret INTERNAL_TOKEN" (Forgejo 17 and older;
+// 18 removed the token and the command): an HS256 JWT with an nbf claim, signed with a
+// throwaway random key. Forgejo only compares it verbatim. It is generated for every
+// instance, so that an instance can always run (or roll back to) a major that needs it.
 func newInternalToken() (string, error) {
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {

@@ -3,6 +3,7 @@ package autopilot
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -109,11 +110,26 @@ func lkgUsesValkey(f *forgejov1.Forgejo, lkg *corev1.Secret) bool {
 	return strings.Contains(ini, "redis://") && strings.Contains(ini, "@"+forgejo.ValkeyName(f)+".")
 }
 
-// lkgUnusable explains why the last known good config cannot run now, or returns "": with
-// highAvailability disabled, an LKG that uses Valkey only works while Valkey still exists.
-// (A Valkey that is merely not ready may recover; it is never re-created once deleted.)
+// configProfile is the forgejo.Traits.ConfigProfile an app.ini Secret was rendered for.
+func configProfile(sec *corev1.Secret) string {
+	if p := sec.Annotations[forgejo.AnnotationConfigProfile]; p != "" {
+		return p
+	}
+	return forgejo.LegacyConfigProfile
+}
+
+// lkgUnusable explains why the last known good config cannot run now, or returns "":
+//   - it was rendered for a Forgejo major that needs other keys than the image now deployed
+//     (e.g. an app.ini without INTERNAL_TOKEN crash-loops Forgejo 17 and older);
+//   - with highAvailability disabled, an LKG that uses Valkey only works while Valkey still
+//     exists. (A Valkey that is merely not ready may recover; it is never re-created once
+//     deleted.)
 func lkgUnusable(ctx context.Context, rc *forgejo.ReconcileContext, lkg *corev1.Secret) (string, error) {
 	f := rc.Instance
+	if have, want := configProfile(lkg), rc.Layout.Traits.ConfigProfile(); have != want {
+		return fmt.Sprintf("the last known good app.ini was rendered for another Forgejo version (%s, %s needs %s)",
+			have, rc.TargetImage, want), nil
+	}
 	if f.Spec.HighAvailability.Enabled || !lkgUsesValkey(f, lkg) {
 		return "", nil
 	}
@@ -181,6 +197,7 @@ func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep 
 			lkg.Annotations = map[string]string{}
 		}
 		lkg.Annotations[forgejo.AnnotationConfigHash] = rc.ConfigHash
+		lkg.Annotations[forgejo.AnnotationConfigProfile] = configProfile(src)
 		if rc.ValkeyURL != "" || lkgUsesValkey(f, src) {
 			lkg.Annotations[annotationUsesValkey] = "true"
 		} else {
@@ -258,10 +275,8 @@ func rollbackFailingConfig(ctx context.Context, rc *forgejo.ReconcileContext, st
 // config. OOM kills are left to vertical scaling.
 func podFailure(p *corev1.Pod, since time.Time) string {
 	statuses := append(append([]corev1.ContainerStatus{}, p.Status.InitContainerStatuses...), p.Status.ContainerStatuses...)
-	for _, cs := range statuses {
-		if oomKilled(cs) {
-			return ""
-		}
+	if slices.ContainsFunc(statuses, oomKilled) {
+		return ""
 	}
 	if c := podReadyCondition(p); c != nil && c.Status == corev1.ConditionTrue {
 		return ""

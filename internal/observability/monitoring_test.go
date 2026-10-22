@@ -336,3 +336,14 @@ func TestOperatorMetricsGuard(t *testing.T) {
 		t.Fatalf("expr %q", r.Expr)
 	}
 }
+
+func TestVersionUnsupportedAlert(t *testing.T) {
+	r := findRule(prometheusRuleSpec(testInstance("ver"), false), "ForgejoVersionUnsupported")
+	want := `max by (namespace, name, major, support) (forgejo_operator_version_supported{namespace="ns", name="ver"}) == 0`
+	if r == nil || r.Expr != want || r.For != "1h" || r.Labels["severity"] != "warning" {
+		t.Fatalf("ForgejoVersionUnsupported %+v", r)
+	}
+	if d := r.Annotations["description"]; !strings.Contains(d, "VersionSupported") || !strings.Contains(d, "docs/versions.md") {
+		t.Fatalf("description %q", d)
+	}
+}

@@ -25,7 +25,9 @@ import (
 
 // Defaults shared by the API and the controllers.
 const (
-	DefaultImage          = "codeberg.org/forgejo/forgejo:16"
+	// DefaultImage is the current Forgejo LTS release (see docs/versions.md). Changing it
+	// only affects new instances: existing ones keep the image stored in their spec.
+	DefaultImage          = "codeberg.org/forgejo/forgejo:15"
 	DefaultPostgresImage  = "ghcr.io/cloudnative-pg/postgresql:17"
 	DefaultValkeyImage    = "docker.io/valkey/valkey:8-alpine"
 	DefaultAdminUsername  = "forgejo_admin"
@@ -51,6 +53,10 @@ const (
 	ConditionStorageHealthy = "StorageHealthy"
 	// ConditionHealthy reflects Forgejo's own /api/healthz checks.
 	ConditionHealthy = "Healthy"
+	// ConditionVersionSupported is True when the running Forgejo major is within the
+	// operator's support policy (the current LTS and the latest release). The reason is
+	// Supported, Deprecated, EndOfLife, Future or Unknown; see docs/versions.md.
+	ConditionVersionSupported = "VersionSupported"
 )
 
 // ForgejoPhase is a coarse, human-readable summary of the instance state.
@@ -73,7 +79,8 @@ type ForgejoSpec struct {
 	// image is the Forgejo container image. The official root image
 	// (codeberg.org/forgejo/forgejo:<version>) and the "-rootless" variant are supported.
 	// Changing it triggers an orchestrated upgrade (backup, migrate, verify, auto-rollback).
-	// +kubebuilder:default="codeberg.org/forgejo/forgejo:16"
+	// The default is the current LTS release when the object is created.
+	// +kubebuilder:default="codeberg.org/forgejo/forgejo:15"
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -969,6 +976,7 @@ type AutoPilotStatus struct {
 // +kubebuilder:printcolumn:name="Version",type=string,JSONPath=`.status.version`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.status.readyReplicas`
+// +kubebuilder:printcolumn:name="Support",type=string,JSONPath=`.status.conditions[?(@.type=="VersionSupported")].reason`,priority=1
 // +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.status.url`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

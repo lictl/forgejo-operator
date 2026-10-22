@@ -324,7 +324,7 @@ func newClient(config *rest.Config, options client.Options) (client.Client, erro
 
 func splitNamespaces(namespaces string) []string {
 	var out []string
-	for _, ns := range strings.Split(namespaces, ",") {
+	for ns := range strings.SplitSeq(namespaces, ",") {
 		if ns = strings.TrimSpace(ns); ns != "" {
 			out = append(out, ns)
 		}

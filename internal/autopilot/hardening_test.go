@@ -226,8 +226,69 @@ func TestConfigGuardDeclinesValkeyLKGWithoutValkey(t *testing.T) {
 	if env.rc.ConfigHash != testHash || env.rc.ConfigSecretName != forgejo.ConfigSecretName(f) {
 		t.Fatalf("switched to the LKG: %s %s", env.rc.ConfigSecretName, env.rc.ConfigHash)
 	}
-	if f.Status.AutoPilot.RejectedConfigHash != "" || !hasEvent(env.events(), "Warning ConfigRollbackUnavailable") {
-		t.Fatal("rejection kept or no ConfigRollbackUnavailable event")
+	if evs := env.events(); f.Status.AutoPilot.RejectedConfigHash != "" || !hasEvent(evs, "Warning ConfigRollbackUnavailable") ||
+		!strings.Contains(strings.Join(evs, "\n"), "needs Valkey") {
+		t.Fatalf("rejection kept or no ConfigRollbackUnavailable event for Valkey: %q", evs)
+	}
+}
+
+// A last known good app.ini is only mounted for an image of the same config profile: one
+// rendered before profiles existed (with INTERNAL_TOKEN) still serves Forgejo 15-17, but not
+// a Forgejo 18 image, and an 18 one (without the token) would crash-loop 17 and older.
+const socketProfile = "internal-socket"
+
+func TestConfigGuardMatchesLKGProfile(t *testing.T) {
+	guard := func(image string, lkg *corev1.Secret) (testEnv, *forgejov1.Forgejo) {
+		f := testInstance()
+		f.Spec.AutoPilot.SelfHealing.Enabled = ptr.To(true)
+		f.Status.AutoPilot = &forgejov1.AutoPilotStatus{LastKnownGoodConfigHash: testOldHash, RejectedConfigHash: testHash}
+		lkg.Name, lkg.Namespace = forgejo.LKGConfigSecretName(f), f.Namespace
+		env := newTestEnv(t, f, lkg)
+		env.rc.TargetImage, env.rc.Layout = image, forgejo.LayoutForImage(image)
+		env.rc.ConfigSecretName = forgejo.ConfigSecretName(f)
+		if _, err := ReconcileConfigGuard(context.Background(), env.rc); err != nil {
+			t.Fatal(err)
+		}
+		return env, f
+	}
+
+	env, _ := guard("codeberg.org/forgejo/forgejo:17", lkgSecret(testInstance(), testOldHash, false))
+	if env.rc.ConfigSecretName != forgejo.LKGConfigSecretName(testInstance()) || env.rc.ConfigHash != testOldHash {
+		t.Fatalf("legacy LKG not used for 17: %s %s %q", env.rc.ConfigSecretName, env.rc.ConfigHash, env.events())
+	}
+
+	old := forgejo.Versions
+	forgejo.Versions = old.WithVerified(18)
+	t.Cleanup(func() { forgejo.Versions = old })
+	env, f := guard("codeberg.org/forgejo/forgejo:18", lkgSecret(testInstance(), testOldHash, false))
+	if env.rc.ConfigSecretName != forgejo.ConfigSecretName(f) || f.Status.AutoPilot.RejectedConfigHash != "" ||
+		!strings.Contains(strings.Join(env.events(), "\n"), "rendered for another Forgejo version") {
+		t.Fatalf("legacy LKG used for 18: %s", env.rc.ConfigSecretName)
+	}
+	socketLKG := lkgSecret(testInstance(), testOldHash, false)
+	socketLKG.Annotations[forgejo.AnnotationConfigProfile] = socketProfile
+	if env, f := guard("codeberg.org/forgejo/forgejo:17", socketLKG); env.rc.ConfigSecretName != forgejo.ConfigSecretName(f) {
+		t.Fatal("an LKG without INTERNAL_TOKEN used for 17")
+	}
+	if env, _ := guard("codeberg.org/forgejo/forgejo:18", socketLKG); env.rc.ConfigHash != testOldHash {
+		t.Fatal("matching LKG not used for 18")
+	}
+}
+
+func TestLastKnownGoodRecordsConfigProfile(t *testing.T) {
+	f := testInstance()
+	f.Status.Health = &forgejov1.HealthStatus{Healthy: true}
+	dep := testDeployment(f, 1)
+	src := configSecret(f)
+	src.Annotations[forgejo.AnnotationConfigProfile] = socketProfile
+	env := newTestEnv(t, f, dep, src, readyPod(f, "fj-a", testHash, time.Hour))
+	pods, _ := serverPods(context.Background(), env.rc)
+	if err := recordLastKnownGood(context.Background(), env.rc, dep, pods, false); err != nil {
+		t.Fatal(err)
+	}
+	lkg := &corev1.Secret{}
+	if !found(t, env.rc.Client, f, forgejo.LKGConfigSecretName(f), lkg) || lkg.Annotations[forgejo.AnnotationConfigProfile] != socketProfile {
+		t.Fatalf("LKG profile not recorded: %+v", lkg.Annotations)
 	}
 }
 
@@ -424,7 +485,7 @@ func TestRightSizingLeavesHPAResourcesAlone(t *testing.T) {
 	f.Spec.Autoscaling.Horizontal = &forgejov1.HorizontalAutoscalingSpec{Enabled: true, MinReplicas: 2, MaxReplicas: 4}
 	env := newTestEnv(t, f)
 	st := stateFor(f)
-	for i := 0; i < minSamples; i++ {
+	for range minSamples {
 		st.samples = append(st.samples, usageSample{at: time.Now(), cpu: 900, memory: 600 << 20})
 	}
 	if !applyRecommendation(env.rc, st, false) {

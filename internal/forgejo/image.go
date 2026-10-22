@@ -41,10 +41,16 @@ type ImageLayout struct {
 	RunUser string
 	// CLI is the Forgejo binary.
 	CLI string
+	// InternalSocketPath is [server] INTERNAL_LISTENER_PATH when Traits.InternalSocket: in a
+	// directory Forgejo creates (and chmods) itself on the per-pod TmpPath volume.
+	InternalSocketPath string
+	// Traits of the image's Forgejo major (Versions.Traits).
+	Traits Traits
 }
 
 // LayoutForImage returns the runtime layout for the given official image reference.
 func LayoutForImage(image string) ImageLayout {
+	v, ok := ImageVersion(image)
 	return ImageLayout{
 		Rootless:          IsRootless(image),
 		DataMountPath:     "/data",
@@ -62,6 +68,9 @@ func LayoutForImage(image string) ImageLayout {
 		GID:               1000,
 		RunUser:           "git",
 		CLI:               "/app/gitea/gitea",
+		// Short enough for the 108-byte limit of a UNIX socket path.
+		InternalSocketPath: "/tmp/forgejo-run/forgejo.sock",
+		Traits:             Versions.Traits(v, ok),
 	}
 }
 

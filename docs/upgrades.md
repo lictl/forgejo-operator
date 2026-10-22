@@ -4,11 +4,12 @@ Changing `spec.image` on a `Forgejo` starts an orchestrated upgrade. The operato
 the versions, takes a cold pre-upgrade backup, rolls out the new image as a single pod that
 migrates the database, verifies it, and rolls back automatically from the backup if the new
 version does not come up. The code lives in `internal/upgrade`; the pipeline step runs after
-`maintenance` and before `workload` (see [design.md](design.md)).
+`maintenance` and before `workload` (see [design.md](design.md)). Which Forgejo versions are
+supported, and the notes for each major upgrade, are in [versions.md](versions.md).
 
 ```yaml
 spec:
-  image: codeberg.org/forgejo/forgejo:16
+  image: codeberg.org/forgejo/forgejo:17
   upgrade:
     backupBeforeUpgrade: true   # default
     autoRollback: true          # default
@@ -81,14 +82,20 @@ While an upgrade is in flight:
 ## Version gate
 
 The versions are read from the image tags (`16`, `16.0.6`, `v16.0.6`, `16.0-rootless`, ...).
+When the running image carries no version (a digest, or a custom tag such as a mirror's
+`prod`), its version is the one Forgejo reports (`status.version`). That version can lag
+behind an image change until the next health check, so it is only used to refuse: a change it
+alone shows to be the same version, or an allowed downgrade, is orchestrated like an
+unparseable tag.
 
 | Change | Result |
 |--------|--------|
-| Newer version | Upgrade. A jump in the major version emits a `MajorUpgrade` event; Forgejo migrates the database forward across majors. |
+| Newer version | Upgrade. A jump in the major version emits a `MajorUpgrade` event; Forgejo migrates the database forward across majors, also when majors are skipped (15 → 17). A target outside the support policy (`Deprecated`, `EndOfLife`, or `Future`: newer than the operator's version table) is upgraded to anyway, with an `UnsupportedVersion` Warning event. |
+| Newer version that skips more majors than the version table allows (e.g. 14 → 17: 17 is upgraded to from 15 or newer) | Refused like a downgrade: `Degraded=True` and `Upgrading=False` with reason `UpgradePathUnsupported`, one Warning event naming the major to upgrade to first, and the current image keeps running. See [versions.md](versions.md#upgrading-between-majors). |
 | Same version (`16` ⇄ `16.0.6`, `16` → `16-rootless`, another registry) | Plain rollout of the new image without orchestration: nothing to migrate. A floating tag compares equal to every version it covers. |
 | Older version | Refused: `Degraded=True` and `Upgrading=False` with reason `DowngradeRefused`, one Warning event, and the current image keeps running. Forgejo cannot migrate a database backwards. |
 | Older version with `allowDowngrade: true` | Plain rollout with a `Downgrade` Warning event, applied even while a restore is running. An orchestrated downgrade could never verify: the old version refuses a database migrated by a newer one, and its rollback would restore the newer state. Combine it with a `ForgejoRestore` (see [Rolling back manually](#rolling-back-manually)). |
-| Unparseable tag (`latest`, digest only) | Orchestrated like an upgrade, with an `UnverifiedVersion` Warning event. |
+| Unparseable tag (`latest`, digest only), and no reported version to compare with | Orchestrated like an upgrade, with an `UnverifiedVersion` Warning event. |
 
 An orchestrated upgrade does not start while a `ForgejoRestore` holds the instance in
 maintenance mode (`Upgrading=False`, reason `WaitingForRestore`); it starts once the restore
@@ -256,10 +263,10 @@ new version never migrated the database (it could not be pulled, or crashed befo
 
 ```yaml
 status:
-  image: codeberg.org/forgejo/forgejo:16
+  image: codeberg.org/forgejo/forgejo:17
   upgrade:
     phase: RolledBack
-    fromImage: codeberg.org/forgejo/forgejo:16
+    fromImage: codeberg.org/forgejo/forgejo:17
     toImage: codeberg.org/forgejo/forgejo:99
     backupName: up-pre-upgrade-20261021071501
     restoreName: up-rollback-20261021071501
@@ -274,15 +281,17 @@ status:
 ```
 
 - Conditions: `Upgrading` (reason = phase while in flight; `UpgradeSucceeded`,
-  `UpgradeRolledBack`, `UpgradeFailed`, `UpgradeCancelled`, `DowngradeRefused`, `Rollout`,
-  `UpToDate` otherwise) and
-  `Degraded` with the reasons `UpgradeRolledBack`, `UpgradeFailed` and `DowngradeRefused`, which
-  are cleared once they no longer apply.
+  `UpgradeRolledBack`, `UpgradeFailed`, `UpgradeCancelled`, `DowngradeRefused`,
+  `UpgradePathUnsupported`, `Rollout`, `UpToDate` otherwise) and
+  `Degraded` with the reasons `UpgradeRolledBack`, `UpgradeFailed`, `DowngradeRefused` and
+  `UpgradePathUnsupported`, which are cleared once they no longer apply. `VersionSupported`
+  reports whether the running version is supported ([versions.md](versions.md#status)).
 - Events: `UpgradeStarted`, `MajorUpgrade`, `UnverifiedVersion`, `Downgrade`,
   `PreUpgradeBackup`, `PreUpgradeBackupCompleted`, `UpgradeRollingOut`, `UpgradeSucceeded`,
   `UpgradeFailed`, `UpgradeRollingBack`, `UpgradeRolledBack`, `UpgradeRollbackFailed`,
   `UpgradeRollbackRestored`, `UpgradeRecovered`, `UpgradeQueued`, `UpgradeCancelled`,
-  `UpgradePaused`, `UpgradeResumed`, `UpgradeRetry`, `DowngradeRefused`.
+  `UpgradePaused`, `UpgradeResumed`, `UpgradeRetry`, `DowngradeRefused`,
+  `UpgradePathUnsupported`, `UnsupportedVersion`, `ConfigIncompatible`.
 - Metric: `forgejo_operator_upgrades_total{result="succeeded|failed|rolledback"}`; the
   `ForgejoUpgradeFailed` alert fires on the latter two. Cancelled upgrades are not counted.
 

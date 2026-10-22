@@ -74,20 +74,32 @@ var (
 		Name: "forgejo_operator_stats",
 		Help: "Forgejo statistics sampled by the operator (users, repositories, ...).",
 	}, []string{"namespace", "name", "kind"})
+
+	VersionSupported = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "forgejo_operator_version_supported",
+		Help: "1 when the running Forgejo major is within the operator's support policy, else 0; " +
+			"support is Supported, Deprecated, EndOfLife, Future or Unknown.",
+	}, []string{"namespace", "name", "major", "support"})
+
+	VersionEndOfLife = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "forgejo_operator_version_end_of_life_timestamp_seconds",
+		Help: "Unix time of the upstream end of life of the running Forgejo major (when it is in the operator's version table).",
+	}, []string{"namespace", "name", "major"})
 )
 
 func init() {
 	metrics.Registry.MustRegister(
 		InstanceReady, InstanceInfo, HealthCheckFailures, HealthCheckUnreachable,
 		BackupLastSuccess, BackupTotal, BackupDuration, BackupSize, RestoreTotal,
-		UpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats,
+		UpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife,
 	)
 }
 
 // DeleteInstanceMetrics removes all series of a deleted instance.
 func DeleteInstanceMetrics(namespace, name string) {
 	l := prometheus.Labels{"namespace": namespace, "name": name}
-	for _, v := range []*prometheus.GaugeVec{InstanceReady, InstanceInfo, BackupLastSuccess, BackupDuration, BackupSize, VolumeUsedRatio, Stats} {
+	for _, v := range []*prometheus.GaugeVec{InstanceReady, InstanceInfo, BackupLastSuccess, BackupDuration, BackupSize,
+		VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife} {
 		v.DeletePartialMatch(l)
 	}
 	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, BackupTotal, RestoreTotal, UpgradeTotal, AutoPilotActions} {

@@ -566,13 +566,7 @@ func (m *measureState) prune(keep []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for name, c := range m.claims {
-		found := false
-		for _, k := range keep {
-			if k == name {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(keep, name)
 		if !found && !c.running {
 			delete(m.claims, name)
 		}

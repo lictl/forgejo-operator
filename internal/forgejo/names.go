@@ -22,6 +22,9 @@ const (
 
 	// AnnotationConfigHash on the pod template triggers a rollout when app.ini changes.
 	AnnotationConfigHash = "forgejo.lucas.icu/config-hash"
+	// AnnotationConfigProfile on an app.ini Secret names the Traits.ConfigProfile it was
+	// rendered for; Secrets without it have LegacyConfigProfile.
+	AnnotationConfigProfile = "forgejo.lucas.icu/config-profile"
 	// AnnotationRestartedAt on the pod template forces a restart (self-healing).
 	AnnotationRestartedAt = "forgejo.lucas.icu/restarted-at"
 

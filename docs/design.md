@@ -4,7 +4,7 @@ A Kubernetes operator for [Forgejo](https://forgejo.org) that targets **Operator
 Capability Level V (Auto Pilot)**. It runs the official image
 `codeberg.org/forgejo/forgejo:<version>` (or its `-rootless` flavor) unchanged and uses
 [CloudNativePG](https://cloudnative-pg.io) (CNPG) for PostgreSQL. Feature details live in
-[backup-restore.md](backup-restore.md), [upgrades.md](upgrades.md),
+[versions.md](versions.md), [backup-restore.md](backup-restore.md), [upgrades.md](upgrades.md),
 [autopilot.md](autopilot.md) and [observability.md](observability.md).
 
 ## APIs (`forgejo.lucas.icu/v1alpha1`)
@@ -50,10 +50,13 @@ checks, the restore handshake or volume expansion. Around the table:
   later steps never mistake an upgrade in flight for an idle instance.
 - **After:** `core.ReconcileStatus` always runs: `phase`, `Ready`, `Progressing`, replicas,
   URLs, `status.image` (only once the Deployment has rolled the image out with every replica
-  available), and the `instance_ready`/`instance_info` metrics. The instance is requeued at
-  least every 60s.
+  available), and the `instance_ready`/`instance_info` metrics. Then
+  `upgrade.ReportVersionSupport` classifies the running version against the version table
+  (`VersionSupported` condition, `forgejo_operator_version_supported`; see
+  [versions.md](versions.md)). The instance is requeued at least every 60s.
 - **Paused** (`spec.paused`): no step runs. Only `phase: Paused` and `Progressing=False` are
-  written, and `instance_info{phase="Paused"}` and `instance_ready` are still exported.
+  written, and `instance_info{phase="Paused"}`, `instance_ready` and `version_supported` are
+  still exported.
 - **Deleted:** the instance's metric series and in-memory state are dropped
   (`forgejo.DeleteInstanceMetrics`, `backup.ForgetLastSuccess`,
   `observability.ForgetInstance`). An instance deleted during a pass is not a reconcile error.
@@ -141,6 +144,17 @@ watched through a separate metadata-only cache of Secrets labelled `cnpg.io/clus
 `--watch-namespace` / `WATCH_NAMESPACE` restricts all caches to the given namespaces. The
 manager runs with `GOMEMLIMIT` at ~90% of its memory limit (`config/manager/manager.yaml`).
 
+## Forgejo versions
+
+`forgejo.Versions` (`internal/forgejo/versions.go`) is the one table of Forgejo majors: LTS flag,
+release and end-of-life dates, the oldest major each one is upgraded to from directly, patch
+advisories, and the **traits** that make the operator run majors differently (e.g.
+`InternalToken`, `InternalSocket`). `forgejo.LayoutForImage` puts the traits of the image's major
+into `rc.Layout.Traits`; rendering code reads them and never compares major numbers. The
+support policy (current LTS + latest release), the `VersionSupported` condition and the
+upgrade-path rule of the version gate are derived from the same table. See
+[versions.md](versions.md).
+
 ## Pod layout
 
 The root image normally runs s6 as root (OpenSSH plus `forgejo web` as `git`), and the
@@ -220,7 +234,7 @@ for their kinds, so the operator has no Go dependency on their modules.
 | Level | Capability | How |
 |-------|-----------|-----|
 | I Basic install | Forgejo, CNPG database, secrets, admin, Services and Ingress from one CR; non-root pods that pass restricted Pod Security | core |
-| II Seamless upgrades | Image change → version gate (no silent downgrade) → cold pre-upgrade backup → single-pod `Recreate` rollout with `forgejo migrate` → verification | upgrade |
+| II Seamless upgrades | Image change → version gate (no silent downgrade, supported upgrade paths) → cold pre-upgrade backup → single-pod `Recreate` rollout with `forgejo migrate` → verification; per-major rendering and support reporting from the version table | upgrade, forgejo |
 | III Full lifecycle | Scheduled and manual backups with retention, restore with maintenance mode and migration hold, retain policy for data, CNPG-managed DB failover | backup, core |
 | IV Deep insights | Operator metrics, Forgejo `/metrics` and ServiceMonitor, PrometheusRule alerts, Grafana dashboard, health and stats in status, events, conditions | observability |
 | V Auto pilot | Auto-rollback of failed upgrades, config rollback on crash loops, health-based restarts, OOM- and usage-driven vertical sizing, HPA with Valkey HA, PVC auto-expansion (also while the database is down), resource-derived tuning (GOMEMLIMIT, DB pool, workers) | autopilot, upgrade |

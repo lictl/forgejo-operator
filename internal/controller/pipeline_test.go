@@ -34,7 +34,6 @@ func stubSteps(outcome func(name string, rc *forgejo.ReconcileContext) (forgejo.
 	ran := &[]string{}
 	out := make([]namedStep, len(steps))
 	for i, s := range steps {
-		s := s
 		out[i] = namedStep{name: s.name, needs: s.needs, fn: func(_ context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 			*ran = append(*ran, s.name)
 			if outcome == nil {

@@ -132,6 +132,7 @@ func newTestEnv(t *testing.T, f *forgejov1.Forgejo, objs ...client.Object) testE
 		rc: &forgejo.ReconcileContext{
 			Client: c, Scheme: s, Recorder: rec, Instance: f,
 			DatabaseReady: true, ConfigHash: testHash, DesiredConfigHash: testHash,
+			TargetImage: forgejov1.DefaultImage, Layout: forgejo.LayoutForImage(forgejov1.DefaultImage),
 		},
 		recorder: rec,
 	}

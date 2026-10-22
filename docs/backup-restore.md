@@ -421,7 +421,7 @@ spec:
             matchLabels: {app.kubernetes.io/name: forgejo, app.kubernetes.io/instance: forgejo, app.kubernetes.io/component: server}
   containers:
     - name: shell
-      image: codeberg.org/forgejo/forgejo:16
+      image: codeberg.org/forgejo/forgejo:15
       command: ["sleep", "infinity"]
       volumeMounts: [{name: backups, mountPath: /backups, readOnly: true}]
   volumes:

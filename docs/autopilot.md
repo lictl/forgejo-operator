@@ -180,6 +180,10 @@ Safeguards:
   belong to the upgrade's auto-rollback. An active rollback stays in place through them.
 - With `highAvailability` off, an LKG that uses Valkey is only rolled back to while Valkey
   still exists; otherwise the rejection is dropped (`ConfigRollbackUnavailable`).
+- An LKG is only rolled back to when it was rendered for the same config profile as the image
+  now deployed (annotation `forgejo.lucas.icu/config-profile`; e.g. Forgejo 18 needs
+  no `INTERNAL_TOKEN` but 17 does), otherwise `ConfigRollbackUnavailable`. See
+  [versions.md](versions.md#per-major-differences).
 - Nothing happens while the database is not ready.
 - A config is rejected at most once per 5 minutes.
 - Set `selfHealing.configRollback: false` (or `selfHealing.enabled: false`) to always deploy

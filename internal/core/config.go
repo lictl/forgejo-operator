@@ -118,6 +118,14 @@ func ReconcileConfig(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		}
 	}
 
+	if rc.Layout.Traits.StrictDurations {
+		if bad := forgejo.InvalidDurations(cfg); len(bad) > 0 {
+			warnEvery(rc, "invalid-durations/"+strings.Join(bad, ","), warnInterval, "ConfigIncompatible", "Config",
+				"%s refuses to start with %s: these must be durations with a unit (e.g. 30s, -1s). Fix them "+
+					"in spec.config or configFrom.", rc.TargetImage, strings.Join(bad, ", "))
+		}
+	}
+
 	content := cfg.render()
 	sum := sha256.Sum256([]byte(content))
 	hash := hex.EncodeToString(sum[:])[:16]
@@ -125,7 +133,10 @@ func ReconcileConfig(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.ConfigSecretName(f), Namespace: f.Namespace}}
 	if err := apply(ctx, rc, sec, true, func() error {
 		sec.Labels = mergeMaps(sec.Labels, forgejo.Labels(f, forgejo.ComponentServer))
-		sec.Annotations = mergeMaps(sec.Annotations, map[string]string{forgejo.AnnotationConfigHash: hash})
+		sec.Annotations = mergeMaps(sec.Annotations, map[string]string{
+			forgejo.AnnotationConfigHash:    hash,
+			forgejo.AnnotationConfigProfile: rc.Layout.Traits.ConfigProfile(),
+		})
 		sec.Type = corev1.SecretTypeOpaque
 		sec.Data = map[string][]byte{forgejo.ConfigSecretKey: []byte(content)}
 		return nil
@@ -202,7 +213,14 @@ func defaultConfig(rc *forgejo.ReconcileContext, secrets map[string][]byte) iniF
 
 	set("security", "INSTALL_LOCK", "true")
 	set("security", "SECRET_KEY", string(secrets[forgejo.SecretKeySecretKey]))
-	set("security", "INTERNAL_TOKEN", string(secrets[forgejo.SecretKeyInternalToken]))
+	// Per Forgejo major (forgejo.Traits). The token stays in "<name>-secrets" either way, so
+	// that rolling back to an older major finds it.
+	if l.Traits.InternalToken {
+		set("security", "INTERNAL_TOKEN", string(secrets[forgejo.SecretKeyInternalToken]))
+	}
+	if l.Traits.InternalSocket {
+		set("server", "INTERNAL_LISTENER_PATH", l.InternalSocketPath)
+	}
 	set("security", "REVERSE_PROXY_TRUSTED_PROXIES", trustedProxies)
 	set("oauth2", "JWT_SECRET", string(secrets[forgejo.SecretKeyJWTSecret]))
 
