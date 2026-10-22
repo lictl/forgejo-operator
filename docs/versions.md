@@ -241,6 +241,13 @@ registry (anonymous token). It prints the matrix and findings, and exits with 1 
 is stale (a `STALE` line), 2 when upstream cannot be read. `WARN` and `INFO` lines need a look
 but do not fail it. Run it on a schedule.
 
+The procedure below is automated by the Claude Code workflow
+[`.claude/workflows/forgejo-new-version.js`](../.claude/workflows/forgejo-new-version.js) (run the
+saved workflow `forgejo-new-version`, optionally with `{event, major}`). It runs the tool,
+researches the release, applies the edits below, verifies them on a local cluster with
+[`test/e2e/checklists/versions.md`](../test/e2e/checklists/versions.md), reviews the change, and
+leaves it uncommitted for you to check and commit.
+
 ### At the branch cut (about three weeks before the release)
 
 Finding: `STALE Forgejo N.0 was branched on ... : add it to Upcoming`.
