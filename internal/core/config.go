@@ -110,6 +110,9 @@ func ReconcileConfig(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	}
 
 	cfg := defaultConfig(rc, secrets.Data)
+	if err := objectStorageConfig(cfg, f); err != nil {
+		return forgejo.StepResult{}, fmt.Errorf("objectStorage: %w", err)
+	}
 	if rc.ValkeyURL != "" {
 		cfg.merge(haConfig(rc.ValkeyURL))
 	}
@@ -232,7 +235,9 @@ func defaultConfig(rc *forgejo.ReconcileContext, secrets map[string][]byte) iniF
 	}
 
 	set("repository", "ROOT", l.RepoRoot)
-	set("lfs", "PATH", l.LFSPath)
+	if lfsOnVolume(f) {
+		set("lfs", "PATH", l.LFSPath)
+	}
 
 	set("database", "DB_TYPE", "postgres")
 	set("database", "HOST", hostPort(db.Host, db.Port))

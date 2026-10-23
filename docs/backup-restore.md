@@ -4,13 +4,22 @@ The operator backs Forgejo up as two artifacts:
 
 1. A **PostgreSQL logical dump** (`pg_dump --format=custom`) of the Forgejo database.
 2. A **gzip-compressed tar archive of the data volume**: repositories, LFS objects,
-   attachments, avatars, packages and the JWT signing key.
+   attachments, avatars, packages and the JWT signing key. With `spec.objectStorage`, the files
+   kept in the bucket are not on the volume, so not in the archive: the bucket's own versioning
+   or copies protect them (see [object-storage.md](object-storage.md#backups)).
 
 It also keeps a copy of the SSH host keys from their Secret (see [ssh.md](ssh.md)).
 
 Both go to a PVC in the instance's namespace. Backups are described by `ForgejoBackup`
 objects and restored with `ForgejoRestore` objects. Scheduled backups and retention are
 configured on the `Forgejo` resource.
+
+With `spec.backup.remote`, every backup is then also uploaded, encrypted, to an S3-compatible
+bucket outside the cluster, together with the instance's identity (its Secrets): see
+[Remote backups](#remote-backups). A remote backup can be restored into an instance by its
+location ([Restoring a remote backup](#restoring-a-remote-backup)), and a lost instance can be
+recreated from one, in a new namespace or cluster, with `spec.restoreFrom`
+([Disaster recovery](#disaster-recovery)).
 
 ## Taking a backup
 
@@ -34,14 +43,16 @@ before-migration   forgejo   Manual   Completed   12s         40s
 
 `status` records `phase` (`Pending` → `Running` → `Completed`/`Failed`), `startTime`,
 `completionTime`, `jobName`, `pvcName`, `path`, `forgejoImage` (the image running when the
-backup was taken), `databaseSizeBytes`, `dataSizeBytes`, `includesData`, `message` and a
-`Ready` condition. Events are recorded on the backup and on the `Forgejo` object. Status is
+backup was taken), `databaseSizeBytes`, `dataSizeBytes`, `includesData`, `message`, a
+`Ready` condition and, with `spec.backup.remote`, `remote` (see
+[Remote backups](#remote-backups)). Events are recorded on the backup and on the `Forgejo` object. Status is
 the record of a finished backup: the Job is deleted once its outcome is written there (see
 [Jobs are deleted when they finish](#jobs-are-deleted-when-they-finish)).
 
 What happens:
 
-* The backup waits while a `ForgejoRestore` of the same instance is in progress. It fails
+* The backup waits while a `ForgejoRestore` of the same instance is in progress, and while the
+  instance is being created from a remote backup (`spec.restoreFrom`). It fails
   straight away if the instance does not exist, and fails after 2 minutes if the database is
   not ready or the backup PVC cannot be provisioned.
 * The operator creates the backup PVC `<forgejo>-backups` on first use, using
@@ -103,7 +114,8 @@ What happens:
     ├── data.tar.gz     # tar of the data volume, paths relative to /data (./git, ./gitea, ...)
     ├── ssh-host-keys/  # ssh_host_{ed25519,ecdsa,rsa}_key: the SSH host keys from their Secret
     └── manifest.json   # backup name, instance, reason, images, pg_dump version,
-                        # timestamps, sizes, excluded paths, tar warnings, host key files
+                        # timestamps, sizes, excluded paths, tar warnings, host key files,
+                        # the bucket and subsystems of spec.objectStorage (or null)
 ```
 
 Every file is first written under a temporary name (`*.partial`) and renamed when complete.
@@ -167,8 +179,10 @@ are re-populated from the database on start).
 ### Deleting a backup
 
 `ForgejoBackup` objects carry the finalizer `forgejo.lucas.icu/finalizer`. Deleting
-one stops its Job if it is still running, then runs a cleanup Job `<backup>-cleanup` that
-removes `<pvc>/<backup-name>/`. If the files of a failed backup were already removed
+one stops its Job (and its upload Job) if it is still running, then runs a cleanup Job
+`<backup>-cleanup` that removes `<pvc>/<backup-name>/`. Deleting a `ForgejoBackup` never deletes
+its remote copy: only remote retention does, for scheduled backups (see
+[Remote retention](#remote-retention)). If the files of a failed backup were already removed
 (`FilesRemoved=True`), deletion finishes right away. The finalizer is released once that is
 done, and the cleanup Job goes with the object. Cleanup waits
 while an unfinished `ForgejoRestore` is reading the backup. The finalizer is also released
@@ -219,7 +233,8 @@ spec:
   the finalizer then removes its files. Independently of retention, the files of every
   failed backup are removed right after it fails (see [Files](#files)); its object stays.
 * A tick that falls while the instance is being upgraded (or while a failed upgrade still
-  holds its new image's migration) is deferred until the upgrade has settled, so a dump is
+  holds its new image's migration, or while it is created from `spec.restoreFrom`) is deferred
+  until that has settled, so a dump is
   never taken mid-migration and labelled with the old image. A deferred run does not count
   as missed for `BackupHealthy`.
 * Under `retainPolicy: Delete`, scheduled and pre-upgrade backups get an owner reference to
@@ -232,8 +247,11 @@ spec:
   `lastSuccessfulBackupTime`, `lastScheduleTime` and `nextScheduleTime`.
 * Condition `BackupHealthy`:
   * `True`/`BackupSucceeded`: the latest scheduled backup succeeded and it is not older
-    than two scheduled runs.
+    than two scheduled runs. With `spec.backup.remote`, the message adds "uploaded to
+    s3://..." or, while its upload runs, "uploading to s3://...".
   * `False`/`BackupFailed`: the latest scheduled backup failed.
+  * `False`/`UploadFailed`: the latest scheduled backup succeeded on the backup PVC, but its
+    upload to `spec.backup.remote` failed; the message has the reason.
   * `False`/`BackupStale`: two runs have passed since the last success.
   * `False`/`InvalidSchedule`: the cron expression is invalid.
   * `Unknown`: no scheduled backup has finished yet.
@@ -246,6 +264,9 @@ spec:
     moves back; it disappears when the instance has no successful backup left.
   * `forgejo_operator_backup_duration_seconds`
   * `forgejo_operator_backup_size_bytes{part="database|data"}`
+  * `forgejo_operator_backup_uploads_total{reason,result}` and
+    `forgejo_operator_backup_last_upload_success_timestamp_seconds` for remote backups (see
+    [Remote backups](#status-events-metrics-and-alerts)).
 
 ## Restoring
 
@@ -264,7 +285,7 @@ spec:
 
 | Phase | What happens |
 |-------|--------------|
-| `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance. Fails otherwise. Waits for another restore of the instance to finish, and while the Secret of SSH host keys is missing or unusable (`status.ssh.message` of the instance; Forgejo could not start again, see [ssh.md](ssh.md#when-something-is-wrong)). |
+| `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance (for a remote backup: reads and checks its manifest, see [Restoring a remote backup](#restoring-a-remote-backup)). Fails otherwise. Waits for another restore of the instance to finish, and while the Secret of SSH host keys is missing or unusable (`status.ssh.message` of the instance; Forgejo could not start again, see [ssh.md](ssh.md#when-something-is-wrong)). |
 | `ScalingDown` | The Forgejo pipeline turns on maintenance mode: `status.backup.activeRestore` is set, the Deployment is scaled to 0, the phase becomes `Restoring` and health checks and autopilot actions are suspended. The restore waits until no Forgejo pod exists, no backup of the instance is running and no Job or pod of another restore of the instance is still running. It fails after 15 minutes if that does not happen, for example because `spec.paused` is set or the reconcile is blocked earlier. |
 | `Restoring` | Job `<restore>-restore` runs (see below); `status.jobStartTime` records when it was created. If its newest pod cannot start within 10 minutes, the Job is stopped and the restore fails. It reports "nothing was changed" only when no earlier pod got past `verify`. Otherwise the failure counts as one that may have changed the instance (see below). A Job that is not found a minute after `jobStartTime` fails the restore with `JobMissing` only after the operator has confirmed with the API server that it is gone. |
 | `ScalingUp` | Maintenance ends and Forgejo is scaled back up. The bootstrap init container runs `forgejo migrate` against the restored database, in a single pod until that pod is available. The restore waits up to 15 minutes for the Deployment to be available. It completes right away when the instance wants no pods (`spec.replicas: 0` without horizontal autoscaling; with an HPA, `minReplicas` applies). |
@@ -375,6 +396,8 @@ written the outcome to status:
   `databaseSizeBytes`, `dataSizeBytes`, `startTime` and `completionTime` the rest.
 * `<backup>-cleanup` of a failed backup: when `FilesRemoved` is recorded. The cleanup Job of
   a deleted backup goes with the `ForgejoBackup`.
+* `<backup>-upload`: when the upload is recorded in `status.remote` (`Uploaded` or `Failed`),
+  together with Secret `<backup>-identity`, which handed the identity bundle to it.
 * `<restore>-restore`: when the restore is `Completed` or `Failed`. It is kept while the
   restore is `ScalingUp`, because its completion time starts the 15-minute scale-up
   timeout; a restore that is `ScalingUp` completes right away when its instance is being
@@ -392,7 +415,7 @@ reconcile that started from an outdated copy (still `Running`, say, after the Jo
 recorded and deleted) cannot overwrite the recorded result with `JobMissing`; it retries
 with the current object instead.
 
-### Restoring into a new instance (disaster recovery)
+### Restoring into a new instance of the same cluster
 
 A backup belongs to the instance named in its `spec.forgejoRef`. To recover after the
 instance was deleted (`retainPolicy: Retain` keeps the backup PVC and the `ForgejoBackup`
@@ -404,53 +427,351 @@ objects, also when it was switched from `Delete` shortly before):
 2. Wait until it is `Running`.
 3. Create a `ForgejoRestore` for the backup.
 
-A restore never changes the SSH host keys: they belong to the instance, not to the backup. When
-the instance is recreated in another cluster, create `<name>-ssh-host-keys` from the backup's
-`ssh-host-keys/` before the `Forgejo` (see [ssh.md](ssh.md#backups-and-disaster-recovery)).
+A restore never changes the SSH host keys: they belong to the instance, not to the backup.
+After losing the namespace or the cluster, use a remote backup and `spec.restoreFrom` instead
+([Disaster recovery](#disaster-recovery)), which brings the identity back as well.
 
-If the `ForgejoBackup` object is gone but its files remain, the operator cannot restore
-them, because a new `ForgejoBackup` always takes a fresh backup. Restore such files by hand,
-as described at the end of the next section.
+## Remote backups
 
-## Copying backups off-cluster
-
-The backup PVC is `ReadWriteOnce` and usually lives on the same node as the data volume,
-so the copy pod should run there. While Forgejo is running, start it next to Forgejo:
+`spec.backup.remote` uploads every backup (scheduled, manual and pre-upgrade) to an
+S3-compatible bucket once it is complete on the backup PVC, encrypted with a key that never
+leaves the cluster except where you keep it:
 
 ```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: backup-shell
 spec:
-  securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
-  affinity:
-    podAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - topologyKey: kubernetes.io/hostname
-          labelSelector:
-            matchLabels: {app.kubernetes.io/name: forgejo, app.kubernetes.io/instance: forgejo, app.kubernetes.io/component: server}
-  containers:
-    - name: shell
-      image: codeberg.org/forgejo/forgejo:15
-      command: ["sleep", "infinity"]
-      volumeMounts: [{name: backups, mountPath: /backups, readOnly: true}]
-  volumes:
-    - name: backups
-      persistentVolumeClaim: {claimName: forgejo-backups, readOnly: true}
+  backup:
+    enabled: true
+    retention: 7
+    remote:
+      s3:                                  # the S3Connection of spec.objectStorage
+        endpoint: https://s3.eu-central-1.amazonaws.com
+        bucket: acme-forgejo-backups       # another bucket than spec.objectStorage, or another prefix
+        region: eu-central-1
+        prefix: forgejo
+        credentialsSecret: {name: backup-s3}   # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+        # tls: {caSecret: {name: my-ca}}       # a private CA (https endpoints)
+      encryption:
+        keySecret: {name: my-backup-key, key: key}   # optional; default: generated "<name>-backup-key"
+      # image: docker.io/rclone/rclone:1.75.2      # the default
 ```
+
+The access key needs to list, read, write and delete objects below the prefix. The operator
+never creates the bucket.
+
+### What is uploaded
+
+```
+s3://<bucket>/<prefix>/<namespace>/<name>/<backup>-<uid>/
+├── db.dump.bin        # the files of the backup PVC, encrypted (rclone crypt appends .bin)
+├── data.tar.gz.bin    # (when the backup has a data archive)
+├── identity.json.bin  # the instance's identity, see below
+└── manifest.json.bin  # uploaded last: the backup is complete only when it exists
+```
+
+`<uid>` is the first 8 characters of the `ForgejoBackup`'s UID (`status.remote.path` has the
+whole path). Every `ForgejoBackup` gets a directory of its own: a backup created again under an
+old name, or one of the same name taken by an instance of the same namespace and name in another
+cluster (a recovery drill while production runs, the original cluster coming back after a
+recovery), never writes into, or cleans up, another backup's directory.
+
+* **identity.json** holds Secret `<name>-secrets` (`SECRET_KEY`, `INTERNAL_TOKEN`, the JWT
+  secrets, the metrics token, the admin sync salt), the admin Secret (`<name>-admin`, or
+  `admin.existingSecret`), the Secret of SSH host keys, and the `Forgejo` object (metadata and
+  spec, without status, for reference). Forgejo derives the keys of two-factor (TOTP) secrets,
+  Actions secrets, push-mirror credentials and webhook secrets from `SECRET_KEY`: a database
+  restored without it loses all of them. The backup encryption key itself is not part of it.
+* **manifest.json** names the backup and its instance (with the UIDs of both), the reason and
+  Forgejo image, the fingerprint of the encryption key and of `SECRET_KEY`, and the size and
+  SHA-256 of every file before encryption. It embeds the manifest of the backup PVC, which records the bucket and
+  subsystems of `spec.objectStorage`.
+* **The object storage bucket is not copied.** Files that `spec.objectStorage` keeps in a bucket
+  (LFS objects, attachments, avatars, packages, Actions data) are not on the data volume and so
+  not in any backup. Protect that bucket with the object store's own versioning, replication or
+  Object Lock (see [object-storage.md](object-storage.md#backups)); after a disaster, point
+  `spec.objectStorage` of the recreated instance at the same bucket and prefix.
+
+### How it is uploaded
+
+When the backup Job has finished, the `ForgejoBackup` is `Completed`: restores and upgrades do
+not wait for the upload. `status.remote` goes `Pending` → `Uploading` → `Uploaded` or `Failed`:
+
+1. The controller checks the key Secret (at least 16 characters, no surrounding white space),
+   the credentials and the CA, then writes the identity bundle into Secret
+   `<backup>-identity`, controlled by the backup.
+2. Job `<backup>-upload` runs one container of the rclone image (uid 1000, read-only root file
+   system, no capabilities) with the backup PVC mounted read-only. rclone is configured
+   entirely through environment variables: the access key comes from the credentials Secret
+   (`secretKeyRef`), and the backup key from its Secret (`BACKUP_KEY`), which the script hands
+   to `rclone obscure -` on stdin, so no secret is in the pod spec or on a command line.
+3. The Job lists the backup's directory and stops if it holds a `manifest.json` already: it never
+   writes into a complete backup. Each file is hashed (SHA-256), uploaded through rclone's crypt
+   remote (streamed, multipart for large files, so nothing is staged), then read back from the
+   bucket, decrypted, and hashed again; a mismatch fails the upload. `manifest.json` follows the
+   same way, last.
+4. The controller records the files with their sizes and checksums and `verified: true`, then
+   deletes the Job and the identity Secret.
+
+`status.remote` records the bucket (`s3`) and the key (`keySecret`) the Job writes with. A failed
+upload never fails the backup: its copy on the backup PVC remains. When the Job failed or
+vanished, the controller waits until its pods have stopped (a pod of a deleted Job may still
+write), then looks at the backup's directory with that recorded connection, whatever
+`spec.backup.remote` says by then:
+
+* this backup's own complete manifest (the Job uploaded everything and lost only its result,
+  e.g. a Job deleted before the operator saw it succeed): the upload is `Uploaded`;
+* objects without a manifest: what the upload left, deleted;
+* a manifest it cannot read, or one of another backup: left as it is, and the message says so.
+
+Nothing else is deleted. A pod that stays terminating for more than 5 minutes (a lost node)
+leaves the directory to remote retention. Take a new backup to upload again.
+
+Encryption is rclone's [crypt](https://rclone.org/crypt/) format: XSalsa20-Poly1305 per 64 KiB
+block, with keys derived from the backup key by scrypt; every block is authenticated, so a
+changed or truncated file, or a wrong key, fails to decrypt. File and directory names are not
+encrypted, so backups can be listed (and pruned) without the key.
+
+### The key
+
+Without `encryption.keySecret`, the operator generates 32 random bytes once into Secret
+`<name>-backup-key`, key `key`, as 43 characters of unpadded base64url (no `=`, no newline,
+like the instance's other generated secrets), annotated `forgejo.lucas.icu/backup-key:
+Generated`, and records a `BackupKeyGenerated` Warning event. The operator never changes or
+deletes that Secret, and it has no owner reference, also under `retainPolicy: Delete`: deleting
+the instance must not take the key of its off-site backups with it. With `keySecret`, bring your
+own key (at least 16 characters).
+
+**Copy the key out of the cluster right away and keep it offline,** then say so on the Secret.
+A remote backup cannot be restored without the key, and the cluster (or namespace) that holds
+the Secret is what the backups protect against losing:
 
 ```console
-$ kubectl cp backup-shell:/backups/before-migration ./before-migration
-$ kubectl exec backup-shell -- tar -C /backups -cf - before-migration | gzip -1 > before-migration.tar.gz  # or stream it
-$ kubectl delete pod backup-shell
+$ kubectl get secret forgejo-backup-key -o jsonpath='{.data.key}' | base64 -d > forgejo-backup-key.txt
+$ kubectl annotate secret forgejo-backup-key forgejo.lucas.icu/backup-key-exported=true
 ```
 
-You can also push from inside the pod with `rclone`, `aws s3 cp` or `restic` from a
-different image, mounting the same PVC read-only.
+Until the generated Secret carries that annotation, `status.backup.remote.message` says that the
+key has not been exported, and `BackupHealthy` is `False` with reason `BackupKeyNotExported` (with
+scheduled backups; only a failed backup reports something else). A key Secret you created
+yourself (`keySecret`, or `<name>-backup-key` restored from your copy) needs no annotation.
 
-To restore files that have no `ForgejoBackup` object, for example ones brought back from
-off-cluster, do by hand what the restore Job does. First scale Forgejo to zero
+**A lost key is never replaced silently.** When `<name>-backup-key` disappears after it encrypted
+backups (its fingerprint is in `status.backup.remote.keyFingerprint`, which is kept, or in a
+`ForgejoBackup`'s `status.remote`), the operator does not generate a new one: uploads fail,
+`BackupHealthy` is `False/BackupKeyMissing`, and a `BackupKeyMissing` Warning event repeats
+hourly. Restore the Secret from your copy. To start over with a new key instead (the backups
+encrypted with the lost one then cannot be restored), annotate the Forgejo with the lost key's
+fingerprint:
+
+```console
+$ kubectl annotate fj forgejo forgejo.lucas.icu/backup-key-lost=692717aef72a8682
+```
+
+`status.backup.remote.keyFingerprint` identifies the key (16 hex digits derived from the
+scrypt key, so it does not help guessing the key), and each backup's
+`status.remote.keyFingerprint` and manifest record the key it was encrypted with. Changing the
+key affects new backups only: keep every key that encrypted a backup you may restore.
+
+### Status, events, metrics and alerts
+
+```console
+$ kubectl get fjb
+NAME                       FORGEJO   REASON      PHASE       REMOTE     COMPLETED   AGE
+forgejo-scheduled-202610   forgejo   Scheduled   Completed   Uploaded   2m          3m
+$ kubectl get fjb forgejo-scheduled-202610 -o jsonpath='{.status.remote}'
+{"phase":"Uploaded","location":"s3://acme-forgejo-backups/forgejo/git/forgejo/forgejo-scheduled-202610-3f2a9c1e/",
+ "path":"git/forgejo/forgejo-scheduled-202610-3f2a9c1e","s3":{"endpoint":"https://s3.eu-central-1.amazonaws.com",...},
+ "keySecret":{"name":"forgejo-backup-key","key":"key"},"keyFingerprint":"692717aef72a8682",
+ "files":[{"name":"db.dump","sizeBytes":415604,"sha256":"10df..."},...],"verified":true,...}
+```
+
+* `status.backup.remote` of the `Forgejo`: `location` (the instance's directory),
+  `keySecretName`, `keyFingerprint`, `lastUploadedBackupName`, `lastUploadTime`,
+  `lastRetentionTime`, and `message` when the key is unusable or remote retention failed.
+* `BackupHealthy` is `False`/`UploadFailed` when the latest scheduled backup was not uploaded,
+  and `False`/`BackupKeyNotExported`, `BackupKeyMissing` or `BackupKeyUnusable` while the key is
+  not exported, missing or unusable (see [The key](#the-key)).
+* Events: `UploadStarted`, `BackupUploaded`, `UploadFailed` on the backup;
+  `BackupUploaded`, `BackupUploadFailed`, `RemoteBackupPruned`, `RemoteRetentionFailed`,
+  `BackupKeyGenerated`, `BackupKeyMissing` on the `Forgejo`.
+* Metrics: `forgejo_operator_backup_uploads_total{reason,result}` and
+  `forgejo_operator_backup_last_upload_success_timestamp_seconds`.
+* Alerts: `ForgejoBackupUploadFailed` (an upload failed in the last hour) and, with scheduled
+  backups, `ForgejoBackupUploadTooOld` and `ForgejoBackupUploadMissing`, with the same
+  `maxAge` as the local backup alerts (see [observability.md](observability.md#alerts)).
+
+### Remote retention
+
+While scheduled backups are enabled, the operator keeps the newest `spec.backup.retention`
+complete scheduled backups of the instance in the bucket and deletes older ones (manifest
+first). It lists `<prefix>/<namespace>/<name>/` and reads the manifests, so it also prunes
+backups whose `ForgejoBackup` is gone. A backup counts as the instance's when its manifest names
+the instance's UID, or, after `spec.restoreFrom`, the UID of the instance that took the restored
+backup and it completed no later than that backup (the backups taken before the disaster;
+`status.restoredFrom.instanceUID` and `backupCompletionTime`). It runs after every upload of a
+scheduled backup and at least hourly. It never deletes:
+
+* backups of another instance, e.g. of the same namespace and name in another cluster: a
+  recovery drill and production, or the original cluster back after a recovery, each keep their
+  own;
+* manual and pre-upgrade backups;
+* a backup whose manifest it cannot read (e.g. encrypted with another key);
+* a backup an unfinished `ForgejoRestore` reads, or the source of `spec.restoreFrom` while
+  the instance is being created from it;
+* an incomplete directory (no manifest) younger than 25 hours; older ones are failed uploads
+  and are deleted.
+
+Remote retention runs in the operator: it needs to reach the endpoint (see
+[design.md](design.md#network-requirements)). A failure is reported in
+`status.backup.remote.message` and a `RemoteRetentionFailed` event, and never holds up local
+backups.
+
+### Reading a remote backup by hand
+
+Any rclone reads the backups (here with the key from the file you exported):
+
+```console
+$ export RCLONE_CONFIG_S3_TYPE=s3 RCLONE_CONFIG_S3_PROVIDER=Other RCLONE_CONFIG_S3_ENV_AUTH=true \
+    RCLONE_CONFIG_S3_ENDPOINT=https://s3.eu-central-1.amazonaws.com RCLONE_CONFIG_S3_REGION=eu-central-1 \
+    RCLONE_CONFIG_ENC_TYPE=crypt RCLONE_CONFIG_ENC_REMOTE=s3:acme-forgejo-backups/forgejo \
+    RCLONE_CONFIG_ENC_FILENAME_ENCRYPTION=off RCLONE_CONFIG_ENC_DIRECTORY_NAME_ENCRYPTION=false \
+    AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+$ export RCLONE_CONFIG_ENC_PASSWORD=$(rclone obscure - < forgejo-backup-key.txt)
+$ rclone lsf enc:git/forgejo/                         # the backups of instance git/forgejo: <backup>-<uid>/
+$ rclone cat enc:git/forgejo/<backup>-<uid>/manifest.json
+$ rclone copy enc:git/forgejo/<backup>-<uid> ./<backup>     # db.dump, data.tar.gz, identity.json
+```
+
+## Restoring a remote backup
+
+A `ForgejoRestore` with `spec.remote` instead of `spec.backupName` restores a remote backup by
+its location; no `ForgejoBackup` object is needed:
+
+```yaml
+apiVersion: forgejo.lucas.icu/v1alpha1
+kind: ForgejoRestore
+metadata:
+  name: from-remote
+spec:
+  forgejoRef: {name: forgejo}
+  remote:
+    s3: {...}                     # the spec.backup.remote.s3 that uploaded it (same prefix)
+    path: git/forgejo/forgejo-scheduled-20261022030000-3f2a9c1e   # <namespace>/<name>/<backup>-<uid>: status.remote.path
+    # keySecret: {name: old-key}  # default: the instance's backup key
+  restoreDatabase: true
+  restoreData: true
+```
+
+* In `Pending` the operator reads `manifest.json` with its own client: the backup must be
+  complete and decrypt with the key, otherwise the restore fails (a bucket it cannot reach is
+  retried for 5 minutes). `status.remote` records the backup's name, image, whether it has a
+  data archive, and the files with their checksums. A `NewerBackup` event warns about a newer
+  image, and an `IdentityMismatch` event when the backup was taken by an instance with another
+  `SECRET_KEY` (its two-factor secrets, Actions secrets and mirror credentials would not
+  decrypt; to bring that instance back, use `spec.restoreFrom`).
+* The restore Job gets a first init container, `download` (rclone), which downloads and
+  decrypts `db.dump` and `data.tar.gz` into an `emptyDir` and checks their SHA-256 against the
+  manifest. The pod requests ephemeral storage for them (`sizeLimit` of the `emptyDir` too),
+  so the node of the data volume needs that much free space. The other steps and the
+  maintenance handshake are those of any restore; nothing is changed before `verify` passed.
+* The instance's Secrets are not changed.
+
+## Disaster recovery
+
+`spec.restoreFrom` creates an instance from a remote backup, in any namespace or cluster:
+before Forgejo starts for the first time, the operator restores the identity Secrets, then the
+database and the data volume. Only the bucket's credentials and the backup key are needed.
+
+### Before a disaster
+
+1. Configure `spec.backup.remote` (and scheduled backups).
+2. Export the backup key (see [The key](#the-key)) and keep it offline, with the S3 credentials.
+3. Keep the `Forgejo` manifest (e.g. in Git), without `spec.restoreFrom`. The last uploaded
+   spec is also in every backup's `identity.json`.
+4. Protect the object storage bucket with versioning or replication.
+
+### Recovering
+
+```console
+$ kubectl create namespace git
+$ kubectl -n git create secret generic backup-s3 --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=...
+$ kubectl -n git create secret generic forgejo-backup-key --from-file=key=forgejo-backup-key.txt
+$ rclone lsf enc:git/forgejo/        # pick a backup (see "Reading a remote backup by hand")
+```
+
+```yaml
+apiVersion: forgejo.lucas.icu/v1alpha1
+kind: Forgejo
+metadata:
+  name: forgejo                   # any name; the identity Secrets get this instance's names
+spec:
+  image: codeberg.org/forgejo/forgejo:17      # the backup's version or newer
+  objectStorage: {...}            # the same bucket and prefix as before
+  backup:
+    enabled: true
+    remote:
+      s3: {...}                   # the same bucket; this instance uploads to <namespace>/<name>/
+  restoreFrom:
+    remote:
+      s3: {...}                   # the bucket the backup is in, with its prefix
+      path: git/forgejo/forgejo-scheduled-20261022030000-3f2a9c1e
+      # keySecret: {name: forgejo-backup-key}   # default: the instance's backup key Secret
+```
+
+What the operator does (`status.restoredFrom`, condition `RestoredFromBackup`):
+
+1. **Maintenance from the first pass.** The instance is in maintenance (`phase: Restoring`, no
+   Forgejo pod) until the backup is restored, and no backup is taken.
+2. **Identity** (`restoredFrom.phase: RestoringIdentity`), step `restore-identity`, before
+   the `secrets` step would generate new values: the operator reads `manifest.json` and
+   `identity.json` with its own S3 client, checks the identity's SHA-256 against the manifest,
+   and creates `<name>-secrets`, `<name>-admin` (unless `admin.existingSecret` is used) and
+   `<name>-ssh-host-keys` (unless `hostKeys.existingSecret` is used) with the backup's values,
+   under the new instance's names and following its `retainPolicy`. A Secret that exists already
+   is kept when it holds the backup's values; otherwise this is a conflict
+   (`RestoredFromBackup=False/IdentityConflict`): the operator never overwrites a Secret. While
+   the backup cannot be read (missing Secrets, wrong key, unreachable bucket), it retries every
+   30 s with `RestoredFromBackup=False/RemoteBackupUnavailable`, and nothing else is created.
+3. **Database and data** (`RestoringData`): once the CNPG cluster is ready and the data volume
+   exists, the operator creates `ForgejoRestore` `<name>-restore-from` (owned by the instance)
+   for the backup, which restores it as described in
+   [Restoring a remote backup](#restoring-a-remote-backup). It refuses to when the CNPG cluster
+   `<name>-db` or the data PVC `<name>-data` is older than the `Forgejo` (kept by `retainPolicy:
+   Retain` from an earlier instance of the same name, so it may hold data the restore would
+   replace), or when `<name>-secrets` records the restore of another backup:
+   `restoredFrom.phase` is `Failed`, `RestoredFromBackup=False/TargetNotEmpty`, and Forgejo stays
+   scaled down. Remove `spec.restoreFrom` to start the instance on its data, or annotate the
+   Forgejo with `forgejo.lucas.icu/restore-from-overwrite=true` to restore the backup over
+   it.
+4. **Start** (`Completed`): once the restore has restored everything (`ScalingUp`), the operator
+   writes the backup's location into the annotation `forgejo.lucas.icu/restored-from` of
+   `<name>-secrets`, and only then Forgejo starts on the restored database (the first pod
+   migrates it alone when the image is newer), with the restored `SECRET_KEY`, admin password
+   and SSH host keys. `RestoredFromBackup=True/Restored`. Remote retention takes over the
+   scheduled backups the lost instance took up to the restored one (see
+   [Remote retention](#remote-retention)).
+
+If the `ForgejoRestore` fails, `restoredFrom.phase` is `Failed` and Forgejo stays scaled down.
+Delete `<name>-restore-from` to try again (the operator creates it anew), or remove
+`spec.restoreFrom` to start the instance without the backup. `spec.restoreFrom` can only be set
+when the `Forgejo` is created. **Remove it once `restoredFrom.phase` is `Completed`**, also from
+the manifest you keep. A backup is never restored twice: the annotation on `<name>-secrets`
+survives a lost status and, with `retainPolicy: Retain`, a deleted and re-created `Forgejo`, which
+then completes at once (`RestoredFromBackup=True`, the message names the annotation); with
+`retainPolicy: Delete`, deleting the `Forgejo` deletes its data too, and a re-created one with
+`spec.restoreFrom` is a new recovery.
+
+After the recovery: users sign in with their passwords and two-factor codes, the admin password
+is the one of the backup's admin Secret (or the one changed in the UI before the backup), clients
+see the same SSH host key fingerprints, and LFS objects and attachments come from the bucket of
+`spec.objectStorage`. Re-create what lives outside the operator's Secrets yourself: Secrets of
+`configFrom`, `admin.existingSecret`, `hostKeys.existingSecret`, and the CNPG database password
+(the new cluster has its own).
+
+## Restoring files by hand
+
+To restore backup files that neither a `ForgejoBackup` nor a remote backup describes (for
+example copied off the backup PVC, or downloaded with rclone as above), do by hand what the
+restore Job does. First scale Forgejo to zero
 (`spec.replicas: 0`). Then run the following in pods that mount the data PVC (as root) and
 reach the database with the app user's credentials:
 
@@ -461,6 +782,7 @@ $ find /data -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +
 $ tar -xzf data.tar.gz -C /data && chown -R 1000:1000 /data
 ```
 
-For production disaster recovery, also consider continuous archiving and point-in-time
-recovery of PostgreSQL with CloudNativePG's own backup support (object storage). Use
-storage snapshots for very large data volumes.
+Remote backups are logical dumps taken on a schedule. For a recovery point closer than the
+last backup, also consider continuous archiving and point-in-time recovery of PostgreSQL with
+CloudNativePG's own backup support (the barman-cloud plugin can use the same bucket under
+another prefix). Use storage snapshots for very large data volumes.

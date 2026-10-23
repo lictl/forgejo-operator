@@ -33,16 +33,24 @@ const (
 	RestorePhaseFailed      RestorePhase = "Failed"
 )
 
-// ForgejoRestoreSpec restores a ForgejoBackup into a Forgejo instance. While a restore is
-// active the instance is scaled to zero (maintenance mode).
+// ForgejoRestoreSpec restores a ForgejoBackup, or a remote backup, into a Forgejo instance.
+// While a restore is active the instance is scaled to zero (maintenance mode).
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.backupName) != has(self.remote)",message="set exactly one of backupName and remote"
 type ForgejoRestoreSpec struct {
 	// forgejoRef is the instance to restore into.
 	ForgejoRef ForgejoRef `json:"forgejoRef"`
 
 	// backupName is a completed ForgejoBackup in the same namespace.
 	// +kubebuilder:validation:MinLength=1
-	BackupName string `json:"backupName"`
+	// +optional
+	BackupName string `json:"backupName,omitempty"`
+
+	// remote restores a backup from object storage by its location; no ForgejoBackup object is
+	// needed. The identity Secrets of the instance are not changed: to recreate a lost instance
+	// with its identity, use spec.restoreFrom of a new Forgejo instead.
+	// +optional
+	Remote *RemoteBackupSource `json:"remote,omitempty"`
 
 	// restoreDatabase replaces the database with the dump. Defaults to true.
 	// +optional
@@ -70,10 +78,36 @@ type ForgejoRestoreStatus struct {
 	JobStartTime *metav1.Time `json:"jobStartTime,omitempty"`
 	// +optional
 	Message string `json:"message,omitempty"`
+	// remote describes the remote backup of spec.remote, read from its manifest.
+	// +optional
+	Remote *RestoreRemoteStatus `json:"remote,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// RestoreRemoteStatus describes the remote backup a restore reads.
+type RestoreRemoteStatus struct {
+	// location of the backup: s3://<bucket>/<prefix>/<path>/.
+	// +optional
+	Location string `json:"location,omitempty"`
+	// backupName is the name of the ForgejoBackup that took it.
+	// +optional
+	BackupName string `json:"backupName,omitempty"`
+	// forgejoImage ran when the backup was taken.
+	// +optional
+	ForgejoImage string `json:"forgejoImage,omitempty"`
+	// includesData is true when the backup has an archive of the data volume.
+	// +optional
+	IncludesData bool `json:"includesData,omitempty"`
+	// keyFingerprint identifies the key the backup was encrypted with.
+	// +optional
+	KeyFingerprint string `json:"keyFingerprint,omitempty"`
+	// files of the backup, with the size and SHA-256 the download is checked against.
+	// +listType=atomic
+	// +optional
+	Files []RemoteBackupFile `json:"files,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -81,6 +115,7 @@ type ForgejoRestoreStatus struct {
 // +kubebuilder:resource:shortName=fjr,categories=forgejo
 // +kubebuilder:printcolumn:name="Forgejo",type=string,JSONPath=`.spec.forgejoRef.name`
 // +kubebuilder:printcolumn:name="Backup",type=string,JSONPath=`.spec.backupName`
+// +kubebuilder:printcolumn:name="Remote",type=string,JSONPath=`.spec.remote.path`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

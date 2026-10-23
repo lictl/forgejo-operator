@@ -71,16 +71,21 @@ keys alone.
 
 ## Backups and disaster recovery
 
-Every backup holds a copy of the keys in `<backup>/ssh-host-keys/` (listed in `manifest.json`).
-A restore does not change the instance's keys.
+Every backup holds a copy of the keys in `<backup>/ssh-host-keys/` (listed in `manifest.json`),
+and every remote backup holds the Secret of host keys in its encrypted `identity.json`. A restore
+does not change the instance's keys.
 
 - **Same cluster.** With `retainPolicy: Retain` the Secret survives the deletion of the
   `Forgejo`; recreate it with the same name and restore (see
-  [backup-restore.md](backup-restore.md#restoring-into-a-new-instance-disaster-recovery)).
-- **Another cluster, or another instance name.** A backup can only be restored into the
-  instance it was taken of (`spec.forgejoRef`), but its keys can serve any instance. Create a
-  Secret from the backup copy **before** the `Forgejo`, then the instance (then restore, for the
-  same name in another cluster):
+  [backup-restore.md](backup-restore.md#restoring-into-a-new-instance-of-the-same-cluster)).
+- **Another namespace or cluster, from a remote backup.** `spec.restoreFrom` of the new
+  `Forgejo` creates `<name>-ssh-host-keys` from the backup before the keys would be generated,
+  so clients see the same fingerprints (see
+  [backup-restore.md](backup-restore.md#disaster-recovery)).
+- **Another cluster, or another instance name, from local backup files.** A backup can only be
+  restored into the instance it was taken of (`spec.forgejoRef`), but its keys can serve any
+  instance. Create a Secret from the backup copy **before** the `Forgejo`, then the instance
+  (then restore, for the same name in another cluster):
 
   ```bash
   kubectl create secret generic git-ssh-host-keys --from-file=./before-migration/ssh-host-keys/

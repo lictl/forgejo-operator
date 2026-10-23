@@ -205,6 +205,28 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 			fmt.Sprintf("Forgejo %s has no successful backup", ref), desc)
 	}
 
+	if f.Spec.Backup.Remote != nil {
+		add("ForgejoBackupUploadFailed", "warning", "",
+			recentlyIncreased(fmt.Sprintf(`forgejo_operator_backup_uploads_total{%s, result="failed"}`, op), "1h"),
+			fmt.Sprintf("A backup of Forgejo %s was not uploaded off-cluster", ref),
+			fmt.Sprintf("At least one upload to spec.backup.remote failed in the last hour; the backup itself is kept on the "+
+				"%s PVC. status.remote.message of the ForgejoBackup (`kubectl get forgejobackups %s -l "+
+				"forgejo.lucas.icu/instance=%s -o wide`) and the BackupUploadFailed events name the cause (credentials, "+
+				"key Secret, bucket reachability).", forgejo.BackupPVCName(f), kc, f.Name))
+		if f.Spec.Backup.Enabled {
+			maxAge := backupMaxAge(f)
+			last := fmt.Sprintf(`forgejo_operator_backup_last_upload_success_timestamp_seconds{%s}`, op)
+			desc := fmt.Sprintf("Scheduled backups should have been uploaded to spec.backup.remote within %s. Check "+
+				"status.backup.remote and the BackupHealthy condition of `kubectl describe fj %s %s`.", model.Duration(maxAge), f.Name, kc)
+			add("ForgejoBackupUploadTooOld", "warning", "10m",
+				fmt.Sprintf(`time() - max(%s) > %d`, last, int64(maxAge.Seconds())),
+				fmt.Sprintf("The last off-cluster backup of Forgejo %s is too old", ref), desc)
+			add("ForgejoBackupUploadMissing", "warning", model.Duration(maxAge).String(),
+				fmt.Sprintf(`absent(%s) and on() count(%s) > 0`, last, ready),
+				fmt.Sprintf("Forgejo %s has no off-cluster backup", ref), desc)
+		}
+	}
+
 	add("ForgejoVolumeAlmostFull", "warning", "10m",
 		fmt.Sprintf(`max by (namespace, name, claim) (forgejo_operator_volume_used_ratio{%s}) > 0.9`, op),
 		fmt.Sprintf("Volume {{ $labels.claim }} of Forgejo %s is almost full", ref),

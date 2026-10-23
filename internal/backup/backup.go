@@ -31,6 +31,11 @@ import (
 // maintenance until it is released (see HoldsMaintenance).
 func ReconcileMaintenance(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
+	if Bootstrapping(f) {
+		if err := recoverBootstrap(ctx, rc); err != nil {
+			return forgejo.StepResult{}, err
+		}
+	}
 	restores, err := ListRestores(ctx, rc.Client, f.Namespace, f.Name)
 	if err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("listing restores: %w", err)
@@ -47,6 +52,12 @@ func ReconcileMaintenance(ctx context.Context, rc *forgejo.ReconcileContext) (fo
 			f.Status.Backup.ActiveRestore = ""
 			rc.Event(corev1.EventTypeNormal, "MaintenanceEnded", "Restore", "ForgejoRestore %s no longer needs maintenance mode", previous)
 		}
+		// spec.restoreFrom: no pod starts before the backup is restored, also before its
+		// ForgejoRestore exists and after it failed.
+		if reason := bootstrapHold(f, restores); reason != "" {
+			rc.Maintenance = true
+			rc.MaintenanceReason = reason
+		}
 		return forgejo.StepResult{}, nil
 	}
 
@@ -60,7 +71,7 @@ func ReconcileMaintenance(ctx context.Context, rc *forgejo.ReconcileContext) (fo
 		}
 		return forgejo.StepResult{}, nil
 	}
-	rc.MaintenanceReason = fmt.Sprintf("ForgejoRestore %s is restoring backup %s", active.Name, active.Spec.BackupName)
+	rc.MaintenanceReason = fmt.Sprintf("ForgejoRestore %s is restoring %s", active.Name, RestoreSource(active))
 	if previous != active.Name {
 		rc.Event(corev1.EventTypeNormal, "MaintenanceStarted", "Restore", "Scaling down for ForgejoRestore %s", active.Name)
 	}
@@ -131,8 +142,10 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	} else {
 		ExportLastSuccess(f)
 	}
+	key := summarizeRemote(ctx, rc, backups)
 
 	if !f.Spec.Backup.Enabled {
+		forgetRemoteRetention(f.Namespace, f.Name)
 		meta.RemoveStatusCondition(&f.Status.Conditions, forgejov1.ConditionBackupHealthy)
 		if f.Status.Backup != nil {
 			f.Status.Backup.NextScheduleTime = nil
@@ -156,7 +169,7 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	due := nextRun(sched, st, now)
 	var deferredSince *time.Time
 	if !now.Before(due) {
-		if busy := firstActive(backups); upgradeInProgress(rc) {
+		if busy := firstActive(backups); upgradeInProgress(rc) || Bootstrapping(f) {
 			// A hot dump taken while an upgrade migrates the database would be labelled with
 			// the old image. The run starts once the upgrade has settled; it is not a missed
 			// run for BackupHealthy.
@@ -184,7 +197,8 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	if err := prune(ctx, rc, scheduled); err != nil {
 		return forgejo.StepResult{}, err
 	}
-	setHealth(rc, sched, scheduled, now, deferredSince)
+	pruneRemote(ctx, rc, backups, now)
+	setHealth(rc, sched, scheduled, now, deferredSince, key)
 	return forgejo.StepResult{}, nil
 }
 
@@ -366,7 +380,7 @@ func finishedAt(b *forgejov1.ForgejoBackup) time.Time {
 // backup turns stale once two further scheduled runs have passed without a newer success.
 // While a due run is deferred (deferredSince), staleness is judged as of the time the run was
 // due, so the deferral itself never makes the backups stale.
-func setHealth(rc *forgejo.ReconcileContext, sched cron.Schedule, scheduled []*forgejov1.ForgejoBackup, now time.Time, deferredSince *time.Time) {
+func setHealth(rc *forgejo.ReconcileContext, sched cron.Schedule, scheduled []*forgejov1.ForgejoBackup, now time.Time, deferredSince *time.Time, key keyProblem) {
 	var latest *forgejov1.ForgejoBackup
 	running := false
 	for _, b := range scheduled {
@@ -378,6 +392,12 @@ func setHealth(rc *forgejo.ReconcileContext, sched cron.Schedule, scheduled []*f
 		break
 	}
 	set := func(status metav1.ConditionStatus, reason, msg string, args ...any) {
+		// A backup key that is missing, unusable or not copied out of the cluster makes the
+		// remote backups worthless for a disaster recovery; only failed backups say more.
+		if key.reason != "" && status != metav1.ConditionFalse {
+			rc.SetCondition(forgejov1.ConditionBackupHealthy, metav1.ConditionFalse, key.reason, key.message)
+			return
+		}
 		rc.SetCondition(forgejov1.ConditionBackupHealthy, status, reason, fmt.Sprintf(msg, args...))
 	}
 	switch {
@@ -400,6 +420,18 @@ func setHealth(rc *forgejo.ReconcileContext, sched cron.Schedule, scheduled []*f
 			set(metav1.ConditionFalse, "BackupStale", "Last successful scheduled backup %s completed at %s; later runs did not succeed%s",
 				latest.Name, done.UTC().Format(time.RFC3339), note)
 			return
+		}
+		if r := latest.Status.Remote; r != nil && RemoteEnabled(rc.Instance) {
+			switch r.Phase {
+			case forgejov1.RemoteBackupFailed:
+				set(metav1.ConditionFalse, "UploadFailed", "Scheduled backup %s completed at %s, but its upload to %s failed: %s",
+					latest.Name, done.UTC().Format(time.RFC3339), r.Location, r.Message)
+				return
+			case forgejov1.RemoteBackupUploaded:
+				note = "; uploaded to " + r.Location + note
+			default:
+				note = "; uploading to " + r.Location + note
+			}
 		}
 		set(metav1.ConditionTrue, "BackupSucceeded", "Scheduled backup %s completed at %s%s", latest.Name, done.UTC().Format(time.RFC3339), note)
 	}

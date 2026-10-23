@@ -283,3 +283,22 @@ func TestUpgradeWaitsForSSHHostKeys(t *testing.T) {
 		t.Fatalf("once the keys are back the upgrade starts: %+v", f.Status.Upgrade)
 	}
 }
+
+// An upgrade does not start while the bucket of spec.objectStorage is unusable: the new
+// version could not start, and its rollback would restore the database for nothing.
+func TestUpgradeWaitsForObjectStorage(t *testing.T) {
+	f := fixture(nil)
+	c := newClient(t)
+	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image,
+		ObjectStorageUnavailable: true}
+	if _, err := Reconcile(context.Background(), rc); err != nil {
+		t.Fatal(err)
+	}
+	cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionUpgrading)
+	if f.Status.Upgrade != nil || rc.Upgrading || rc.TargetImage != imgA || cond == nil || cond.Reason != "WaitingForObjectStorage" {
+		t.Fatalf("upgrade %+v, upgrading %v, target %s, condition %+v", f.Status.Upgrade, rc.Upgrading, rc.TargetImage, cond)
+	}
+	if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade == nil || !inFlight(f.Status.Upgrade.Phase) {
+		t.Fatalf("once the bucket is usable the upgrade starts: %+v", f.Status.Upgrade)
+	}
+}

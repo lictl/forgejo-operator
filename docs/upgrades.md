@@ -47,7 +47,7 @@ spec.image ───────────► Pending ─► BackingUp ─► 
 | Phase | What happens | Deployed image / replicas |
 |-------|--------------|---------------------------|
 | `Pending` | `fromImage`, `toImage`, `startTime` and the backup name are recorded. | old image, unchanged (a [retry](#retrying) keeps the new image) |
-| `BackingUp` | Forgejo is stopped. Once no server pod is left, `ForgejoBackup <name>-pre-upgrade-<start>` (`reason: PreUpgrade`) is created and the operator waits for it to complete. If server pods are still there 15 minutes after `startTime` (a pod stuck terminating on an unreachable node or behind a finalizer), the upgrade is aborted (`Failed`, old image back at its usual scale) instead of taking a backup while something may still write. | old image, 0 replicas |
+| `BackingUp` | Forgejo is stopped. Once no server pod is left, `ForgejoBackup <name>-pre-upgrade-<start>` (`reason: PreUpgrade`) is created and the operator waits for it to complete (on the backup PVC; with `spec.backup.remote` its upload runs afterwards and does not hold up the upgrade). If server pods are still there 15 minutes after `startTime` (a pod stuck terminating on an unreachable node or behind a finalizer), the upgrade is aborted (`Failed`, old image back at its usual scale) instead of taking a backup while something may still write. | old image, 0 replicas |
 | `RollingOut` | The new image is deployed with the `Recreate` strategy and one replica, in the same reconcile that records `rolloutStartTime`. The `bootstrap` init container runs `forgejo migrate`. | new image, 1 replica |
 | `Verifying` | The migration finished and the server container started; the operator waits until the pod is Ready, core reports the image as verified (`status.image`), and the Deployment has rolled it out (its current generation observed, every replica updated and available). | new image, 1 replica |
 | `Succeeded` | `status.image` is the new image and the Deployment runs it with every replica available. The usual replica count, strategy and HPA come back. | new image |
@@ -101,7 +101,9 @@ An orchestrated upgrade does not start while a `ForgejoRestore` holds the instan
 maintenance mode (`Upgrading=False`, reason `WaitingForRestore`); it starts once the restore
 has finished. Nor does it start while the Secret of SSH host keys is missing or unusable
 (`Upgrading=False`, reason `WaitingForSSHHostKeys`): the new image's pods could not start (see
-[ssh.md](ssh.md#when-something-is-wrong)).
+[ssh.md](ssh.md#when-something-is-wrong)), or while the endpoint of `spec.objectStorage` answers
+with a failure (`Upgrading=False`, reason `WaitingForObjectStorage`; an endpoint only the operator
+cannot reach holds nothing, see [object-storage.md](object-storage.md#status)).
 
 ## Restores during an upgrade
 

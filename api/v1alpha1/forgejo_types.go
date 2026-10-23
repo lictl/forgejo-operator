@@ -33,6 +33,8 @@ const (
 	DefaultAdminUsername  = "forgejo_admin"
 	DefaultAdminEmail     = "forgejo_admin@forgejo.local"
 	DefaultBackupSchedule = "0 3 * * *"
+	// DefaultRcloneImage uploads and downloads remote backups (spec.backup.remote.image).
+	DefaultRcloneImage = "docker.io/rclone/rclone:1.75.2"
 )
 
 // Condition types reported on Forgejo.status.conditions.
@@ -65,6 +67,14 @@ const (
 	// ready (and the ReferenceGrant of spec.tls.gatewayNamespaces exists). Only reported
 	// while spec.tls is set; see docs/networking.md.
 	ConditionTLSReady = "TLSReady"
+	// ConditionObjectStorageReady is True when the operator reached the bucket of
+	// spec.objectStorage with its credentials. Only reported while spec.objectStorage is set;
+	// see docs/object-storage.md.
+	ConditionObjectStorageReady = "ObjectStorageReady"
+	// ConditionRestoredFromBackup reports the bootstrap of spec.restoreFrom: False while the
+	// identity, database and data volume are restored from the remote backup, True once Forgejo
+	// started on them. Only reported while spec.restoreFrom is set; see docs/backup-restore.md.
+	ConditionRestoredFromBackup = "RestoredFromBackup"
 )
 
 // ForgejoPhase is a coarse, human-readable summary of the instance state.
@@ -83,6 +93,7 @@ const (
 )
 
 // ForgejoSpec defines the desired state of a Forgejo instance.
+// +kubebuilder:validation:XValidation:rule="!has(self.restoreFrom) || (has(oldSelf.restoreFrom) && self.restoreFrom == oldSelf.restoreFrom)",message="restoreFrom can only be set when the Forgejo is created and cannot be changed afterwards (it may be removed)"
 type ForgejoSpec struct {
 	// image is the Forgejo container image. The official root image
 	// (codeberg.org/forgejo/forgejo:<version>) and the "-rootless" variant are supported.
@@ -138,6 +149,12 @@ type ForgejoSpec struct {
 	// +kubebuilder:default={}
 	// +optional
 	Storage StorageSpec `json:"storage,omitempty"`
+
+	// objectStorage keeps Forgejo's files (LFS objects, attachments, avatars, packages, Actions
+	// logs and artifacts, archive downloads) in an S3-compatible bucket instead of the data
+	// volume. Git repositories stay on the volume. See docs/object-storage.md.
+	// +optional
+	ObjectStorage *ObjectStorageSpec `json:"objectStorage,omitempty"`
 
 	// admin configures the bootstrap administrator account.
 	// +kubebuilder:default={}
@@ -196,6 +213,40 @@ type ForgejoSpec struct {
 	// +kubebuilder:default={}
 	// +optional
 	AutoPilot AutoPilotSpec `json:"autoPilot,omitempty"`
+
+	// restoreFrom creates the instance from a remote backup (disaster recovery): before Forgejo
+	// starts for the first time, the operator restores the instance's identity (Secrets
+	// "<name>-secrets", "<name>-admin" and "<name>-ssh-host-keys"), then its database and data
+	// volume. It can only be set when the Forgejo is created, and is refused when the
+	// instance's database or data volume existed before it. Remove it once
+	// status.restoredFrom.phase is Completed. See docs/backup-restore.md, "Disaster recovery".
+	// +optional
+	RestoreFrom *RestoreFromSpec `json:"restoreFrom,omitempty"`
+}
+
+// RestoreFromSpec names the backup a new instance is created from.
+type RestoreFromSpec struct {
+	// remote is a backup uploaded by spec.backup.remote.
+	Remote RemoteBackupSource `json:"remote"`
+}
+
+// RemoteBackupSource locates a backup that spec.backup.remote uploaded.
+type RemoteBackupSource struct {
+	// s3 is the bucket holding the backup, with the endpoint, bucket and prefix of the
+	// spec.backup.remote.s3 that uploaded it.
+	S3 S3Connection `json:"s3"`
+
+	// path of the backup below the prefix: "<namespace>/<name>/<backup>" of the instance that
+	// took it, as status.remote.path of its ForgejoBackup shows it.
+	// +kubebuilder:validation:MinLength=5
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?/[a-z0-9]([-a-z0-9.]*[a-z0-9])?/[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`
+	Path string `json:"path"`
+
+	// keySecret holds the key the backup was encrypted with. Defaults to the instance's backup
+	// key: spec.backup.remote.encryption.keySecret, else Secret "<name>-backup-key" (key "key").
+	// +optional
+	KeySecret *BackupKeySecretRef `json:"keySecret,omitempty"`
 }
 
 // ServerSpec configures Forgejo's public identity and Services.
@@ -643,6 +694,159 @@ type StorageSpec struct {
 	RetainPolicy RetainPolicy `json:"retainPolicy,omitempty"`
 }
 
+// ObjectStorageSpec moves Forgejo's files to an S3-compatible bucket.
+type ObjectStorageSpec struct {
+	// s3 is the bucket. Forgejo checks it when it starts, creates it when it is missing
+	// (if the key may create buckets), and does not start when it cannot reach it.
+	S3 S3Connection `json:"s3"`
+
+	// subsystems selects what is stored in the bucket. Every subsystem is stored there unless
+	// it is set to false here; the others stay on the data volume.
+	// +kubebuilder:default={}
+	// +optional
+	Subsystems ObjectStorageSubsystems `json:"subsystems,omitempty"`
+
+	// serveDirect makes Forgejo answer downloads (LFS, attachments, archive downloads,
+	// packages, Actions artifacts and, on Forgejo 15, avatars) with a redirect to a presigned
+	// URL of the bucket, valid for 5 minutes, instead of streaming the file itself
+	// ([storage] SERVE_DIRECT). Clients must then reach the endpoint under the same host name
+	// as Forgejo does. Uploads always go through Forgejo.
+	// +optional
+	ServeDirect bool `json:"serveDirect,omitempty"`
+}
+
+// ObjectStorageSubsystems selects the Forgejo subsystems whose files go to object storage.
+// Each one defaults to true.
+type ObjectStorageSubsystems struct {
+	// lfs: Git LFS objects ([lfs], prefix "lfs/").
+	// +optional
+	LFS *bool `json:"lfs,omitempty"`
+	// attachments of issues, pull requests and releases ([attachment], prefix "attachments/").
+	// +optional
+	Attachments *bool `json:"attachments,omitempty"`
+	// avatars of users and organizations ([avatar], prefix "avatars/").
+	// +optional
+	Avatars *bool `json:"avatars,omitempty"`
+	// repoAvatars: repository avatars ([repo-avatar], prefix "repo-avatars/").
+	// +optional
+	RepoAvatars *bool `json:"repoAvatars,omitempty"`
+	// repoArchives: the cache of archive downloads (zip, tar.gz, bundle) ([repo-archive],
+	// prefix "repo-archive/").
+	// +optional
+	RepoArchives *bool `json:"repoArchives,omitempty"`
+	// packages of the package registry ([packages], prefix "packages/").
+	// +optional
+	Packages *bool `json:"packages,omitempty"`
+	// actionsLogs: logs of Forgejo Actions runs ([storage.actions_log], prefix "actions_log/").
+	// +optional
+	ActionsLogs *bool `json:"actionsLogs,omitempty"`
+	// actionsArtifacts: artifacts of Forgejo Actions runs ([actions.artifacts], prefix
+	// "actions_artifacts/").
+	// +optional
+	ActionsArtifacts *bool `json:"actionsArtifacts,omitempty"`
+}
+
+// S3Connection is a bucket of an S3-compatible object store and the credentials to use it.
+// +kubebuilder:validation:XValidation:rule="!has(self.tls) || self.endpoint.startsWith('https://')",message="tls requires an https:// endpoint"
+type S3Connection struct {
+	// endpoint is the URL of the S3 API, scheme://host[:port] without a path, e.g.
+	// https://s3.eu-central-1.amazonaws.com or http://garage.s3-lab.svc.cluster.local:3900.
+	// A short host name is resolved from the instance's namespace. https uses TLS.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^https?://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9]([-A-Za-z0-9.]*[A-Za-z0-9])?)(:[0-9]{1,5})?/?$`
+	Endpoint string `json:"endpoint"`
+
+	// bucket is the bucket name.
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`
+	Bucket string `json:"bucket"`
+
+	// region of the bucket, which requests are signed for. It must match the server's
+	// region (e.g. "garage" for Garage's default configuration).
+	// +kubebuilder:default="us-east-1"
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_-]*$`
+	// +optional
+	Region string `json:"region,omitempty"`
+
+	// pathStyle addresses the bucket in the path (https://host/bucket/key) when true, and as
+	// a host name (https://bucket.host/key, virtual-hosted style) when false. Unset uses
+	// virtual-hosted style for Amazon S3, Google Cloud Storage and Alibaba Cloud OSS endpoints
+	// and path style for every other endpoint.
+	// +optional
+	PathStyle *bool `json:"pathStyle,omitempty"`
+
+	// prefix is prepended to every object key, e.g. "forgejo-a" to share a bucket between
+	// instances. Each subsystem uses its own prefix below it ("forgejo-a/lfs/...").
+	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_-][A-Za-z0-9_.-]*(/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*/?$`
+	// +optional
+	Prefix string `json:"prefix,omitempty"`
+
+	// tls configures how the server's certificate is verified (https endpoints only). By
+	// default it must be signed by a CA of the image's system trust store.
+	// +optional
+	TLS *S3TLSSpec `json:"tls,omitempty"`
+
+	// credentialsSecret holds the access key. Forgejo gets it through environment variables
+	// that reference the Secret, never in app.ini; changing the Secret restarts the pods.
+	CredentialsSecret S3CredentialsSecretRef `json:"credentialsSecret"`
+}
+
+// S3TLSSpec configures the verification of an S3 endpoint's certificate.
+// +kubebuilder:validation:XValidation:rule="!(has(self.insecureSkipVerify) && self.insecureSkipVerify && has(self.caSecret))",message="caSecret and insecureSkipVerify are mutually exclusive"
+type S3TLSSpec struct {
+	// caSecret names a Secret key holding the PEM certificate(s) of the CA that signed the
+	// server's certificate, e.g. the "ca.crt" of a cert-manager certificate. They are trusted
+	// in addition to the system trust store.
+	// +optional
+	CASecret *SecretKeyRef `json:"caSecret,omitempty"`
+
+	// insecureSkipVerify accepts any certificate. For tests only.
+	// +optional
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+}
+
+// SecretKeyRef selects a key of a Secret in the instance's namespace.
+type SecretKeyRef struct {
+	// name of the Secret.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+
+	// key in the Secret.
+	// +kubebuilder:default="ca.crt"
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]*$`
+	// +optional
+	Key string `json:"key,omitempty"`
+}
+
+// S3CredentialsSecretRef references the access key of an S3 bucket in a Secret of the
+// instance's namespace.
+type S3CredentialsSecretRef struct {
+	// name of the Secret.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+
+	// accessKeyIDKey is the key holding the access key ID.
+	// +kubebuilder:default=AWS_ACCESS_KEY_ID
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]*$`
+	// +optional
+	AccessKeyIDKey string `json:"accessKeyIDKey,omitempty"`
+
+	// secretAccessKeyKey is the key holding the secret access key.
+	// +kubebuilder:default=AWS_SECRET_ACCESS_KEY
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]*$`
+	// +optional
+	SecretAccessKeyKey string `json:"secretAccessKeyKey,omitempty"`
+}
+
 // AdminSpec configures the bootstrap administrator.
 type AdminSpec struct {
 	// +kubebuilder:default="forgejo_admin"
@@ -719,6 +923,61 @@ type BackupSpec struct {
 	// +kubebuilder:default={}
 	// +optional
 	Storage BackupStorageSpec `json:"storage,omitempty"`
+
+	// remote uploads every backup (scheduled, manual and pre-upgrade), encrypted, to an
+	// S3-compatible bucket outside the cluster, after it was written to the backup PVC. Remote
+	// copies of scheduled backups follow retention; the others are never deleted by the
+	// operator. See docs/backup-restore.md, "Remote backups".
+	// +optional
+	Remote *RemoteBackupSpec `json:"remote,omitempty"`
+}
+
+// RemoteBackupSpec uploads backups to object storage.
+type RemoteBackupSpec struct {
+	// s3 is the bucket. Backups go to "<prefix>/<namespace>/<name>/<backup>/". Use another
+	// bucket, or another prefix, than spec.objectStorage, and a key that may write, read, list
+	// and delete objects there.
+	S3 S3Connection `json:"s3"`
+
+	// encryption configures the key every remote backup is encrypted with.
+	// +kubebuilder:default={}
+	// +optional
+	Encryption BackupEncryptionSpec `json:"encryption,omitempty"`
+
+	// image is the rclone image of the Jobs that upload and download remote backups. Defaults to
+	// docker.io/rclone/rclone:1.75.2.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	Image string `json:"image,omitempty"`
+}
+
+// BackupEncryptionSpec configures the encryption of remote backups (rclone crypt:
+// XSalsa20-Poly1305 with a key derived by scrypt).
+type BackupEncryptionSpec struct {
+	// keySecret names the Secret key that holds the encryption key: at least 16 characters,
+	// without leading or trailing white space. Without it, the operator generates a random key
+	// once into Secret "<name>-backup-key" (key "key"), which it never changes and never
+	// deletes; BackupHealthy is False (BackupKeyNotExported) until that Secret is annotated
+	// forgejo.lucas.icu/backup-key-exported=true. Keep a copy of the key outside the
+	// cluster: backups cannot be restored without it.
+	// +optional
+	KeySecret *BackupKeySecretRef `json:"keySecret,omitempty"`
+}
+
+// BackupKeySecretRef selects the key of a Secret in the instance's namespace that holds a
+// backup encryption key.
+type BackupKeySecretRef struct {
+	// name of the Secret.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+
+	// key in the Secret.
+	// +kubebuilder:default=key
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]*$`
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 // BackupStorageSpec configures where backups are written.
@@ -1021,6 +1280,62 @@ type ForgejoStatus struct {
 	// ssh reports the SSH server's host keys.
 	// +optional
 	SSH *SSHStatus `json:"ssh,omitempty"`
+
+	// restoredFrom reports the bootstrap of spec.restoreFrom.
+	// +optional
+	RestoredFrom *RestoredFromStatus `json:"restoredFrom,omitempty"`
+}
+
+// RestoredFromPhase is the progress of a bootstrap from a remote backup.
+// +kubebuilder:validation:Enum=RestoringIdentity;RestoringData;Completed;Failed
+type RestoredFromPhase string
+
+const (
+	// RestoredFromRestoringIdentity: the identity Secrets are read from the backup.
+	RestoredFromRestoringIdentity RestoredFromPhase = "RestoringIdentity"
+	// RestoredFromRestoringData: the identity is restored; a ForgejoRestore restores the
+	// database and the data volume.
+	RestoredFromRestoringData RestoredFromPhase = "RestoringData"
+	// RestoredFromCompleted: the database and the data volume are restored and Forgejo may
+	// start on them (recorded on Secret "<name>-secrets" too). Final.
+	RestoredFromCompleted RestoredFromPhase = "Completed"
+	// RestoredFromFailed: the ForgejoRestore failed, or the instance's database or data volume
+	// may already hold data (RestoredFromBackup=False/TargetNotEmpty); Forgejo stays scaled down.
+	RestoredFromFailed RestoredFromPhase = "Failed"
+)
+
+// RestoredFromStatus reports the bootstrap of spec.restoreFrom.
+type RestoredFromStatus struct {
+	// +optional
+	Phase RestoredFromPhase `json:"phase,omitempty"`
+	// location of the backup: s3://<bucket>/<prefix>/<path>/.
+	// +optional
+	Location string `json:"location,omitempty"`
+	// backupName is the name of the ForgejoBackup that took the backup.
+	// +optional
+	BackupName string `json:"backupName,omitempty"`
+	// forgejoImage ran when the backup was taken.
+	// +optional
+	ForgejoImage string `json:"forgejoImage,omitempty"`
+	// instanceUID is the UID of the instance that took the backup (from its manifest).
+	// Remote retention of this instance also prunes that instance's scheduled backups in this
+	// instance's remote directory that completed no later than the restored backup
+	// (backupCompletionTime): those taken before the disaster.
+	// +optional
+	InstanceUID string `json:"instanceUID,omitempty"`
+	// backupCompletionTime is when the restored backup was completed.
+	// +optional
+	BackupCompletionTime *metav1.Time `json:"backupCompletionTime,omitempty"`
+	// identityRestoredTime is when the identity Secrets were restored.
+	// +optional
+	IdentityRestoredTime *metav1.Time `json:"identityRestoredTime,omitempty"`
+	// restoreName is the ForgejoRestore that restores the database and the data volume.
+	// +optional
+	RestoreName string `json:"restoreName,omitempty"`
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // SSHHostKeysSource tells where an instance's SSH host keys came from.
@@ -1149,6 +1464,35 @@ type BackupStatusSummary struct {
 	NextScheduleTime *metav1.Time `json:"nextScheduleTime,omitempty"`
 	// +optional
 	ActiveRestore string `json:"activeRestore,omitempty"`
+	// remote summarizes the remote backups of spec.backup.remote.
+	// +optional
+	Remote *RemoteBackupSummary `json:"remote,omitempty"`
+}
+
+// RemoteBackupSummary summarizes the remote backups of an instance.
+type RemoteBackupSummary struct {
+	// location is where the instance's backups are uploaded: s3://<bucket>/<prefix>/<namespace>/<name>/.
+	// +optional
+	Location string `json:"location,omitempty"`
+	// keySecretName holds the encryption key ("<name>-backup-key" unless
+	// spec.backup.remote.encryption.keySecret names another Secret).
+	// +optional
+	KeySecretName string `json:"keySecretName,omitempty"`
+	// keyFingerprint identifies the encryption key without revealing it; each uploaded backup
+	// records the fingerprint of the key it needs.
+	// +optional
+	KeyFingerprint string `json:"keyFingerprint,omitempty"`
+	// lastUploadedBackupName is the newest backup uploaded and verified.
+	// +optional
+	LastUploadedBackupName string `json:"lastUploadedBackupName,omitempty"`
+	// +optional
+	LastUploadTime *metav1.Time `json:"lastUploadTime,omitempty"`
+	// lastRetentionTime is when retention last checked the remote backups.
+	// +optional
+	LastRetentionTime *metav1.Time `json:"lastRetentionTime,omitempty"`
+	// message explains a problem with the key or with remote retention.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // HealthStatus reports operator-observed application health.

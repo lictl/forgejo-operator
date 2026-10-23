@@ -50,6 +50,16 @@ var (
 		Help: "Size of the last successful backup by part (database/data).",
 	}, []string{"namespace", "name", "part"})
 
+	BackupUploadTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "forgejo_operator_backup_uploads_total",
+		Help: "Finished uploads of backups to spec.backup.remote by result (succeeded/failed) and reason.",
+	}, []string{"namespace", "name", "reason", "result"})
+
+	BackupLastUploadSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "forgejo_operator_backup_last_upload_success_timestamp_seconds",
+		Help: "Unix time of the last backup uploaded to spec.backup.remote and verified.",
+	}, []string{"namespace", "name"})
+
 	RestoreTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "forgejo_operator_restores_total",
 		Help: "Finished restores by result.",
@@ -90,7 +100,7 @@ var (
 func init() {
 	metrics.Registry.MustRegister(
 		InstanceReady, InstanceInfo, HealthCheckFailures, HealthCheckUnreachable,
-		BackupLastSuccess, BackupTotal, BackupDuration, BackupSize, RestoreTotal,
+		BackupLastSuccess, BackupTotal, BackupDuration, BackupSize, BackupUploadTotal, BackupLastUploadSuccess, RestoreTotal,
 		UpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife,
 	)
 }
@@ -98,11 +108,11 @@ func init() {
 // DeleteInstanceMetrics removes all series of a deleted instance.
 func DeleteInstanceMetrics(namespace, name string) {
 	l := prometheus.Labels{"namespace": namespace, "name": name}
-	for _, v := range []*prometheus.GaugeVec{InstanceReady, InstanceInfo, BackupLastSuccess, BackupDuration, BackupSize,
+	for _, v := range []*prometheus.GaugeVec{InstanceReady, InstanceInfo, BackupLastSuccess, BackupLastUploadSuccess, BackupDuration, BackupSize,
 		VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife} {
 		v.DeletePartialMatch(l)
 	}
-	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, BackupTotal, RestoreTotal, UpgradeTotal, AutoPilotActions} {
+	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, BackupTotal, BackupUploadTotal, RestoreTotal, UpgradeTotal, AutoPilotActions} {
 		v.DeletePartialMatch(l)
 	}
 }

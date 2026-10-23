@@ -217,7 +217,8 @@ func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep 
 // rollbackFailingConfig rejects the desired app.ini when pods running it crash-loop or never
 // become Ready, while the last known good config is available. Image changes are owned by
 // the upgrade step, so nothing happens while an upgrade, a restore or a migration holding the
-// workload is in progress. Only failures since the database last became ready count.
+// workload is in progress. Only failures since the database (and the bucket of
+// spec.objectStorage) last became ready count.
 func rollbackFailingConfig(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState, pods []corev1.Pod) error {
 	f := rc.Instance
 	ap := f.Status.AutoPilot
@@ -231,13 +232,26 @@ func rollbackFailingConfig(ctx context.Context, rc *forgejo.ReconcileContext, st
 	if dbReady == nil || dbReady.Status != metav1.ConditionTrue {
 		return nil
 	}
+	since := dbReady.LastTransitionTime.Time
+	// Likewise the bucket: a crash loop while it was unusable (e.g. rotated credentials that
+	// are wrong) is not app.ini's fault. A bucket only the operator cannot reach
+	// (UnreachableFromOperator) holds nothing.
+	if forgejo.ObjectStorageEnabled(f) {
+		if rc.ObjectStorageUnavailable {
+			return nil
+		}
+		if osReady := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionObjectStorageReady); osReady != nil &&
+			osReady.Status == metav1.ConditionTrue {
+			since = later(since, osReady.LastTransitionTime.Time)
+		}
+	}
 	var failure string
 	var failed *corev1.Pod
 	for i := range pods {
 		if pods[i].Annotations[forgejo.AnnotationConfigHash] != desired {
 			continue
 		}
-		if failure = podFailure(&pods[i], dbReady.LastTransitionTime.Time); failure != "" {
+		if failure = podFailure(&pods[i], since); failure != "" {
 			failed = &pods[i]
 			break
 		}

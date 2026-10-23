@@ -11,13 +11,18 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
   **17**; new instances get the LTS. Older and newer versions still run and are reported as
   unsupported. See [docs/versions.md](docs/versions.md).
 - It uses [CloudNativePG](https://cloudnative-pg.io) for PostgreSQL, or an existing database.
+- It can keep LFS objects, attachments, avatars, packages and Actions data in an S3-compatible
+  bucket instead of the data volume. See [docs/object-storage.md](docs/object-storage.md).
+- It uploads backups, encrypted and with the instance's identity, to an S3-compatible bucket off
+  the cluster, and recreates a lost instance from one (`spec.restoreFrom`). See
+  [docs/backup-restore.md](docs/backup-restore.md#disaster-recovery).
 - Everything is driven by three resources in `forgejo.lucas.icu/v1alpha1`:
 
 | Kind | Short name | Purpose |
 |------|-----------|---------|
 | `Forgejo` | `fj` | One instance: image, database, storage, networking, backup schedule, upgrade policy, monitoring, scaling, autopilot. |
-| `ForgejoBackup` | `fjb` | A point-in-time backup: `pg_dump` of the database plus an archive of the data volume. |
-| `ForgejoRestore` | `fjr` | Restores a completed backup into an instance, which is scaled to zero meanwhile. |
+| `ForgejoBackup` | `fjb` | A point-in-time backup: `pg_dump` of the database plus an archive of the data volume, uploaded off-cluster with `spec.backup.remote`. |
+| `ForgejoRestore` | `fjr` | Restores a completed backup, or a remote backup by its location, into an instance, which is scaled to zero meanwhile. |
 
 ## Capability levels
 
@@ -25,13 +30,14 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
 |-------|------------------------|
 | **I Basic install** | One `Forgejo` resource provisions a CNPG cluster (or uses an external database), generated secrets, the admin account, the data volume, the Deployment, HTTP/SSH Services, and optionally an Ingress or Gateway API routes (HTTPRoute, TCPRoute for SSH) with a cert-manager certificate. It renders the whole `app.ini` and rolls pods when it changes. |
 | **II Seamless upgrades** | Changing `spec.image` to a newer version is version-gated and preceded by a cold backup. Forgejo is migrated with a single pod and verified. Downgrades are refused, and upgrades can be cancelled or retried. |
-| **III Full lifecycle** | On-demand and cron-scheduled backups with retention, and restores with maintenance mode. Data is retained on deletion by default (`retainPolicy`), and CNPG handles database failover. |
+| **III Full lifecycle** | On-demand and cron-scheduled backups with retention, uploaded encrypted (with the instance's identity) to S3 off the cluster, and restores with maintenance mode, also of remote backups. Disaster recovery recreates a lost instance from a remote backup before it first starts. Data is retained on deletion by default (`retainPolicy`), and CNPG handles database failover. |
 | **IV Deep insights** | Health, version and statistics in status. Conditions and events, operator metrics, Forgejo `/metrics` through a ServiceMonitor, a PrometheusRule with per-instance alerts, and a Grafana dashboard. |
 | **V Auto pilot** | Automatic rollback of failed upgrades and of configs that make Forgejo crash. Restarts hung pods. Vertical right-sizing from OOM kills and usage. HPA with Valkey-backed HA. PVC auto-expansion. Tuning derived from resources (GOMEMLIMIT, DB pool). |
 
 Details are in [docs/design.md](docs/design.md), [docs/versions.md](docs/versions.md), [docs/upgrades.md](docs/upgrades.md),
 [docs/backup-restore.md](docs/backup-restore.md), [docs/observability.md](docs/observability.md),
-[docs/autopilot.md](docs/autopilot.md), [docs/networking.md](docs/networking.md) and [docs/ssh.md](docs/ssh.md).
+[docs/autopilot.md](docs/autopilot.md), [docs/networking.md](docs/networking.md), [docs/ssh.md](docs/ssh.md) and
+[docs/object-storage.md](docs/object-storage.md).
 
 ## Quick start (local or any other cluster)
 
@@ -123,6 +129,27 @@ spec:
     certManager:
       issuerRef: {name: letsencrypt, kind: ClusterIssuer}
     gatewayNamespaces: [envoy-gateway-system]   # ReferenceGrant for the Gateway's HTTPS listener
+```
+
+### Object storage
+
+`spec.objectStorage` moves LFS objects, attachments, avatars, repository avatars, archive
+downloads, packages and Actions logs and artifacts to an S3-compatible bucket; each can be kept on
+the volume instead (`subsystems`). Forgejo gets the access key through environment variables that
+reference the Secret, never in `app.ini`, and changing the Secret rolls the pods.
+`ObjectStorageReady` reports whether the operator reaches the bucket with that key. Files in the
+bucket are not in `ForgejoBackup`s: versioning or copies of the bucket are up to you. See
+[docs/object-storage.md](docs/object-storage.md), which also describes a local Garage lab
+(`hack/s3-lab/setup.sh`).
+
+```yaml
+spec:
+  objectStorage:
+    s3:
+      endpoint: https://s3.eu-central-1.amazonaws.com
+      bucket: acme-forgejo
+      region: eu-central-1
+      credentialsSecret: {name: forgejo-s3}   # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 ```
 
 ### SSH host keys

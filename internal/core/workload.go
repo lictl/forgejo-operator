@@ -92,6 +92,9 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 		if servingHostKeys(rc) {
 			annotations[forgejo.AnnotationSSHHostKeys] = rc.SSHHostKeys.Digest
 		}
+		if rc.ObjectStorage != nil && forgejo.ObjectStorageEnabled(f) {
+			annotations[forgejo.AnnotationObjectStorage] = rc.ObjectStorage.Digest
+		}
 		dep.Spec.Template.ObjectMeta = metav1.ObjectMeta{
 			Labels:      podLabels(rc, f.Spec.PodTemplate.Labels),
 			Annotations: annotations,
@@ -274,6 +277,11 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		}},
 		{Name: tmpVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	}
+	s3Env := objectStorageEnv(f, l)
+	if v, m := objectStorageVolume(f, l); v != nil {
+		volumes = append(volumes, *v)
+		mounts = append(mounts, *m)
+	}
 	mainMounts := mounts
 	if servingHostKeys(rc) {
 		volumes = append(volumes, hostKeysVolumes(rc.SSHHostKeys)...)
@@ -285,7 +293,7 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		Image:           rc.TargetImage,
 		ImagePullPolicy: pullPolicy,
 		Command:         []string{l.CLI, "web", "--config", l.ConfigPath},
-		Env:             dedupeEnv(baseEnv, rc.TuningEnv, f.Spec.Env),
+		Env:             dedupeEnv(baseEnv, s3Env, rc.TuningEnv, f.Spec.Env),
 		Ports:           ports,
 		Resources:       resources,
 		VolumeMounts:    mainMounts,
@@ -328,7 +336,7 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 	}
 
-	bootstrapEnv := append(dedupeEnv(baseEnv, f.Spec.Env),
+	bootstrapEnv := append(dedupeEnv(baseEnv, s3Env, f.Spec.Env),
 		corev1.EnvVar{Name: "ADMIN_USERNAME", Value: AdminUsername(f)},
 		corev1.EnvVar{Name: "ADMIN_EMAIL", Value: adminEmail(f)},
 		corev1.EnvVar{Name: "ADMIN_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{

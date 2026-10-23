@@ -1,0 +1,97 @@
+# Local S3 lab for object storage tests: Garage v2.4.1, single node, in namespace s3-lab.
+# Not for production. Apply with hack/s3-lab/setup.sh, which creates the Secrets first.
+# See docs/object-storage.md#local-lab.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage
+  namespace: s3-lab
+  labels: {app.kubernetes.io/name: garage}
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "sqlite"
+    replication_factor = 1
+    rpc_bind_addr = "0.0.0.0:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+
+    [s3_api]
+    s3_region = "garage"
+    api_bind_addr = "0.0.0.0:3900"
+    root_domain = ".s3.garage.test"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: garage
+  namespace: s3-lab
+  labels: {app.kubernetes.io/name: garage}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 10Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garage
+  namespace: s3-lab
+  labels: {app.kubernetes.io/name: garage}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: garage}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: garage}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: garage
+          image: docker.io/dxflrs/garage:v2.4.1
+          # --single-node creates the layout, --default-bucket the key (GARAGE_DEFAULT_*) and
+          # the bucket GARAGE_DEFAULT_BUCKET, both from the environment, on every start.
+          args: [/garage, server, --single-node, --default-bucket]
+          env:
+            - {name: GARAGE_CONFIG_FILE, value: /etc/garage/garage.toml}
+            - {name: GARAGE_DEFAULT_BUCKET, value: forgejo}
+          envFrom:
+            - secretRef: {name: garage}
+          ports:
+            - {name: s3, containerPort: 3900}
+          readinessProbe:
+            tcpSocket: {port: s3}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/garage, readOnly: true}
+            - {name: data, mountPath: /var/lib/garage}
+      volumes:
+        - name: config
+          configMap: {name: garage}
+        - name: data
+          persistentVolumeClaim: {claimName: garage}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+  namespace: s3-lab
+  labels: {app.kubernetes.io/name: garage}
+spec:
+  selector: {app.kubernetes.io/name: garage}
+  ports:
+    - {name: s3, port: 3900, targetPort: s3}

@@ -10,8 +10,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
@@ -62,6 +64,10 @@ func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		return nil
 	}); err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("secrets: %w", err)
+	}
+
+	if err := ensureBackupKey(ctx, rc); err != nil {
+		return forgejo.StepResult{}, err
 	}
 
 	if f.Spec.Admin.ExistingSecret != "" {
@@ -136,4 +142,91 @@ func newInternalToken() (string, error) {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(unsigned))
 	return unsigned + "." + enc.EncodeToString(mac.Sum(nil)), nil
+}
+
+// AnnotationBackupKey on "<name>-backup-key" records that the operator generated the key.
+const AnnotationBackupKey = forgejo.AnnotationBackupKey
+
+// ensureBackupKey generates the encryption key of remote backups into "<name>-backup-key"
+// when spec.backup.remote is set without its own keySecret. The Secret is created once and
+// then left alone: it has no owner reference (deleting the instance must not take the key of
+// its off-site backups with it), and an existing one, e.g. the key restored from an offline
+// copy before a disaster recovery, is used as it is. A key that encrypted backups (its
+// fingerprint is in status.backup.remote or in a ForgejoBackup) is never replaced silently
+// when its Secret goes missing: only the annotation forgejo.lucas.icu/backup-key-lost
+// with that fingerprint lets a new one be generated. Until then BackupHealthy reports
+// BackupKeyMissing and uploads fail.
+func ensureBackupKey(ctx context.Context, rc *forgejo.ReconcileContext) error {
+	f := rc.Instance
+	if f.Spec.Backup.Remote == nil || f.Spec.Backup.Remote.Encryption.KeySecret != nil {
+		return nil
+	}
+	name := forgejo.BackupKeySecretName(f)
+	sec := &corev1.Secret{}
+	err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: name}, sec)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("reading %s: %w", name, err)
+	}
+	lost, err := lostBackupKey(ctx, rc, name)
+	if err != nil {
+		return err
+	}
+	if lost != "" && f.Annotations[forgejo.AnnotationBackupKeyLost] != lost {
+		warnEvery(rc, "backup-key-missing", warnInterval, "BackupKeyMissing", "Backup",
+			"Secret %s with the key of the remote backups (fingerprint %s) is missing, and no new key is generated: restore it "+
+				"from your copy, or set the annotation %s=%s on the Forgejo to start over with a new key (the backups "+
+				"encrypted with the lost one can then not be restored)", name, lost, forgejo.AnnotationBackupKeyLost, lost)
+		return nil
+	}
+	key, err := randomBase64(32)
+	if err != nil {
+		return err
+	}
+	sec = &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: f.Namespace,
+			Labels:      forgejo.Labels(f, forgejo.ComponentBackup),
+			Annotations: map[string]string{AnnotationBackupKey: "Generated"}},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{forgejo.BackupKeySecretKey: []byte(key)},
+	}
+	if err := rc.Client.Create(ctx, sec); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
+		return fmt.Errorf("creating %s: %w", name, err)
+	}
+	rc.Event(corev1.EventTypeWarning, "BackupKeyGenerated", "Backup",
+		"Generated the encryption key of remote backups in Secret %s. Copy it to a safe place outside the cluster now "+
+			"(kubectl get secret %s -n %s -o jsonpath='{.data.key}' | base64 -d): remote backups cannot be restored without it. "+
+			"Then annotate the Secret with %s=true; until then status.backup.remote.message says so and BackupHealthy (with scheduled "+
+			"backups) is False", name, name, f.Namespace, forgejo.AnnotationBackupKeyExported)
+	return nil
+}
+
+// lostBackupKey returns the fingerprint of the key that Secret name held when it encrypted
+// the instance's backups, or "" when nothing records one: status.backup.remote, else the
+// newest ForgejoBackup of the instance uploaded with that Secret.
+func lostBackupKey(ctx context.Context, rc *forgejo.ReconcileContext, name string) (string, error) {
+	f := rc.Instance
+	if st := f.Status.Backup; st != nil && st.Remote != nil && st.Remote.KeySecretName == name && st.Remote.KeyFingerprint != "" {
+		return st.Remote.KeyFingerprint, nil
+	}
+	list := &forgejov1.ForgejoBackupList{}
+	if err := rc.Client.List(ctx, list, client.InNamespace(f.Namespace), client.MatchingLabels{forgejo.LabelForgejo: f.Name}); err != nil {
+		return "", fmt.Errorf("listing backups: %w", err)
+	}
+	fp, at := "", time.Time{}
+	for i := range list.Items {
+		r := list.Items[i].Status.Remote
+		if r == nil || r.KeySecret == nil || r.KeySecret.Name != name || r.KeyFingerprint == "" || r.StartTime == nil {
+			continue
+		}
+		if fp == "" || r.StartTime.After(at) {
+			fp, at = r.KeyFingerprint, r.StartTime.Time
+		}
+	}
+	return fp, nil
 }

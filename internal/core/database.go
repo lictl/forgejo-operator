@@ -111,17 +111,8 @@ func reconcileExternalDB(ctx context.Context, rc *forgejo.ReconcileContext) (for
 	return forgejo.StepResult{}, nil
 }
 
-// probeHosts lists the names to probe for an external database host, in the order a pod in
-// namespace resolves them: a single-label name is a Service in that namespace first
-// ("<host>.<ns>.svc" resolves through the pod's search path whatever the cluster domain;
-// the fully qualified form serves an operator running outside the cluster), then the name
-// as given (node or corporate search domains).
-func probeHosts(host, namespace string) []string {
-	if net.ParseIP(host) != nil || strings.Contains(host, ".") || strings.EqualFold(host, "localhost") {
-		return []string{host}
-	}
-	return []string{host + "." + namespace + ".svc", forgejo.ServiceHost(host, namespace), host}
-}
+// probeHosts lists the names to probe for an external database host (forgejo.ProbeHosts).
+func probeHosts(host, namespace string) []string { return forgejo.ProbeHosts(host, namespace) }
 
 func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance

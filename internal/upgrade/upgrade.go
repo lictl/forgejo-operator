@@ -154,6 +154,11 @@ func idle(rc *forgejo.ReconcileContext, desired, current string, retry bool) {
 		// scale Forgejo down for nothing.
 		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, "WaitingForSSHHostKeys",
 			fmt.Sprintf("The upgrade to %s starts once the Secret of SSH host keys is usable again (Degraded/SSHHostKeysUnavailable)", desired))
+	case rc.ObjectStorageUnavailable:
+		// Forgejo does not start without its bucket: the new version could not be verified,
+		// and the rollback would restore the database for nothing.
+		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, "WaitingForObjectStorage",
+			fmt.Sprintf("The upgrade to %s starts once the bucket of spec.objectStorage is usable (ObjectStorageReady)", desired))
 	default:
 		start(rc, current, desired, c)
 	}

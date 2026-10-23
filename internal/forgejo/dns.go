@@ -1,8 +1,12 @@
 package forgejo
 
 import (
+	"context"
+	"errors"
+	"net"
 	"os"
 	"strings"
+	"time"
 )
 
 // defaultClusterDomain is the DNS domain of almost every cluster (kubelet --cluster-domain).
@@ -47,4 +51,41 @@ func clusterDomainFromResolvConf(content string) string {
 // ServiceHost is the fully qualified in-cluster DNS name of a Service.
 func ServiceHost(name, namespace string) string {
 	return name + "." + namespace + ".svc." + ClusterDomain
+}
+
+// ProbeHosts lists the names to try for host, in the order a pod in namespace resolves them:
+// a single-label name is a Service in that namespace first ("<host>.<ns>.svc" resolves through
+// the pod's search path whatever the cluster domain; the fully qualified form serves an
+// operator running outside the cluster), then the name as given (node or corporate search
+// domains).
+func ProbeHosts(host, namespace string) []string {
+	if net.ParseIP(host) != nil || strings.Contains(host, ".") || strings.EqualFold(host, "localhost") {
+		return []string{host}
+	}
+	return []string{host + "." + namespace + ".svc", ServiceHost(host, namespace), host}
+}
+
+// NamespaceDialer dials host names as a pod of namespace resolves them (ProbeHosts): a short
+// name is a Service of that namespace. The operator usually runs in another namespace.
+func NamespaceDialer(namespace string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		var firstErr error
+		for _, h := range ProbeHosts(host, namespace) {
+			conn, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, net.JoinHostPort(h, port))
+			if err == nil {
+				return conn, nil
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			if dnsErr := (*net.DNSError)(nil); !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+				return nil, err
+			}
+		}
+		return nil, firstErr
+	}
 }

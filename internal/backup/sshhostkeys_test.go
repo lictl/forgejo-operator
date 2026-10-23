@@ -99,7 +99,8 @@ func TestArchiveScriptCopiesSSHHostKeys(t *testing.T) {
 	cmd := exec.Command("sh", "-c", script)
 	cmd.Env = []string{"PATH=" + bin + ":" + os.Getenv("PATH"), "BACKUP_DIR=" + backupDir, "BACKUP_NAME=b1", "INCLUDE_DATA=false",
 		"DATA_EXCLUDES_JSON=[]", "NAMESPACE=ns", "FORGEJO_NAME=fj", "REASON=Manual", "FORGEJO_IMAGE=i", "POSTGRES_IMAGE=p",
-		"DATABASE_NAME=forgejo", "STARTED_AT=now", "SSH_HOST_KEYS_DIR=" + keys, "SSH_HOST_KEYS_SECRET=fj-ssh-host-keys"}
+		"DATABASE_NAME=forgejo", "STARTED_AT=now", "SSH_HOST_KEYS_DIR=" + keys, "SSH_HOST_KEYS_SECRET=fj-ssh-host-keys",
+		"OBJECT_STORAGE_JSON=" + objectStorageManifest(objectStorageInstance())}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -120,6 +121,11 @@ func TestArchiveScriptCopiesSSHHostKeys(t *testing.T) {
 			Secret    string   `json:"secret"`
 			Files     []string `json:"files"`
 		} `json:"sshHostKeys"`
+		ObjectStorage *struct {
+			Bucket     string   `json:"bucket"`
+			Prefix     string   `json:"prefix"`
+			Subsystems []string `json:"subsystems"`
+		} `json:"objectStorage"`
 	}
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatalf("manifest: %v\n%s", err, b)
@@ -128,4 +134,21 @@ func TestArchiveScriptCopiesSSHHostKeys(t *testing.T) {
 		len(m.SSHHostKeys.Files) != 1 || m.SSHHostKeys.Files[0] != "ssh_host_ed25519_key" {
 		t.Fatalf("manifest sshHostKeys: %+v", m.SSHHostKeys)
 	}
+	if o := m.ObjectStorage; o == nil || o.Bucket != "forgejo" || o.Prefix != "fj/" || strings.Join(o.Subsystems, ",") !=
+		"lfs,attachments,avatars,repo-avatars,repo-archive,packages,actions_log" {
+		t.Fatalf("manifest objectStorage: %+v\n%s", o, b)
+	}
+	if got := objectStorageManifest(&forgejov1.Forgejo{}); got != "null" {
+		t.Fatalf("without object storage: %s", got)
+	}
+}
+
+func objectStorageInstance() *forgejov1.Forgejo {
+	f := &forgejov1.Forgejo{}
+	f.Spec.ObjectStorage = &forgejov1.ObjectStorageSpec{
+		S3: forgejov1.S3Connection{Endpoint: "http://garage.s3-lab:3900", Bucket: "forgejo", Prefix: "fj",
+			CredentialsSecret: forgejov1.S3CredentialsSecretRef{Name: "s3"}},
+		Subsystems: forgejov1.ObjectStorageSubsystems{ActionsArtifacts: ptr.To(false)},
+	}
+	return f
 }

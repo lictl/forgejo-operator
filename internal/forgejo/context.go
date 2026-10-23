@@ -94,6 +94,15 @@ type ReconcileContext struct {
 	// Deployment's keys). A new pod could not start, so the workload step leaves the
 	// Deployment as it is, and restarts, resizes, config rollbacks and upgrades wait.
 	SSHHostKeysUnavailable bool
+	// ObjectStorage is set by the object-storage step while spec.objectStorage is set and its
+	// Secrets resolve; the workload puts its digest on the pod template.
+	ObjectStorage *ObjectStorage
+	// ObjectStorageUnavailable is set by the object-storage step while spec.objectStorage is
+	// set and its Secrets are unusable or the operator's last check of the bucket failed
+	// (ObjectStorageReady is not True). Forgejo does not start without its bucket, so
+	// autonomous actions that replace pods and upgrades wait, and a crash loop meanwhile is
+	// not blamed on app.ini.
+	ObjectStorageUnavailable bool
 	// ReplicasOverride, when set, replaces the computed replica count.
 	ReplicasOverride *int32
 	// HPAManaged is true when an HPA owns the replica count.

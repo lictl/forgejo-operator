@@ -34,6 +34,11 @@ type ImageLayout struct {
 	SSHContainerPort int32
 	// SSHHostKeysDir is where the Secret of SSH host keys is mounted read-only.
 	SSHHostKeysDir string
+	// S3CADir is where the CA certificate of spec.objectStorage.s3.tls.caSecret is mounted
+	// read-only; it is added to SSL_CERT_DIR after SystemCertDir.
+	S3CADir string
+	// SystemCertDir is the image's directory of trusted CA certificates (Alpine).
+	SystemCertDir string
 	// HTTPContainerPort is HTTP_PORT.
 	HTTPContainerPort int32
 	// UID/GID Forgejo runs as (user "git" in both images).
@@ -66,6 +71,8 @@ func LayoutForImage(image string) ImageLayout {
 		TmpPath:           "/tmp",
 		SSHContainerPort:  2222,
 		SSHHostKeysDir:    "/etc/forgejo-ssh",
+		S3CADir:           "/etc/forgejo-s3-ca",
+		SystemCertDir:     "/etc/ssl/certs",
 		HTTPContainerPort: 3000,
 		UID:               1000,
 		GID:               1000,

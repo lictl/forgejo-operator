@@ -110,6 +110,9 @@ const (
 	stepBackupSchedule   = "backup-schedule"
 	stepBackupOwnership  = "backup-ownership"
 	stepStorageAutopilot = "storage-autopilot"
+	stepObjectStorage    = "object-storage"
+	stepRestoreIdentity  = "restore-identity"
+	stepRestoreFrom      = "restore-from"
 )
 
 // steps run in order. maintenance → restore-guard → secrets → database → high-availability
@@ -125,7 +128,10 @@ var steps = []namedStep{
 	// take the instance down while the database or Valkey is unavailable.
 	{name: stepMaintenance, fn: backup.ReconcileMaintenance},
 	{name: stepRestoreGuard, fn: reconcileRestoreGuard, needs: []string{stepMaintenance}},
-	{name: "secrets", fn: core.ReconcileSecrets, needs: []string{stepRestoreGuard}},
+	// spec.restoreFrom: the identity Secrets come from the backup, before the secrets and
+	// ssh-host-keys steps would generate new ones (a no-op otherwise).
+	{name: stepRestoreIdentity, fn: backup.ReconcileRestoreIdentity, needs: []string{stepRestoreGuard}},
+	{name: "secrets", fn: core.ReconcileSecrets, needs: []string{stepRestoreIdentity}},
 	// Owner references of the ForgejoBackups and the backup PVC follow
 	// spec.storage.retainPolicy. It reads only the instance and its backups, so a database
 	// or Valkey that is down must not delay it (the instance may be deleted meanwhile).
@@ -133,11 +139,19 @@ var steps = []namedStep{
 	{name: "database", fn: core.ReconcileDatabase, needs: []string{"secrets"}},
 	{name: "high-availability", fn: autopilot.ReconcileHA, needs: []string{"database"}},
 	{name: "storage", fn: core.ReconcileStorage, needs: []string{"high-availability"}},
+	// spec.restoreFrom: once the identity is restored and the database and the data volume
+	// exist, a ForgejoRestore restores them from the backup.
+	{name: stepRestoreFrom, fn: backup.ReconcileBootstrap, needs: []string{"storage"}},
 	// The SSH host keys are identity, like the secrets: independent of the database, Valkey
 	// and storage. The config step consumes them; the upgrade step waits while they are
 	// unavailable (rc.SSHHostKeysUnavailable), so it runs first.
 	{name: "ssh-host-keys", fn: core.ReconcileSSHHostKeys, needs: []string{"secrets"}},
-	{name: stepUpgrade, fn: upgrade.Reconcile, needs: []string{"storage"}},
+	// spec.objectStorage: its Secrets (which pods reference) and the bucket check
+	// (ObjectStorageReady). It stops only while the Secrets are unusable, which no pod could
+	// start without; an unreachable bucket is only reported. No prerequisites, so the
+	// condition stays current while the database is down.
+	{name: stepObjectStorage, fn: core.ReconcileObjectStorage},
+	{name: stepUpgrade, fn: upgrade.Reconcile, needs: []string{"storage", stepObjectStorage}},
 	{name: "tuning", fn: autopilot.ReconcileTuning, needs: []string{stepUpgrade}},
 	{name: "config", fn: core.ReconcileConfig, needs: []string{"tuning", "ssh-host-keys"}},
 	{name: "config-guard", fn: autopilot.ReconcileConfigGuard, needs: []string{"config"}},
@@ -313,6 +327,7 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// while the backup-schedule step is skipped or the instance is paused (the backup
 	// staleness alerts depend on it).
 	backup.ExportLastSuccess(instance)
+	backup.ExportLastUpload(instance)
 
 	original := instance.DeepCopy()
 	rc := &forgejo.ReconcileContext{
@@ -460,8 +475,10 @@ func (r *ForgejoReconciler) patchStatus(ctx context.Context, original, instance 
 func forgetInstance(namespace, name string) {
 	forgejo.DeleteInstanceMetrics(namespace, name)
 	backup.ForgetLastSuccess(namespace, name)
+	backup.ForgetRemote(namespace, name)
 	observability.ForgetInstance(namespace, name)
 	core.ForgetInstance(namespace, name)
+	core.ForgetObjectStorage(namespace, name)
 }
 
 // exportInstanceReady sets forgejo_operator_instance_ready from the Ready condition, as

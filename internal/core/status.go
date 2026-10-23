@@ -217,6 +217,10 @@ func notDeployedMessage(rc *forgejo.ReconcileContext) string {
 	if c := meta.FindStatusCondition(rc.Instance.Status.Conditions, forgejov1.ConditionDatabaseReady); c != nil && c.Status != metav1.ConditionTrue {
 		return "Waiting for the database: " + c.Message
 	}
+	if c := meta.FindStatusCondition(rc.Instance.Status.Conditions, forgejov1.ConditionObjectStorageReady); c != nil &&
+		(c.Reason == reasonCredentialsUnavailable || c.Reason == reasonObjectStorageInvalid) {
+		return "Waiting for spec.objectStorage: " + c.Message
+	}
 	return "Waiting for the Deployment to be created"
 }
 

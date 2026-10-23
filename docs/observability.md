@@ -204,6 +204,8 @@ all of an instance's series when the instance is deleted.
 | `forgejo_operator_backups_total` | counter | `reason`, `result` | Finished backups |
 | `forgejo_operator_backup_duration_seconds` | gauge | | Duration of the last finished backup |
 | `forgejo_operator_backup_size_bytes` | gauge | `part` (database/data) | Size of the last successful backup |
+| `forgejo_operator_backup_uploads_total` | counter | `reason`, `result` | Finished uploads of backups to `spec.backup.remote` ([backup-restore.md](backup-restore.md#remote-backups)) |
+| `forgejo_operator_backup_last_upload_success_timestamp_seconds` | gauge | | Unix time of the last backup uploaded and verified; re-exported from `status.backup.remote.lastUploadTime` on every reconcile, never lowered |
 | `forgejo_operator_restores_total` | counter | `result` | Finished restores |
 | `forgejo_operator_upgrades_total` | counter | `result` (succeeded/failed/rolledback) | Finished upgrades |
 | `forgejo_operator_autopilot_actions_total` | counter | `action` | Autonomous actions, by type |
@@ -242,6 +244,9 @@ those metrics are missing.
 | `ForgejoBackupFailed` | warning | A `result="failed"` backup in the last hour | – |
 | `ForgejoBackupTooOld` | warning | `time() - backup_last_success_timestamp > maxAge`. Only rendered when `spec.backup.enabled` | 10m |
 | `ForgejoBackupMissing` | warning | No successful backup recorded at all, while the instance's operator metrics are present (`absent(last_success) and on() count(instance_ready) > 0`), so a scrape gap is not reported as a missing backup. Only rendered when `spec.backup.enabled` | maxAge |
+| `ForgejoBackupUploadFailed` | warning | A `result="failed"` upload to `spec.backup.remote` in the last hour. Only rendered with `spec.backup.remote` | – |
+| `ForgejoBackupUploadTooOld` | warning | `time() - backup_last_upload_success_timestamp > maxAge`. Only rendered with `spec.backup.remote` and `spec.backup.enabled` | 10m |
+| `ForgejoBackupUploadMissing` | warning | No upload recorded at all while the instance's operator metrics are present. Only rendered with `spec.backup.remote` and `spec.backup.enabled` | maxAge |
 | `ForgejoVolumeAlmostFull` | warning | `forgejo_operator_volume_used_ratio > 0.9` | 10m |
 | `ForgejoUpgradeFailed` | warning | An upgrade with `result!="succeeded"` (failed or rolled back) in the last hour | – |
 | `ForgejoVersionUnsupported` | warning | `forgejo_operator_version_supported == 0`: the running major is `Deprecated`, `EndOfLife`, `Future` or `Unknown`; the `VersionSupported` condition says what to upgrade to and by when | 1h |
@@ -361,7 +366,8 @@ once sampling works again. `status.stats` keeps the last good values in the mean
 | `Degraded` | core / orchestrator, feature packages | Something is wrong but the operator keeps trying (e.g. `ReconcileError` names the failing step, `MonitoringFailed` a monitoring object that could not be applied) |
 | `DatabaseReady` | core | The PostgreSQL backend is reachable/healthy |
 | `Upgrading` | upgrade | A version upgrade is being orchestrated |
-| `BackupHealthy` | backup | State of scheduled backups |
+| `BackupHealthy` | backup | State of scheduled backups (`UploadFailed` when the latest one was not uploaded to `spec.backup.remote`; `BackupKeyNotExported`, `BackupKeyMissing`, `BackupKeyUnusable` while the backup key is not acknowledged as copied out of the cluster, missing or unusable, see [backup-restore.md](backup-restore.md#the-key)) |
+| `RestoredFromBackup` | backup | Bootstrap of `spec.restoreFrom`: `False` while the identity, database and data volume are restored (`TargetNotEmpty` when the database or data volume predates the instance), `True`/`Restored` once they are restored and recorded on `<name>-secrets` ([backup-restore.md](backup-restore.md#disaster-recovery)) |
 | `StorageHealthy` | autopilot | PVC capacity/usage |
 | `Healthy` | observability | Result of the operator's `/api/healthz` probe. Reasons: `HealthCheckPassed`, `HealthCheckFailed` (message includes the streak), `Unreachable` (the operator cannot connect; status `Unknown`), `NoReadyReplicas`, `Maintenance` |
 
@@ -387,6 +393,10 @@ Other packages emit their own events:
 - `ReconcileError` (Warning) names a failing reconcile step.
 - Backup, maintenance, HA and config events include `BackupScheduled`, `BackupPruned`,
   `MaintenanceStarted`, `MaintenanceEnded`, `LastKnownGoodConfig` and `ConfigRetry`.
+- Remote backups and disaster recovery: `BackupKeyGenerated`, `BackupUploaded`,
+  `BackupUploadFailed`, `RemoteBackupPruned`, `RemoteRetentionFailed`, `IdentityRestored`,
+  `RestoreFromStarted`, `RestoredFromBackup`, `RestoreFromFailed` (see
+  [backup-restore.md](backup-restore.md#remote-backups)).
 
 ## How to look at it
 

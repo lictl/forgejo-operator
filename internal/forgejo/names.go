@@ -30,6 +30,30 @@ const (
 	// AnnotationSSHHostKeys on the pod template is a digest of the SSH host keys the pods
 	// serve from their Secret, so that changed keys roll the pods.
 	AnnotationSSHHostKeys = "forgejo.lucas.icu/ssh-host-keys"
+	// AnnotationSSHHostKeysSource on "<name>-ssh-host-keys" records that the operator generated
+	// its keys (Generated). A Secret without it was created by the user.
+	AnnotationSSHHostKeysSource = "forgejo.lucas.icu/ssh-host-keys-source"
+	// AnnotationObjectStorage on the pod template is a digest of the object storage
+	// credentials and CA certificate, so that changing them rolls the pods.
+	AnnotationObjectStorage = "forgejo.lucas.icu/object-storage"
+	// AnnotationBackupKey on "<name>-backup-key" records that the operator generated the key
+	// (Generated). A Secret without it was created by the user.
+	AnnotationBackupKey = "forgejo.lucas.icu/backup-key"
+	// AnnotationBackupKeyExported=true on a generated "<name>-backup-key" acknowledges that the
+	// key was copied out of the cluster; until then BackupHealthy is False/BackupKeyNotExported.
+	AnnotationBackupKeyExported = "forgejo.lucas.icu/backup-key-exported"
+	// AnnotationBackupKeyLost on the Forgejo, set to the fingerprint of a generated backup key
+	// whose Secret is gone, lets the operator generate a new key. Without it a missing key that
+	// encrypted backups is reported (BackupKeyMissing), never silently replaced.
+	AnnotationBackupKeyLost = "forgejo.lucas.icu/backup-key-lost"
+	// AnnotationRestoredFrom on "<name>-secrets" records the location of the backup that
+	// spec.restoreFrom restored, written before Forgejo starts on it. It outlives status (and,
+	// under retainPolicy Retain, the Forgejo object), so the bootstrap never runs twice.
+	AnnotationRestoredFrom = "forgejo.lucas.icu/restored-from"
+	// AnnotationRestoreFromOverwrite=true on the Forgejo lets spec.restoreFrom restore over a
+	// database or data volume that existed before the instance (RestoredFromBackup=
+	// False/TargetNotEmpty otherwise).
+	AnnotationRestoreFromOverwrite = "forgejo.lucas.icu/restore-from-overwrite"
 
 	ManagedBy = "forgejo-operator"
 	AppName   = "forgejo"
@@ -73,6 +97,16 @@ func TLSSecretName(f *forgejov1.Forgejo) string { return f.Name + "-tls" }
 
 // SSHHostKeysSecretName is the operator's Secret of SSH host keys ("<name>-ssh-host-keys").
 func SSHHostKeysSecretName(f *forgejov1.Forgejo) string { return f.Name + "-ssh-host-keys" }
+
+// BackupKeySecretName is the Secret of the generated backup encryption key ("<name>-backup-key").
+func BackupKeySecretName(f *forgejov1.Forgejo) string { return f.Name + "-backup-key" }
+
+// BackupKeySecretKey is the key of the generated backup encryption key in its Secret.
+const BackupKeySecretKey = "key"
+
+// SecretKeyAdminSyncSalt in "<name>-secrets" salts the digest of the admin credentials that
+// Forgejo's bootstrap init container keeps on the data volume.
+const SecretKeyAdminSyncSalt = "admin-sync-salt"
 
 // Keys inside the generated "<name>-secrets" Secret.
 const (

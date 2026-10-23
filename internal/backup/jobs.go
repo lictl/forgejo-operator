@@ -93,6 +93,7 @@ func BackupJob(in JobInput, b *forgejov1.ForgejoBackup, includeData bool, starte
 		corev1.EnvVar{Name: "DATABASE_NAME", Value: in.DB.Name},
 		corev1.EnvVar{Name: "STARTED_AT", Value: startedAt.UTC().Format(time.RFC3339)},
 		corev1.EnvVar{Name: "DATA_EXCLUDES_JSON", Value: string(excludes)},
+		corev1.EnvVar{Name: "OBJECT_STORAGE_JSON", Value: objectStorageManifest(in.Instance)},
 	)
 	archiveMounts := mounts
 	volumes := []corev1.Volume{backupVolume(in.BackupPVC, false), tmpVolume()}
@@ -121,6 +122,26 @@ func BackupJob(in JobInput, b *forgejov1.ForgejoBackup, includeData bool, starte
 	return job, controllerutil.SetControllerReference(b, job, in.Scheme)
 }
 
+// objectStorageManifest records in manifest.json where the files of the subsystems that
+// spec.objectStorage keeps in a bucket are ("null" without object storage): they are not on the
+// data volume, so not in the data archive.
+func objectStorageManifest(f *forgejov1.Forgejo) string {
+	if f == nil || !forgejo.ObjectStorageEnabled(f) {
+		return "null"
+	}
+	c := f.Spec.ObjectStorage.S3
+	b, err := json.Marshal(map[string]any{
+		"endpoint":   c.Endpoint,
+		"bucket":     c.Bucket,
+		"prefix":     forgejo.S3Prefix(&c),
+		"subsystems": forgejo.ObjectStorageSubsystemNames(f),
+	})
+	if err != nil {
+		return "null"
+	}
+	return string(b)
+}
+
 // CleanupJob removes "<pvc>/<backup>/" when a ForgejoBackup is deleted.
 func CleanupJob(in JobInput, b *forgejov1.ForgejoBackup) (*batchv1.Job, error) {
 	c := container(ContainerCleanup, in.ForgejoImage, cleanupScript,
@@ -135,18 +156,41 @@ func CleanupJob(in JobInput, b *forgejov1.ForgejoBackup) (*batchv1.Job, error) {
 // The data step runs as root (CHOWN/FOWNER/DAC_OVERRIDE only) so it can replace files of any
 // owner and hand everything back to uid/gid 1000.
 func RestoreJob(in JobInput, r *forgejov1.ForgejoRestore, b *forgejov1.ForgejoBackup, restoreDB, restoreData bool) (*batchv1.Job, error) {
+	return restoreJob(in, r, restoreSteps{
+		dir:     BackupDir(b.Name),
+		volumes: []corev1.Volume{backupVolume(b.Status.PVCName, true)},
+		mounts: []corev1.VolumeMount{
+			{Name: volBackups, MountPath: BackupMountPath, ReadOnly: true},
+			{Name: volTmp, MountPath: "/tmp"},
+		},
+	}, restoreDB, restoreData)
+}
+
+// restoreSteps is where a restore Job finds the backup's files.
+type restoreSteps struct {
+	// dir holds db.dump and data.tar.gz (BACKUP_DIR).
+	dir string
+	// volumes hold the files (and anything first needs), mounts make them readable at dir.
+	volumes []corev1.Volume
+	mounts  []corev1.VolumeMount
+	// first, when set, runs before verify (e.g. the download of a remote backup).
+	first *corev1.Container
+}
+
+func restoreJob(in JobInput, r *forgejov1.ForgejoRestore, src restoreSteps, restoreDB, restoreData bool) (*batchv1.Job, error) {
 	env := []corev1.EnvVar{
-		{Name: "BACKUP_DIR", Value: BackupDir(b.Name)},
+		{Name: "BACKUP_DIR", Value: src.dir},
 		{Name: "RESTORE_DATABASE", Value: strconv.FormatBool(restoreDB)},
 		{Name: "RESTORE_DATA", Value: strconv.FormatBool(restoreData)},
 	}
-	roBackups := []corev1.VolumeMount{
-		{Name: volBackups, MountPath: BackupMountPath, ReadOnly: true},
-		{Name: volTmp, MountPath: "/tmp"},
-	}
-	volumes := []corev1.Volume{backupVolume(b.Status.PVCName, true), tmpVolume()}
+	roBackups := src.mounts
+	volumes := append(append([]corev1.Volume{}, src.volumes...), tmpVolume())
 
-	steps := []corev1.Container{container(ContainerVerify, in.ForgejoImage, verifyScript, roBackups, env)}
+	var steps []corev1.Container
+	if src.first != nil {
+		steps = append(steps, *src.first)
+	}
+	steps = append(steps, container(ContainerVerify, in.ForgejoImage, verifyScript, roBackups, env))
 	if restoreDB {
 		steps = append(steps, container(ContainerRestoreDB, in.PostgresImage, restoreDBScript, roBackups,
 			append(append([]corev1.EnvVar{}, env...), dbEnv(in.DB)...)))
@@ -455,6 +499,7 @@ cat > "$BACKUP_DIR/manifest.json.partial" <<EOF
   "completedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "database": {"file": "db.dump", "format": "pg_dump-custom", "name": "$DATABASE_NAME", "pgDumpVersion": "$pg_dump_version", "sizeBytes": $db_size},
   "data": {"included": $INCLUDE_DATA, "file": "$data_file", "sizeBytes": $data_size, "excludes": $DATA_EXCLUDES_JSON, "warnings": $warnings},
+  "objectStorage": ${OBJECT_STORAGE_JSON:-null},
   "sshHostKeys": {"directory": "` + SSHHostKeysDir + `", "secret": "${SSH_HOST_KEYS_SECRET:-}", "files": [$ssh_keys]}
 }
 EOF

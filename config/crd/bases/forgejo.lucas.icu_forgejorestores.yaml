@@ -25,6 +25,9 @@ spec:
     - jsonPath: .spec.backupName
       name: Backup
       type: string
+    - jsonPath: .spec.remote.path
+      name: Remote
+      type: string
     - jsonPath: .status.phase
       name: Phase
       type: string
@@ -69,6 +72,154 @@ spec:
                 required:
                 - name
                 type: object
+              remote:
+                description: |-
+                  remote restores a backup from object storage by its location; no ForgejoBackup object is
+                  needed. The identity Secrets of the instance are not changed: to recreate a lost instance
+                  with its identity, use spec.restoreFrom of a new Forgejo instead.
+                properties:
+                  keySecret:
+                    description: |-
+                      keySecret holds the key the backup was encrypted with. Defaults to the instance's backup
+                      key: spec.backup.remote.encryption.keySecret, else Secret "<name>-backup-key" (key "key").
+                    properties:
+                      key:
+                        default: key
+                        description: key in the Secret.
+                        maxLength: 253
+                        pattern: ^[-._a-zA-Z0-9]*$
+                        type: string
+                      name:
+                        description: name of the Secret.
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  path:
+                    description: |-
+                      path of the backup below the prefix: "<namespace>/<name>/<backup>" of the instance that
+                      took it, as status.remote.path of its ForgejoBackup shows it.
+                    maxLength: 512
+                    minLength: 5
+                    pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?/[a-z0-9]([-a-z0-9.]*[a-z0-9])?/[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                    type: string
+                  s3:
+                    description: |-
+                      s3 is the bucket holding the backup, with the endpoint, bucket and prefix of the
+                      spec.backup.remote.s3 that uploaded it.
+                    properties:
+                      bucket:
+                        description: bucket is the bucket name.
+                        maxLength: 63
+                        minLength: 3
+                        pattern: ^[a-z0-9][a-z0-9.-]*[a-z0-9]$
+                        type: string
+                      credentialsSecret:
+                        description: |-
+                          credentialsSecret holds the access key. Forgejo gets it through environment variables
+                          that reference the Secret, never in app.ini; changing the Secret restarts the pods.
+                        properties:
+                          accessKeyIDKey:
+                            default: AWS_ACCESS_KEY_ID
+                            description: accessKeyIDKey is the key holding the access
+                              key ID.
+                            maxLength: 253
+                            pattern: ^[-._a-zA-Z0-9]*$
+                            type: string
+                          name:
+                            description: name of the Secret.
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          secretAccessKeyKey:
+                            default: AWS_SECRET_ACCESS_KEY
+                            description: secretAccessKeyKey is the key holding the
+                              secret access key.
+                            maxLength: 253
+                            pattern: ^[-._a-zA-Z0-9]*$
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      endpoint:
+                        description: |-
+                          endpoint is the URL of the S3 API, scheme://host[:port] without a path, e.g.
+                          https://s3.eu-central-1.amazonaws.com or http://garage.s3-lab.svc.cluster.local:3900.
+                          A short host name is resolved from the instance's namespace. https uses TLS.
+                        maxLength: 512
+                        minLength: 1
+                        pattern: ^https?://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9]([-A-Za-z0-9.]*[A-Za-z0-9])?)(:[0-9]{1,5})?/?$
+                        type: string
+                      pathStyle:
+                        description: |-
+                          pathStyle addresses the bucket in the path (https://host/bucket/key) when true, and as
+                          a host name (https://bucket.host/key, virtual-hosted style) when false. Unset uses
+                          virtual-hosted style for Amazon S3, Google Cloud Storage and Alibaba Cloud OSS endpoints
+                          and path style for every other endpoint.
+                        type: boolean
+                      prefix:
+                        description: |-
+                          prefix is prepended to every object key, e.g. "forgejo-a" to share a bucket between
+                          instances. Each subsystem uses its own prefix below it ("forgejo-a/lfs/...").
+                        maxLength: 256
+                        pattern: ^[A-Za-z0-9_-][A-Za-z0-9_.-]*(/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*/?$
+                        type: string
+                      region:
+                        default: us-east-1
+                        description: |-
+                          region of the bucket, which requests are signed for. It must match the server's
+                          region (e.g. "garage" for Garage's default configuration).
+                        maxLength: 64
+                        pattern: ^[A-Za-z0-9_-]*$
+                        type: string
+                      tls:
+                        description: |-
+                          tls configures how the server's certificate is verified (https endpoints only). By
+                          default it must be signed by a CA of the image's system trust store.
+                        properties:
+                          caSecret:
+                            description: |-
+                              caSecret names a Secret key holding the PEM certificate(s) of the CA that signed the
+                              server's certificate, e.g. the "ca.crt" of a cert-manager certificate. They are trusted
+                              in addition to the system trust store.
+                            properties:
+                              key:
+                                default: ca.crt
+                                description: key in the Secret.
+                                maxLength: 253
+                                pattern: ^[-._a-zA-Z0-9]*$
+                                type: string
+                              name:
+                                description: name of the Secret.
+                                maxLength: 253
+                                minLength: 1
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          insecureSkipVerify:
+                            description: insecureSkipVerify accepts any certificate.
+                              For tests only.
+                            type: boolean
+                        type: object
+                        x-kubernetes-validations:
+                        - message: caSecret and insecureSkipVerify are mutually exclusive
+                          rule: '!(has(self.insecureSkipVerify) && self.insecureSkipVerify
+                            && has(self.caSecret))'
+                    required:
+                    - bucket
+                    - credentialsSecret
+                    - endpoint
+                    type: object
+                    x-kubernetes-validations:
+                    - message: tls requires an https:// endpoint
+                      rule: '!has(self.tls) || self.endpoint.startsWith(''https://'')'
+                required:
+                - path
+                - s3
+                type: object
               restoreData:
                 description: restoreData replaces the data volume with the archive
                   (if the backup has one). Defaults to true.
@@ -78,12 +229,13 @@ spec:
                   Defaults to true.
                 type: boolean
             required:
-            - backupName
             - forgejoRef
             type: object
             x-kubernetes-validations:
             - message: spec is immutable
               rule: self == oldSelf
+            - message: set exactly one of backupName and remote
+              rule: has(self.backupName) != has(self.remote)
           status:
             description: status defines the observed state of ForgejoRestore
             properties:
@@ -170,6 +322,52 @@ spec:
                 - Completed
                 - Failed
                 type: string
+              remote:
+                description: remote describes the remote backup of spec.remote, read
+                  from its manifest.
+                properties:
+                  backupName:
+                    description: backupName is the name of the ForgejoBackup that
+                      took it.
+                    type: string
+                  files:
+                    description: files of the backup, with the size and SHA-256 the
+                      download is checked against.
+                    items:
+                      description: RemoteBackupFile is one file of a remote backup.
+                      properties:
+                        name:
+                          description: name of the file before encryption (the object's
+                            name ends in ".bin").
+                          type: string
+                        sha256:
+                          description: sha256 of the contents before encryption, in
+                            hex.
+                          type: string
+                        sizeBytes:
+                          description: sizeBytes of the contents before encryption.
+                          format: int64
+                          type: integer
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  forgejoImage:
+                    description: forgejoImage ran when the backup was taken.
+                    type: string
+                  includesData:
+                    description: includesData is true when the backup has an archive
+                      of the data volume.
+                    type: boolean
+                  keyFingerprint:
+                    description: keyFingerprint identifies the key the backup was
+                      encrypted with.
+                    type: string
+                  location:
+                    description: 'location of the backup: s3://<bucket>/<prefix>/<path>/.'
+                    type: string
+                type: object
               startTime:
                 format: date-time
                 type: string

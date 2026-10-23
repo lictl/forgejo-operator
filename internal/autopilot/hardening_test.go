@@ -768,3 +768,57 @@ func TestFailedUpgradeHoldStopsAutonomousChanges(t *testing.T) {
 		})
 	}
 }
+
+// --- object storage (spec.objectStorage) ---
+
+// Forgejo does not start without its bucket: a crash loop while the bucket is unusable (e.g.
+// rotated credentials that are wrong, which are not in app.ini) is not blamed on app.ini, and
+// pods are not replaced meanwhile.
+func TestConfigRollbackWaitsForObjectStorage(t *testing.T) {
+	ctx := context.Background()
+	hourAgo := metav1.NewTime(time.Now().Add(-time.Hour))
+	for _, tc := range []struct {
+		name        string
+		ready       metav1.ConditionStatus
+		since       metav1.Time
+		unavailable bool
+		wantRollbk  bool
+	}{
+		{"bucket unusable", metav1.ConditionFalse, hourAgo, true, false},
+		{"bucket usable again after the crashes", metav1.ConditionTrue, metav1.Now(), false, false},
+		{"bucket usable all along", metav1.ConditionTrue, hourAgo, false, true},
+		// Only the operator cannot reach the bucket (UnreachableFromOperator): nothing is held.
+		{"bucket unreachable from the operator", metav1.ConditionFalse, metav1.Now(), false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := testInstance()
+			f.Spec.AutoPilot.SelfHealing.Enabled = ptr.To(true)
+			f.Spec.ObjectStorage = &forgejov1.ObjectStorageSpec{S3: forgejov1.S3Connection{Endpoint: "http://s3:9000", Bucket: "forgejo"}}
+			f.Status.AutoPilot = &forgejov1.AutoPilotStatus{LastKnownGoodConfigHash: testOldHash}
+			f.Status.Conditions = []metav1.Condition{
+				{Type: forgejov1.ConditionDatabaseReady, Status: metav1.ConditionTrue, Reason: "ClusterHealthy", LastTransitionTime: hourAgo},
+				{Type: forgejov1.ConditionObjectStorageReady, Status: tc.ready, Reason: "X", LastTransitionTime: tc.since},
+			}
+			p := readyPod(f, "fj-a", testHash, time.Minute)
+			p.Status.Conditions[0].Status = corev1.ConditionFalse
+			p.Status.ContainerStatuses[0] = corev1.ContainerStatus{
+				Name: serverContainerName, RestartCount: 3,
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1,
+					FinishedAt: metav1.NewTime(time.Now().Add(-30 * time.Second))}},
+			}
+			env := newTestEnv(t, f, lkgSecret(f, testOldHash, false), p)
+			env.rc.ObjectStorageUnavailable = tc.unavailable
+			if replacementsHeld(env.rc) != tc.unavailable {
+				t.Fatalf("replacementsHeld = %v", !tc.unavailable)
+			}
+			pods, _ := serverPods(ctx, env.rc)
+			if err := rollbackFailingConfig(ctx, env.rc, stateFor(f), pods); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.Status.AutoPilot.RejectedConfigHash == testHash; got != tc.wantRollbk {
+				t.Fatalf("rolled back = %v, want %v (events %q)", got, tc.wantRollbk, env.events())
+			}
+		})
+	}
+}

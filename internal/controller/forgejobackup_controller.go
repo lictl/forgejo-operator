@@ -78,7 +78,7 @@ type ForgejoBackupReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile runs a backup Job for each ForgejoBackup and removes the backup files when the
@@ -141,6 +141,9 @@ func (r *ForgejoBackupReconciler) reconcile(ctx context.Context, req ctrl.Reques
 		}
 		if err := r.releaseJobs(ctx, b); err != nil {
 			return ctrl.Result{}, err
+		}
+		if b.Status.Phase == forgejov1.BackupPhaseCompleted {
+			return r.reconcileUpload(ctx, b, f)
 		}
 		return r.removeFailedFiles(ctx, b)
 	}
@@ -226,6 +229,10 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 		}
 	}
 
+	if backup.Bootstrapping(f) {
+		// Nothing to back up before spec.restoreFrom has restored the instance.
+		return r.wait(ctx, b, fmt.Sprintf("Waiting for Forgejo %q to be restored from spec.restoreFrom", f.Name), 30*time.Second)
+	}
 	if !backup.DatabaseReady(f) {
 		return r.waitForDependency(ctx, b, "DatabaseNotReady", fmt.Sprintf("Database of Forgejo %q is not ready", f.Name))
 	}
@@ -375,6 +382,13 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 		b.Status.Message += fmt.Sprintf("; %d file(s) changed or vanished while archiving", res.Warnings)
 	}
 	setCondition(&b.Status.Conditions, b.Generation, metav1.ConditionTrue, "Completed", b.Status.Message)
+	if backup.RemoteEnabled(f) && f.DeletionTimestamp.IsZero() {
+		// The upload starts on the next pass (reconcileUpload); the backup is complete on the
+		// backup PVC now, so restores and upgrades need not wait for it.
+		path := backup.BackupRemotePath(b)
+		b.Status.Remote = &forgejov1.RemoteBackupStatus{Phase: forgejov1.RemoteBackupPending, Path: path,
+			Location: backup.RemoteLocation(&f.Spec.Backup.Remote.S3, path), Message: "Waiting to be uploaded"}
+	}
 	if err := r.patchStatus(ctx, b, orig); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -393,7 +407,13 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 	}
 	// Status now holds everything the Job reported; its pod would only keep the data and
 	// backup PVCs from being deleted.
-	return ctrl.Result{}, backup.RemoveJob(ctx, r.Client, job)
+	if err := backup.RemoveJob(ctx, r.Client, job); err != nil {
+		return ctrl.Result{}, err
+	}
+	if b.Status.Remote != nil {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 // waitForDependency keeps the backup Pending until dependencyTimeout, then fails it.
@@ -478,10 +498,14 @@ func (r *ForgejoBackupReconciler) cleanup(ctx context.Context, b *forgejov1.Forg
 		return true, nil
 	}
 
-	// Stop a still-running backup first so it cannot write after the cleanup.
-	if b.Status.JobName != "" {
+	// Stop a still-running backup first so it cannot write after the cleanup, and an upload,
+	// which would read files that are going away.
+	for _, name := range []string{b.Status.JobName, uploadJobName(b)} {
+		if name == "" {
+			continue
+		}
 		job := &batchv1.Job{}
-		err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.JobName}, job)
+		err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, job)
 		if err == nil && metav1.IsControlledBy(job, b) {
 			if state, _ := backup.StateOf(job); state == backup.JobRunning {
 				if job.DeletionTimestamp.IsZero() {

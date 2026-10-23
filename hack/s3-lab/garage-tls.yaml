@@ -1,0 +1,80 @@
+# Optional HTTPS endpoint of the S3 lab, for tests of spec.objectStorage.s3.tls: nginx
+# terminates TLS with a certificate from the cert-manager ClusterIssuer "lab-ca" and passes
+# requests (and their Host header, which requests are signed with) to Garage.
+# Endpoint: https://garage-tls.s3-lab.svc.cluster.local, CA: key ca.crt of Secret garage-tls.
+# Applied by hack/s3-lab/setup.sh when the ClusterIssuer lab-ca exists.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: garage-tls
+  namespace: s3-lab
+spec:
+  secretName: garage-tls
+  issuerRef: {kind: ClusterIssuer, name: lab-ca}
+  dnsNames: [garage-tls.s3-lab.svc.cluster.local, garage-tls.s3-lab.svc, garage-tls.s3-lab]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-tls
+  namespace: s3-lab
+data:
+  default.conf: |
+    server {
+      listen 8443 ssl;
+      ssl_certificate /tls/tls.crt;
+      ssl_certificate_key /tls/tls.key;
+      client_max_body_size 0;
+      proxy_request_buffering off;
+      proxy_buffering off;
+      location / {
+        proxy_pass http://garage.s3-lab.svc.cluster.local:3900;
+        proxy_set_header Host $http_host;
+        proxy_http_version 1.1;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garage-tls
+  namespace: s3-lab
+  labels: {app.kubernetes.io/name: garage-tls}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: garage-tls}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: garage-tls}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: nginx
+          image: docker.io/library/nginx:1.29-alpine
+          ports:
+            - {name: https, containerPort: 8443}
+          readinessProbe:
+            tcpSocket: {port: https}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: conf, mountPath: /etc/nginx/conf.d, readOnly: true}
+            - {name: tls, mountPath: /tls, readOnly: true}
+      volumes:
+        - name: conf
+          configMap: {name: garage-tls}
+        - name: tls
+          secret: {secretName: garage-tls}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage-tls
+  namespace: s3-lab
+spec:
+  selector: {app.kubernetes.io/name: garage-tls}
+  ports:
+    - {name: https, port: 443, targetPort: https}

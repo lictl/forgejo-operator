@@ -63,7 +63,7 @@ var HostKeyFiles = []string{HostKeyEd25519, HostKeyECDSA, HostKeyRSA}
 const (
 	// AnnotationSSHHostKeysSource on "<name>-ssh-host-keys" records that the operator generated
 	// its keys (Generated). A Secret without it was created by the user.
-	AnnotationSSHHostKeysSource = "forgejo.lucas.icu/ssh-host-keys-source"
+	AnnotationSSHHostKeysSource = forgejo.AnnotationSSHHostKeysSource
 
 	// ReasonSSHHostKeysUnavailable is the Degraded reason while the Secret the pods serve
 	// their host keys from is missing or unusable. The Deployment keeps serving the keys it

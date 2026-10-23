@@ -92,10 +92,78 @@ type ForgejoBackupStatus struct {
 	IncludesData bool `json:"includesData,omitempty"`
 	// +optional
 	Message string `json:"message,omitempty"`
+	// remote reports the upload of the backup to spec.backup.remote of its instance.
+	// +optional
+	Remote *RemoteBackupStatus `json:"remote,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// RemoteBackupPhase is the lifecycle of the upload of a backup.
+// +kubebuilder:validation:Enum=Pending;Uploading;Uploaded;Failed
+type RemoteBackupPhase string
+
+const (
+	RemoteBackupPending   RemoteBackupPhase = "Pending"
+	RemoteBackupUploading RemoteBackupPhase = "Uploading"
+	RemoteBackupUploaded  RemoteBackupPhase = "Uploaded"
+	RemoteBackupFailed    RemoteBackupPhase = "Failed"
+)
+
+// RemoteBackupStatus reports the remote copy of a backup.
+type RemoteBackupStatus struct {
+	// +optional
+	Phase RemoteBackupPhase `json:"phase,omitempty"`
+	// location of the backup: s3://<bucket>/<prefix>/<path>/.
+	// +optional
+	Location string `json:"location,omitempty"`
+	// path of the backup below the prefix ("<namespace>/<name>/<backup>-<uid>", where <uid> is
+	// the first 8 characters of the ForgejoBackup's UID, so that every ForgejoBackup has a
+	// directory of its own): what a ForgejoRestore (spec.remote.path) or a new Forgejo
+	// (spec.restoreFrom.remote.path) restores it by.
+	// +optional
+	Path string `json:"path,omitempty"`
+	// s3 is the bucket the upload Job writes to, recorded when it starts: what the operator
+	// checks (and cleans up) after an upload that did not succeed, whatever spec.backup.remote
+	// says by then.
+	// +optional
+	S3 *S3Connection `json:"s3,omitempty"`
+	// +optional
+	JobName string `json:"jobName,omitempty"`
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// keySecret held the encryption key.
+	// +optional
+	KeySecret *BackupKeySecretRef `json:"keySecret,omitempty"`
+	// keyFingerprint identifies the key the backup was encrypted with.
+	// +optional
+	KeyFingerprint string `json:"keyFingerprint,omitempty"`
+	// files uploaded, with the size and SHA-256 of their contents before encryption.
+	// +listType=atomic
+	// +optional
+	Files []RemoteBackupFile `json:"files,omitempty"`
+	// verified is true when every file was read back from the bucket, decrypted, and its
+	// SHA-256 matched.
+	// +optional
+	Verified bool `json:"verified,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// RemoteBackupFile is one file of a remote backup.
+type RemoteBackupFile struct {
+	// name of the file before encryption (the object's name ends in ".bin").
+	Name string `json:"name"`
+	// sizeBytes of the contents before encryption.
+	// +optional
+	SizeBytes int64 `json:"sizeBytes,omitempty"`
+	// sha256 of the contents before encryption, in hex.
+	// +optional
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -104,6 +172,7 @@ type ForgejoBackupStatus struct {
 // +kubebuilder:printcolumn:name="Forgejo",type=string,JSONPath=`.spec.forgejoRef.name`
 // +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.spec.reason`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Remote",type=string,JSONPath=`.status.remote.phase`
 // +kubebuilder:printcolumn:name="Completed",type=date,JSONPath=`.status.completionTime`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

@@ -121,12 +121,13 @@ func workloadHeld(rc *forgejo.ReconcileContext) bool {
 }
 
 // replacementsHeld reports whether autonomous actions that replace pods (restarts, resizes,
-// config rollbacks) must wait: a migration owns the workload, or the Secret of SSH host keys
-// the pods serve is missing or unusable, so that a replacement pod could not start (the
-// workload step leaves the Deployment as it is meanwhile). The HPA is left alone: pods it
+// config rollbacks) must wait: a migration owns the workload, the Secret of SSH host keys
+// the pods serve is missing or unusable (the workload step leaves the Deployment as it is
+// meanwhile), or the bucket of spec.objectStorage is not usable (Forgejo does not start
+// without it), so that a replacement pod could not start. The HPA is left alone: pods it
 // adds just do not start, and the running ones keep serving.
 func replacementsHeld(rc *forgejo.ReconcileContext) bool {
-	return workloadHeld(rc) || rc.SSHHostKeysUnavailable
+	return workloadHeld(rc) || rc.SSHHostKeysUnavailable || rc.ObjectStorageUnavailable
 }
 
 // serverPods lists the Forgejo server pods of the instance that are neither terminating nor

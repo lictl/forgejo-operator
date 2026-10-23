@@ -347,3 +347,30 @@ func TestVersionUnsupportedAlert(t *testing.T) {
 		t.Fatalf("description %q", d)
 	}
 }
+
+// Upload alerts exist only with spec.backup.remote; staleness ones only with scheduled backups.
+func TestBackupUploadAlerts(t *testing.T) {
+	f := testInstance("up")
+	for _, name := range []string{"ForgejoBackupUploadFailed", "ForgejoBackupUploadTooOld", "ForgejoBackupUploadMissing"} {
+		if findRule(prometheusRuleSpec(f, false), name) != nil {
+			t.Errorf("%s without spec.backup.remote", name)
+		}
+	}
+	f.Spec.Backup.Remote = &forgejov1.RemoteBackupSpec{}
+	r := findRule(prometheusRuleSpec(f, false), "ForgejoBackupUploadFailed")
+	if r == nil || !strings.Contains(r.Expr, `forgejo_operator_backup_uploads_total{namespace="ns", name="up", result="failed"}`) {
+		t.Fatalf("upload failed rule %+v", r)
+	}
+	if findRule(prometheusRuleSpec(f, false), "ForgejoBackupUploadTooOld") != nil {
+		t.Error("staleness alert without scheduled backups")
+	}
+	f.Spec.Backup.Enabled = true
+	f.Spec.Backup.Schedule = "0 3 * * *"
+	if r := findRule(prometheusRuleSpec(f, false), "ForgejoBackupUploadTooOld"); r == nil ||
+		!strings.Contains(r.Expr, "forgejo_operator_backup_last_upload_success_timestamp_seconds") {
+		t.Errorf("too old rule %+v", r)
+	}
+	if r := findRule(prometheusRuleSpec(f, false), "ForgejoBackupUploadMissing"); r == nil || !strings.Contains(r.Expr, "absent(") {
+		t.Errorf("missing rule %+v", r)
+	}
+}

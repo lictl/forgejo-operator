@@ -24,7 +24,10 @@ bookkeeping, no health-based restart and no vertical scaling. Restores (scaled t
 treated the same way. While the Secret of SSH host keys is missing or unusable
 (`Degraded=SSHHostKeysUnavailable`), new pods could not start, so there is no health-based
 restart, no config rollback, no vertical scaling and no restart for a file system resize
-either; see [ssh.md](ssh.md#when-something-is-wrong).
+either; see [ssh.md](ssh.md#when-something-is-wrong). The same holds while the endpoint of
+`spec.objectStorage` answers with a failure (`ObjectStorageReady=False`, except
+`UnreachableFromOperator`): Forgejo does not start without its bucket; see
+[object-storage.md](object-storage.md#status).
 
 | Feature | Spec | Default |
 |---|---|---|
@@ -158,7 +161,8 @@ The operator renders `app.ini` into `<name>-config`. Its hash is
    it is not Ready and one of its containers, init containers included (the `bootstrap`
    init container runs `forgejo migrate` with the same app.ini), is failing now:
    - it has 3 or more restarts, or is in `CrashLoopBackOff` after at least 2, and its last
-     exit was after the database last became ready (`DatabaseReady` turned True). Restart
+     exit was after the database last became ready (`DatabaseReady` turned True) and, with
+     `spec.objectStorage`, after the bucket last became usable (`ObjectStorageReady`). Restart
      counts never reset, so a completed init container or a Ready container is never
      counted, and restarts during a database outage (for example CNPG restarting the
      primary after a `max_connections` change) are put down to the outage;

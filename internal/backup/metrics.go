@@ -48,3 +48,38 @@ func RecordLastSuccess(namespace, name string, t time.Time) {
 	lastSuccess.at[key] = v
 	forgejo.BackupLastSuccess.WithLabelValues(namespace, name).Set(float64(v))
 }
+
+// lastUpload holds the exported forgejo_operator_backup_last_upload_success_timestamp_seconds
+// per instance, which, like lastSuccess, only moves forward.
+var lastUpload = struct {
+	sync.Mutex
+	at map[string]int64
+}{at: map[string]int64{}}
+
+// ExportLastUpload publishes the last-upload gauge from status.backup.remote.lastUploadTime
+// (no API call), so that it is back right after an operator restart.
+func ExportLastUpload(f *forgejov1.Forgejo) {
+	if f == nil || f.Status.Backup == nil || f.Status.Backup.Remote == nil || f.Status.Backup.Remote.LastUploadTime == nil {
+		return
+	}
+	RecordLastUpload(f.Namespace, f.Name, f.Status.Backup.Remote.LastUploadTime.Time)
+}
+
+// RecordLastUpload raises the instance's last-upload gauge to t; it never lowers it.
+func RecordLastUpload(namespace, name string, t time.Time) {
+	lastUpload.Lock()
+	defer lastUpload.Unlock()
+	key := namespace + "/" + name
+	v := max(lastUpload.at[key], t.Unix())
+	lastUpload.at[key] = v
+	forgejo.BackupLastUploadSuccess.WithLabelValues(namespace, name).Set(float64(v))
+}
+
+// ForgetLastUpload removes the instance's last-upload series: it has no remote backups (any
+// more), or it is gone.
+func ForgetLastUpload(namespace, name string) {
+	lastUpload.Lock()
+	defer lastUpload.Unlock()
+	delete(lastUpload.at, namespace+"/"+name)
+	forgejo.BackupLastUploadSuccess.DeleteLabelValues(namespace, name)
+}
