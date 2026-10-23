@@ -51,6 +51,9 @@ and 17:
 | `actionsLogs` | Forgejo Actions logs | `actions_log/` | `[storage.actions_log]` |
 | `actionsArtifacts` | Forgejo Actions artifacts | `actions_artifacts/` | `[actions.artifacts]` |
 
+Actions jobs run on the runners of a `ForgejoRunner` (see [actions-runners.md](actions-runners.md));
+their logs and artifacts reach Forgejo over its API and land here.
+
 Every subsystem defaults to `true`. One set to `false` stays on the data volume, in its usual
 directory (LFS in `/data/git/lfs`, the others under `/data/gitea`).
 

@@ -5,6 +5,7 @@ resources:
 - bases/forgejo.lucas.icu_forgejos.yaml
 - bases/forgejo.lucas.icu_forgejobackups.yaml
 - bases/forgejo.lucas.icu_forgejorestores.yaml
+- bases/forgejo.lucas.icu_forgejorunners.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

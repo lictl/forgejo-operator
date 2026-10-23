@@ -30,8 +30,8 @@ type CacheScope struct {
 // CacheScopes are the label-restricted kinds. Everything the operator creates of these
 // kinds carries Labels(), which every feature package applies after user labels.
 // Secrets and ConfigMaps are only ever read by name, so the narrowest selector fits them.
-// Pods, Jobs, Deployments and Services are also listed by SelectorLabels (and other sets
-// that include LabelName), which must stay answerable from the cache.
+// Pods, Jobs, Deployments, StatefulSets and Services are also listed by SelectorLabels (and
+// other sets that include LabelName), which must stay answerable from the cache.
 func CacheScopes() []CacheScope {
 	managed := labels.Set{LabelManagedBy: ManagedBy}
 	app := labels.Set{LabelName: AppName}
@@ -41,6 +41,7 @@ func CacheScopes() []CacheScope {
 		{Object: &corev1.Pod{}, Labels: app},
 		{Object: &batchv1.Job{}, Labels: app},
 		{Object: &appsv1.Deployment{}, Labels: app},
+		{Object: &appsv1.StatefulSet{}, Labels: app},
 		{Object: &corev1.Service{}, Labels: app},
 	}
 }

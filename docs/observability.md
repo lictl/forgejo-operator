@@ -191,7 +191,8 @@ you enable `[metrics] ENABLED_ISSUE_BY_LABEL` / `ENABLED_ISSUE_BY_REPOSITORY` th
 ### Operator (manager `/metrics`)
 
 Every series has the labels `namespace` and `name` (the `Forgejo` object). The operator removes
-all of an instance's series when the instance is deleted.
+all of an instance's series when the instance is deleted, and a `ForgejoRunner`'s series when it
+is deleted.
 
 | Metric | Type | Extra labels | Meaning |
 |--------|------|--------------|---------|
@@ -212,12 +213,16 @@ all of an instance's series when the instance is deleted.
 | `forgejo_operator_volume_used_ratio` | gauge | `claim` | Used/capacity of each PVC |
 | `forgejo_operator_version_supported` | gauge | `major`, `support` | 1 when the running Forgejo major is within the support policy, else 0; `support` is `Supported`, `Deprecated`, `EndOfLife`, `Future` or `Unknown` ([versions.md](versions.md)) |
 | `forgejo_operator_version_end_of_life_timestamp_seconds` | gauge | `major` | Upstream end of life of the running major, when it is in the version table |
+| `forgejo_operator_runners_desired` | gauge | `runner` | `spec.replicas` of a `ForgejoRunner` of the instance ([actions-runners.md](actions-runners.md#metrics-and-alert)) |
+| `forgejo_operator_runners_registered` | gauge | `runner` | Its runners recorded as registered |
+| `forgejo_operator_runners_online` | gauge | `runner` | Its runners Forgejo reports online; absent while the operator cannot read Forgejo's API |
+| `forgejo_operator_runner_jobs_waiting` | gauge | `runner` | Waiting jobs in its scope that its labels could run; absent while the API cannot be read |
 
 The endpoint also serves the standard controller-runtime metrics:
 
 - `controller_runtime_reconcile_total`, `controller_runtime_reconcile_errors_total` and
   `controller_runtime_reconcile_time_seconds`, each with a `controller` label: `forgejo`,
-  `forgejobackup` or `forgejorestore`.
+  `forgejobackup`, `forgejorestore` or `forgejorunner`.
 - `workqueue_*`
 - `rest_client_*`
 - Go runtime metrics.
@@ -250,6 +255,7 @@ those metrics are missing.
 | `ForgejoVolumeAlmostFull` | warning | `forgejo_operator_volume_used_ratio > 0.9` | 10m |
 | `ForgejoUpgradeFailed` | warning | An upgrade with `result!="succeeded"` (failed or rolled back) in the last hour | – |
 | `ForgejoVersionUnsupported` | warning | `forgejo_operator_version_supported == 0`: the running major is `Deprecated`, `EndOfLife`, `Future` or `Unknown`; the `VersionSupported` condition says what to upgrade to and by when | 1h |
+| `ForgejoRunnersOffline` | warning | Per `ForgejoRunner` (label `runner`): `runner_jobs_waiting > 0 and runners_online == 0 and runners_desired > 0`: jobs wait and none of its runners is online ([actions-runners.md](actions-runners.md)) | 10m |
 | `ForgejoAutoPilotActive` | warning | At least 5 autopilot actions in the last hour | – |
 
 `maxAge` is the longest gap between two runs of `spec.backup.schedule` plus half of that gap,

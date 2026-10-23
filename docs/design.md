@@ -6,7 +6,7 @@ Capability Level V (Auto Pilot)**. It runs the official image
 [CloudNativePG](https://cloudnative-pg.io) (CNPG) for PostgreSQL. Feature details live in
 [versions.md](versions.md), [backup-restore.md](backup-restore.md), [upgrades.md](upgrades.md),
 [autopilot.md](autopilot.md), [observability.md](observability.md), [networking.md](networking.md),
-[ssh.md](ssh.md) and [object-storage.md](object-storage.md).
+[ssh.md](ssh.md), [object-storage.md](object-storage.md) and [actions-runners.md](actions-runners.md).
 
 ## APIs (`forgejo.lucas.icu/v1alpha1`)
 
@@ -15,11 +15,14 @@ Capability Level V (Auto Pilot)**. It runs the official image
 | `Forgejo` (`fj`) | One Forgejo instance: image, DB, storage (volume and S3 object storage), networking (Services, Ingress, Gateway API routes, cert-manager TLS), backup schedule, upgrade policy, monitoring, HA, autoscaling, autopilot. Has a `scale` subresource. |
 | `ForgejoBackup` (`fjb`) | Immutable one-shot backup: `pg_dump` (custom format) + tar.gz of the data volume, written to the `<name>-backups` PVC, then (with `spec.backup.remote`) uploaded encrypted with the instance's identity to S3. Reasons: Manual, Scheduled, PreUpgrade. |
 | `ForgejoRestore` (`fjr`) | Restores a completed backup, or a remote backup by its location, into an instance, which is in maintenance (scaled to zero) meanwhile. |
+| `ForgejoRunner` (`fjrn`) | A set of Forgejo Actions runners for an instance in the same namespace: a StatefulSet of Forgejo Runner pods (Docker executor with a privileged dind sidecar, or Host executor), each runner registered under its own name and unregistered when scaled away or deleted. Has a `scale` subresource. |
 
 See `api/v1alpha1/*_types.go` for every field and default. `ForgejoBackup` and
 `ForgejoRestore` have their own controllers (`internal/controller/forgejobackup_controller.go`,
 `forgejobackup_upload.go`, `forgejorestore_controller.go`, backed by `internal/backup`); their
-Jobs are deleted once the result is recorded in status.
+Jobs are deleted once the result is recorded in status. So has `ForgejoRunner`
+(`internal/controller/forgejorunner_controller.go`, backed by `internal/runner`; see
+[ForgejoRunner](#forgejorunner)).
 
 ## Remote backups and disaster recovery
 
@@ -203,10 +206,57 @@ pods: autopilot restarts, resizes and config rollbacks, and the start of an upgr
 not start without its bucket, so a replacement pod would not come up, and a crash loop meanwhile
 is not blamed on `app.ini` (see [object-storage.md](object-storage.md#status)).
 
+## ForgejoRunner
+
+`internal/controller/forgejorunner_controller.go` reconciles a `ForgejoRunner` in one pass with a
+single optimistic-lock status patch (user documentation in [actions-runners.md](actions-runners.md)).
+It does not join the `Forgejo` pipeline: it reads the instance (`status.image`, `Ready`, phase,
+UID), and the instance's controller ignores the runner pods (`managedByOperator` skips the
+`runner` and `runner-registration` components).
+
+| Object | Content |
+|--------|---------|
+| Secret `<name>-tokens` | One runner secret per index (`token-<i>`, 40 hex), generated once; the UUID Forgejo gives the runner is derived from it (`runner.UUIDOf`). Kept for every wanted, recorded, registering or running index, dropped once a runner is unregistered |
+| Secret `<name>-runner` | `config-<i>.yaml`: the operator's defaults, `spec.config` merged on top, then the keys it owns (`server.connections` with `token_url: file:`, labels, capacity, shutdown timeout). `<name>-runner` differs from every Secret of an instance, so a runner and an instance may share a name |
+| Job `<name>-register` | `forgejo-cli actions register --secret-file --scope --name --keep-labels` for the runners that are not registered as wanted, with the instance's running image and `app.ini` Secret (read from its Deployment, so also the last-known-good copy), no data volume. Annotated with the scope and `<index>=<uuid>` pairs it registers; recorded into `status.runners` and deleted when it succeeds |
+| StatefulSet `<name>` | Pods `<name>-<i>` (Parallel pod management) for the registered prefix of the wanted runners; pod `i` reads `config-$(POD_INDEX).yaml` (downward API, label `apps.kubernetes.io/pod-index`). Only the digest of the shared configuration is on the pod template, so scaling never rolls the other pods; a runner whose secret changed leaves the registered prefix (its pod is scaled away) until it is registered again |
+
+- **Order.** Each pass: read the registration Job (live when the cache misses it) and the
+  runner pods; ensure the two Secrets; collect a succeeded Job (its records are written to the
+  status with the optimistic lock before the Job is deleted, so a conflict keeps the Job, the
+  only trace of the registration, for the next pass); read Forgejo's runner list (IDs, online
+  state, recorded runners Forgejo lost, which are flagged `missing` and registered again under
+  the same UUID after a 2-minute grace while their pods keep running) and waiting jobs;
+  unregister stale records (an index scaled away whose pod is gone, or a record whose UUID no
+  longer matches its secret); start a registration Job when wanted runners are not registered as
+  wanted and the instance is Ready and not paused, upgrading or restoring; update the
+  StatefulSet; report `Ready`, `Registered`, `Degraded` and the metrics.
+- **Forgejo's API** (`internal/runner/api.go`): `GET /api/v1/admin/actions/runners?visible=true`
+  (all pages, by `X-Total-Count`), `GET` and `DELETE /api/v1/admin/actions/runners/{id}` and the
+  waiting jobs of the scope, as the instance admin with basic authentication. It is only needed
+  for unregistering and the online state; without it `Degraded=ForgejoAPIUnavailable`. The list
+  is ordered by `last_online` (no other order is offered) and runners move between pages while it
+  is read, so a read whose distinct runners do not add up to `X-Total-Count` is repeated, a list
+  of several pages is read twice and merged, a recorded runner the list lacks is asked for by its
+  id (only a 404 means gone), and runners are deleted by id (a 404 is "gone already").
+- **Stale cache.** After its own status write the controller reads the `ForgejoRunner` live until
+  the cache has that write (as the `Forgejo` controller does), so a pass right after a
+  registration does not register the same runners again.
+- **Deletion.** The finalizer deletes the StatefulSet and the registration Job, waits for their
+  pods (grace period plus 2 minutes at most), then unregisters every runner whose UUID is recorded
+  or derived from a secret of the `ForgejoRunner` (recorded ones by id; the others from the list,
+  read again until it shows none of them); 5 minutes after the first failed attempt (kept in
+  memory: an operator restart grants another 5 minutes) it gives up with a Warning event. Nothing is unregistered when the instance is gone or another instance (UID) holds
+  the name.
+- **Watches.** The `ForgejoRunner` (generation, labels, annotations, deletion), its StatefulSet,
+  Job and Secrets, runner pods (a stopped pod lets its runner be unregistered), and `Forgejo`
+  objects (generation, `status.image`, phase, `Ready`, deletion). Requeued every 60 s (Forgejo's
+  runner list), every 10 s while registering, unregistering or rolling out.
+
 ## Informer cache and reads
 
 The manager caches Secrets and ConfigMaps only with `app.kubernetes.io/managed-by=forgejo-operator`,
-and Pods, Jobs, Deployments and Services only with `app.kubernetes.io/name=forgejo`
+and Pods, Jobs, Deployments, StatefulSets and Services only with `app.kubernetes.io/name=forgejo`
 (`forgejo.CacheScopes`, applied in `cmd/main.go`). Everything the operator creates carries
 `forgejo.Labels`. `managedFields` are stripped from cached objects. Without this the operator
 would hold every Secret (Helm releases included), ConfigMap and Pod of the cluster in memory.
@@ -328,12 +378,14 @@ the `svc.<domain>` search entry of the operator pod's `/etc/resolv.conf`, else
 
 ## Network requirements
 
-Besides the Kubernetes API (including `pods/exec`, used to measure volumes, and
-`metrics.k8s.io` for vertical sizing), the operator's pod must reach:
+Besides the Kubernetes API (including `pods/exec`, used to measure volumes, `metrics.k8s.io`
+for vertical sizing, and `namespaces` get for the Pod Security level of a `ForgejoRunner`'s
+namespace), the operator's pod must reach:
 
 - `<name>-http.<ns>.svc.<domain>:<spec.server.http.port>` (default 3000) for health, version
   and statistics probes. Self-healing depends on them. When NetworkPolicies or mesh mTLS
-  shut the operator out, probes are counted as *unreachable*, not as failures.
+  shut the operator out, probes are counted as *unreachable*, not as failures. A `ForgejoRunner`
+  uses the same Service for Forgejo's runner API (unregistering, online state).
 - For an external database, its host and port (a TCP dial). Failing this sets
   `DatabaseReady=False/UnreachableFromOperator`, which pauses self-healing and scheduled
   backups, but Forgejo is still deployed.
@@ -357,6 +409,10 @@ All names come from `internal/forgejo/names.go`. Every child resource carries
 scheduled and pre-upgrade backups) and the identity Secrets (`<name>-secrets`, `<name>-admin`,
 `<name>-ssh-host-keys`) get an owner reference only with `spec.storage.retainPolicy: Delete`.
 Manual backups never do, and neither does the backup encryption key `<name>-backup-key`.
+The objects of a `ForgejoRunner` are named in `internal/runner/names.go`, carry
+`runner.Labels` (instance label = the runner's name, component `runner` or
+`runner-registration`, `forgejo.lucas.icu/instance` = the Forgejo,
+`forgejo.lucas.icu/runner` = the runner) and are controlled by the `ForgejoRunner`.
 
 ## Optional integrations
 
@@ -378,8 +434,8 @@ that do not use a feature cost no request per pass.
 
 | Level | Capability | How |
 |-------|-----------|-----|
-| I Basic install | Forgejo, CNPG database, secrets, admin, S3 object storage, Services, Ingress or Gateway API routes and cert-manager TLS from one CR; non-root pods that pass restricted Pod Security | core |
+| I Basic install | Forgejo, CNPG database, secrets, admin, S3 object storage, Services, Ingress or Gateway API routes and cert-manager TLS from one CR; non-root pods that pass restricted Pod Security; Forgejo Actions runners registered and unregistered without exec (`ForgejoRunner`) | core, runner |
 | II Seamless upgrades | Image change → version gate (no silent downgrade, supported upgrade paths) → cold pre-upgrade backup → single-pod `Recreate` rollout with `forgejo migrate` → verification; per-major rendering and support reporting from the version table | upgrade, forgejo |
 | III Full lifecycle | Scheduled and manual backups with retention, encrypted off-cluster copies with the instance's identity and remote retention, restore with maintenance mode and migration hold (also of remote backups), disaster recovery into a new namespace or cluster (`spec.restoreFrom`), retain policy for data, CNPG-managed DB failover | backup, core |
-| IV Deep insights | Operator metrics, Forgejo `/metrics` and ServiceMonitor, PrometheusRule alerts, Grafana dashboard, health and stats in status, events, conditions | observability |
+| IV Deep insights | Operator metrics, Forgejo `/metrics` and ServiceMonitor, PrometheusRule alerts, Grafana dashboard, health and stats in status, events, conditions; runners online and waiting jobs per `ForgejoRunner` | observability, runner |
 | V Auto pilot | Auto-rollback of failed upgrades, config rollback on crash loops, health-based restarts, OOM- and usage-driven vertical sizing, HPA with Valkey HA, PVC auto-expansion (also while the database is down), resource-derived tuning (GOMEMLIMIT, DB pool, workers) | autopilot, upgrade |

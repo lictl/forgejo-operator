@@ -19,6 +19,8 @@ const (
 	LabelForgejo = "forgejo.lucas.icu/instance"
 	// LabelBackupReason marks ForgejoBackup objects with their reason (for retention).
 	LabelBackupReason = "forgejo.lucas.icu/backup-reason"
+	// LabelRunner marks the objects of a ForgejoRunner with its name.
+	LabelRunner = "forgejo.lucas.icu/runner"
 
 	// AnnotationConfigHash on the pod template triggers a rollout when app.ini changes.
 	AnnotationConfigHash = "forgejo.lucas.icu/config-hash"
@@ -63,6 +65,10 @@ const (
 	ComponentValkey   = "valkey"
 	ComponentBackup   = "backup"
 	ComponentRestore  = "restore"
+	// ComponentRunner marks the pods of a ForgejoRunner, ComponentRunnerRegistration its
+	// registration Job. The Forgejo controller ignores both.
+	ComponentRunner             = "runner"
+	ComponentRunnerRegistration = "runner-registration"
 
 	// FinalizerName is used by controllers that must clean up external state.
 	FinalizerName = "forgejo.lucas.icu/finalizer"

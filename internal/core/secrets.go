@@ -112,6 +112,10 @@ func AdminUsername(f *forgejov1.Forgejo) string {
 	return forgejov1.DefaultAdminUsername
 }
 
+// AdminCredentialsSecret is the Secret holding the admin password: spec.admin.existingSecret,
+// or the generated "<name>-admin".
+func AdminCredentialsSecret(f *forgejov1.Forgejo) string { return adminSecretName(f) }
+
 // AdminPasswordKey is the key holding the admin password in status.adminSecretName.
 func AdminPasswordKey(f *forgejov1.Forgejo) string {
 	if f.Spec.Admin.ExistingSecret != "" && f.Spec.Admin.PasswordKey != "" {

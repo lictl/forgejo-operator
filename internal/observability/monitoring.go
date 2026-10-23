@@ -251,6 +251,19 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 			"version cannot be determined). The VersionSupported condition of `kubectl describe fj %s %s` says "+
 			"what to upgrade to and by when; see docs/versions.md.", f.Name, kc))
 
+	// ForgejoRunners of the instance (docs/actions-runners.md): jobs wait while none of a
+	// runner set's runners is online. Both series come from Forgejo's API, so they are absent
+	// (and the alert inactive) while the operator cannot read it.
+	add("ForgejoRunnersOffline", "warning", "10m",
+		fmt.Sprintf(`max by (namespace, name, runner) (forgejo_operator_runner_jobs_waiting{%[1]s}) > 0 `+
+			`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_online{%[1]s}) == 0 `+
+			`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_desired{%[1]s}) > 0`, op),
+		fmt.Sprintf("Jobs wait for ForgejoRunner {{ $labels.runner }} of Forgejo %s, but none of its runners is online", ref),
+		fmt.Sprintf("{{ $value | printf \"%%.0f\" }} jobs have waited for at least 10 minutes for runners with the labels of "+
+			"ForgejoRunner {{ $labels.runner }}, and Forgejo reports none of its runners online. `kubectl %s describe "+
+			"forgejorunner {{ $labels.runner }}` shows why (Ready and Registered conditions); check the runner pods' logs "+
+			"(`kubectl %s logs {{ $labels.runner }}-0 -c runner`) for connection or authentication errors.", kc, kc))
+
 	add("ForgejoAutoPilotActive", "warning", "",
 		fmt.Sprintf(`sum by (namespace, name) (increase(forgejo_operator_autopilot_actions_total{%s}[1h])) >= 5`, op),
 		fmt.Sprintf("The operator keeps intervening on Forgejo %s", ref),

@@ -374,3 +374,17 @@ func TestBackupUploadAlerts(t *testing.T) {
 		t.Errorf("missing rule %+v", r)
 	}
 }
+
+func TestRunnersOfflineAlert(t *testing.T) {
+	r := findRule(prometheusRuleSpec(testInstance("run"), false), "ForgejoRunnersOffline")
+	want := `max by (namespace, name, runner) (forgejo_operator_runner_jobs_waiting{namespace="ns", name="run"}) > 0 ` +
+		`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_online{namespace="ns", name="run"}) == 0 ` +
+		`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_desired{namespace="ns", name="run"}) > 0`
+	if r == nil || r.Expr != want || r.For != "10m" || r.Labels["severity"] != "warning" {
+		t.Fatalf("ForgejoRunnersOffline %+v", r)
+	}
+	if d := r.Annotations["description"]; !strings.Contains(d, "kubectl -n ns describe forgejorunner {{ $labels.runner }}") ||
+		!strings.Contains(d, `{{ $value | printf "%.0f" }}`) {
+		t.Fatalf("description %q", d)
+	}
+}

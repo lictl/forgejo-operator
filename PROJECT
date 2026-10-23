@@ -36,4 +36,13 @@ resources:
   kind: ForgejoRestore
   path: github.com/lictl/forgejo-operator/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: lucas.icu
+  group: forgejo
+  kind: ForgejoRunner
+  path: github.com/lictl/forgejo-operator/api/v1alpha1
+  version: v1alpha1
 version: "3"

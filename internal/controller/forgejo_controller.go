@@ -716,9 +716,16 @@ func mapCNPGSecretToForgejo(_ context.Context, obj client.Object) []reconcile.Re
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: strings.TrimSuffix(cluster, "-db")}}}
 }
 
+// managedByOperator selects the operator's objects that belong to a Forgejo instance. The
+// pods and Jobs of a ForgejoRunner carry the runner's name as their instance label and are
+// left to the ForgejoRunner controller.
 func managedByOperator() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		l := obj.GetLabels()
+		switch l[forgejo.LabelComponent] {
+		case forgejo.ComponentRunner, forgejo.ComponentRunnerRegistration:
+			return false
+		}
 		return l[forgejo.LabelName] == forgejo.AppName && l[forgejo.LabelInstance] != ""
 	})
 }

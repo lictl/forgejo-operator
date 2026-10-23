@@ -16,13 +16,16 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
 - It uploads backups, encrypted and with the instance's identity, to an S3-compatible bucket off
   the cluster, and recreates a lost instance from one (`spec.restoreFrom`). See
   [docs/backup-restore.md](docs/backup-restore.md#disaster-recovery).
-- Everything is driven by three resources in `forgejo.lucas.icu/v1alpha1`:
+- It runs Forgejo Actions runners, registered with the instance without exec into pods and
+  unregistered when they are scaled away or deleted. See [docs/actions-runners.md](docs/actions-runners.md).
+- Everything is driven by four resources in `forgejo.lucas.icu/v1alpha1`:
 
 | Kind | Short name | Purpose |
 |------|-----------|---------|
 | `Forgejo` | `fj` | One instance: image, database, storage, networking, backup schedule, upgrade policy, monitoring, scaling, autopilot. |
 | `ForgejoBackup` | `fjb` | A point-in-time backup: `pg_dump` of the database plus an archive of the data volume, uploaded off-cluster with `spec.backup.remote`. |
 | `ForgejoRestore` | `fjr` | Restores a completed backup, or a remote backup by its location, into an instance, which is scaled to zero meanwhile. |
+| `ForgejoRunner` | `fjrn` | Forgejo Actions runners for an instance: Docker (privileged dind sidecar) or Host executor, for the whole instance, an organization or a repository, scalable. |
 
 ## Capability levels
 
@@ -36,8 +39,8 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
 
 Details are in [docs/design.md](docs/design.md), [docs/versions.md](docs/versions.md), [docs/upgrades.md](docs/upgrades.md),
 [docs/backup-restore.md](docs/backup-restore.md), [docs/observability.md](docs/observability.md),
-[docs/autopilot.md](docs/autopilot.md), [docs/networking.md](docs/networking.md), [docs/ssh.md](docs/ssh.md) and
-[docs/object-storage.md](docs/object-storage.md).
+[docs/autopilot.md](docs/autopilot.md), [docs/networking.md](docs/networking.md), [docs/ssh.md](docs/ssh.md),
+[docs/object-storage.md](docs/object-storage.md) and [docs/actions-runners.md](docs/actions-runners.md).
 
 ## Quick start (local or any other cluster)
 
@@ -152,6 +155,23 @@ spec:
       credentialsSecret: {name: forgejo-s3}   # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 ```
 
+### Actions runners
+
+A `ForgejoRunner` runs Forgejo Runner pods for an instance in the same namespace. Each runner is
+registered with a short-lived Job that runs `forgejo-cli actions register` with a secret the
+operator generated (never in pod arguments, logs, events or status), its pod starts once it is
+registered, and it is unregistered through Forgejo's API when it is scaled away or the
+`ForgejoRunner` is deleted. The Docker executor runs each job in a container of a privileged
+Docker daemon next to the runner (the namespace must allow privileged pods); the Host executor
+runs steps in the runner's container and passes the `restricted` Pod Security Standard. See
+[docs/actions-runners.md](docs/actions-runners.md).
+
+```bash
+kubectl apply -n forgejo -f config/samples/forgejo_v1alpha1_forgejorunner.yaml
+kubectl get fjrn -n forgejo                      # DESIRED, READY, ONLINE, REGISTERED
+kubectl scale fjrn forgejorunner-sample -n forgejo --replicas=3
+```
+
 ### SSH host keys
 
 The SSH server's host keys live in the Secret `<name>-ssh-host-keys`, not on the data volume, so
@@ -213,8 +233,9 @@ make forgejo-versions                 # compare the Forgejo version table with u
 
 The reconcile pipeline is a table of steps in `internal/controller/forgejo_controller.go`. Each
 step is owned by one package: `core`, `backup`, `upgrade`, `observability` or `autopilot`, and
-declares the steps it depends on. A failing step only skips the steps that depend on it. See
-[docs/design.md](docs/design.md).
+declares the steps it depends on. A failing step only skips the steps that depend on it.
+`ForgejoBackup`, `ForgejoRestore` and `ForgejoRunner` have controllers of their own (the last
+backed by `internal/runner`). See [docs/design.md](docs/design.md).
 
 ## License
 

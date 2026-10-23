@@ -3,4 +3,5 @@ resources:
 - forgejo_v1alpha1_forgejo.yaml
 - forgejo_v1alpha1_forgejobackup.yaml
 - forgejo_v1alpha1_forgejorestore.yaml
+- forgejo_v1alpha1_forgejorunner.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

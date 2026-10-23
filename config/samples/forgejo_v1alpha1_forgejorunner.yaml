@@ -1,0 +1,47 @@
+apiVersion: forgejo.lucas.icu/v1alpha1
+kind: ForgejoRunner
+metadata:
+  labels:
+    app.kubernetes.io/name: forgejo-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: forgejorunner-sample
+  # The Docker executor runs a privileged Docker daemon next to each runner: the namespace
+  # must allow privileged pods (pod-security.kubernetes.io/enforce: privileged, or no label
+  # where the cluster default allows them). See docs/actions-runners.md.
+spec:
+  # The Forgejo instance in this namespace the runners register with.
+  forgejoRef:
+    name: forgejo-sample
+  # Two runners, registered as forgejorunner-sample-0 and -1 and unregistered when they are
+  # scaled away (kubectl scale forgejorunner forgejorunner-sample --replicas=N).
+  replicas: 2
+  # Jobs per runner at once.
+  capacity: 1
+  # Docker: every job runs in a container of the runner's own Docker daemon.
+  # Host: job steps run in the runner's container (restricted Pod Security; no isolation).
+  executor: Docker
+  # Jobs with "runs-on: docker" run in data.forgejo.org/oci/node:22-bookworm (node for
+  # actions/checkout and other JavaScript actions).
+  labels:
+    - docker:docker://data.forgejo.org/oci/node:22-bookworm
+  # Whole instance by default; or one organization, or one repository.
+  # scope:
+  #   organization: acme
+  #   repository: acme/app
+  docker:
+    # Let steps run "docker build" / "docker run" against the runner's daemon. A job with
+    # the socket controls a privileged daemon: enable it for trusted repositories only.
+    mountSocket: false
+    # storageSizeLimit: 20Gi
+  # How long a stopping runner lets running jobs finish.
+  shutdownTimeout: 10m
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  # Merged into the runner's config.yml (see Forgejo Runner's config.example.yaml).
+  # config:
+  #   runner:
+  #     timeout: 1h
+  #     envs:
+  #       NODE_OPTIONS: --max-old-space-size=2048
