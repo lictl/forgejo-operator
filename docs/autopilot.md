@@ -146,8 +146,9 @@ rollout.
 
 ## Config rollback
 
-The operator renders `app.ini` into `<name>-config`. Its hash is
-`status.configHash`; the operator also tracks the hash the spec would produce.
+The operator renders `app.ini` into `<name>-config`. `status.configHash` is the hash of the
+app.ini the pods run (the LKG's during a rollback); the operator also tracks the hash the
+spec would produce.
 
 1. **Last known good (LKG).** When the Deployment is fully rolled out with the desired
    config, every replica is listed and has been Ready for 1 minute, and
