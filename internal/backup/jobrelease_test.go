@@ -38,7 +38,7 @@ func runningBackup(name string) *forgejov1.ForgejoBackup {
 	b.Status.Phase = forgejov1.BackupPhaseRunning
 	b.Status.StartTime = &metav1.Time{Time: time.Now().Add(-5 * time.Minute)}
 	b.Status.JobName = backup.BackupJobName(b)
-	b.Status.PVCName = "fb-backups"
+	b.Status.PVCName = testBackupsPVC
 	b.Status.Path = "/" + name
 	b.Status.IncludesData = true
 	return b
@@ -129,7 +129,7 @@ func TestFailedBackupDeletesItsJobsAndRecordsFileRemoval(t *testing.T) {
 	b := runningBackup("m2")
 	job := finishedJob(t, s, b.Status.JobName, b, batchv1.JobFailed)
 	pod := jobPod(job.Name, backup.ContainerArchive, 1, "gzip failed with exit code 1 (backup volume full?)")
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "fb-backups", Namespace: ns}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: testBackupsPVC, Namespace: ns}}
 	c := newFakeClient(s, instance(""), b, job, pod, pvc)
 
 	reconcileBackup(t, c, b.Name)

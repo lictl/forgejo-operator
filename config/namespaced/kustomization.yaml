@@ -1,0 +1,48 @@
+# Namespaced install: the operator watches only the namespaces in WATCH_NAMESPACE and holds
+# its namespaced permissions (Secrets, Pods, Deployments, Jobs, ...) only there, through
+# RoleBindings to ClusterRole manager-role, instead of the cluster-wide ClusterRoleBinding of
+# config/default. What stays cluster-wide is read-only: nodes, persistentvolumes and
+# storageclasses (get/list/watch) and namespaces (get), in ClusterRole cluster-reader, plus
+# the metrics endpoint's token and access reviews. The CRDs are cluster-scoped either way.
+# See docs/permissions.md.
+#
+# To use it, for every namespace the operator should manage (here: forgejo):
+#   1. list it in WATCH_NAMESPACE below (comma-separated);
+#   2. add RoleBindings for it to rolebindings.yaml (copy the two of namespace forgejo);
+#   3. create it before applying: kubectl create namespace forgejo
+# then: make manifests && bin/kustomize build config/namespaced | kubectl apply -f -
+# (after `cd config/manager && kustomize edit set image controller=<image>`).
+# Drop the volume-usage RoleBinding of a namespace to keep pods/exec out of it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../default
+- cluster_reader_role.yaml
+- rolebindings.yaml
+patches:
+# No cluster-wide bindings of manager-role and volume-usage: rolebindings.yaml binds them in
+# the watched namespaces only.
+- patch: |-
+    $patch: delete
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: forgejo-operator-manager-rolebinding
+- patch: |-
+    $patch: delete
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: forgejo-operator-volume-usage-rolebinding
+- target:
+    kind: Deployment
+    name: forgejo-operator-controller-manager
+  patch: |-
+    - op: test
+      path: /spec/template/spec/containers/0/env/0/name
+      value: WATCH_NAMESPACE
+    - op: replace
+      path: /spec/template/spec/containers/0/env/0
+      value:
+        name: WATCH_NAMESPACE
+        value: forgejo

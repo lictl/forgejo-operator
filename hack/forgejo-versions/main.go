@@ -14,7 +14,9 @@
 //	go run ./hack/forgejo-versions [-now YYYY-MM-DD] [-registry=false]
 //
 // Exit status: 0 the table is current, 1 it is stale (see the STALE lines), 2 an upstream
-// source could not be read. docs/versions.md describes what to do for each finding.
+// source could not be read or the arguments are invalid (then the usage is printed). `go run`
+// itself exits with 1 and make with 2 whenever the tool fails; both print the tool's
+// "exit status N" first. docs/versions.md describes what to do for each finding.
 package main
 
 import (
@@ -79,7 +81,7 @@ func main() {
 	if *nowFlag != "" {
 		t, err := time.Parse(time.DateOnly, *nowFlag)
 		if err != nil {
-			fail(err)
+			usageError(fmt.Errorf("-now %q is not a day (YYYY-MM-DD)", *nowFlag))
 		}
 		now = t
 	}
@@ -178,22 +180,78 @@ func checkDefaultImage(r *report, table forgejo.VersionTable, now time.Time) {
 	}
 }
 
-// checkAdvisories compares the advisories of the table with the newest patch releases.
+// checkAdvisories compares the advisories of the table with the newest patch releases. Only
+// a sentence of the notes that advises against the patch's own version is a WARN with an
+// instruction: notes that mention an earlier advisory ("we no longer advise against 17.0.0")
+// are quoted as INFO.
 func checkAdvisories(r *report, table forgejo.VersionTable, latest map[int]patch) {
 	for _, row := range table.Releases {
 		p, ok := latest[row.Major]
 		if !ok {
 			continue
 		}
-		switch {
-		case row.Advisory != nil && p.version.Patch < row.Advisory.FixedIn:
+		if row.Advisory != nil && p.version.Patch < row.Advisory.FixedIn {
 			r.add("INFO", "%d: the advisory's fix %d.0.%d is not released yet (latest %s)",
 				row.Major, row.Major, row.Advisory.FixedIn, p.version)
-		case strings.Contains(strings.ToLower(p.body), "advise against"):
-			r.add("WARN", "%s: the release notes advise against it; set Advisory.FixedIn of %d to %d",
-				p.version, row.Major, p.version.Patch+1)
+			continue
+		}
+		own := versionPattern(p.version)
+		var others []string
+		warned := false
+		for _, s := range sentences(p.body) {
+			if !strings.Contains(strings.ToLower(s), "advise against") {
+				continue
+			}
+			if own.MatchString(s) {
+				r.add("WARN", "%s: the release notes advise against it (%q); set Advisory.FixedIn of %d to %d",
+					p.version, quote(s), row.Major, p.version.Patch+1)
+				warned = true
+				break
+			}
+			others = append(others, s)
+		}
+		if warned {
+			continue
+		}
+		for _, s := range others {
+			r.add("INFO", "%s: the release notes mention an advisory: %q", p.version, quote(s))
 		}
 	}
+}
+
+// sentenceBreak ends a sentence (or clause): punctuation followed by white space, a blank
+// line, or a new line that starts a list item or a heading. Version numbers ("17.0.1") do not
+// break.
+var sentenceBreak = regexp.MustCompile(`[.!?;]+\s+|\n\s*(?:\n|[-*+]\s|#|\d+\.\s)`)
+
+// listMarker is the list or heading marker that starts a sentence after a punctuation break.
+var listMarker = regexp.MustCompile(`^(?:[-*+]|#+|\d+\.)\s+`)
+
+// sentences splits release notes into sentences with their white space and leading list or
+// heading markers removed.
+func sentences(notes string) []string {
+	var out []string
+	for _, s := range sentenceBreak.Split(notes, -1) {
+		s = listMarker.ReplaceAllString(strings.Join(strings.Fields(s), " "), "")
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// versionPattern matches v as a whole version: "17.0.1", not "17.0.10" or "117.0.1".
+func versionPattern(v forgejo.Version) *regexp.Regexp {
+	return regexp.MustCompile(`(?:^|[^0-9.])v?` + regexp.QuoteMeta(v.String()) + `(?:[^0-9]|$)`)
+}
+
+// quote shortens a sentence of the release notes for a finding.
+func quote(s string) string {
+	const limit = 200
+	if r := []rune(s); len(r) > limit {
+		return string(r[:limit]) + "..."
+	}
+	return s
 }
 
 type report struct {
@@ -368,5 +426,13 @@ func getJSON(url string, into any) error {
 
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "forgejo-versions:", err)
+	os.Exit(2)
+}
+
+// usageError reports invalid arguments like the flag package does: the error, the usage and
+// exit status 2.
+func usageError(err error) {
+	_, _ = fmt.Fprintln(flag.CommandLine.Output(), err)
+	flag.Usage()
 	os.Exit(2)
 }

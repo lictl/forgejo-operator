@@ -250,6 +250,13 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 			"EndOfLife: no more security fixes; Future: newer than the operator's version table; Unknown: the "+
 			"version cannot be determined). The VersionSupported condition of `kubectl describe fj %s %s` says "+
 			"what to upgrade to and by when; see docs/versions.md.", f.Name, kc))
+	add("ForgejoVersionAdvisory", "warning", "1h",
+		fmt.Sprintf(`max by (namespace, name, major) (forgejo_operator_version_advisory{%s}) == 1`, op),
+		fmt.Sprintf("Forgejo %s runs a patch release that an advisory recommends replacing", ref),
+		fmt.Sprintf("The running Forgejo {{ $labels.major }} patch release is older than the one the operator's version "+
+			"table recommends (critical security fixes, or a release upstream advises against). The VersionSupported "+
+			"condition of `kubectl describe fj %s %s` names the minimum patch release and why; pin spec.image to it "+
+			"(N.0.P), or pull the floating tag again (imagePullPolicy: Always). See docs/versions.md.", f.Name, kc))
 
 	// ForgejoRunners of the instance (docs/actions-runners.md): jobs wait while none of a
 	// runner set's runners is online. Both series come from Forgejo's API, so they are absent

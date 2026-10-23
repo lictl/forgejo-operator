@@ -6,7 +6,8 @@ Capability Level V (Auto Pilot)**. It runs the official image
 [CloudNativePG](https://cloudnative-pg.io) (CNPG) for PostgreSQL. Feature details live in
 [versions.md](versions.md), [backup-restore.md](backup-restore.md), [upgrades.md](upgrades.md),
 [autopilot.md](autopilot.md), [observability.md](observability.md), [networking.md](networking.md),
-[ssh.md](ssh.md), [object-storage.md](object-storage.md) and [actions-runners.md](actions-runners.md).
+[ssh.md](ssh.md), [object-storage.md](object-storage.md), [actions-runners.md](actions-runners.md)
+and [permissions.md](permissions.md).
 
 ## APIs (`forgejo.lucas.icu/v1alpha1`)
 
@@ -23,6 +24,25 @@ See `api/v1alpha1/*_types.go` for every field and default. `ForgejoBackup` and
 Jobs are deleted once the result is recorded in status. So has `ForgejoRunner`
 (`internal/controller/forgejorunner_controller.go`, backed by `internal/runner`; see
 [ForgejoRunner](#forgejorunner)).
+
+### Validation
+
+Mistakes that the operator could only report later (as `Degraded`, a failed child object or a
+setting that is silently ignored) are refused by the API server, through OpenAPI markers and CEL
+rules (`+kubebuilder:validation:XValidation`) in `api/v1alpha1`. `api/v1alpha1/validation_test.go`
+runs the generated CRDs through the API server's own CRD validation (every rule compiles within
+the CEL cost budget), defaulting, schema and CEL validation, without a cluster, against the samples
+and the mistakes below. The operator's runtime checks stay as a second line.
+
+| Kind | Refused |
+|------|---------|
+| `Forgejo` | a name that is not a DNS-1035 label, longer than 56 (Service `<name>-valkey`) or, with CNPG, than 47 (CNPG limits Cluster `<name>-db` to 50); an empty `image`, `database.cnpg.imageName` or `highAvailability.valkey.image` (it would follow the operator's default); `replicas` > 1 or `autoscaling.horizontal.enabled` without `highAvailability.enabled` (also through the scale subresource); `minReplicas` > `maxReplicas`; type `External` without `external`, `external` without type `External`, and CNPG settings with `External` (except `imageName`, used by backup Jobs); `ingress.enabled` without a host (`ingress.host`, `server.domain`, `server.rootURL` or `gateway.hostnames`); Ingress and Gateway paths that Kubernetes or `HTTPPathMatch` refuse; `gateway.ssh` with SSH disabled; an issuer kind other than `Issuer`/`ClusterIssuer` for cert-manager's group; `nodePort` or `loadBalancerClass` on a Service type that ignores it; a `domain` or `rootURL` that is no host name or http(s) URL; an admin user name Forgejo refuses or reserves (e.g. `admin`); a `backup.schedule` that is no five-field cron expression or descriptor; `restoreFrom` set or changed after creation |
+| `ForgejoBackup` | any change of `spec` |
+| `ForgejoRestore` | any change of `spec`; neither or both of `backupName` and `remote`; `restoreDatabase` and `restoreData` both false |
+| `ForgejoRunner` | a name longer than 52 (pod label `controller-revision-hash=<name>-<hash>`) or with a `.` (pod host names); a missing `executor`; a changed `forgejoRef`; both `scope.organization` and `scope.repository`; labels of the other executor's form; `docker` settings with `Host` and `host.image` with `Docker` |
+
+`forgejoRef.name` of the other kinds must be a possible `Forgejo` name. Ports, percentages,
+durations and pull policies have their ranges, forms and enums.
 
 ## Remote backups and disaster recovery
 
@@ -273,7 +293,8 @@ know about the selectors:
 
 `rc.APIReader` reads live where a stale cache would be unsafe. CNPG credential rotations are
 watched through a separate metadata-only cache of Secrets labelled `cnpg.io/cluster`.
-`--watch-namespace` / `WATCH_NAMESPACE` restricts all caches to the given namespaces. The
+`--watch-namespace` / `WATCH_NAMESPACE` restricts all caches to the given namespaces; the overlay
+`config/namespaced` also restricts the permissions to them (see [permissions.md](permissions.md)). The
 manager runs with `GOMEMLIMIT` at ~90% of its memory limit (`config/manager/manager.yaml`).
 
 ## Forgejo versions
@@ -378,9 +399,10 @@ the `svc.<domain>` search entry of the operator pod's `/etc/resolv.conf`, else
 
 ## Network requirements
 
-Besides the Kubernetes API (including `pods/exec`, used to measure volumes, `metrics.k8s.io`
-for vertical sizing, and `namespaces` get for the Pod Security level of a `ForgejoRunner`'s
-namespace), the operator's pod must reach:
+Besides the Kubernetes API (including `pods/exec` where ClusterRole
+`forgejo-operator-volume-usage` is bound, used to measure volumes, `metrics.k8s.io` for vertical
+sizing, and `namespaces` get for the Pod Security level of a `ForgejoRunner`'s namespace; every
+permission is listed in [permissions.md](permissions.md)), the operator's pod must reach:
 
 - `<name>-http.<ns>.svc.<domain>:<spec.server.http.port>` (default 3000) for health, version
   and statistics probes. Self-healing depends on them. When NetworkPolicies or mesh mTLS
@@ -420,7 +442,9 @@ CNPG, prometheus-operator (ServiceMonitor/PrometheusRule), metrics-server, Gatew
 (HTTPRoute, TCPRoute, ReferenceGrant) and cert-manager (Certificate) are optional.
 Check `rc.HasAPI(gvk)` (or `rc.FirstAPI` for kinds served in several versions, such as TCPRoute
 `v1`/`v1alpha2`) before touching their objects, and use `unstructured.Unstructured`
-for their kinds, so the operator has no Go dependency on their modules.
+for their kinds, so the operator has no Go dependency on their modules. Their objects are written
+for whoever may edit a `Forgejo`; what that delegates (notably Certificates for any DNS name from
+any `ClusterIssuer`) is described in [networking.md](networking.md#permissions).
 
 The Gateway API and cert-manager objects are rendered from small typed mirrors with the CRDs'
 defaults filled in (`group`, `kind`, `weight`, the path match), so an unchanged object compares

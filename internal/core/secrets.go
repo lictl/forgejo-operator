@@ -33,17 +33,23 @@ const (
 // the volume, so data backups do not carry a digest that could be brute-forced on its own.
 const secretKeyAdminSyncSalt = "admin-sync-salt"
 
+// secretKeyPodDigestSalt in "<name>-secrets" keys the digests of secret values on the pod
+// template (podDigest), such as the object storage credentials' annotation, which anyone who
+// can read Deployments or Pods sees.
+const secretKeyPodDigestSalt = "pod-digest-salt"
+
 // ReconcileSecrets ensures "<name>-secrets" (SECRET_KEY, INTERNAL_TOKEN, JWT secrets,
 // metrics token) and the admin credentials secret exist. Never rotates existing values.
 func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	generators := map[string]func() (string, error){
-		forgejo.SecretKeySecretKey:     func() (string, error) { return randomBase64(32) },
+		forgejo.SecretKeySecretKey:     func() (string, error) { return randomBase64() },
 		forgejo.SecretKeyInternalToken: newInternalToken,
-		forgejo.SecretKeyJWTSecret:     func() (string, error) { return randomBase64(32) },
-		forgejo.SecretKeyLFSJWTSecret:  func() (string, error) { return randomBase64(32) },
+		forgejo.SecretKeyJWTSecret:     func() (string, error) { return randomBase64() },
+		forgejo.SecretKeyLFSJWTSecret:  func() (string, error) { return randomBase64() },
 		forgejo.SecretKeyMetricsToken:  func() (string, error) { return randomString(40) },
-		secretKeyAdminSyncSalt:         func() (string, error) { return randomBase64(32) },
+		secretKeyAdminSyncSalt:         func() (string, error) { return randomBase64() },
+		secretKeyPodDigestSalt:         func() (string, error) { return randomBase64() },
 	}
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace}}
 	if err := apply(ctx, rc, sec, rc.OwnerRefsEnabled(), func() error {
@@ -65,6 +71,8 @@ func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 	}); err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("secrets: %w", err)
 	}
+	// From the Secret as applied, so that a lagging cache cannot hand out another value.
+	rc.PodDigestSalt = string(sec.Data[secretKeyPodDigestSalt])
 
 	if err := ensureBackupKey(ctx, rc); err != nil {
 		return forgejo.StepResult{}, err
@@ -179,13 +187,13 @@ func ensureBackupKey(ctx context.Context, rc *forgejo.ReconcileContext) error {
 		return err
 	}
 	if lost != "" && f.Annotations[forgejo.AnnotationBackupKeyLost] != lost {
-		warnEvery(rc, "backup-key-missing", warnInterval, "BackupKeyMissing", "Backup",
+		warnEvery(rc, "backup-key-missing", "BackupKeyMissing", "Backup",
 			"Secret %s with the key of the remote backups (fingerprint %s) is missing, and no new key is generated: restore it "+
 				"from your copy, or set the annotation %s=%s on the Forgejo to start over with a new key (the backups "+
 				"encrypted with the lost one can then not be restored)", name, lost, forgejo.AnnotationBackupKeyLost, lost)
 		return nil
 	}
-	key, err := randomBase64(32)
+	key, err := randomBase64()
 	if err != nil {
 		return err
 	}

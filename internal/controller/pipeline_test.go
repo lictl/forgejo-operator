@@ -76,13 +76,13 @@ func TestPipelineAllSucceed(t *testing.T) {
 func TestPipelineIndependentStepsRunAfterError(t *testing.T) {
 	boom := errors.New("admission webhook denied the Ingress")
 	st, ran := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-		if name == "network" {
+		if name == stepNetwork {
 			return forgejo.StepResult{}, boom
 		}
 		return forgejo.StepResult{}, nil
 	})
 	p := runPipeline(context.Background(), newRC(), st)
-	for _, want := range []string{"scaling", "monitoring", stepBackupSchedule, "health", "autopilot"} {
+	for _, want := range []string{"scaling", stepMonitoring, stepBackupSchedule, stepHealth, stepAutopilot} {
 		if !slices.Contains(*ran, want) {
 			t.Errorf("%s did not run after the network step failed; ran %v", want, *ran)
 		}
@@ -96,15 +96,15 @@ func TestPipelineIndependentStepsRunAfterError(t *testing.T) {
 // backups or health.
 func TestPipelineValkeyStop(t *testing.T) {
 	st, ran := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-		if name == "high-availability" {
+		if name == stepHighAvailability {
 			return forgejo.StepResult{Stop: true, RequeueAfter: 5 * time.Second}, nil
 		}
 		return forgejo.StepResult{RequeueAfter: time.Minute}, nil
 	})
 	rc := newRC()
 	p := runPipeline(context.Background(), rc, st)
-	want := []string{stepMaintenance, stepRestoreGuard, stepRestoreIdentity, "secrets", stepBackupOwnership, "database", "high-availability",
-		"ssh-host-keys", stepObjectStorage, "network", "gateway", "tls", "monitoring", stepBackupSchedule, "health", stepStorageAutopilot}
+	want := []string{stepMaintenance, stepRestoreGuard, stepRestoreIdentity, stepSecrets, stepBackupOwnership, stepDatabase, stepHighAvailability,
+		stepSSHHostKeys, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepBackupSchedule, stepHealth, stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
 		t.Errorf("ran %v, want %v", *ran, want)
 	}
@@ -125,7 +125,7 @@ func TestPipelineInfersUpgradingWhenUpgradeSkipped(t *testing.T) {
 	var upgradingAtSchedule bool
 	st, ran := stubSteps(func(name string, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 		switch name {
-		case "database":
+		case stepDatabase:
 			return forgejo.StepResult{Stop: true}, nil
 		case stepBackupSchedule:
 			upgradingAtSchedule = rc.Upgrading
@@ -152,14 +152,14 @@ func TestPipelineInfersUpgradingWhenUpgradeSkipped(t *testing.T) {
 
 func TestPipelineConflictEndsPass(t *testing.T) {
 	st, ran := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-		if name == "config" {
+		if name == stepConfig {
 			return forgejo.StepResult{}, apierrors.NewConflict(schema.GroupResource{Resource: "secrets"}, "x", errors.New("stale"))
 		}
 		return forgejo.StepResult{}, nil
 	})
 	rc := newRC()
 	p := runPipeline(context.Background(), rc, st)
-	if !p.conflict || p.err() != nil || (*ran)[len(*ran)-1] != "config" || rc.RequeueAfter != time.Second {
+	if !p.conflict || p.err() != nil || (*ran)[len(*ran)-1] != stepConfig || rc.RequeueAfter != time.Second {
 		t.Errorf("conflict %v err %v ran %v requeue %v", p.conflict, p.err(), *ran, rc.RequeueAfter)
 	}
 }
@@ -173,7 +173,7 @@ func TestPipelineStorageAndOwnershipRunWhenDatabaseStops(t *testing.T) {
 		switch name {
 		case stepMaintenance:
 			rc.Maintenance = true
-		case "database":
+		case stepDatabase:
 			return forgejo.StepResult{Stop: true, RequeueAfter: 10 * time.Second}, nil
 		case stepStorageAutopilot:
 			maintenanceAtStorage = rc.Maintenance
@@ -186,7 +186,7 @@ func TestPipelineStorageAndOwnershipRunWhenDatabaseStops(t *testing.T) {
 			t.Errorf("%s did not complete while the database step waits; ran %v", want, *ran)
 		}
 	}
-	for _, skipped := range []string{"high-availability", "workload", "autopilot"} {
+	for _, skipped := range []string{stepHighAvailability, stepWorkload, stepAutopilot} {
 		if slices.Contains(*ran, skipped) {
 			t.Errorf("%s ran although the database step stopped", skipped)
 		}
@@ -208,7 +208,7 @@ func TestPipelineStepsWithoutNeedsRunAfterMaintenanceError(t *testing.T) {
 		return forgejo.StepResult{}, nil
 	})
 	runPipeline(context.Background(), newRC(), st)
-	want := []string{stepMaintenance, stepBackupOwnership, stepObjectStorage, "network", "gateway", "tls", "monitoring", stepStorageAutopilot}
+	want := []string{stepMaintenance, stepBackupOwnership, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
 		t.Errorf("ran %v, want %v", *ran, want)
 	}
@@ -223,7 +223,7 @@ func TestStepTableWiring(t *testing.T) {
 		byName[s.name] = s
 		order[s.name] = i
 	}
-	for _, name := range []string{stepBackupOwnership, stepStorageAutopilot, stepObjectStorage, "network", "gateway", "tls", "monitoring", stepMaintenance} {
+	for _, name := range []string{stepBackupOwnership, stepStorageAutopilot, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepMaintenance} {
 		s, ok := byName[name]
 		if !ok {
 			t.Fatalf("step %q missing", name)
@@ -244,7 +244,7 @@ func TestStepTableWiring(t *testing.T) {
 	if !slices.Equal(byName["secrets"].needs, []string{stepRestoreIdentity}) || order[stepRestoreIdentity] > order["secrets"] {
 		t.Errorf("secrets must need %s (needs %v)", stepRestoreIdentity, byName["secrets"].needs)
 	}
-	if !slices.Equal(byName[stepRestoreFrom].needs, []string{"storage"}) {
+	if !slices.Equal(byName[stepRestoreFrom].needs, []string{stepStorage}) {
 		t.Errorf("%s needs %v, want storage", stepRestoreFrom, byName[stepRestoreFrom].needs)
 	}
 	if order[stepStorageAutopilot] != len(steps)-1 {
@@ -256,7 +256,7 @@ func TestStepTableWiring(t *testing.T) {
 	for name, want := range map[string]string{
 		stepBackupOwnership:  "internal/backup.ReconcileOwnership",
 		stepStorageAutopilot: "internal/autopilot.ReconcileStorage",
-		"storage":            "internal/core.ReconcileStorage",
+		stepStorage:          "internal/core.ReconcileStorage",
 		stepObjectStorage:    "internal/core.ReconcileObjectStorage",
 		stepRestoreIdentity:  "internal/backup.ReconcileRestoreIdentity",
 		stepRestoreFrom:      "internal/backup.ReconcileBootstrap",

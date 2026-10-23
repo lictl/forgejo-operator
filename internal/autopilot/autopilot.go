@@ -203,9 +203,12 @@ func clearDegraded(rc *forgejo.ReconcileContext, reasons ...string) {
 	}
 }
 
-// warnEvery emits a Warning event at most once per interval for the given key.
-func warnEvery(rc *forgejo.ReconcileContext, st *instanceState, key string, every time.Duration, reason, note string, args ...any) {
-	if st.allow(key, every) {
+// warnInterval is how often a persisting problem is repeated as a Warning event.
+const warnInterval = time.Hour
+
+// warnEvery emits a Warning event at most once per warnInterval for the given key.
+func warnEvery(rc *forgejo.ReconcileContext, st *instanceState, key, reason, note string, args ...any) {
+	if st.allow(key, warnInterval) {
 		rc.Event(corev1.EventTypeWarning, reason, "AutoPilot", note, args...)
 	}
 }

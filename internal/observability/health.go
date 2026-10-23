@@ -33,6 +33,14 @@ import (
 )
 
 const (
+	statUsers         = "users"
+	statOrganizations = "organizations"
+	statRepositories  = "repositories"
+	statIssues        = "issues"
+	statusPass        = "pass"
+)
+
+const (
 	defaultHealthInterval = 30 * time.Second
 	defaultStatsInterval  = 5 * time.Minute
 	// dialTimeout bounds DNS resolution plus the TCP connect. A blackholed Service
@@ -96,10 +104,10 @@ func newProbeClient(dial, header time.Duration) *http.Client {
 
 // statsMetrics maps Forgejo metric names to the "kind" label of forgejo_operator_stats.
 var statsMetrics = map[string]string{
-	"gitea_users":         "users",
-	"gitea_organizations": "organizations",
-	"gitea_repositories":  "repositories",
-	"gitea_issues":        "issues",
+	"gitea_users":         statUsers,
+	"gitea_organizations": statOrganizations,
+	"gitea_repositories":  statRepositories,
+	"gitea_issues":        statIssues,
 }
 
 // ReconcileHealth probes /api/healthz and /api/v1/version and samples statistics into
@@ -178,7 +186,9 @@ func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	if v, err := fetchVersion(ctx, base); err != nil {
 		logf.FromContext(ctx).Info("reading Forgejo version failed", "error", err.Error())
 	} else if v != f.Status.Version {
-		rc.Event(corev1.EventTypeNormal, "VersionDetected", "HealthCheck", "Forgejo reports version %s", v)
+		if newVersionFor(f, v) {
+			rc.Event(corev1.EventTypeNormal, "VersionDetected", "HealthCheck", "Forgejo reports version %s", v)
+		}
 		f.Status.Version = v
 	}
 
@@ -186,6 +196,35 @@ func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		startStatsSample(ctx, rc, base, now)
 	}
 	return forgejo.StepResult{}, nil
+}
+
+// detectedVersions remembers, per instance, the versions Forgejo reported for its current
+// status.image in this process.
+var detectedVersions sync.Map // types.NamespacedName -> detected
+
+type detected struct {
+	uid, image string
+	versions   []string
+}
+
+// newVersionFor reports whether version has not been reported before for the instance's
+// status.image in this process, and records it. status.version follows every probe, but the
+// probe goes through the Service: with a floating tag, nodes that pulled different patch
+// releases make it alternate, and VersionDetected is not repeated for every switch.
+func newVersionFor(f *forgejov1.Forgejo, version string) bool {
+	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
+	d := detected{uid: string(f.UID), image: f.Status.Image}
+	if v, ok := detectedVersions.Load(key); ok {
+		if prev := v.(detected); prev.uid == d.uid && prev.image == d.image {
+			if slices.Contains(prev.versions, version) {
+				return false
+			}
+			d.versions = slices.Clone(prev.versions)
+		}
+	}
+	d.versions = append(d.versions, version)
+	detectedVersions.Store(key, d)
+	return true
 }
 
 // lastProbe remembers when each instance was last probed by this process. The informer
@@ -202,6 +241,7 @@ func ForgetInstance(namespace, name string) {
 	lastProbe.Delete(key)
 	statsSamplers.Delete(key)
 	monitoringWarned.Delete(key)
+	detectedVersions.Delete(key)
 }
 
 // servingPods counts the instance's Ready pods that are not terminating, i.e. the pods
@@ -245,7 +285,7 @@ func skipHealth(rc *forgejo.ReconcileContext, reason, msg string) {
 	if lastProbeFailed(h) {
 		var bad []string
 		for _, name := range slices.Sorted(maps.Keys(h.Checks)) {
-			if st := h.Checks[name]; st != "pass" {
+			if st := h.Checks[name]; st != statusPass {
 				bad = append(bad, name+"="+st)
 			}
 		}
@@ -367,7 +407,7 @@ type healthzResponse struct {
 	} `json:"checks"`
 }
 
-var statusRank = map[string]int{"pass": 0, "warn": 1, "fail": 2}
+var statusRank = map[string]int{statusPass: 0, "warn": 1, "fail": 2}
 
 // intermediaryStatus are codes that a proxy (service-mesh sidecar, authorization policy)
 // returns when it does not let a request through to Forgejo. Combined with a body that is
@@ -423,7 +463,7 @@ func probeHealthz(ctx context.Context, base string) healthResult {
 	res := healthResult{checks: map[string]string{}}
 	var problems []string
 	for _, name := range slices.Sorted(maps.Keys(hz.Checks)) {
-		worst := "pass"
+		worst := statusPass
 		var outputs []string
 		for _, c := range hz.Checks[name] {
 			if statusRank[c.Status] > statusRank[worst] {
@@ -434,7 +474,7 @@ func probeHealthz(ctx context.Context, base string) healthResult {
 			}
 		}
 		res.checks[name] = worst
-		if worst != "pass" {
+		if worst != statusPass {
 			p := name + "=" + worst
 			if len(outputs) > 0 {
 				p += " (" + strings.Join(outputs, "; ") + ")"
@@ -443,7 +483,7 @@ func probeHealthz(ctx context.Context, base string) healthResult {
 		}
 	}
 
-	res.healthy = code == http.StatusOK && (hz.Status == "pass" || hz.Status == "warn")
+	res.healthy = code == http.StatusOK && (hz.Status == statusPass || hz.Status == "warn")
 	switch {
 	case len(problems) > 0:
 		res.message = fmt.Sprintf("status %s: %s", hz.Status, strings.Join(problems, ", "))
@@ -716,8 +756,8 @@ func publishStats(f *forgejov1.Forgejo) {
 		return
 	}
 	for kind, v := range map[string]int64{
-		"users": s.Users, "organizations": s.Organizations, "repositories": s.Repositories,
-		"issues": s.Issues,
+		statUsers: s.Users, statOrganizations: s.Organizations, statRepositories: s.Repositories,
+		statIssues: s.Issues,
 	} {
 		forgejo.Stats.WithLabelValues(f.Namespace, f.Name, kind).Set(float64(v))
 	}

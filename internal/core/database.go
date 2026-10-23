@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -101,7 +101,7 @@ func reconcileExternalDB(ctx context.Context, rc *forgejo.ReconcileContext) (for
 			"if Forgejo pods can reach the database, allow the operator's namespace in the database's "+
 			"NetworkPolicy or firewall as well", net.JoinHostPort(db.Host, port), strings.Join(errs, "; "))
 		rc.SetCondition(forgejov1.ConditionDatabaseReady, metav1.ConditionFalse, reasonUnreachableFromOperator, msg)
-		warnEvery(rc, "external-db-unreachable", warnInterval, "DatabaseUnreachable", "Database", "%s", msg)
+		warnEvery(rc, "external-db-unreachable", "DatabaseUnreachable", "Database", "%s", msg)
 		return forgejo.StepResult{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -325,7 +325,7 @@ func mergePGParameters(c *unstructured.Unstructured, want map[string]string) err
 		params[k] = v
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	if len(keys) > 0 {
 		annotations = mergeMaps(annotations, map[string]string{annotationManagedPGParams: strings.Join(keys, ",")})
 	} else {

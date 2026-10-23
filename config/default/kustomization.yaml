@@ -27,6 +27,13 @@ resources:
 #- ../prometheus
 # [METRICS] Expose the controller manager metrics service.
 - metrics_service.yaml
+
+# [VOLUME-USAGE] Binds ClusterRole volume-usage (pods/exec, cluster-wide) so that the operator
+# can measure volumes (df/du) and expand them automatically. Without this line volumes are
+# not measured (StorageHealthy=Unknown/MeasurementUnavailable); bind the ClusterRole with a
+# RoleBinding in the namespaces that want it instead. See docs/permissions.md.
+components:
+- ../components/volume-usage
 # [NETWORK POLICY] Protect the /metrics endpoint and Webhook Server with NetworkPolicy.
 # Only Pod(s) running a namespace labeled with 'metrics: enabled' will be able to gather the metrics.
 # Only CR(s) which requires webhooks and are applied on namespaces labeled with 'webhooks: enabled' will

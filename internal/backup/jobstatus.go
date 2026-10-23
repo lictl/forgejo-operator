@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -55,8 +55,8 @@ func JobPodsByName(ctx context.Context, c client.Client, namespace, name string)
 		client.MatchingLabels{batchv1.JobNameLabel: name}); err != nil {
 		return nil, err
 	}
-	sort.Slice(pods.Items, func(i, j int) bool {
-		return pods.Items[j].CreationTimestamp.Before(&pods.Items[i].CreationTimestamp)
+	slices.SortStableFunc(pods.Items, func(a, b corev1.Pod) int {
+		return b.CreationTimestamp.Compare(a.CreationTimestamp.Time)
 	})
 	return pods.Items, nil
 }

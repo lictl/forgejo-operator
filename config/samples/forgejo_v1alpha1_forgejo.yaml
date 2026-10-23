@@ -14,7 +14,7 @@ spec:
   # The current Forgejo LTS release (the default); docs/versions.md lists the supported ones.
   image: codeberg.org/forgejo/forgejo:15
   # More than one replica requires highAvailability.enabled (Valkey for cache, sessions and
-  # queues); without it the operator runs a single pod and reports Degraded/ReplicasRequireHA.
+  # queues); the API server refuses replicas > 1 without it.
   replicas: 1
   server:
     appName: Forgejo

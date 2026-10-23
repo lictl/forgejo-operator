@@ -2,6 +2,8 @@ package upgrade
 
 import (
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,7 +63,9 @@ func ReportVersionSupport(rc *forgejo.ReconcileContext, now time.Time) {
 		case s.Level == forgejo.SupportDeprecated || s.Level == forgejo.SupportEndOfLife || s.Level == forgejo.SupportFuture:
 			rc.Event(corev1.EventTypeWarning, reasonUnsupportedVersion, eventAction, "%s", msg)
 		case s.Advisory != nil:
-			rc.Event(corev1.EventTypeWarning, reasonVersionAdvisory, eventAction, "%s", msg)
+			if adviseOnce(f, image, s.Version, now) {
+				rc.Event(corev1.EventTypeWarning, reasonVersionAdvisory, eventAction, "%s", msg)
+			}
 		case s.Level == forgejo.SupportSupported && prev != nil && prev.Status == metav1.ConditionFalse:
 			rc.Event(corev1.EventTypeNormal, reasonSupportedVersion, eventAction, "%s", msg)
 		}
@@ -81,6 +85,7 @@ func exportSupport(f *forgejov1.Forgejo, s forgejo.Support) {
 	l := prometheus.Labels{"namespace": f.Namespace, "name": f.Name}
 	forgejo.VersionSupported.DeletePartialMatch(l)
 	forgejo.VersionEndOfLife.DeletePartialMatch(l)
+	forgejo.VersionAdvisory.DeletePartialMatch(l)
 	major := ""
 	if s.Version.Major >= 0 {
 		major = strconv.Itoa(s.Version.Major)
@@ -93,4 +98,53 @@ func exportSupport(f *forgejov1.Forgejo, s forgejo.Support) {
 	if s.Release != nil {
 		forgejo.VersionEndOfLife.WithLabelValues(f.Namespace, f.Name, major).Set(float64(s.Release.EOL.Unix()))
 	}
+	if major != "" {
+		advisory := 0.0
+		if s.Advisory != nil {
+			advisory = 1
+		}
+		forgejo.VersionAdvisory.WithLabelValues(f.Namespace, f.Name, major).Set(advisory)
+	}
+}
+
+// advisoryRepeat is how long the VersionAdvisory event for the same image and patch release
+// is not repeated.
+const advisoryRepeat = 24 * time.Hour
+
+// advised is the last VersionAdvisory event of an instance.
+type advised struct {
+	image, version string
+	at             time.Time
+}
+
+// advisories maps "<namespace>/<name>/<uid>" to the instance's last advised. It lives only in
+// memory: after an operator restart an advisory that persists is reported once more.
+var advisories sync.Map
+
+// adviseOnce reports whether the VersionAdvisory event for version on image is due: it was
+// not emitted for that pair in this process, or not within advisoryRepeat. The condition
+// follows every probe, but a floating tag served by nodes that hold different patch releases
+// makes status.version (and with it the advisory text) alternate; the event is not repeated
+// for every switch back.
+func adviseOnce(f *forgejov1.Forgejo, image string, version forgejo.Version, now time.Time) bool {
+	key := f.Namespace + "/" + f.Name + "/" + string(f.UID)
+	cur := advised{image: image, version: version.String(), at: now}
+	if v, ok := advisories.Load(key); ok {
+		if prev := v.(advised); prev.image == cur.image && prev.version == cur.version && now.Sub(prev.at) < advisoryRepeat {
+			return false
+		}
+	}
+	advisories.Store(key, cur)
+	return true
+}
+
+// ForgetInstance drops the in-memory bookkeeping of a deleted instance.
+func ForgetInstance(namespace, name string) {
+	prefix := namespace + "/" + name + "/"
+	advisories.Range(func(k, _ any) bool {
+		if strings.HasPrefix(k.(string), prefix) {
+			advisories.Delete(k)
+		}
+		return true
+	})
 }

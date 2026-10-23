@@ -20,6 +20,12 @@ import (
 )
 
 const (
+	envBackupDir = "BACKUP_DIR"
+	tmpPath      = "/tmp"
+	jsonNull     = "null"
+)
+
+const (
 	volBackups     = "backups"
 	volData        = "data"
 	volTmp         = "tmp"
@@ -73,11 +79,11 @@ func BackupJob(in JobInput, b *forgejov1.ForgejoBackup, includeData bool, starte
 	dir := BackupDir(b.Name)
 	env := []corev1.EnvVar{
 		{Name: "BACKUP_NAME", Value: b.Name},
-		{Name: "BACKUP_DIR", Value: dir},
+		{Name: envBackupDir, Value: dir},
 	}
 	mounts := []corev1.VolumeMount{
 		{Name: volBackups, MountPath: BackupMountPath},
-		{Name: volTmp, MountPath: "/tmp"},
+		{Name: volTmp, MountPath: tmpPath},
 	}
 	excludes, _ := json.Marshal(DataExcludes)
 
@@ -127,7 +133,7 @@ func BackupJob(in JobInput, b *forgejov1.ForgejoBackup, includeData bool, starte
 // data volume, so not in the data archive.
 func objectStorageManifest(f *forgejov1.Forgejo) string {
 	if f == nil || !forgejo.ObjectStorageEnabled(f) {
-		return "null"
+		return jsonNull
 	}
 	c := f.Spec.ObjectStorage.S3
 	b, err := json.Marshal(map[string]any{
@@ -137,7 +143,7 @@ func objectStorageManifest(f *forgejov1.Forgejo) string {
 		"subsystems": forgejo.ObjectStorageSubsystemNames(f),
 	})
 	if err != nil {
-		return "null"
+		return jsonNull
 	}
 	return string(b)
 }
@@ -146,7 +152,7 @@ func objectStorageManifest(f *forgejov1.Forgejo) string {
 func CleanupJob(in JobInput, b *forgejov1.ForgejoBackup) (*batchv1.Job, error) {
 	c := container(ContainerCleanup, in.ForgejoImage, cleanupScript,
 		[]corev1.VolumeMount{{Name: volBackups, MountPath: BackupMountPath}},
-		[]corev1.EnvVar{{Name: "BACKUP_DIR", Value: BackupDir(b.Name)}})
+		[]corev1.EnvVar{{Name: envBackupDir, Value: BackupDir(b.Name)}})
 	job := newJob(in, b.Namespace, CleanupJobName(b), forgejo.ComponentBackup, in.Affinity,
 		[]corev1.Volume{backupVolume(in.BackupPVC, false)}, nil, c)
 	return job, controllerutil.SetControllerReference(b, job, in.Scheme)
@@ -161,7 +167,7 @@ func RestoreJob(in JobInput, r *forgejov1.ForgejoRestore, b *forgejov1.ForgejoBa
 		volumes: []corev1.Volume{backupVolume(b.Status.PVCName, true)},
 		mounts: []corev1.VolumeMount{
 			{Name: volBackups, MountPath: BackupMountPath, ReadOnly: true},
-			{Name: volTmp, MountPath: "/tmp"},
+			{Name: volTmp, MountPath: tmpPath},
 		},
 	}, restoreDB, restoreData)
 }
@@ -179,7 +185,7 @@ type restoreSteps struct {
 
 func restoreJob(in JobInput, r *forgejov1.ForgejoRestore, src restoreSteps, restoreDB, restoreData bool) (*batchv1.Job, error) {
 	env := []corev1.EnvVar{
-		{Name: "BACKUP_DIR", Value: src.dir},
+		{Name: envBackupDir, Value: src.dir},
 		{Name: "RESTORE_DATABASE", Value: strconv.FormatBool(restoreDB)},
 		{Name: "RESTORE_DATA", Value: strconv.FormatBool(restoreData)},
 	}
@@ -283,7 +289,7 @@ func container(name, image, script string, mounts []corev1.VolumeMount, env []co
 		Name:                     name,
 		Image:                    image,
 		Command:                  []string{"/bin/sh", "-c", script},
-		Env:                      append(append([]corev1.EnvVar{}, env...), corev1.EnvVar{Name: "HOME", Value: "/tmp"}),
+		Env:                      append(append([]corev1.EnvVar{}, env...), corev1.EnvVar{Name: "HOME", Value: tmpPath}),
 		VolumeMounts:             mounts,
 		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{

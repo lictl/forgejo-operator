@@ -26,6 +26,8 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const testNewImage = "new"
+
 func owned(t *testing.T, f *forgejov1.Forgejo, obj client.Object) client.Object {
 	t.Helper()
 	if err := controllerutil.SetControllerReference(f, obj, testScheme(t)); err != nil {
@@ -101,7 +103,7 @@ func TestHPAWaitsForFirstRolloutAndMigrations(t *testing.T) {
 		"upgrading":         func(rc *forgejo.ReconcileContext) { rc.Upgrading = true },
 		"failed upgrade holds the workload": func(rc *forgejo.ReconcileContext) {
 			rc.Instance.Status.Upgrade = &forgejov1.UpgradeStatus{
-				Phase: forgejov1.UpgradePhaseFailed, RolloutStartTime: &now, ToImage: "new", FailedImage: "new",
+				Phase: forgejov1.UpgradePhaseFailed, RolloutStartTime: &now, ToImage: testNewImage, FailedImage: testNewImage,
 			}
 		},
 	}
@@ -164,14 +166,14 @@ func valkeyObjects(t *testing.T, f *forgejov1.Forgejo) []client.Object {
 	}
 }
 
-func lkgSecret(f *forgejov1.Forgejo, hash string, redis bool) *corev1.Secret {
+func lkgSecret(f *forgejov1.Forgejo, redis bool) *corev1.Secret {
 	ini := "[cache]\nADAPTER = memory\n"
 	if redis {
 		ini = "[cache]\nADAPTER = redis\nHOST = redis://:pw@" + forgejo.ValkeyName(f) + "." + f.Namespace + ".svc.cluster.local:6379/0\n"
 	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: forgejo.LKGConfigSecretName(f), Namespace: f.Namespace,
-			Annotations: map[string]string{forgejo.AnnotationConfigHash: hash}},
+			Annotations: map[string]string{forgejo.AnnotationConfigHash: testOldHash}},
 		Data: map[string][]byte{forgejo.ConfigSecretKey: []byte(ini)},
 	}
 }
@@ -198,7 +200,7 @@ func TestValkeyKeptWhileRedisConfigMayRun(t *testing.T) {
 			}
 			dep := testDeployment(f, 1)
 			dep.Spec.Template.Annotations[forgejo.AnnotationConfigHash] = deployed
-			objs := append(valkeyObjects(t, f), dep, lkgSecret(f, testOldHash, tc.lkgRedis), readyPod(f, "fj-a", deployed, time.Hour))
+			objs := append(valkeyObjects(t, f), dep, lkgSecret(f, tc.lkgRedis), readyPod(f, "fj-a", deployed, time.Hour))
 			env := newTestEnv(t, f, objs...)
 			env.rc.ConfigHash = deployed
 			pods, _ := serverPods(ctx, env.rc)
@@ -218,7 +220,7 @@ func TestConfigGuardDeclinesValkeyLKGWithoutValkey(t *testing.T) {
 	f := testInstance()
 	f.Spec.AutoPilot.SelfHealing.Enabled = ptr.To(true)
 	f.Status.AutoPilot = &forgejov1.AutoPilotStatus{LastKnownGoodConfigHash: testOldHash, RejectedConfigHash: testHash}
-	env := newTestEnv(t, f, lkgSecret(f, testOldHash, true))
+	env := newTestEnv(t, f, lkgSecret(f, true))
 	env.rc.ConfigSecretName = forgejo.ConfigSecretName(f)
 	if _, err := ReconcileConfigGuard(context.Background(), env.rc); err != nil {
 		t.Fatal(err)
@@ -252,7 +254,7 @@ func TestConfigGuardMatchesLKGProfile(t *testing.T) {
 		return env, f
 	}
 
-	env, _ := guard("codeberg.org/forgejo/forgejo:17", lkgSecret(testInstance(), testOldHash, false))
+	env, _ := guard("codeberg.org/forgejo/forgejo:17", lkgSecret(testInstance(), false))
 	if env.rc.ConfigSecretName != forgejo.LKGConfigSecretName(testInstance()) || env.rc.ConfigHash != testOldHash {
 		t.Fatalf("legacy LKG not used for 17: %s %s %q", env.rc.ConfigSecretName, env.rc.ConfigHash, env.events())
 	}
@@ -260,12 +262,12 @@ func TestConfigGuardMatchesLKGProfile(t *testing.T) {
 	old := forgejo.Versions
 	forgejo.Versions = old.WithVerified(18)
 	t.Cleanup(func() { forgejo.Versions = old })
-	env, f := guard("codeberg.org/forgejo/forgejo:18", lkgSecret(testInstance(), testOldHash, false))
+	env, f := guard("codeberg.org/forgejo/forgejo:18", lkgSecret(testInstance(), false))
 	if env.rc.ConfigSecretName != forgejo.ConfigSecretName(f) || f.Status.AutoPilot.RejectedConfigHash != "" ||
 		!strings.Contains(strings.Join(env.events(), "\n"), "rendered for another Forgejo version") {
 		t.Fatalf("legacy LKG used for 18: %s", env.rc.ConfigSecretName)
 	}
-	socketLKG := lkgSecret(testInstance(), testOldHash, false)
+	socketLKG := lkgSecret(testInstance(), false)
 	socketLKG.Annotations[forgejo.AnnotationConfigProfile] = socketProfile
 	if env, f := guard("codeberg.org/forgejo/forgejo:17", socketLKG); env.rc.ConfigSecretName != forgejo.ConfigSecretName(f) {
 		t.Fatal("an LKG without INTERNAL_TOKEN used for 17")
@@ -303,7 +305,7 @@ func TestLastKnownGoodMarksValkeyConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	lkg := &corev1.Secret{}
-	if !found(t, env.rc.Client, f, forgejo.LKGConfigSecretName(f), lkg) || lkg.Annotations[annotationUsesValkey] != "true" {
+	if !found(t, env.rc.Client, f, forgejo.LKGConfigSecretName(f), lkg) || lkg.Annotations[annotationUsesValkey] != valueTrue {
 		t.Fatalf("LKG not marked as using Valkey: %+v", lkg.Annotations)
 	}
 }
@@ -330,7 +332,7 @@ func TestPodFailureCountsOnlyCurrentFailures(t *testing.T) {
 	q.Status.Conditions[0].Status = corev1.ConditionFalse
 	q.Status.ContainerStatuses[0] = corev1.ContainerStatus{
 		Name: serverContainerName, RestartCount: 3,
-		State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+		State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonCrashLoopBackOff}},
 		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, FinishedAt: tenMinAgo}},
 	}
 	if got := podFailure(q, time.Now().Add(-5*time.Minute)); got != "" {
@@ -408,7 +410,7 @@ func oomPod(f *forgejov1.Forgejo, res corev1.ResourceRequirements) *corev1.Pod {
 	p.Spec.Containers = []corev1.Container{{Name: serverContainerName, Resources: res}}
 	p.Status.ContainerStatuses[0].RestartCount = 1
 	p.Status.ContainerStatuses[0].LastTerminationState = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-		Reason: "OOMKilled", ExitCode: 137, FinishedAt: metav1.NewTime(time.Now().Add(-time.Second)),
+		Reason: reasonOOMKilled, ExitCode: 137, FinishedAt: metav1.NewTime(time.Now().Add(-time.Second)),
 	}}
 	return p
 }
@@ -521,9 +523,9 @@ func dataPVC(f *forgejov1.Forgejo, request, capacity string) *corev1.PersistentV
 
 func mountingPod(f *forgejov1.Forgejo) *corev1.Pod {
 	p := readyPod(f, "fj-data", testHash, time.Hour)
-	p.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
+	p.Spec.Volumes = []corev1.Volume{{Name: volData, VolumeSource: corev1.VolumeSource{
 		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: forgejo.DataPVCName(f)}}}}
-	p.Spec.Containers = []corev1.Container{{Name: serverContainerName, VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}}}
+	p.Spec.Containers = []corev1.Container{{Name: serverContainerName, VolumeMounts: []corev1.VolumeMount{{Name: volData, MountPath: "/data"}}}}
 	return p
 }
 
@@ -730,7 +732,7 @@ func TestFailedUpgradeHoldStopsAutonomousChanges(t *testing.T) {
 		p.Status.Conditions[0].Status = corev1.ConditionFalse
 		p.Status.InitContainerStatuses = []corev1.ContainerStatus{{
 			Name: "bootstrap", RestartCount: 5,
-			State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+			State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonCrashLoopBackOff}},
 			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, FinishedAt: now}},
 		}}
 		return p
@@ -744,13 +746,13 @@ func TestFailedUpgradeHoldStopsAutonomousChanges(t *testing.T) {
 			ctx := context.Background()
 			f := verticalInstance()
 			f.Status.Image = "old"
-			f.Status.Upgrade = &forgejov1.UpgradeStatus{Phase: forgejov1.UpgradePhaseFailed, RolloutStartTime: &now, ToImage: "new", FailedImage: "new"}
-			f.Status.Health = &forgejov1.HealthStatus{ConsecutiveFailures: 9, Checks: map[string]string{"database": "fail"}}
+			f.Status.Upgrade = &forgejov1.UpgradeStatus{Phase: forgejov1.UpgradePhaseFailed, RolloutStartTime: &now, ToImage: testNewImage, FailedImage: testNewImage}
+			f.Status.Health = &forgejov1.HealthStatus{ConsecutiveFailures: 9, Checks: map[string]string{testCheckDatabase: testCheckFail}}
 			f.Status.AutoPilot = &forgejov1.AutoPilotStatus{LastKnownGoodConfigHash: testOldHash}
 			meta.SetStatusCondition(&f.Status.Conditions, metav1.Condition{Type: forgejov1.ConditionDatabaseReady, Status: metav1.ConditionTrue,
 				Reason: "OK", LastTransitionTime: metav1.NewTime(time.Now().Add(-time.Hour))})
 			dep := testDeployment(f, 1)
-			env := newTestEnv(t, f, dep, lkgSecret(f, testOldHash, false), pod(f))
+			env := newTestEnv(t, f, dep, lkgSecret(f, false), pod(f))
 			if !workloadHeld(env.rc) {
 				t.Fatal("fixture does not hold the workload")
 			}
@@ -803,11 +805,11 @@ func TestConfigRollbackWaitsForObjectStorage(t *testing.T) {
 			p.Status.Conditions[0].Status = corev1.ConditionFalse
 			p.Status.ContainerStatuses[0] = corev1.ContainerStatus{
 				Name: serverContainerName, RestartCount: 3,
-				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonCrashLoopBackOff}},
 				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1,
 					FinishedAt: metav1.NewTime(time.Now().Add(-30 * time.Second))}},
 			}
-			env := newTestEnv(t, f, lkgSecret(f, testOldHash, false), p)
+			env := newTestEnv(t, f, lkgSecret(f, false), p)
 			env.rc.ObjectStorageUnavailable = tc.unavailable
 			if replacementsHeld(env.rc) != tc.unavailable {
 				t.Fatalf("replacementsHeld = %v", !tc.unavailable)

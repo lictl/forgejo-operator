@@ -23,7 +23,7 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// +kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
+// +kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=list
 
 const (
 	oomGrowthPercent = 50
@@ -242,29 +242,12 @@ func handleOOM(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceSt
 	curLimit, curReq := cur.Limits.Memory(), cur.Requests.Memory()
 	since := lastAction(f, ActionResourcesScaled)
 
-	var victim, container string
-	for i := range pods {
-		p := &pods[i]
-		for _, cs := range append(append([]corev1.ContainerStatus{}, p.Status.InitContainerStatuses...), p.Status.ContainerStatuses...) {
-			t := cs.LastTerminationState.Terminated
-			if cs.State.Terminated != nil {
-				t = cs.State.Terminated
-			}
-			if t == nil || t.Reason != "OOMKilled" || !t.FinishedAt.After(since) {
-				continue
-			}
-			// Pods still running an older, smaller limit were already handled.
-			if spec := podContainer(p, cs.Name); spec == nil || !spec.Resources.Limits.Memory().Equal(*curLimit) {
-				continue
-			}
-			victim, container = p.Name, cs.Name
-		}
-	}
+	victim, container := oomVictim(pods, curLimit, since)
 	if victim == "" {
 		return false, false
 	}
 	if curLimit.IsZero() && curReq.IsZero() {
-		warnEvery(rc, st, "oom-unbounded", time.Hour, "OOMWithoutResources", "container %s of pod %s was OOM-killed but has no memory request or limit to raise", container, victim)
+		warnEvery(rc, st, "oom-unbounded", "OOMWithoutResources", "container %s of pod %s was OOM-killed but has no memory request or limit to raise", container, victim)
 		return true, false
 	}
 
@@ -311,7 +294,7 @@ func handleOOM(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceSt
 		if !strings.Contains(why, "maxAllowed") && !strings.Contains(why, "default ceiling") {
 			reason = "OOMAtNodeCapacity"
 		}
-		warnEvery(rc, st, "oom-max", time.Hour, reason,
+		warnEvery(rc, st, "oom-max", reason,
 			"container %s of pod %s was OOM-killed with memory limit %s, request %s; not raised further: capped by %s",
 			container, victim, curLimit.String(), curReq.String(), why)
 		return true, false
@@ -324,6 +307,29 @@ func handleOOM(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceSt
 		container, victim, curLimit.String(), next.Limits.Memory().String(), curReq.String(), next.Requests.Memory().String()))
 	rc.Requeue(time.Second)
 	return true, true
+}
+
+// oomVictim returns the pod and container of the last OOM kill after since in a pod that runs
+// the current memory limit, or empty strings when there is none. Pods still running an older,
+// smaller limit were already handled.
+func oomVictim(pods []corev1.Pod, curLimit *resource.Quantity, since time.Time) (victim, container string) {
+	for i := range pods {
+		p := &pods[i]
+		for _, cs := range append(append([]corev1.ContainerStatus{}, p.Status.InitContainerStatuses...), p.Status.ContainerStatuses...) {
+			t := cs.LastTerminationState.Terminated
+			if cs.State.Terminated != nil {
+				t = cs.State.Terminated
+			}
+			if t == nil || t.Reason != reasonOOMKilled || !t.FinishedAt.After(since) {
+				continue
+			}
+			if spec := podContainer(p, cs.Name); spec == nil || !spec.Resources.Limits.Memory().Equal(*curLimit) {
+				continue
+			}
+			victim, container = p.Name, cs.Name
+		}
+	}
+	return victim, container
 }
 
 // revertUnschedulable undoes the last resource change when a server pod that requests the
@@ -365,7 +371,7 @@ func revertUnschedulable(rc *forgejo.ReconcileContext, st *instanceState, pods [
 	}
 	targetReq := memoryRequest(&targetRes)
 	if targetReq >= curReq {
-		warnEvery(rc, st, "unschedulable", time.Hour, "ResourcesUnschedulable",
+		warnEvery(rc, st, "unschedulable", "ResourcesUnschedulable",
 			"pod %s cannot be scheduled (%s) and no smaller memory request is known to revert to; lower spec.resources or autoscaling.vertical.maxAllowed",
 			stuck.Name, msg)
 		return false
@@ -375,7 +381,7 @@ func revertUnschedulable(rc *forgejo.ReconcileContext, st *instanceState, pods [
 	text := fmt.Sprintf("pod %s requesting %s of memory could not be scheduled for %s (%s); reverted to %s",
 		stuck.Name, resource.NewQuantity(curReq, resource.BinarySI).String(), unschedulableAfter, msg, describeResources(&targetRes))
 	rc.RecordAutoPilotAction(ActionResourcesScaled, text)
-	warnEvery(rc, st, "unschedulable", time.Hour, "ResourcesUnschedulable", "%s", text)
+	warnEvery(rc, st, "unschedulable", "ResourcesUnschedulable", "%s", text)
 	rc.Requeue(time.Second)
 	return true
 }

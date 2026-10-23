@@ -13,12 +13,22 @@ import (
 	"testing"
 )
 
+const (
+	testLabelHost   = "host"
+	testKeyStatus   = "status"
+	testKeyOwnerID  = "owner_id"
+	testOrg         = "acme"
+	testRepo        = "acme/app"
+	testLabelDocker = "docker"
+)
+
 // fakeForgejo serves the runner endpoints of Forgejo's API (15 and 17) for user admin:pw. It
 // caps pages at maxItems, as [api] MAX_RESPONSE_ITEMS does.
 type fakeForgejo struct {
 	mu       sync.Mutex
 	runners  []APIRunner
 	jobs     map[string][]map[string]any // by path
+	users    map[string]int64            // user and organization ids by name
 	maxItems int
 	visible  []string
 	deleted  []int64
@@ -78,6 +88,13 @@ func (f *fakeForgejo) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 		w.WriteHeader(http.StatusNotFound)
+	case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/api/v1/users/"):
+		id, ok := f.users[strings.TrimPrefix(req.URL.Path, "/api/v1/users/")]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "login": strings.TrimPrefix(req.URL.Path, "/api/v1/users/")})
 	case req.Method == http.MethodGet:
 		jobs, ok := f.jobs[req.URL.Path]
 		if !ok {
@@ -97,7 +114,7 @@ func (f *fakeForgejo) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 func TestAPIListsEveryPage(t *testing.T) {
 	f := &fakeForgejo{maxItems: 20}
 	for i := 1; i <= 45; i++ {
-		f.runners = append(f.runners, APIRunner{ID: int64(i), UUID: fmt.Sprintf("u%d", i), Status: "idle"})
+		f.runners = append(f.runners, APIRunner{ID: int64(i), UUID: fmt.Sprintf("u%d", i), Status: statusIdle})
 	}
 	srv := httptest.NewServer(f)
 	defer srv.Close()
@@ -132,7 +149,7 @@ func TestAPIDelete(t *testing.T) {
 }
 
 func TestAPIGetRunner(t *testing.T) {
-	f := &fakeForgejo{maxItems: 50, runners: []APIRunner{{ID: 7, UUID: "u", Status: "idle"}}}
+	f := &fakeForgejo{maxItems: 50, runners: []APIRunner{{ID: 7, UUID: "u", Status: statusIdle}}}
 	srv := httptest.NewServer(f)
 	defer srv.Close()
 	api := NewAPI(srv.URL, "admin", "pw")
@@ -151,7 +168,7 @@ func TestAPIGetRunner(t *testing.T) {
 func TestAPIListSurvivesRunnersMovingBetweenPages(t *testing.T) {
 	f := &fakeForgejo{maxItems: 2}
 	for i := 1; i <= 5; i++ {
-		f.runners = append(f.runners, APIRunner{ID: int64(i), UUID: fmt.Sprintf("u%d", i), Status: "idle"})
+		f.runners = append(f.runners, APIRunner{ID: int64(i), UUID: fmt.Sprintf("u%d", i), Status: statusIdle})
 	}
 	// After page 1 of the first read, runner 4 (on page 2) polls and moves to the front.
 	f.afterPage = func(f *fakeForgejo, page int) {
@@ -199,7 +216,7 @@ func TestAPIUnauthorized(t *testing.T) {
 }
 
 func TestAPIWaitingJobsByScope(t *testing.T) {
-	waiting := []map[string]any{{"status": "waiting"}, {"status": "running"}, {"status": "waiting"}}
+	waiting := []map[string]any{{testKeyStatus: statusWaiting}, {testKeyStatus: "running"}, {testKeyStatus: statusWaiting}}
 	f := &fakeForgejo{maxItems: 50, jobs: map[string][]map[string]any{
 		"/api/v1/admin/actions/runners/jobs":            waiting,
 		"/api/v1/orgs/acme/actions/runners/jobs":        waiting[:1],
@@ -209,13 +226,38 @@ func TestAPIWaitingJobsByScope(t *testing.T) {
 	srv := httptest.NewServer(f)
 	defer srv.Close()
 	api := NewAPI(srv.URL, "admin", "pw")
-	for scope, want := range map[string]int{"": 2, "acme": 1, "acme/app": 0} {
-		got, err := api.WaitingJobs(context.Background(), scope, []string{"docker", "host"})
+	for scope, want := range map[string]int{"": 2, testOrg: 1, testRepo: 0} {
+		got, err := api.WaitingJobs(context.Background(), scope, []string{testLabelDocker, testLabelHost})
 		if err != nil || got != want {
 			t.Errorf("scope %q: %d, %v; want %d", scope, got, err, want)
 		}
 	}
-	if _, err := api.WaitingJobs(context.Background(), "nobody", []string{"docker", "host"}); err == nil {
+	if _, err := api.WaitingJobs(context.Background(), "nobody", []string{testLabelDocker, testLabelHost}); err == nil {
 		t.Error("a 404 counted as no waiting jobs")
+	}
+}
+
+// A user scope: /orgs/{user}/actions/runners/jobs answers 404 (Forgejo 15 and 17), so the
+// instance's waiting jobs are counted for the user's id.
+func TestAPIWaitingJobsOfAUser(t *testing.T) {
+	f := &fakeForgejo{maxItems: 50, users: map[string]int64{"alice": 2, testOrg: 3}, jobs: map[string][]map[string]any{
+		"/api/v1/admin/actions/runners/jobs": {
+			{testKeyStatus: statusWaiting, testKeyOwnerID: 2}, {testKeyStatus: "running", testKeyOwnerID: 2},
+			{testKeyStatus: statusWaiting, testKeyOwnerID: 2}, {testKeyStatus: statusWaiting, testKeyOwnerID: 3},
+		},
+		"/api/v1/orgs/acme/actions/runners/jobs": {{testKeyStatus: statusWaiting, testKeyOwnerID: 3}},
+	}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	api := NewAPI(srv.URL, "admin", "pw")
+	for scope, want := range map[string]int{"alice": 2, testOrg: 1, "": 3} {
+		got, err := api.WaitingJobs(context.Background(), scope, []string{testLabelDocker, testLabelHost})
+		if err != nil || got != want {
+			t.Errorf("scope %q: %d, %v; want %d", scope, got, err, want)
+		}
+	}
+	_, err := api.WaitingJobs(context.Background(), "nobody", []string{testLabelDocker, testLabelHost})
+	if err == nil || !strings.Contains(err.Error(), `owner "nobody" does not exist`) {
+		t.Errorf("an unknown owner: %v", err)
 	}
 }

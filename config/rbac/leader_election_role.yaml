@@ -1,4 +1,7 @@
 # permissions to do leader election.
+# controller-runtime keeps the leader lock in a Lease (get, create, update; it never lists,
+# watches, patches or deletes it) and records the leader's events in the operator's own
+# namespace through the core/v1 event API.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -8,29 +11,13 @@ metadata:
   name: leader-election-role
 rules:
 - apiGroups:
-  - ""
-  resources:
-  - configmaps
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
-- apiGroups:
   - coordination.k8s.io
   resources:
   - leases
   verbs:
   - get
-  - list
-  - watch
   - create
   - update
-  - patch
-  - delete
 - apiGroups:
   - ""
   resources:

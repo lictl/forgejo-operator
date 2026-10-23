@@ -17,6 +17,13 @@ import (
 )
 
 const (
+	testSectionServer      = "server"
+	testVersion170         = "17.0.0+gitea-1.22.0"
+	testVersion171         = "17.0.1+gitea-1.22.0"
+	testKeyPerWriteTimeout = "PER_WRITE_TIMEOUT"
+)
+
+const (
 	img11 = "codeberg.org/forgejo/forgejo:11"
 	img15 = "codeberg.org/forgejo/forgejo:15"
 	img16 = "codeberg.org/forgejo/forgejo:16"
@@ -83,7 +90,7 @@ func TestReportVersionSupport(t *testing.T) {
 	// 16 is still maintained upstream but outside the policy: Deprecated, one Warning.
 	ReportVersionSupport(rc, supportNow)
 	c := cond()
-	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "Deprecated" || !strings.Contains(c.Message, "Upgrade to 17 before 2026-10-29") {
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "Deprecated" || !strings.Contains(c.Message, "Upgrade to 17 (17.0.1 or newer) before 2026-10-29") {
 		t.Fatalf("16: %+v", c)
 	}
 	if evs := withPrefix(drain(rec), "Warning UnsupportedVersion"); len(evs) != 1 {
@@ -112,7 +119,7 @@ func TestReportVersionSupport(t *testing.T) {
 	}
 
 	// Upgraded to 17: supported again (Normal event), but 17.0.0 carries an advisory.
-	f.Status.Image, f.Status.Version = img17, "17.0.0+gitea-1.22.0"
+	f.Status.Image, f.Status.Version = img17, testVersion170
 	ReportVersionSupport(rc, supportNow)
 	c = cond()
 	if c.Status != metav1.ConditionTrue || c.Reason != "Supported" || !strings.Contains(c.Message, "17.0.1 or newer") {
@@ -128,7 +135,7 @@ func TestReportVersionSupport(t *testing.T) {
 	if n := seriesCount(forgejo.VersionSupported); n != 1 {
 		t.Fatalf("one series per instance, got %d", n)
 	}
-	f.Status.Version = "17.0.1+gitea-1.22.0"
+	f.Status.Version = testVersion171
 	ReportVersionSupport(rc, supportNow)
 	if evs := drain(rec); len(evs) != 0 || strings.Contains(cond().Message, "or newer") {
 		t.Fatalf("17.0.1: events %q, message %q", evs, cond().Message)
@@ -172,6 +179,87 @@ func TestReportVersionSupport(t *testing.T) {
 	}
 	forgejo.DeleteInstanceMetrics("ns", "vs")
 	forgejo.DeleteInstanceMetrics("ns", "new")
+	ForgetInstance("ns", "vs")
+	ForgetInstance("ns", "new")
+}
+
+// forgejo_operator_version_advisory is 1 while the running patch release has an advisory, 0
+// for a later patch, absent while the version is unknown, and deleted with the instance.
+func TestVersionAdvisoryGauge(t *testing.T) {
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "adv", Namespace: "ns", UID: "uid-adv"},
+		Spec: forgejov1.ForgejoSpec{Image: img17}, Status: forgejov1.ForgejoStatus{Image: img17, Version: testVersion170}}
+	rc, _ := supportContext(f)
+	t.Cleanup(func() { ForgetInstance("ns", "adv") })
+	advisory := func() float64 { return gaugeValue(t, forgejo.VersionAdvisory.WithLabelValues("ns", "adv", "17")) }
+	ReportVersionSupport(rc, supportNow)
+	if advisory() != 1 || seriesCount(forgejo.VersionAdvisory) != 1 {
+		t.Fatal("17.0.0: want 1")
+	}
+	f.Status.Version = testVersion171
+	ReportVersionSupport(rc, supportNow)
+	if advisory() != 0 || seriesCount(forgejo.VersionAdvisory) != 1 {
+		t.Fatal("17.0.1: want 0")
+	}
+	f.Status.Image, f.Status.Version = "codeberg.org/forgejo/forgejo@sha256:0123", ""
+	ReportVersionSupport(rc, supportNow)
+	if seriesCount(forgejo.VersionAdvisory) != 0 {
+		t.Fatal("unknown version: want no series")
+	}
+	f.Status.Image, f.Status.Version = img15, "15.0.7+gitea-1.22.0"
+	ExportVersionSupport(f, supportNow)
+	if gaugeValue(t, forgejo.VersionAdvisory.WithLabelValues("ns", "adv", "15")) != 1 {
+		t.Fatal("15.0.7 (paused instance): want 1")
+	}
+	forgejo.DeleteInstanceMetrics("ns", "adv")
+	if seriesCount(forgejo.VersionAdvisory) != 0 {
+		t.Fatal("not deleted with the instance")
+	}
+}
+
+// An HA instance on a floating tag whose nodes hold different patch releases: the probe
+// through the Service makes status.version alternate, and with it the advisory text. The
+// condition follows every probe, but VersionAdvisory is emitted once per image and patch.
+func TestVersionAdvisoryIsNotRepeatedByAlternatingPatches(t *testing.T) {
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "flip", Namespace: "ns", UID: "uid-flip"},
+		Spec: forgejov1.ForgejoSpec{Image: img17}, Status: forgejov1.ForgejoStatus{Image: img17}}
+	rc, rec := supportContext(f)
+	t.Cleanup(func() {
+		forgejo.DeleteInstanceMetrics("ns", "flip")
+		ForgetInstance("ns", "flip")
+	})
+	var advisories int
+	for i := range 6 {
+		f.Status.Version = []string{testVersion170, testVersion171}[i%2]
+		ReportVersionSupport(rc, supportNow.Add(time.Duration(i)*time.Minute))
+		advisories += len(withPrefix(drain(rec), "Warning VersionAdvisory"))
+		if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionVersionSupported); (i%2 == 0) != strings.Contains(c.Message, "17.0.1 or newer") {
+			t.Fatalf("probe %d: the condition does not follow %s: %s", i, f.Status.Version, c.Message)
+		}
+	}
+	if advisories != 1 {
+		t.Fatalf("want one VersionAdvisory, got %d", advisories)
+	}
+	// A day later the advisory is repeated once, and a new image is reported at once.
+	f.Status.Version = testVersion171
+	ReportVersionSupport(rc, supportNow.Add(25*time.Hour))
+	f.Status.Version = testVersion170
+	ReportVersionSupport(rc, supportNow.Add(25*time.Hour))
+	if evs := withPrefix(drain(rec), "Warning VersionAdvisory"); len(evs) != 1 {
+		t.Fatalf("after a day: %q", evs)
+	}
+	f.Status.Image = "codeberg.org/forgejo/forgejo:17-rootless"
+	f.Status.Version = testVersion171
+	ReportVersionSupport(rc, supportNow.Add(26*time.Hour))
+	f.Status.Version = testVersion170
+	ReportVersionSupport(rc, supportNow.Add(26*time.Hour))
+	if evs := withPrefix(drain(rec), "Warning VersionAdvisory"); len(evs) != 1 {
+		t.Fatalf("new image: %q", evs)
+	}
+	// Forgetting the instance (deleted) reports it again.
+	ForgetInstance("ns", "flip")
+	if !adviseOnce(f, f.Status.Image, forgejo.Version{Major: 17, Minor: 0, Patch: 0}, supportNow.Add(26*time.Hour)) {
+		t.Fatal("ForgetInstance kept the advisory")
+	}
 }
 
 // gate runs the upgrade step for an instance that runs from and requests to.
@@ -241,11 +329,27 @@ func TestUpgradeGateAcrossMajors(t *testing.T) {
 
 	// 16 -> 17 with a duration value 17 refuses: warned, not blocked.
 	f, _, evs = gate(t, img16, img17, func(f *forgejov1.Forgejo) {
-		f.Spec.Config = map[string]map[string]string{"server": {"PER_WRITE_TIMEOUT": "-1"}}
+		f.Spec.Config = map[string]map[string]string{testSectionServer: {testKeyPerWriteTimeout: "-1"}}
 	})
 	if f.Status.Upgrade == nil || len(withPrefix(evs, "Warning ConfigIncompatible")) != 1 ||
 		!strings.Contains(withPrefix(evs, "Warning ConfigIncompatible")[0], "[server] PER_WRITE_TIMEOUT") {
 		t.Fatalf("16 -> 17 with -1: upgrade %+v, events %q", f.Status.Upgrade, evs)
+	}
+}
+
+// A major beyond every row of the table is held to the newest row's UpgradeFrom: 14 -> 20
+// skips the LTS 15 and is refused like 14 -> 17, while 15 -> 20 is allowed (with a warning).
+func TestUpgradeGateBeyondTheTable(t *testing.T) {
+	const img14, img20 = "codeberg.org/forgejo/forgejo:14", "codeberg.org/forgejo/forgejo:20"
+	f, rc, evs := gate(t, img14, img20, nil)
+	if up := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionUpgrading); f.Status.Upgrade != nil ||
+		rc.TargetImage != img14 || up == nil || up.Reason != ReasonUpgradePathUnsupported ||
+		!strings.Contains(up.Message, "Upgrade to Forgejo 15 first") || len(withPrefix(evs, "Warning UpgradePathUnsupported")) != 1 {
+		t.Fatalf("14 -> 20: upgrade %+v, conditions %+v, events %q", f.Status.Upgrade, f.Status.Conditions, evs)
+	}
+	f, _, evs = gate(t, img15, img20, nil)
+	if f.Status.Upgrade == nil || len(withPrefix(evs, "Warning UnsupportedVersion Upgrading to "+img20+" anyway")) != 1 {
+		t.Fatalf("15 -> 20: upgrade %+v, events %q", f.Status.Upgrade, evs)
 	}
 }
 
@@ -287,7 +391,7 @@ func TestUpgradeGateUsesReportedVersion(t *testing.T) {
 	// 16 -> 17 is an orchestrated major upgrade, and the duration check knows 16 is lenient.
 	f, _, evs = gate(t, digest, img17, func(f *forgejov1.Forgejo) {
 		f.Status.Version = "16.0.6+gitea-1.22.0"
-		f.Spec.Config = map[string]map[string]string{"server": {"PER_WRITE_TIMEOUT": "-1"}}
+		f.Spec.Config = map[string]map[string]string{testSectionServer: {testKeyPerWriteTimeout: "-1"}}
 	})
 	if f.Status.Upgrade == nil || f.Status.Upgrade.Phase != forgejov1.UpgradePhasePending ||
 		len(withPrefix(evs, "Normal MajorUpgrade Upgrading across major versions from 16 to 17;")) != 1 ||
@@ -300,7 +404,7 @@ func TestUpgradeGateUsesReportedVersion(t *testing.T) {
 	for name, mutate := range map[string]func(*forgejov1.Forgejo){
 		"same version": reports("17.0.0+gitea-1.22.0"),
 		"allowed downgrade": func(f *forgejov1.Forgejo) {
-			f.Status.Version = "17.0.0+gitea-1.22.0"
+			f.Status.Version = testVersion170
 			f.Spec.Image = img15
 			f.Spec.Upgrade.AllowDowngrade = true
 		},
@@ -316,5 +420,13 @@ func TestUpgradeGateUsesReportedVersion(t *testing.T) {
 	f, _, evs = gate(t, digest, img15, nil)
 	if f.Status.Upgrade == nil || len(withPrefix(evs, "Warning UnverifiedVersion Cannot compare")) != 1 {
 		t.Fatalf("digest without status.version: upgrade %+v, events %q", f.Status.Upgrade, evs)
+	}
+	// An unknown running version is not assumed to be strict about durations, so the upgrade
+	// to 17 warns about the values 17 refuses (the running image may be 15 or 16).
+	f, _, evs = gate(t, digest, img17, func(f *forgejov1.Forgejo) {
+		f.Spec.Config = map[string]map[string]string{testSectionServer: {testKeyPerWriteTimeout: "-1"}}
+	})
+	if f.Status.Upgrade == nil || len(withPrefix(evs, "Warning ConfigIncompatible")) != 1 {
+		t.Fatalf("digest without status.version -> 17 with -1: upgrade %+v, events %q", f.Status.Upgrade, evs)
 	}
 }

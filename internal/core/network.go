@@ -112,7 +112,7 @@ func reconcileIngress(ctx context.Context, rc *forgejo.ReconcileContext) error {
 						PathType: &pathType,
 						Backend: networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{
 							Name: forgejo.HTTPServiceName(f),
-							Port: networkingv1.ServiceBackendPort{Name: "http"},
+							Port: networkingv1.ServiceBackendPort{Name: portNameHTTP},
 						}},
 					}},
 				}},

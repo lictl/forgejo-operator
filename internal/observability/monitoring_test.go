@@ -25,6 +25,8 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const testSeverityWarning = "warning"
+
 func monitoringRC(t *testing.T, f *forgejov1.Forgejo, funcs interceptor.Funcs) (*forgejo.ReconcileContext, *events.FakeRecorder) {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -340,11 +342,16 @@ func TestOperatorMetricsGuard(t *testing.T) {
 func TestVersionUnsupportedAlert(t *testing.T) {
 	r := findRule(prometheusRuleSpec(testInstance("ver"), false), "ForgejoVersionUnsupported")
 	want := `max by (namespace, name, major, support) (forgejo_operator_version_supported{namespace="ns", name="ver"}) == 0`
-	if r == nil || r.Expr != want || r.For != "1h" || r.Labels["severity"] != "warning" {
+	if r == nil || r.Expr != want || r.For != "1h" || r.Labels["severity"] != testSeverityWarning {
 		t.Fatalf("ForgejoVersionUnsupported %+v", r)
 	}
 	if d := r.Annotations["description"]; !strings.Contains(d, "VersionSupported") || !strings.Contains(d, "docs/versions.md") {
 		t.Fatalf("description %q", d)
+	}
+	r = findRule(prometheusRuleSpec(testInstance("ver"), false), "ForgejoVersionAdvisory")
+	want = `max by (namespace, name, major) (forgejo_operator_version_advisory{namespace="ns", name="ver"}) == 1`
+	if r == nil || r.Expr != want || r.For != "1h" || r.Labels["severity"] != testSeverityWarning {
+		t.Fatalf("ForgejoVersionAdvisory %+v", r)
 	}
 }
 
@@ -380,7 +387,7 @@ func TestRunnersOfflineAlert(t *testing.T) {
 	want := `max by (namespace, name, runner) (forgejo_operator_runner_jobs_waiting{namespace="ns", name="run"}) > 0 ` +
 		`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_online{namespace="ns", name="run"}) == 0 ` +
 		`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_desired{namespace="ns", name="run"}) > 0`
-	if r == nil || r.Expr != want || r.For != "10m" || r.Labels["severity"] != "warning" {
+	if r == nil || r.Expr != want || r.For != "10m" || r.Labels["severity"] != testSeverityWarning {
 		t.Fatalf("ForgejoRunnersOffline %+v", r)
 	}
 	if d := r.Annotations["description"]; !strings.Contains(d, "kubectl -n ns describe forgejorunner {{ $labels.runner }}") ||

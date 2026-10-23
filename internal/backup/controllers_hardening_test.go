@@ -13,6 +13,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -26,6 +27,8 @@ import (
 	"github.com/lictl/forgejo-operator/internal/controller"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
+
+const testBackupsPVC = "fb-backups"
 
 // deletedOwnedBackup is a completed scheduled backup owned by instance f that garbage
 // collection is deleting.
@@ -56,7 +59,7 @@ func TestBackupFinalizerKeepsFilesOfRetainedInstance(t *testing.T) {
 	s := scheme(t)
 	gone := instance("")
 	b := deletedOwnedBackup(t, gone)
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "fb-backups", Namespace: ns}} // retained: no owner
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: testBackupsPVC, Namespace: ns}} // retained: no owner
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(b, pvc).WithStatusSubresource(b).Build()
 
 	reconcileBackup(t, c, b.Name)
@@ -84,7 +87,7 @@ func TestBackupFinalizerStillCleansUp(t *testing.T) {
 			f := instance("")
 			f.Spec.Storage.RetainPolicy = forgejov1.RetainPolicyDelete
 			b := deletedOwnedBackup(t, f)
-			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "fb-backups", Namespace: ns}}
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: testBackupsPVC, Namespace: ns}}
 			if tc.ownedPVC {
 				if err := controllerutil.SetControllerReference(f, pvc, s); err != nil {
 					t.Fatal(err)
@@ -242,5 +245,41 @@ func TestRestoreWaitsForSSHHostKeys(t *testing.T) {
 	}
 	if got = reconcileRestore(t, c, s, rs.Name, 1); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
 		t.Fatalf("phase %s (%s), want ScalingDown once the keys are back", got.Status.Phase, got.Status.Message)
+	}
+}
+
+// A restore does not scale Forgejo down while the Secrets of spec.objectStorage are missing or
+// unusable: the Forgejo pipeline stops before the workload step (no scale-down), and no pod
+// could start again afterwards. An unreachable bucket does not hold it.
+func TestRestoreWaitsForObjectStorageSecrets(t *testing.T) {
+	s := scheme(t)
+	b := completedBackup("b1")
+	rs := newRestore("r1", "")
+	rs.Finalizers = []string{forgejo.FinalizerName}
+	rs.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
+	rs.Spec.BackupName = "b1"
+	f := instance("")
+	f.Spec.ObjectStorage = &forgejov1.ObjectStorageSpec{}
+	setReady := func(status metav1.ConditionStatus, reason, msg string) {
+		meta.SetStatusCondition(&f.Status.Conditions, metav1.Condition{Type: forgejov1.ConditionObjectStorageReady,
+			Status: status, Reason: reason, Message: msg})
+	}
+	setReady(metav1.ConditionFalse, "CredentialsUnavailable", `secret "s3" not found`)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, b, rs).WithStatusSubresource(rs).Build()
+
+	got := reconcileRestore(t, c, s, rs.Name, 1)
+	if got.Status.Phase != forgejov1.RestorePhasePending || got.Status.Message != `Waiting for spec.objectStorage: secret "s3" not found` {
+		t.Fatalf("phase %s (%s), want Pending, waiting for the Secret", got.Status.Phase, got.Status.Message)
+	}
+	if active, _ := backup.MaintenanceRestore([]forgejov1.ForgejoRestore{*got}); active != nil {
+		t.Fatal("a restore waiting for object storage puts the instance into maintenance")
+	}
+
+	setReady(metav1.ConditionFalse, "UnreachableFromOperator", "dial tcp: i/o timeout")
+	if err := c.Update(context.Background(), f); err != nil {
+		t.Fatal(err)
+	}
+	if got = reconcileRestore(t, c, s, rs.Name, 1); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
+		t.Fatalf("phase %s (%s), want ScalingDown once the Secret is back", got.Status.Phase, got.Status.Message)
 	}
 }

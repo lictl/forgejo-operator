@@ -67,7 +67,7 @@ func TestCheckBucket(t *testing.T) {
 	}))
 	defer srv.Close()
 	u, _ := url.Parse(srv.URL)
-	b := Bucket{Scheme: "http", Host: u.Host, Name: "forgejo", Region: "garage", Prefix: "team-a/",
+	b := Bucket{Scheme: schemeHTTP, Host: u.Host, Name: "forgejo", Region: "garage", Prefix: "team-a/",
 		AccessKeyID: "GKexample", SecretAccessKey: "very-secret"}
 	ctx := context.Background()
 
@@ -219,7 +219,7 @@ func TestObjects(t *testing.T) {
 	srv := httptest.NewServer(store)
 	defer srv.Close()
 	u, _ := url.Parse(srv.URL)
-	b := Bucket{Scheme: "http", Host: u.Host, Name: "backups", Region: "garage", AccessKeyID: "GKexample", SecretAccessKey: "very-secret"}
+	b := Bucket{Scheme: schemeHTTP, Host: u.Host, Name: "backups", Region: "garage", AccessKeyID: "GKexample", SecretAccessKey: "very-secret"}
 	ctx := context.Background()
 
 	objs, err := ListObjects(ctx, b, "team/ns/fj/", 100)
@@ -262,5 +262,29 @@ func TestObjects(t *testing.T) {
 	srv.Close()
 	if _, err := ListObjects(ctx, b, "", 10); !IsUnreachable(err) {
 		t.Errorf("closed server: %v", err)
+	}
+}
+
+func TestHTTPClientBoundsAStalledEndpoint(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	old := responseHeaderTimeout
+	responseHeaderTimeout = 100 * time.Millisecond
+	defer func() { responseHeaderTimeout = old }()
+
+	b := Bucket{Scheme: schemeHTTP}
+	start := time.Now()
+	resp, err := b.httpClient().Get(srv.URL)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("want a timeout from an endpoint that never answers")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("request took %s, want it bounded by the response header timeout", elapsed)
 	}
 }

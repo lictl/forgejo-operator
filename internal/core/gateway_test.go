@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -22,6 +23,35 @@ import (
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
+)
+
+const (
+	testKeyKind               = "kind"
+	testKeyStatus             = "status"
+	testKeyGroup              = "group"
+	testKeyReason             = "reason"
+	testKeyObservedGeneration = "observedGeneration"
+	testGatewayGroup          = "gateway.networking.k8s.io"
+	testKeyType               = "type"
+	testKeyMessage            = "message"
+	testKeyTransitionTime     = "lastTransitionTime"
+	testKeySecretName         = "secretName"
+	testKeyNamespace          = "namespace"
+	testGatewayNS             = "gateways"
+	testKeyPath               = "path"
+	testCodeHost              = "code.example.com"
+	testSectionServer         = "server"
+	testWWWHost               = "www.example.com"
+	testPodCIDR               = "10.42.0.0/16"
+	testCondAccepted          = "Accepted"
+	testTransitionTime        = "2026-10-22T00:00:00Z"
+	testCondTrue              = "True"
+	testIssuerKind            = "ClusterIssuer"
+	testTLSSecret             = "fj-tls"
+	testCondReady             = "Ready"
+	testRootURL               = "http://git.example.com/"
+	testSSLModeDisable        = "disable"
+	testKeyName               = "name"
 )
 
 var (
@@ -71,12 +101,12 @@ func getOptional(t *testing.T, rc *forgejo.ReconcileContext, gvk schema.GroupVer
 
 func gatewayInstance() *forgejov1.Forgejo {
 	f := testInstance()
-	f.Spec.Server.Domain = "git.example.com"
+	f.Spec.Server.Domain = testDomain
 	f.Spec.Server.SSH.ExternalPort = 2222
 	f.Spec.Gateway = &forgejov1.GatewaySpec{
-		ParentRefs: []forgejov1.GatewayParentReference{{Name: "eg", Namespace: "gateways"}},
+		ParentRefs: []forgejov1.GatewayParentReference{{Name: "eg", Namespace: testGatewayNS}},
 		SSH: &forgejov1.GatewaySSHSpec{ParentRefs: []forgejov1.GatewayParentReference{
-			{Name: "eg", Namespace: "gateways", SectionName: "ssh"},
+			{Name: "eg", Namespace: testGatewayNS, SectionName: "ssh"},
 		}},
 	}
 	return f
@@ -117,15 +147,15 @@ func TestGatewayRendersRoutes(t *testing.T) {
 		t.Errorf("HTTPRoute not owned and labelled: %v %v", route.GetOwnerReferences(), route.GetLabels())
 	}
 	want := map[string]any{
-		"parentRefs": []any{map[string]any{"group": "gateway.networking.k8s.io", "kind": "Gateway", "namespace": "gateways", "name": "eg"}},
-		"hostnames":  []any{"git.example.com"},
+		"parentRefs": []any{map[string]any{testKeyGroup: testGatewayGroup, testKeyKind: kindGateway, testKeyNamespace: testGatewayNS, testKeyName: "eg"}},
+		"hostnames":  []any{testDomain},
 		"rules": []any{map[string]any{
-			"matches": []any{map[string]any{"path": map[string]any{"type": "PathPrefix", "value": "/"}}},
+			"matches": []any{map[string]any{testKeyPath: map[string]any{testKeyType: "PathPrefix", "value": "/"}}},
 			"filters": []any{map[string]any{
-				"type":                  "RequestHeaderModifier",
+				testKeyType:             filterRequestHeaderModifier,
 				"requestHeaderModifier": map[string]any{"remove": []any{"X-Real-IP"}},
 			}},
-			"backendRefs": []any{map[string]any{"group": "", "kind": "Service", "name": "fj-http", "port": int64(3000), "weight": int64(1)}},
+			"backendRefs": []any{map[string]any{testKeyGroup: "", testKeyKind: "Service", testKeyName: "fj-http", "port": int64(3000), "weight": int64(1)}},
 			"timeouts":    map[string]any{"request": "0s"},
 		}},
 	}
@@ -139,9 +169,9 @@ func TestGatewayRendersRoutes(t *testing.T) {
 		t.Fatal("no TCPRoute v1")
 	}
 	wantSSH := map[string]any{
-		"parentRefs": []any{map[string]any{"group": "gateway.networking.k8s.io", "kind": "Gateway", "namespace": "gateways", "name": "eg", "sectionName": "ssh"}},
+		"parentRefs": []any{map[string]any{testKeyGroup: testGatewayGroup, testKeyKind: kindGateway, testKeyNamespace: testGatewayNS, testKeyName: "eg", "sectionName": "ssh"}},
 		"rules": []any{map[string]any{"backendRefs": []any{
-			map[string]any{"group": "", "kind": "Service", "name": "fj-ssh", "port": int64(22), "weight": int64(1)},
+			map[string]any{testKeyGroup: "", testKeyKind: "Service", testKeyName: "fj-ssh", "port": int64(22), "weight": int64(1)},
 		}}},
 	}
 	if got := ssh.Object["spec"]; !reflect.DeepEqual(got, wantSSH) {
@@ -168,7 +198,7 @@ func TestGatewayRouteOptions(t *testing.T) {
 	f := gatewayInstance()
 	f.Spec.Gateway.SSH = nil
 	f.Spec.Gateway.Path = "/git/"
-	f.Spec.Gateway.Hostnames = []string{"*.example.com", "code.example.com"}
+	f.Spec.Gateway.Hostnames = []string{"*.example.com", testCodeHost}
 	f.Spec.Gateway.RequestTimeout = ptr.To("")
 	f.Spec.Gateway.RemoveRequestHeaders = []string{"x-real-ip", "X-Forwarded-For"}
 	f.Spec.Gateway.ParentRefs[0].Namespace = f.Namespace // same namespace: left out
@@ -182,19 +212,19 @@ func TestGatewayRouteOptions(t *testing.T) {
 	}
 	// X-Real-IP is removed whatever else is listed, once.
 	wantFilters := []any{map[string]any{
-		"type":                  "RequestHeaderModifier",
+		testKeyType:             filterRequestHeaderModifier,
 		"requestHeaderModifier": map[string]any{"remove": []any{"X-Real-IP", "X-Forwarded-For"}},
 	}, map[string]any{
-		"type":       "URLRewrite",
-		"urlRewrite": map[string]any{"path": map[string]any{"type": "ReplacePrefixMatch", "replacePrefixMatch": "/"}},
+		testKeyType:  "URLRewrite",
+		"urlRewrite": map[string]any{testKeyPath: map[string]any{testKeyType: "ReplacePrefixMatch", "replacePrefixMatch": "/"}},
 	}}
 	if !reflect.DeepEqual(rule["filters"], wantFilters) {
 		t.Errorf("filters: got %#v, want X-Real-IP and X-Forwarded-For removed, then the prefix rewrite", rule["filters"])
 	}
-	if got := rule["matches"]; !reflect.DeepEqual(got, []any{map[string]any{"path": map[string]any{"type": "PathPrefix", "value": "/git"}}}) {
+	if got := rule["matches"]; !reflect.DeepEqual(got, []any{map[string]any{testKeyPath: map[string]any{testKeyType: "PathPrefix", "value": "/git"}}}) {
 		t.Errorf("matches: %#v", got)
 	}
-	if got := nested(t, route, "spec", "hostnames"); !reflect.DeepEqual(got, []any{"*.example.com", "code.example.com"}) {
+	if got := nested(t, route, "spec", "hostnames"); !reflect.DeepEqual(got, []any{"*.example.com", testCodeHost}) {
 		t.Errorf("hostnames: %#v", got)
 	}
 	if ref := nested(t, route, "spec", "parentRefs").([]any)[0].(map[string]any); ref["namespace"] != nil {
@@ -209,7 +239,7 @@ func TestGatewayRouteOptions(t *testing.T) {
 		t.Errorf("ROOT_URL %q", got)
 	}
 	f.Spec.Server.Domain = ""
-	if got, d := RootURL(f), Domain(f); got != "http://code.example.com/git/" || d != "code.example.com" {
+	if got, d := RootURL(f), Domain(f); got != "http://code.example.com/git/" || d != testCodeHost {
 		t.Errorf("without a domain: ROOT_URL %q, DOMAIN %q, want the first host name that is not a wildcard", got, d)
 	}
 }
@@ -222,22 +252,22 @@ func TestRouteHostnamesFromPublicHosts(t *testing.T) {
 		mutate func(f *forgejov1.Forgejo)
 		want   []string
 	}{
-		{"domain", func(*forgejov1.Forgejo) {}, []string{"git.example.com"}},
+		{"domain", func(*forgejov1.Forgejo) {}, []string{testDomain}},
 		{"rootURL", func(f *forgejov1.Forgejo) {
 			f.Spec.Server.Domain = ""
 			f.Spec.Server.RootURL = "https://Code.Example.com/"
-		}, []string{"code.example.com"}},
+		}, []string{testCodeHost}},
 		{"ROOT_URL in spec.config", func(f *forgejov1.Forgejo) {
 			f.Spec.Server.Domain = ""
-			f.Spec.Config = map[string]map[string]string{"server": {"ROOT_URL": "https://code.example.com/"}}
-		}, []string{"code.example.com"}},
+			f.Spec.Config = map[string]map[string]string{testSectionServer: {"ROOT_URL": "https://code.example.com/"}}
+		}, []string{testCodeHost}},
 		{"domain and another rootURL", func(f *forgejov1.Forgejo) {
 			f.Spec.Server.RootURL = "https://code.example.com/"
-		}, []string{"git.example.com", "code.example.com"}},
+		}, []string{testDomain, testCodeHost}},
 		{"ingress host", func(f *forgejov1.Forgejo) {
 			f.Spec.Server.Domain = ""
-			f.Spec.Ingress = &forgejov1.IngressSpec{Enabled: true, Host: "www.example.com"}
-		}, []string{"www.example.com"}},
+			f.Spec.Ingress = &forgejov1.IngressSpec{Enabled: true, Host: testWWWHost}
+		}, []string{testWWWHost}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := gatewayInstance()
@@ -322,8 +352,8 @@ func TestTrustedProxiesForDirectServices(t *testing.T) {
 	}
 	f := testInstance()
 	f.Spec.Server.HTTP.Type = corev1.ServiceTypeLoadBalancer
-	f.Spec.Server.TrustedProxies = []string{"10.42.0.0/16"}
-	if got := trustedProxies(f); got != "10.42.0.0/16" {
+	f.Spec.Server.TrustedProxies = []string{testPodCIDR}
+	if got := trustedProxies(f); got != testPodCIDR {
 		t.Errorf("spec.server.trustedProxies must win: %q", got)
 	}
 }
@@ -378,10 +408,10 @@ func acceptRoute(t *testing.T, rc *forgejo.ReconcileContext, gvk schema.GroupVer
 			"controllerName": "gateway.envoyproxy.io/gatewayclass-controller",
 			"parentRef":      r,
 			"conditions": []any{
-				map[string]any{"type": "Accepted", "status": accepted, "reason": "Accepted", "message": "accepted?",
-					"lastTransitionTime": "2026-10-22T00:00:00Z", "observedGeneration": route.GetGeneration()},
-				map[string]any{"type": "ResolvedRefs", "status": resolved, "reason": "BackendNotFound", "message": "service not found",
-					"lastTransitionTime": "2026-10-22T00:00:00Z", "observedGeneration": route.GetGeneration()},
+				map[string]any{testKeyType: testCondAccepted, testKeyStatus: accepted, testKeyReason: testCondAccepted, testKeyMessage: "accepted?",
+					testKeyTransitionTime: testTransitionTime, testKeyObservedGeneration: route.GetGeneration()},
+				map[string]any{testKeyType: "ResolvedRefs", testKeyStatus: resolved, testKeyReason: "BackendNotFound", testKeyMessage: "service not found",
+					testKeyTransitionTime: testTransitionTime, testKeyObservedGeneration: route.GetGeneration()},
 			},
 		})
 	}
@@ -439,14 +469,14 @@ func TestRoutesConditionIgnoresStaleStatus(t *testing.T) {
 	route.SetName("fj")
 	route.SetNamespace("ns")
 	route.SetGeneration(3)
-	parent := gwParentRef{Group: forgejo.GatewayAPIGroup, Kind: "Gateway", Name: "eg"}
+	parent := gwParentRef{Group: forgejo.GatewayAPIGroup, Kind: kindGateway, Name: "eg"}
 	cond := func(gen int64) []any {
-		return []any{map[string]any{"type": "Accepted", "status": "True", "reason": "Accepted",
-			"lastTransitionTime": "2026-10-22T00:00:00Z", "observedGeneration": gen}}
+		return []any{map[string]any{testKeyType: testCondAccepted, testKeyStatus: testCondTrue, testKeyReason: testCondAccepted,
+			testKeyTransitionTime: testTransitionTime, testKeyObservedGeneration: gen}}
 	}
 	_ = unstructured.SetNestedSlice(route.Object, []any{map[string]any{
 		// A controller may write the defaulted fields and the namespace into status.
-		"parentRef":  map[string]any{"group": forgejo.GatewayAPIGroup, "kind": "Gateway", "namespace": "ns", "name": "eg"},
+		"parentRef":  map[string]any{testKeyGroup: forgejo.GatewayAPIGroup, testKeyKind: kindGateway, testKeyNamespace: "ns", testKeyName: "eg"},
 		"conditions": cond(2),
 	}}, "status", "parents")
 	routes := []routeStatus{{kind: "HTTPRoute", obj: route, parents: []gwParentRef{parent}}}
@@ -507,8 +537,8 @@ func TestRemovingGatewayDeletesRoutes(t *testing.T) {
 func TestNoRoutesOrCertificatesWithoutCRDs(t *testing.T) {
 	f := gatewayInstance()
 	f.Spec.TLS = &forgejov1.TLSSpec{
-		CertManager:       &forgejov1.CertManagerTLSSpec{IssuerRef: forgejov1.CertManagerIssuerRef{Name: "ca", Kind: "ClusterIssuer"}},
-		GatewayNamespaces: []string{"gateways"},
+		CertManager:       &forgejov1.CertManagerTLSSpec{IssuerRef: forgejov1.CertManagerIssuerRef{Name: "ca", Kind: testIssuerKind}},
+		GatewayNamespaces: []string{testGatewayNS},
 	}
 	rc, _ := optionalRC(t, f, nil)
 	if res := runStep(t, rc, ReconcileGateway); res.Stop {
@@ -544,11 +574,11 @@ func TestNoRoutesOrCertificatesWithoutCRDs(t *testing.T) {
 
 func certInstance() *forgejov1.Forgejo {
 	f := gatewayInstance()
-	f.Spec.Ingress = &forgejov1.IngressSpec{Enabled: true, Host: "www.example.com"}
-	f.Spec.Gateway.Hostnames = []string{"git.example.com", "*.git.example.com"}
+	f.Spec.Ingress = &forgejov1.IngressSpec{Enabled: true, Host: testWWWHost}
+	f.Spec.Gateway.Hostnames = []string{testDomain, "*.git.example.com"}
 	f.Spec.TLS = &forgejov1.TLSSpec{
-		CertManager:       &forgejov1.CertManagerTLSSpec{IssuerRef: forgejov1.CertManagerIssuerRef{Name: "lab-ca", Kind: "ClusterIssuer"}},
-		GatewayNamespaces: []string{"gateways", "ns", "gateways"},
+		CertManager:       &forgejov1.CertManagerTLSSpec{IssuerRef: forgejov1.CertManagerIssuerRef{Name: "lab-ca", Kind: testIssuerKind}},
+		GatewayNamespaces: []string{testGatewayNS, "ns", testGatewayNS},
 	}
 	return f
 }
@@ -559,7 +589,7 @@ func setCertificateStatus(t *testing.T, rc *forgejo.ReconcileContext, conds ...m
 	cert := getOptional(t, rc, forgejo.CertificateGVK, "fj-tls")
 	items := make([]any, 0, len(conds))
 	for _, c := range conds {
-		c["lastTransitionTime"] = "2026-10-22T00:00:00Z"
+		c["lastTransitionTime"] = testTransitionTime
 		items = append(items, c)
 	}
 	_ = unstructured.SetNestedSlice(cert.Object, items, "status", "conditions")
@@ -579,9 +609,9 @@ func TestCertManagerCertificate(t *testing.T) {
 		t.Fatalf("Certificate not created and owned: %v", cert)
 	}
 	want := map[string]any{
-		"secretName": "fj-tls",
-		"dnsNames":   []any{"git.example.com", "www.example.com", "*.git.example.com"},
-		"issuerRef":  map[string]any{"name": "lab-ca", "kind": "ClusterIssuer", "group": "cert-manager.io"},
+		testKeySecretName: testTLSSecret,
+		"dnsNames":        []any{testDomain, testWWWHost, "*.git.example.com"},
+		"issuerRef":       map[string]any{testKeyName: "lab-ca", testKeyKind: testIssuerKind, testKeyGroup: "cert-manager.io"},
 	}
 	if got := cert.Object["spec"]; !reflect.DeepEqual(got, want) {
 		t.Errorf("Certificate spec\n got %#v\nwant %#v", got, want)
@@ -592,8 +622,8 @@ func TestCertManagerCertificate(t *testing.T) {
 		t.Fatal("no ReferenceGrant")
 	}
 	wantGrant := map[string]any{
-		"from": []any{map[string]any{"group": "gateway.networking.k8s.io", "kind": "Gateway", "namespace": "gateways"}},
-		"to":   []any{map[string]any{"group": "", "kind": "Secret", "name": "fj-tls"}},
+		"from": []any{map[string]any{testKeyGroup: testGatewayGroup, testKeyKind: kindGateway, testKeyNamespace: testGatewayNS}},
+		"to":   []any{map[string]any{testKeyGroup: "", testKeyKind: "Secret", testKeyName: testTLSSecret}},
 	}
 	if got := grant.Object["spec"]; !reflect.DeepEqual(got, wantGrant) {
 		t.Errorf("ReferenceGrant spec\n got %#v\nwant %#v", got, wantGrant)
@@ -606,11 +636,11 @@ func TestCertManagerCertificate(t *testing.T) {
 	}{
 		{nil, metav1.ConditionUnknown, reasonTLSPending},
 		{[]map[string]any{
-			{"type": "Ready", "status": "False", "reason": "DoesNotExist", "message": "Issuing certificate as Secret does not exist"},
-			{"type": "Issuing", "status": "True", "reason": "DoesNotExist"},
+			{testKeyType: testCondReady, testKeyStatus: "False", testKeyReason: "DoesNotExist", testKeyMessage: "Issuing certificate as Secret does not exist"},
+			{testKeyType: "Issuing", testKeyStatus: testCondTrue, testKeyReason: "DoesNotExist"},
 		}, metav1.ConditionUnknown, reasonTLSPending},
-		{[]map[string]any{{"type": "Ready", "status": "True", "reason": "Ready", "message": "up to date"}}, metav1.ConditionTrue, reasonTLSReady},
-		{[]map[string]any{{"type": "Ready", "status": "False", "reason": "Expired", "message": "expired"}}, metav1.ConditionFalse, reasonCertificateNotReady},
+		{[]map[string]any{{testKeyType: testCondReady, testKeyStatus: testCondTrue, testKeyReason: testCondReady, testKeyMessage: "up to date"}}, metav1.ConditionTrue, reasonTLSReady},
+		{[]map[string]any{{testKeyType: testCondReady, testKeyStatus: "False", testKeyReason: "Expired", testKeyMessage: "expired"}}, metav1.ConditionFalse, reasonCertificateNotReady},
 	} {
 		if tc.conds != nil {
 			setCertificateStatus(t, rc, tc.conds...)
@@ -633,7 +663,7 @@ func TestCertManagerCertificate(t *testing.T) {
 	if err := rc.Client.Get(context.Background(), types.NamespacedName{Namespace: f.Namespace, Name: "fj"}, ing); err != nil {
 		t.Fatal(err)
 	}
-	if len(ing.Spec.TLS) != 1 || ing.Spec.TLS[0].SecretName != "fj-tls" || !reflect.DeepEqual(ing.Spec.TLS[0].Hosts, []string{"www.example.com"}) {
+	if len(ing.Spec.TLS) != 1 || ing.Spec.TLS[0].SecretName != testTLSSecret || !reflect.DeepEqual(ing.Spec.TLS[0].Hosts, []string{testWWWHost}) {
 		t.Errorf("Ingress TLS: %+v", ing.Spec.TLS)
 	}
 	if got := RootURL(f); got != "https://www.example.com/" {
@@ -653,7 +683,7 @@ func TestCertManagerCertificate(t *testing.T) {
 	if condition(f, forgejov1.ConditionTLSReady) != nil {
 		t.Error("TLSReady left after removing spec.tls")
 	}
-	if got := RootURL(f); got != "http://git.example.com/" {
+	if got := RootURL(f); got != testRootURL {
 		t.Errorf("ROOT_URL without spec.tls: %q", got)
 	}
 }
@@ -696,9 +726,9 @@ func TestPublicIdentityWithoutGatewayOrTLS(t *testing.T) {
 		domain, root string
 	}{
 		{"defaults", forgejov1.ServerSpec{}, nil, "fj-http.ns.svc.cluster.local", "http://fj-http.ns.svc.cluster.local:3000/"},
-		{"domain", forgejov1.ServerSpec{Domain: "git.example.com"}, nil, "git.example.com", "http://git.example.com/"},
-		{"ingress", forgejov1.ServerSpec{}, ing("git.example.com", ""), "git.example.com", "http://git.example.com/"},
-		{"ingress tls", forgejov1.ServerSpec{}, ing("git.example.com", "s"), "git.example.com", "https://git.example.com/"},
+		{"domain", forgejov1.ServerSpec{Domain: testDomain}, nil, testDomain, testRootURL},
+		{"ingress", forgejov1.ServerSpec{}, ing("git.example.com", ""), testDomain, testRootURL},
+		{"ingress tls", forgejov1.ServerSpec{}, ing("git.example.com", "s"), testDomain, "https://git.example.com/"},
 		{"rootURL", forgejov1.ServerSpec{RootURL: "https://x.example.com/f"}, nil, "x.example.com", "https://x.example.com/f/"},
 	} {
 		f := testInstance()
@@ -717,14 +747,14 @@ func TestConfigWithGatewayAndTLS(t *testing.T) {
 	ctx := context.Background()
 	f := gatewayInstance()
 	f.Spec.Server.Domain = ""
-	f.Spec.Gateway.Hostnames = []string{"code.example.com"}
+	f.Spec.Gateway.Hostnames = []string{testCodeHost}
 	f.Spec.TLS = &forgejov1.TLSSpec{}
-	f.Spec.Server.TrustedProxies = []string{"10.42.0.0/16", "fd00::/8"}
+	f.Spec.Server.TrustedProxies = []string{testPodCIDR, "fd00::/8"}
 	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace}}
 	rc := testContext(t, f, secrets)
 	rc.TargetImage = img15
 	rc.Layout = forgejo.LayoutForImage(img15)
-	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: "forgejo", User: "forgejo", Password: "pw", SSLMode: "disable"}
+	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: testForgejoName, User: testForgejoName, Password: "pw", SSLMode: testSSLModeDisable}
 	if _, err := ReconcileConfig(ctx, rc); err != nil {
 		t.Fatal(err)
 	}
@@ -809,5 +839,222 @@ func unusedFeaturesPasses(t *testing.T, served []schema.GroupVersionKind) {
 		if mapper.lookups != 0 || gets != 0 {
 			t.Errorf("second pass made %d lookups and %d reads", mapper.lookups, gets)
 		}
+	}
+}
+
+// Without spec.server.ssh.externalPort, SSH_PORT follows the port of the Gateway's TCP
+// listener when every spec.gateway.ssh parent reference names the same port. The operator
+// does not read Gateways, so references by sectionName only (or with different ports) keep the
+// Service port.
+func TestSSHPortFollowsGatewayListenerPort(t *testing.T) {
+	ref := func(section string, port int32) forgejov1.GatewayParentReference {
+		r := forgejov1.GatewayParentReference{Name: "eg", Namespace: testGatewayNS, SectionName: section}
+		if port != 0 {
+			r.Port = ptr.To(port)
+		}
+		return r
+	}
+	for _, tc := range []struct {
+		name     string
+		external int32
+		refs     []forgejov1.GatewayParentReference
+		want     int32
+	}{
+		{"single port", 0, []forgejov1.GatewayParentReference{ref("", 2022)}, 2022},
+		{"same port twice", 0, []forgejov1.GatewayParentReference{ref("", 2022), ref("ssh", 2022)}, 2022},
+		{"mixed ports", 0, []forgejov1.GatewayParentReference{ref("", 2022), ref("", 2200)}, 22},
+		{"one without port", 0, []forgejov1.GatewayParentReference{ref("", 2022), ref("ssh", 0)}, 22},
+		{"sectionName only", 0, []forgejov1.GatewayParentReference{ref("ssh", 0)}, 22},
+		{"externalPort wins", 443, []forgejov1.GatewayParentReference{ref("", 2022)}, 443},
+	} {
+		f := gatewayInstance()
+		f.Spec.Server.SSH.ExternalPort = tc.external
+		f.Spec.Gateway.SSH.ParentRefs = tc.refs
+		if got := sshExternalPort(f); got != tc.want {
+			t.Errorf("%s: SSH_PORT %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	// Without spec.gateway.ssh (or with SSH disabled) the parent references do not count.
+	f := gatewayInstance()
+	f.Spec.Server.SSH.ExternalPort = 0
+	f.Spec.Gateway.SSH.ParentRefs = []forgejov1.GatewayParentReference{ref("", 2022)}
+	f.Spec.Server.SSH.Enabled = ptr.To(false)
+	if got := sshExternalPort(f); got != 22 {
+		t.Errorf("SSH disabled: %d", got)
+	}
+}
+
+// foreignObject creates an object of gvk named name in the instance's namespace, with the
+// given labels, controller and spec.
+func foreignObject(t *testing.T, rc *forgejo.ReconcileContext, gvk schema.GroupVersionKind, name string,
+	labels map[string]string, controller *metav1.OwnerReference, spec map[string]any) {
+	t.Helper()
+	u := &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
+	u.SetGroupVersionKind(gvk)
+	u.SetNamespace(rc.Instance.Namespace)
+	u.SetName(name)
+	u.SetLabels(labels)
+	if controller != nil {
+		u.SetOwnerReferences([]metav1.OwnerReference{*controller})
+	}
+	if err := rc.Client.Create(context.Background(), u); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Routes, the Certificate and the ReferenceGrant are created, but an existing object of the
+// same name is only written while the instance controls it: a user's own route or
+// Certificate is neither taken over (and later deleted with the instance) nor fought over
+// with its controller. The conflict is reported as NameConflict.
+func TestOptionalObjectsNeverTakeOverOthers(t *testing.T) {
+	userSpec := map[string]any{"hostnames": []any{"mine.example.com"}}
+
+	// A hand-made HTTPRoute "fj" without a controller: left untouched; the TCPRoute is still
+	// reconciled.
+	f := gatewayInstance()
+	rc, rec := optionalRC(t, f, allOptionalAPIs)
+	foreignObject(t, rc, forgejo.HTTPRouteGVK, "fj", map[string]string{"team": "web"}, nil, userSpec)
+	before := getOptional(t, rc, forgejo.HTTPRouteGVK, "fj")
+	if res := runStep(t, rc, ReconcileGateway); res.RequeueAfter != notReadyRequeue {
+		t.Errorf("requeue %v", res.RequeueAfter)
+	}
+	after := getOptional(t, rc, forgejo.HTTPRouteGVK, "fj")
+	if after.GetResourceVersion() != before.GetResourceVersion() || len(after.GetOwnerReferences()) != 0 ||
+		!reflect.DeepEqual(after.Object["spec"], userSpec) {
+		t.Fatalf("the user's HTTPRoute was changed: %+v", after.Object)
+	}
+	if tcp := getOptional(t, rc, tcpRouteV1, "fj-ssh"); tcp == nil || !metav1.IsControlledBy(tcp, f) {
+		t.Fatal("the TCPRoute was not reconciled next to the conflict")
+	}
+	c := condition(f, forgejov1.ConditionRoutesReady)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != reasonNameConflict ||
+		!strings.Contains(c.Message, "HTTPRoute fj already exists and does not belong to this Forgejo (it has no controller)") {
+		t.Fatalf("RoutesReady %+v", c)
+	}
+	if evs := drainEvents(rec); len(evs) != 1 || !strings.HasPrefix(evs[0], "Warning NameConflict") {
+		t.Fatalf("events %q", evs)
+	}
+	// Removing spec.gateway does not delete it either.
+	f.Spec.Gateway = nil
+	runStep(t, rc, ReconcileGateway)
+	if getOptional(t, rc, forgejo.HTTPRouteGVK, "fj") == nil {
+		t.Fatal("the user's HTTPRoute was deleted")
+	}
+
+	// A route left behind by an orphaning delete of an earlier instance of this name (its
+	// labels, no controller) is adopted.
+	f = gatewayInstance()
+	rc, _ = optionalRC(t, f, allOptionalAPIs)
+	foreignObject(t, rc, forgejo.HTTPRouteGVK, "fj", forgejo.Labels(f, forgejo.ComponentServer), nil, userSpec)
+	runStep(t, rc, ReconcileGateway)
+	adopted := getOptional(t, rc, forgejo.HTTPRouteGVK, "fj")
+	if !metav1.IsControlledBy(adopted, f) || reflect.DeepEqual(adopted.Object["spec"], userSpec) {
+		t.Fatalf("orphaned route not adopted: %+v", adopted.Object)
+	}
+	if c := condition(f, forgejov1.ConditionRoutesReady); c == nil || c.Reason == reasonNameConflict {
+		t.Fatalf("RoutesReady %+v", c)
+	}
+
+}
+
+// The Certificate and the ReferenceGrant follow the same rule as the routes.
+func TestTLSObjectsNeverTakeOverOthers(t *testing.T) {
+	// A Certificate "fj-tls" that cert-manager's ingress-shim created for the Ingress (a
+	// cert-manager.io/cluster-issuer annotation): TLSReady says to remove the annotation.
+	f := certInstance()
+	rc, _ := optionalRC(t, f, allOptionalAPIs)
+	shim := &metav1.OwnerReference{APIVersion: "networking.k8s.io/v1", Kind: "Ingress", Name: "fj", UID: "ingress-uid", Controller: ptr.To(true)}
+	foreignObject(t, rc, forgejo.CertificateGVK, "fj-tls", nil, shim, map[string]any{testKeySecretName: testTLSSecret})
+	if res := runStep(t, rc, ReconcileTLS); res.RequeueAfter != notReadyRequeue {
+		t.Errorf("requeue %v", res.RequeueAfter)
+	}
+	c := condition(f, forgejov1.ConditionTLSReady)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != reasonNameConflict ||
+		!strings.Contains(c.Message, "controlled by Ingress fj") || !strings.Contains(c.Message, "remove that annotation from spec.ingress.annotations") {
+		t.Fatalf("TLSReady %+v", c)
+	}
+	if cert := getOptional(t, rc, forgejo.CertificateGVK, "fj-tls"); !reflect.DeepEqual(cert.Object["spec"], map[string]any{testKeySecretName: testTLSSecret}) {
+		t.Fatalf("the shim's Certificate was changed: %+v", cert.Object)
+	}
+	// The ReferenceGrant was still created.
+	if getOptional(t, rc, referenceGrantV1, "fj-tls") == nil {
+		t.Fatal("no ReferenceGrant next to the conflicting Certificate")
+	}
+
+	// A user's Certificate without a controller: untouched, no annotation hint; a conflicting
+	// ReferenceGrant is reported too.
+	f = certInstance()
+	rc, _ = optionalRC(t, f, allOptionalAPIs)
+	foreignObject(t, rc, forgejo.CertificateGVK, "fj-tls", nil, nil, map[string]any{testKeySecretName: testTLSSecret, "duration": "2160h"})
+	foreignObject(t, rc, referenceGrantV1, "fj-tls", nil, nil, map[string]any{"from": []any{}})
+	runStep(t, rc, ReconcileTLS)
+	c = condition(f, forgejov1.ConditionTLSReady)
+	if c == nil || c.Reason != reasonNameConflict || strings.Contains(c.Message, "annotation") ||
+		!strings.Contains(c.Message, "Certificate fj-tls already exists") || !strings.Contains(c.Message, "ReferenceGrant fj-tls already exists") {
+		t.Fatalf("TLSReady %+v", c)
+	}
+	if cert := getOptional(t, rc, forgejo.CertificateGVK, "fj-tls"); nested(t, cert, "spec", "duration") != "2160h" || len(cert.GetOwnerReferences()) != 0 {
+		t.Fatalf("the user's Certificate was changed: %+v", cert.Object)
+	}
+}
+
+// failingMapper fails every lookup, as API discovery does during a control-plane hiccup.
+type failingMapper struct {
+	meta.RESTMapper
+	err error
+}
+
+func (m *failingMapper) RESTMapping(schema.GroupKind, ...string) (*meta.RESTMapping, error) {
+	return nil, m.err
+}
+
+// A failed discovery is not taken for an absent kind: removed routes are deleted once
+// discovery works again, not left in place until the operator restarts.
+func TestDeleteOptionalRetriesAfterDiscoveryError(t *testing.T) {
+	f := gatewayInstance()
+	f.Spec.TLS = &forgejov1.TLSSpec{GatewayNamespaces: []string{testGatewayNS}}
+	rc, rec := optionalRC(t, f, allOptionalAPIs)
+	runStep(t, rc, ReconcileGateway)
+	runStep(t, rc, ReconcileTLS)
+	if getOptional(t, rc, forgejo.HTTPRouteGVK, "fj") == nil || getOptional(t, rc, referenceGrantV1, "fj-tls") == nil {
+		t.Fatal("not created")
+	}
+	drainEvents(rec)
+
+	served := rc.RESTMapper
+	rc.RESTMapper = &failingMapper{RESTMapper: served, err: errors.New("the server was unable to return a response in the time allotted")}
+	f.Spec.Gateway, f.Spec.TLS = nil, nil
+	ForgetInstance(f.Namespace, f.Name) // a restarted operator, whose mapper is still cold
+	if _, err := ReconcileGateway(context.Background(), rc); err == nil || !strings.Contains(err.Error(), "discovering HTTPRoute") {
+		t.Fatalf("ReconcileGateway: %v", err)
+	}
+	if _, err := ReconcileTLS(context.Background(), rc); err == nil || !strings.Contains(err.Error(), "discovering ReferenceGrant") {
+		t.Fatalf("ReconcileTLS: %v", err)
+	}
+	if _, ok := optionalAbsent.Load(optionalKey(f, forgejo.HTTPRouteGVK.GroupKind(), "fj")); ok {
+		t.Fatal("absence cached after a discovery error")
+	}
+
+	// Enabled features do not flip to *Unavailable on a discovery error either.
+	g := gatewayInstance()
+	g.Spec.TLS = &forgejov1.TLSSpec{CertManager: &forgejov1.CertManagerTLSSpec{IssuerRef: forgejov1.CertManagerIssuerRef{Name: "ca"}}}
+	grc, grec := optionalRC(t, g, allOptionalAPIs)
+	grc.RESTMapper = rc.RESTMapper
+	if _, err := ReconcileGateway(context.Background(), grc); err == nil {
+		t.Fatal("ReconcileGateway with a failing discovery succeeded")
+	}
+	if _, err := ReconcileTLS(context.Background(), grc); err == nil {
+		t.Fatal("ReconcileTLS with a failing discovery succeeded")
+	}
+	if len(g.Status.Conditions) != 0 || len(drainEvents(grec)) != 0 {
+		t.Fatalf("conditions %+v", g.Status.Conditions)
+	}
+
+	rc.RESTMapper = served
+	runStep(t, rc, ReconcileGateway)
+	runStep(t, rc, ReconcileTLS)
+	if getOptional(t, rc, forgejo.HTTPRouteGVK, "fj") != nil || getOptional(t, rc, tcpRouteV1, "fj-ssh") != nil ||
+		getOptional(t, rc, referenceGrantV1, "fj-tls") != nil {
+		t.Fatal("removed objects were not deleted once discovery recovered")
 	}
 }

@@ -169,8 +169,9 @@ func hostOnly(hostPort string) string {
 // ObjectStorage is the resolved spec.objectStorage of an instance (set by the object-storage
 // step).
 type ObjectStorage struct {
-	// Digest identifies the credentials and the CA certificate (the pod template's
-	// object-storage annotation): environment variables and the trust store are read at
-	// start, so a change rolls the pods.
-	Digest string
+	// ContentDigest identifies the credentials and the CA certificate: an unkeyed SHA-256 that
+	// is kept in memory only (the bucket check's cache and the input of the pod template's
+	// keyed object-storage annotation) and must never be written to an object. Environment
+	// variables and the trust store are read at start, so a change rolls the pods.
+	ContentDigest string
 }

@@ -1,0 +1,22 @@
+# exec into pods, used only to measure volume usage (df, du) in the containers that mount an
+# instance's claims (the forgejo container, CNPG's postgres). Kept out of manager-role and
+# bound only where volume measurement is wanted: cluster-wide by the kustomize component
+# config/components/volume-usage (part of config/default), or per namespace with a
+# RoleBinding (config/namespaced). Unbound, StorageHealthy is Unknown/MeasurementUnavailable
+# and volumes are not expanded automatically. See docs/permissions.md.
+# Older API servers authorize a WebSocket exec as get, newer ones (and SPDY exec) as create.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: forgejo-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: volume-usage
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods/exec
+  verbs:
+  - get
+  - create

@@ -30,6 +30,11 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const (
+	testSSHHostKeysSecret  = "fj-ssh-host-keys"
+	testExistingKeysSecret = "my-keys"
+)
+
 const hostKeysImage = "codeberg.org/forgejo/forgejo:15"
 
 func init() {
@@ -62,7 +67,7 @@ func newHostKeysEnv(t *testing.T, mutate func(f *forgejov1.Forgejo), objs ...cli
 	rc.TargetImage = forgejo.Image(f)
 	rc.Layout = forgejo.LayoutForImage(rc.TargetImage)
 	rc.ConfigSecretName = forgejo.ConfigSecretName(f)
-	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: "fjdb", User: "fjuser", Password: "pw", SSLMode: "disable"}
+	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: "fjdb", User: "fjuser", Password: "pw", SSLMode: testSSLModeDisable}
 	return &hostKeysEnv{t: t, ctx: context.Background(), rc: rc, f: f}
 }
 
@@ -290,7 +295,7 @@ func TestExistingHostKeysSecretIsReused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	own := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fj-ssh-host-keys", Namespace: "ns"}, Data: map[string][]byte{HostKeyEd25519: pemBytes}}
+	own := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSSHHostKeysSecret, Namespace: "ns"}, Data: map[string][]byte{HostKeyEd25519: pemBytes}}
 	e = newHostKeysEnv(t, nil, own)
 	e.pass()
 	got, _ := e.secret(own.Name)
@@ -414,15 +419,15 @@ func TestExistingSecretHostKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	own := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "my-keys", Namespace: "ns"}, Data: map[string][]byte{HostKeyEd25519: pemBytes, "other": []byte("x")}}
+	own := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testExistingKeysSecret, Namespace: "ns"}, Data: map[string][]byte{HostKeyEd25519: pemBytes, "other": []byte("x")}}
 	e := newHostKeysEnv(t, func(f *forgejov1.Forgejo) {
-		f.Spec.Server.SSH.HostKeys = &forgejov1.SSHHostKeysSpec{ExistingSecret: "my-keys"}
+		f.Spec.Server.SSH.HostKeys = &forgejov1.SSHHostKeysSpec{ExistingSecret: testExistingKeysSecret}
 	}, own)
 	d, ini := e.pass()
 	if !strings.Contains(section(ini, "server"), "SSH_SERVER_HOST_KEYS = /etc/forgejo-ssh/ssh_host_ed25519_key\n") {
 		t.Fatalf("app.ini:\n%s", ini)
 	}
-	if s := servedHostKeys(d); s == nil || s.SecretName != "my-keys" {
+	if s := servedHostKeys(d); s == nil || s.SecretName != testExistingKeysSecret {
 		t.Fatalf("served: %+v", s)
 	}
 	if _, err := e.secret(forgejo.SSHHostKeysSecretName(e.f)); !apierrors.IsNotFound(err) {
@@ -505,5 +510,69 @@ func TestParseHostKeys(t *testing.T) {
 	pkcs1 := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rk)})
 	if keys, err := parseHostKeys(map[string][]byte{HostKeyRSA: pkcs1}); err != nil || ssh.FingerprintSHA256(keys[0].pub) != fingerprintOf(t, rk) {
 		t.Fatalf("PKCS#1: %v", err)
+	}
+}
+
+// A "<name>-ssh-host-keys" that another controller controls (a SealedSecret or ExternalSecret
+// of a GitOps setup, created before the instance for a disaster recovery) is served as it is,
+// but never adopted: with retainPolicy Delete a controller reference would be refused
+// (AlreadyOwnedError) and block config and workload on every pass.
+func TestHostKeysSecretControlledByAnotherController(t *testing.T) {
+	_, ed, _ := ed25519.GenerateKey(rand.Reader)
+	pemBytes, err := marshalHostKey(ed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: testSSHHostKeysSecret, Namespace: "ns",
+			Labels: map[string]string{"sealedsecrets.bitnami.com/managed": valueTrue},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "bitnami.com/v1alpha1", Kind: "SealedSecret",
+				Name: testSSHHostKeysSecret, UID: "sealed-uid", Controller: ptr.To(true)}}},
+		Data: map[string][]byte{HostKeyEd25519: pemBytes},
+	}
+	e := newHostKeysEnv(t, func(f *forgejov1.Forgejo) { f.Spec.Storage.RetainPolicy = forgejov1.RetainPolicyDelete }, sealed)
+	before, err := e.secret(sealed.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, ini := e.pass()
+	if e.rc.SSHHostKeys == nil || e.rc.SSHHostKeys.SecretName != sealed.Name || !mountsHostKeys(d) ||
+		!strings.Contains(ini, "SSH_SERVER_HOST_KEYS = /etc/forgejo-ssh/"+HostKeyEd25519) {
+		t.Fatalf("keys not served: %+v\n%s", e.rc.SSHHostKeys, ini)
+	}
+	if st := e.f.Status.SSH; st == nil || st.HostKeysSource != forgejov1.SSHHostKeysExistingSecret || statusFingerprints(e.f)[0] != fingerprintOf(t, ed) {
+		t.Fatalf("status: %+v", st)
+	}
+	after, _ := e.secret(sealed.Name)
+	if after.ResourceVersion != before.ResourceVersion || !equality.Semantic.DeepEqual(after.Labels, before.Labels) ||
+		!equality.Semantic.DeepEqual(after.OwnerReferences, before.OwnerReferences) {
+		t.Fatalf("the Secret was changed: %+v", after.ObjectMeta)
+	}
+	// A second pass is just as quiet.
+	e.pass()
+	if again, _ := e.secret(sealed.Name); again.ResourceVersion != before.ResourceVersion {
+		t.Fatal("the Secret was changed on the second pass")
+	}
+}
+
+// SSH_SERVER_HOST_KEYS from configFrom means the user manages the host keys, as in
+// spec.config: no Secret, no mount, no status.ssh, and app.ini keeps the user's value.
+func TestHostKeysOverriddenThroughConfigFrom(t *testing.T) {
+	userKeys := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "my-ssh", Namespace: "ns"},
+		Data: map[string][]byte{"paths": []byte("/data/ssh/key1,/data/ssh/key2")}}
+	e := newHostKeysEnv(t, func(f *forgejov1.Forgejo) {
+		f.Spec.ConfigFrom = []forgejov1.ConfigValueFromSecret{{Section: "Server", Key: "SSH_SERVER_HOST_KEYS",
+			SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "my-ssh"}, Key: "paths"}}}
+	}, userKeys)
+	e.f.Status.SSH = &forgejov1.SSHStatus{HostKeysSecretName: "stale"}
+	d, ini := e.pass()
+	if _, err := e.secret(forgejo.SSHHostKeysSecretName(e.f)); !apierrors.IsNotFound(err) {
+		t.Fatal("generated host keys although configFrom sets SSH_SERVER_HOST_KEYS")
+	}
+	if mountsHostKeys(d) || e.f.Status.SSH != nil || e.rc.SSHHostKeys != nil {
+		t.Fatalf("unmanaged host keys must be left alone: status %+v", e.f.Status.SSH)
+	}
+	if !strings.Contains(section(ini, "server"), "SSH_SERVER_HOST_KEYS = /data/ssh/key1,/data/ssh/key2\n") {
+		t.Fatalf("app.ini lost the configFrom value:\n%s", ini)
 	}
 }

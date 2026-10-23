@@ -13,6 +13,11 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const (
+	dockerCLI  = "docker"
+	capDropAll = "ALL"
+)
+
 // Container and volume names of the runner pods.
 const (
 	ContainerRunner  = "runner"
@@ -211,7 +216,7 @@ func PodSpec(r *forgejov1.ForgejoRunner) corev1.PodSpec {
 			Resources:     r.Spec.Docker.Resources,
 			StartupProbe: &corev1.Probe{
 				ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{
-					Command: []string{"docker", "--host=unix://" + DockerSocket, "info"},
+					Command: []string{dockerCLI, "--host=unix://" + DockerSocket, "info"},
 				}},
 				PeriodSeconds: 2, TimeoutSeconds: 5, SuccessThreshold: 1, FailureThreshold: 150,
 			},
@@ -268,7 +273,7 @@ func restrictedContext(readOnlyRoot bool) *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),
 		ReadOnlyRootFilesystem:   ptr.To(readOnlyRoot),
-		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{capDropAll}},
 	}
 }
 

@@ -78,6 +78,7 @@ type RunnerScope struct {
 // RunnerDockerSpec configures the Docker daemon of the Docker executor.
 type RunnerDockerSpec struct {
 	// image of the Docker daemon (docker:dind). Defaults to DefaultDindImage.
+	// +kubebuilder:validation:MaxLength=512
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -108,6 +109,7 @@ type RunnerHostSpec struct {
 	// image the runner and the job steps run in. An init container copies the runner binary
 	// into it, so it needs no runner of its own; it should have node (for JavaScript actions),
 	// git and a shell, and run as a non-root user. Defaults to DefaultRunnerToolchainImage.
+	// +kubebuilder:validation:MaxLength=512
 	// +optional
 	Image string `json:"image,omitempty"`
 }
@@ -126,6 +128,8 @@ type RunnerCacheSpec struct {
 // ForgejoRunnerSpec defines a set of Forgejo Actions runners for one Forgejo instance.
 // +kubebuilder:validation:XValidation:rule="!has(self.labels) || self.executor != 'Host' || self.labels.all(l, l.matches('^[^:,]+:host$'))",message="labels of the Host executor have the form name:host"
 // +kubebuilder:validation:XValidation:rule="!has(self.labels) || self.executor != 'Docker' || self.labels.all(l, l.matches('^[^:,]+:docker://[^,]+$'))",message="labels of the Docker executor have the form name:docker://image"
+// +kubebuilder:validation:XValidation:rule="self.executor == 'Docker' || !has(self.docker) || (!has(self.docker.image) && !has(self.docker.args) && !has(self.docker.storageSizeLimit) && (!has(self.docker.mountSocket) || !self.docker.mountSocket))",message="docker settings apply to the Docker executor only",fieldPath=".docker",reason="FieldValueForbidden"
+// +kubebuilder:validation:XValidation:rule="self.executor == 'Host' || !has(self.host) || !has(self.host.image)",message="host.image applies to the Host executor only",fieldPath=".host.image",reason="FieldValueForbidden"
 type ForgejoRunnerSpec struct {
 	// forgejoRef is the Forgejo instance (in the same namespace) the runners register with.
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="forgejoRef is immutable"
@@ -168,8 +172,11 @@ type ForgejoRunnerSpec struct {
 	// image of Forgejo Runner.
 	// +optional
 	// +kubebuilder:default="data.forgejo.org/forgejo/runner:13.2.0"
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
 	Image string `json:"image,omitempty"`
 
+	// +kubebuilder:validation:Enum=Always;Never;IfNotPresent
 	// +optional
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 
@@ -199,6 +206,10 @@ type ForgejoRunnerSpec struct {
 
 	// shutdownTimeout is how long a stopping runner (scale-down, rollout, deletion) lets its
 	// running jobs finish before it cancels them. Defaults to 10m.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="must be a positive Go duration such as 30s, 5m or 1h"
 	// +optional
 	ShutdownTimeout *metav1.Duration `json:"shutdownTimeout,omitempty"`
 
@@ -302,6 +313,8 @@ type ForgejoRunnerStatus struct {
 // +kubebuilder:printcolumn:name="Organization",type=string,JSONPath=`.spec.scope.organization`,priority=1
 // +kubebuilder:printcolumn:name="Repository",type=string,JSONPath=`.spec.scope.repository`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 52",message="metadata.name must be at most 52 characters: the runner pods carry it in labels limited to 63 characters"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must contain only lowercase letters, digits and '-' (no '.'): the runner pods' host names are \"<name>-<index>\""
 
 // ForgejoRunner is a set of Forgejo Actions runners registered with a Forgejo instance.
 type ForgejoRunner struct {

@@ -16,6 +16,8 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const testBucketName = "forgejo"
+
 // Backups carry a copy of the SSH host keys from the Secret the pods serve them from.
 func TestBackupJobCopiesSSHHostKeys(t *testing.T) {
 	s := testScheme(t)
@@ -50,12 +52,12 @@ func TestBackupJobCopiesSSHHostKeys(t *testing.T) {
 		}
 		return ""
 	}
-	if got := secretOf(build(nil)); got != "fj-ssh-host-keys" {
+	if got := secretOf(build(nil)); got != testSSHHostKeysSecret {
 		t.Errorf("default: %q", got)
 	}
 	if got := secretOf(build(func(f *forgejov1.Forgejo) {
-		f.Spec.Server.SSH.HostKeys = &forgejov1.SSHHostKeysSpec{ExistingSecret: "mine"}
-	})); got != "mine" {
+		f.Spec.Server.SSH.HostKeys = &forgejov1.SSHHostKeysSpec{ExistingSecret: testOwnSecret}
+	})); got != testOwnSecret {
 		t.Errorf("existingSecret: %q", got)
 	}
 	if got := secretOf(build(func(f *forgejov1.Forgejo) { f.Spec.Server.SSH.Enabled = ptr.To(false) })); got != "" {
@@ -130,15 +132,15 @@ func TestArchiveScriptCopiesSSHHostKeys(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatalf("manifest: %v\n%s", err, b)
 	}
-	if m.SSHHostKeys.Directory != SSHHostKeysDir || m.SSHHostKeys.Secret != "fj-ssh-host-keys" ||
-		len(m.SSHHostKeys.Files) != 1 || m.SSHHostKeys.Files[0] != "ssh_host_ed25519_key" {
+	if m.SSHHostKeys.Directory != SSHHostKeysDir || m.SSHHostKeys.Secret != testSSHHostKeysSecret ||
+		len(m.SSHHostKeys.Files) != 1 || m.SSHHostKeys.Files[0] != testHostKeyFile {
 		t.Fatalf("manifest sshHostKeys: %+v", m.SSHHostKeys)
 	}
-	if o := m.ObjectStorage; o == nil || o.Bucket != "forgejo" || o.Prefix != "fj/" || strings.Join(o.Subsystems, ",") !=
+	if o := m.ObjectStorage; o == nil || o.Bucket != testBucketName || o.Prefix != "fj/" || strings.Join(o.Subsystems, ",") !=
 		"lfs,attachments,avatars,repo-avatars,repo-archive,packages,actions_log" {
 		t.Fatalf("manifest objectStorage: %+v\n%s", o, b)
 	}
-	if got := objectStorageManifest(&forgejov1.Forgejo{}); got != "null" {
+	if got := objectStorageManifest(&forgejov1.Forgejo{}); got != jsonNull {
 		t.Fatalf("without object storage: %s", got)
 	}
 }
@@ -146,7 +148,7 @@ func TestArchiveScriptCopiesSSHHostKeys(t *testing.T) {
 func objectStorageInstance() *forgejov1.Forgejo {
 	f := &forgejov1.Forgejo{}
 	f.Spec.ObjectStorage = &forgejov1.ObjectStorageSpec{
-		S3: forgejov1.S3Connection{Endpoint: "http://garage.s3-lab:3900", Bucket: "forgejo", Prefix: "fj",
+		S3: forgejov1.S3Connection{Endpoint: "http://garage.s3-lab:3900", Bucket: testBucketName, Prefix: "fj",
 			CredentialsSecret: forgejov1.S3CredentialsSecretRef{Name: "s3"}},
 		Subsystems: forgejov1.ObjectStorageSubsystems{ActionsArtifacts: ptr.To(false)},
 	}

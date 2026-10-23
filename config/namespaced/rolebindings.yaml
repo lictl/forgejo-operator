@@ -1,0 +1,36 @@
+# One pair per namespace in WATCH_NAMESPACE (kustomization.yaml). The namespace must exist
+# before this is applied.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: forgejo-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: forgejo-operator-manager-rolebinding
+  namespace: forgejo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: forgejo-operator-manager-role
+subjects:
+- kind: ServiceAccount
+  name: forgejo-operator-controller-manager
+  namespace: forgejo-operator-system
+---
+# pods/exec for volume measurement in this namespace only; drop it to do without.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: forgejo-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: forgejo-operator-volume-usage-rolebinding
+  namespace: forgejo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: forgejo-operator-volume-usage
+subjects:
+- kind: ServiceAccount
+  name: forgejo-operator-controller-manager
+  namespace: forgejo-operator-system

@@ -3,6 +3,7 @@ package forgejo
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -59,7 +60,8 @@ var Versions = VersionTable{
 // VersionTable lists Forgejo major releases. Releases have been verified with the operator;
 // Upcoming ones are known from the upstream schedule but not verified yet: images of an
 // upcoming major are reported as Future and run with the traits of the newest verified
-// release.
+// release combined with the prepared app.ini traits of the upcoming rows up to that major
+// (Traits).
 type VersionTable struct {
 	// Releases, oldest first, one row per major without gaps. Keep every row after its end
 	// of life: majors older than the oldest row are reported as end of life and run with
@@ -348,16 +350,29 @@ func (t VersionTable) scheduleText(major int) string {
 	return ""
 }
 
-// upgradeAdvice names the supported releases an instance on major can upgrade to.
+// upgradeAdvice names the supported releases an instance on major can upgrade to, with the
+// minimum patch release of a target that has an advisory ("17 (17.0.1 or newer)"): a floating
+// tag may still pull the patch the advisory is about. The text comes from the table only, so
+// it stays the same across the running patch releases.
 func (t VersionTable) upgradeAdvice(major int, now time.Time, when string) string {
 	var targets []string
 	for _, r := range t.Supported(now) {
 		if r.Major <= major {
 			continue
 		}
-		name := r.Name()
+		var notes []string
+		if r.LTS {
+			notes = append(notes, "LTS")
+		}
+		if r.Advisory != nil {
+			notes = append(notes, fmt.Sprintf("%d.0.%d or newer", r.Major, r.Advisory.FixedIn))
+		}
 		if ok, via := t.DirectUpgrade(major, r.Major); !ok {
-			name += fmt.Sprintf(" (through %d first)", via)
+			notes = append(notes, fmt.Sprintf("through %d first", via))
+		}
+		name := strconv.Itoa(r.Major)
+		if len(notes) > 0 {
+			name += " (" + strings.Join(notes, ", ") + ")"
 		}
 		targets = append(targets, name)
 	}
@@ -367,13 +382,26 @@ func (t VersionTable) upgradeAdvice(major int, now time.Time, when string) strin
 	return fmt.Sprintf("Upgrade to %s %s.", strings.Join(targets, " or "), when)
 }
 
+// newestRow is the newest row of the table, upcoming or verified.
+func (t VersionTable) newestRow() *Release {
+	if len(t.Upcoming) > 0 {
+		return &t.Upcoming[len(t.Upcoming)-1]
+	}
+	return t.Newest()
+}
+
 // DirectUpgrade reports whether the operator upgrades from major from to major to in one
-// step. When it does not, via is the major to upgrade to first. Majors without a row
-// (verified or upcoming) are not restricted.
+// step. When it does not, via is the major to upgrade to first. The target's row (verified or
+// upcoming) decides; a major newer than every row is held to the newest row's UpgradeFrom, so
+// that an unknown future major is at least as strict as the newest known one. Majors older
+// than the table are not restricted.
 func (t VersionTable) DirectUpgrade(from, to int) (ok bool, via int) {
 	r := t.Release(to)
 	if r == nil {
 		r = t.upcoming(to)
+	}
+	if newest := t.newestRow(); r == nil && to > newest.Major {
+		r = newest
 	}
 	if r == nil || from >= to || r.UpgradeFrom == 0 || from >= r.UpgradeFrom {
 		return true, 0
@@ -382,8 +410,11 @@ func (t VersionTable) DirectUpgrade(from, to int) (ok bool, via int) {
 }
 
 // Traits returns how the operator runs a version. Unknown versions get the traits that work
-// on every verified release and on older majors (CompatTraits); majors newer than the table
-// those of the newest verified release, and older ones LegacyTraits.
+// on every major (CompatTraits), and majors older than the table LegacyTraits. Majors newer
+// than the verified releases run with the newest verified release's traits plus the app.ini
+// traits (InternalToken, InternalSocket) and StrictDurations of every upcoming row up to
+// their major (all of them beyond the table): app.ini then carries what both need, as for
+// CompatTraits, while CLI traits (PasswordFromStdin) stay those of the verified release.
 func (t VersionTable) Traits(v Version, ok bool) Traits {
 	switch {
 	case !ok || v.Major < 0:
@@ -391,16 +422,37 @@ func (t VersionTable) Traits(v Version, ok bool) Traits {
 	case t.Release(v.Major) != nil:
 		return t.Release(v.Major).Traits
 	case v.Major > t.Newest().Major:
-		return t.Newest().Traits
+		c := t.Newest().Traits
+		for _, u := range t.Upcoming {
+			if u.Major <= v.Major {
+				c.InternalToken = c.InternalToken || u.Traits.InternalToken
+				c.InternalSocket = c.InternalSocket || u.Traits.InternalSocket
+				c.StrictDurations = c.StrictDurations || u.Traits.StrictDurations
+			}
+		}
+		return c
 	default:
 		return LegacyTraits
 	}
 }
 
+// StrictDurationsSince is the oldest major (verified or upcoming) whose traits have
+// StrictDurations, or 0 when none has.
+func (t VersionTable) StrictDurationsSince() int {
+	for _, r := range append(slices.Clone(t.Releases), t.Upcoming...) {
+		if r.Traits.StrictDurations {
+			return r.Major
+		}
+	}
+	return 0
+}
+
 // CompatTraits are the traits for an image of unknown version, which may be any major,
-// including one older than the table: app.ini carries every key that LegacyTraits or some
-// verified release needs (each one is ignored or only logged by the others), and CLI
-// features are used only when all of them have them.
+// including one older or newer than the table: app.ini carries every key that LegacyTraits,
+// some verified release or some upcoming one needs (each one is ignored or only logged by the
+// others), and CLI features are used only when every verified release and LegacyTraits have
+// them. StrictDurations is set when some verified release has it, so the duration warnings
+// cover a digest-pinned 17; ReconcileConfig takes it from the reported version once known.
 func (t VersionTable) CompatTraits() Traits {
 	c := LegacyTraits
 	for _, r := range t.Releases {
@@ -408,6 +460,10 @@ func (t VersionTable) CompatTraits() Traits {
 		c.InternalSocket = c.InternalSocket || r.Traits.InternalSocket
 		c.StrictDurations = c.StrictDurations || r.Traits.StrictDurations
 		c.PasswordFromStdin = c.PasswordFromStdin && r.Traits.PasswordFromStdin
+	}
+	for _, u := range t.Upcoming {
+		c.InternalToken = c.InternalToken || u.Traits.InternalToken
+		c.InternalSocket = c.InternalSocket || u.Traits.InternalSocket
 	}
 	return c
 }

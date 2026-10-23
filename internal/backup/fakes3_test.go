@@ -21,6 +21,14 @@ import (
 	"github.com/lictl/forgejo-operator/internal/rclone"
 )
 
+const (
+	testCredsSecret    = "creds"
+	testKeyField       = "key"
+	testSecretKeyField = "secret-key"
+	testPasswordField  = "password"
+	testHostKeyFile    = "ssh_host_ed25519_key"
+)
+
 // Exported test helpers (fake S3 store, Secrets, remote backups) shared with the backup_test
 // package of this directory.
 
@@ -41,6 +49,8 @@ type FakeS3 struct {
 	Deleted []string
 	// Down makes every request fail with 503.
 	Down bool
+	// Requests counts the requests served.
+	Requests int
 }
 
 // NewFakeS3 starts a FakeS3; it is closed with the test.
@@ -49,6 +59,13 @@ func NewFakeS3(t *testing.T) *FakeS3 {
 	f.Server = httptest.NewServer(f)
 	t.Cleanup(f.Server.Close)
 	return f
+}
+
+// RequestCount is the number of requests served so far.
+func (f *FakeS3) RequestCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Requests
 }
 
 // Endpoint is the server's URL.
@@ -79,6 +96,7 @@ func (f *FakeS3) Keys(prefix string) []string {
 func (f *FakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.Requests++
 	if f.Down {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -132,7 +150,7 @@ func (f *FakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // FakeConnection is an S3Connection to the FakeS3 with Secret "creds".
 func (f *FakeS3) FakeConnection(prefix string) forgejov1.S3Connection {
 	return forgejov1.S3Connection{Endpoint: f.Endpoint(), Bucket: FakeBucket, Region: "garage", PathStyle: ptrTrue(),
-		Prefix: prefix, CredentialsSecret: forgejov1.S3CredentialsSecretRef{Name: "creds"}}
+		Prefix: prefix, CredentialsSecret: forgejov1.S3CredentialsSecretRef{Name: testCredsSecret}}
 }
 
 func ptrTrue() *bool { t := true; return &t }
@@ -141,10 +159,10 @@ func ptrTrue() *bool { t := true; return &t }
 // in namespace.
 func FakeSecrets(namespace, keyName string) []*corev1.Secret {
 	return []*corev1.Secret{
-		{ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: namespace},
-			Data: map[string][]byte{"AWS_ACCESS_KEY_ID": []byte("GKtest"), "AWS_SECRET_ACCESS_KEY": []byte("test-secret")}},
+		{ObjectMeta: metav1.ObjectMeta{Name: testCredsSecret, Namespace: namespace},
+			Data: map[string][]byte{envAWSAccessKeyID: []byte("GKtest"), envAWSSecretAccessKey: []byte("test-secret")}},
 		{ObjectMeta: metav1.ObjectMeta{Name: keyName, Namespace: namespace},
-			Data: map[string][]byte{"key": []byte(FakeKey)}},
+			Data: map[string][]byte{testKeyField: []byte(FakeKey)}},
 	}
 }
 
@@ -188,10 +206,10 @@ func (f *FakeS3) PutBackup(t *testing.T, prefix, path string, m RemoteManifest, 
 func FakeIdentity(t *testing.T, secretKey string) []byte {
 	t.Helper()
 	id := Identity{FormatVersion: remoteFormatVersion, Secrets: []IdentitySecret{
-		{Role: IdentityRoleSecrets, Name: "old-secrets", Data: map[string][]byte{"secret-key": []byte(secretKey), "internal-token": []byte("tok")}},
-		{Role: IdentityRoleAdmin, Name: "old-admin", Data: map[string][]byte{"username": []byte("forgejo_admin"), "password": []byte("pw")}},
-		{Role: IdentityRoleSSHHostKeys, Name: "old-ssh-host-keys", Annotations: map[string]string{"forgejo.lucas.icu/ssh-host-keys-source": "Generated"},
-			Data: map[string][]byte{"ssh_host_ed25519_key": []byte("ed25519 key")}},
+		{Role: IdentityRoleSecrets, Name: "old-secrets", Data: map[string][]byte{testSecretKeyField: []byte(secretKey), "internal-token": []byte("tok")}},
+		{Role: IdentityRoleAdmin, Name: "old-admin", Data: map[string][]byte{"username": []byte("forgejo_admin"), testPasswordField: []byte("pw")}},
+		{Role: IdentityRoleSSHHostKeys, Name: "old-ssh-host-keys", Annotations: map[string]string{"forgejo.lucas.icu/ssh-host-keys-source": keySourceGenerated},
+			Data: map[string][]byte{testHostKeyFile: []byte("ed25519 key")}},
 	}}
 	data, err := json.Marshal(id)
 	if err != nil {

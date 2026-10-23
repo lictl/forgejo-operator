@@ -2,6 +2,8 @@ package runner
 
 import (
 	"fmt"
+	"maps"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -14,11 +16,31 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// Slot is one runner to register: its index, name and secret.
+// Slot is one runner to register: its index, name and secret, and the version Forgejo lists
+// for it.
 type Slot struct {
 	Index int32
 	Name  string
 	Token string
+	// Version is the runner version Forgejo lists for a runner registered before ("" for a
+	// new or lost runner, which declares its version when its pod connects). Registering
+	// writes Forgejo's version column (models/actions.RegisterRunner on Forgejo 15 and 17), so
+	// a runner registered again without its pod restarting, as on a scope change, keeps the
+	// version only when it is passed on.
+	Version string
+}
+
+// versionPattern is a runner version as Forgejo Runner declares it (e.g. 13.2.0, v12.7.0-rc1).
+var versionPattern = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$`)
+
+// SafeVersion returns v when it is a plain version string and "" otherwise. The version is
+// what a runner declared to Forgejo and is passed through the registration script, so nothing
+// that could split a word or reach the shell gets through.
+func SafeVersion(v string) string {
+	if versionPattern.MatchString(v) {
+		return v
+	}
+	return ""
 }
 
 // UUID of the slot's runner in Forgejo.
@@ -62,10 +84,12 @@ type RegisterJobInput struct {
 	Slots        []Slot
 }
 
-// registerScript registers every runner of $RUNNERS ("<index>:<name> ...") with
+// registerScript registers every runner of $RUNNERS ("<index>:<version>:<name> ...") with
 // "forgejo-cli actions register", which is idempotent: it creates the runner whose UUID the
-// secret's first 16 characters give, or updates its name, scope and secret. Only the UUID is
-// printed. Labels are left alone (--keep-labels): the runners declare them when they connect.
+// secret's first 16 characters give, or updates its name, scope, secret and version. Only the
+// UUID is printed. Labels are left alone (--keep-labels): the runners declare them when they
+// connect. The version is the one Forgejo listed for the runner (see Slot.Version), empty for
+// a new runner; neither a version (SafeVersion) nor a name (a DNS label) contains a ':'.
 // The secrets are read from files; error output is passed through a filter that masks
 // anything shaped like a secret, because Forgejo prints the runner record (with its secret)
 // when updating it fails.
@@ -73,8 +97,10 @@ const registerScript = `set -eu
 F=%s
 for runner in $RUNNERS; do
   i=${runner%%%%:*}
-  name=${runner#*:}
-  if uuid=$("$F" --config "$GITEA_APP_INI" forgejo-cli actions register --secret-file "%s/token-$i" --scope "$RUNNER_SCOPE" --name "$name" --keep-labels 2>/tmp/register.err); then
+  rest=${runner#*:}
+  version=${rest%%%%:*}
+  name=${rest#*:}
+  if uuid=$("$F" --config "$GITEA_APP_INI" forgejo-cli actions register --secret-file "%s/token-$i" --scope "$RUNNER_SCOPE" --name "$name" --version "$version" --keep-labels 2>/tmp/register.err); then
     echo "Registered runner $name ($uuid)"
   else
     sed -E 's/[0-9a-fA-F]{40}/<redacted>/g' /tmp/register.err >&2
@@ -92,14 +118,19 @@ func registerScriptFor(cli, tokensDir string) string {
 
 // RegisterJob renders the registration Job. It runs the instance's own image as uid 1000 with
 // a read-only root file system and the instance's app.ini (which holds the database
-// credentials), but without the data volume: the CLI only writes to the database.
+// credentials), but without the data volume: the CLI only writes to the database. It is placed
+// like the instance's pods (see instancePlacement).
+//
+// The Job has no TTL: the controller deletes it once its result is recorded (or a minute
+// after it failed), and the finalizer deletes it with the ForgejoRunner. A Job that vanished
+// before it was collected would leave runners registered that nothing records.
 func RegisterJob(in RegisterJobInput) *batchv1.Job {
 	r, f := in.Runner, in.Forgejo
 	l := forgejo.LayoutForImage(in.Image)
 	runners := make([]string, 0, len(in.Slots))
 	items := make([]corev1.KeyToPath, 0, len(in.Slots))
 	for _, s := range in.Slots {
-		runners = append(runners, fmt.Sprintf("%d:%s", s.Index, s.Name))
+		runners = append(runners, fmt.Sprintf("%d:%s:%s", s.Index, SafeVersion(s.Version), s.Name))
 		items = append(items, corev1.KeyToPath{Key: TokenKey(s.Index), Path: TokenKey(s.Index)})
 	}
 	const tokensDir = "/etc/forgejo-runner-tokens"
@@ -110,9 +141,9 @@ func RegisterJob(in RegisterJobInput) *batchv1.Job {
 		RunAsNonRoot:             ptr.To(true),
 		AllowPrivilegeEscalation: ptr.To(false),
 		ReadOnlyRootFilesystem:   ptr.To(true),
-		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{capDropAll}},
 	}
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      RegisterJobName(r),
 			Namespace: r.Namespace,
@@ -123,9 +154,8 @@ func RegisterJob(in RegisterJobInput) *batchv1.Job {
 			},
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:            ptr.To[int32](2),
-			ActiveDeadlineSeconds:   ptr.To[int64](600),
-			TTLSecondsAfterFinished: ptr.To[int32](3600),
+			BackoffLimit:          ptr.To[int32](2),
+			ActiveDeadlineSeconds: ptr.To[int64](600),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
@@ -153,8 +183,8 @@ func RegisterJob(in RegisterJobInput) *batchv1.Job {
 							{Name: "RUNNER_SCOPE", Value: Scope(r)},
 						},
 						VolumeMounts: []corev1.VolumeMount{
-							{Name: "config", MountPath: l.ConfigDir, ReadOnly: true},
-							{Name: "tokens", MountPath: tokensDir, ReadOnly: true},
+							{Name: volConfig, MountPath: l.ConfigDir, ReadOnly: true},
+							{Name: volTokens, MountPath: tokensDir, ReadOnly: true},
 							// Forgejo creates directories under WORK_PATH when it loads its
 							// settings; they are thrown away with the pod.
 							{Name: "data", MountPath: l.DataMountPath},
@@ -165,10 +195,10 @@ func RegisterJob(in RegisterJobInput) *batchv1.Job {
 						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 					}},
 					Volumes: []corev1.Volume{
-						{Name: "config", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						{Name: volConfig, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 							SecretName: in.AppIniSecret, DefaultMode: ptr.To[int32](0o440),
 						}}},
-						{Name: "tokens", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						{Name: volTokens, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 							SecretName: TokensSecretName(r), Items: items, DefaultMode: ptr.To[int32](0o440),
 						}}},
 						{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
@@ -178,4 +208,25 @@ func RegisterJob(in RegisterJobInput) *batchv1.Job {
 			},
 		},
 	}
+	instancePlacement(&job.Spec.Template.Spec, f)
+	return job
+}
+
+// instancePlacement puts a registration pod where the instance's pods may run: the node
+// selector, tolerations, node affinity and priority class of the instance's pod template, and
+// its service account, whose imagePullSecrets may be how the instance's image is pulled (its
+// token stays unmounted). Pod affinity and anti-affinity are left out: their terms select the
+// instance's pods, and would misplace or block a pod that carries the operator's labels.
+func instancePlacement(spec *corev1.PodSpec, f *forgejov1.Forgejo) {
+	pt := f.Spec.PodTemplate
+	spec.NodeSelector = maps.Clone(pt.NodeSelector)
+	for _, t := range pt.Tolerations {
+		spec.Tolerations = append(spec.Tolerations, *t.DeepCopy())
+	}
+	if pt.Affinity != nil && pt.Affinity.NodeAffinity != nil {
+		spec.Affinity = &corev1.Affinity{NodeAffinity: pt.Affinity.NodeAffinity.DeepCopy()}
+	}
+	spec.PriorityClassName = pt.PriorityClassName
+	spec.ServiceAccountName = pt.ServiceAccountName
+	spec.AutomountServiceAccountToken = ptr.To(false)
 }

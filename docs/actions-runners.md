@@ -66,6 +66,12 @@ jobs:
 | `config` | | Merged into the runner's `config.yml` (keys of Forgejo Runner's `config.example.yaml`), e.g. `{runner: {timeout: 1h, envs: {...}}, container: {options: "--memory=2g"}}`. `server`, `runner.labels`, `runner.capacity` and `runner.shutdown_timeout` always come from the operator. |
 | `podTemplate` | | Annotations, labels, node selector, tolerations, affinity, topology spread, priority class and service account of the runner pods. |
 
+The API server refuses a `ForgejoRunner` whose name is longer than 52 characters or contains a
+`.`: the pods of StatefulSet `<name>` carry `controller-revision-hash=<name>-<hash>` (a label value
+of at most 63 characters, the hash up to 10) and the host name `<name>-<index>`. It also refuses
+`scope` with both `organization` and `repository`, labels of the other executor's form, `docker`
+settings (other than `resources`) with the Host executor, and `host.image` with the Docker executor.
+
 ## Executors
 
 | | Docker | Host |
@@ -130,24 +136,33 @@ variables, logs, events, status or the runner configuration:
    asking.
 2. **Registration Job.** For runners that are not registered yet (or registered for another
    scope), Job `<name>-register` runs `forgejo-cli actions register --secret-file ... --scope ...
-   --name <name>-<i> --keep-labels` for each of them. It runs the instance's own running image
-   (`status.image`), with its `app.ini` Secret (which has the database credentials) and only the
-   secrets it registers, as uid 1000 with a read-only root file system and without the data
-   volume: the command only writes to the database. It is idempotent: registering a runner again
-   updates its name, scope and secret. It prints the UUIDs only; error output passes a filter that
-   masks anything shaped like a secret (Forgejo prints the runner record, secret included, when an
-   update fails). The Job waits until the instance is `Ready` and neither paused, upgrading nor
-   being restored (`Registered=False/WaitingForForgejo`). When it succeeds, the operator records
-   the runners in `status.runners` and only then deletes the Job (if the status cannot be written,
-   e.g. because a scale came in at the same moment, the Job stays until the next attempt); a
-   failed Job is kept for a minute (`Registered=False/RegistrationFailed`, with its error) and then
-   retried.
+   --name <name>-<i> --version <version> --keep-labels` for each of them. It runs the instance's
+   own running image (`status.image`), with its `app.ini` Secret (which has the database
+   credentials) and only the secrets it registers, as uid 1000 with a read-only root file system
+   and without the data volume: the command only writes to the database. Its pod is placed like
+   the instance's pods: the node selector, tolerations, node affinity, priority class and service
+   account (whose `imagePullSecrets` apply to the instance's image; its token is not mounted) of
+   the `Forgejo`'s `podTemplate`, but not its pod affinity or anti-affinity. It is idempotent:
+   registering a runner again updates its name, scope, secret and version. It prints the UUIDs
+   only; error output passes a filter that masks anything shaped like a secret (Forgejo prints the
+   runner record, secret included, when an update fails). The Job waits until the instance is
+   `Ready` and neither paused, upgrading nor being restored (`Registered=False/WaitingForForgejo`).
+   When it succeeds, the operator records the runners in `status.runners` and only then deletes
+   the Job (if the status cannot be written, e.g. because a scale came in at the same moment, the
+   Job stays until the next attempt; the Job has no TTL, so it cannot vanish before it is
+   recorded); a failed Job is kept for a minute (`Registered=False/RegistrationFailed`, with its
+   error) and then retried. Runners a failed Job registered before it failed are registered again
+   by the next attempt, or, when they are no longer wanted, deleted in Forgejo (see
+   [Scaling and unregistering](#scaling-and-unregistering)).
 3. **Pods.** StatefulSet `<name>` runs pods `<name>-0`, `<name>-1`, ... only for runners that are
    registered (a pod without a registration would only be refused by Forgejo). Pod `i` reads
    `config-<i>.yaml` from Secret `<name>-runner`, whose connection names the instance's in-cluster
    URL (`http://<forgejo>-http.<namespace>.svc.<domain>:3000/`), the runner's UUID and
    `token_url: file:/etc/forgejo-runner/tokens/token-<i>`: the secret stays in its own Secret. The
-   runner declares its labels and version when it connects. A change of the shared configuration
+   runner declares its labels and version when it connects. Registering writes the version too,
+   so the Job passes on the version Forgejo lists for a runner it registers again (a scope change
+   keeps the pods running and the version shown); a runner Forgejo lost shows no version until its
+   pod restarts. A change of the shared configuration
    (labels, capacity, `config`, images) rolls the pods; adding or removing a runner does not
    touch the other pods (nothing per runner is on the pod template).
 
@@ -163,7 +178,17 @@ need Forgejo 15. Runner 13 needs Docker 25 or newer and dropped the `set-output`
 - **Scale down.** The StatefulSet stops the highest pods. A runner that is running a job lets it
   finish within `shutdownTimeout`. Once the pod is gone, the operator deletes the runner in Forgejo
   (`DELETE /api/v1/admin/actions/runners/{id}`), drops it from `status.runners` and deletes its
-  secret. A runner scaled back later gets a new secret, so a copied old secret stays useless.
+  secret. A runner scaled back later gets a new secret, so a copied old secret stays useless. A
+  pod stuck `Terminating` (e.g. on a lost node, until it is force-deleted) holds this up for at
+  most 2 minutes after its grace period: then its runner is unregistered anyway and a Warning
+  event `RunnerPodStuck` names the pod and its node (its secret stays while the pod object
+  exists, so scaling back up reuses it).
+- **Secrets without a record.** A secret is only deleted once Forgejo no longer lists its runner.
+  A registration Job that registered some runners and then failed leaves them in Forgejo without
+  a record; if they are scaled away before the next attempt, the operator finds them in Forgejo's
+  list by the UUID their secret gives and deletes them (`Unregistered` event) before it deletes
+  the secret. While Forgejo's list cannot be read, such secrets are kept (without a runner
+  configuration).
 - **Deletion.** A finalizer deletes the StatefulSet and a running registration Job, waits for their
   pods to stop (at most the grace period plus 2 minutes), then deletes every runner of the
   `ForgejoRunner` in Forgejo: the recorded ones (by their id) and any runner whose UUID one of its
@@ -242,8 +267,8 @@ $ kubectl get fjrn ci -o jsonpath='{.status.runners}' | jq
 | `Ready` | `RunnersOnline`; `PodsReady` (pods ready, online state unknown), `ScaledToZero`; not ready: `PodsNotReady`, `RunnersOffline`, `PodSecurityBlocked`, `ActionsDisabled`, `InvalidConfig`, `ForgejoNotFound` or the reason of `Registered` |
 | `Degraded` | `AsExpected`; `ForgejoAPIUnavailable`, `UnregisterFailed` |
 
-Events on the `ForgejoRunner`: `Registered`, `Unregistered`, `RunnerMissing`, `RegistrationFailed`,
-`UnregisterFailed`, `ForgejoAPIUnavailable`, `PodSecurityBlocked`.
+Events on the `ForgejoRunner`: `Registered`, `Unregistered`, `RunnerMissing`, `RunnerPodStuck`,
+`RegistrationFailed`, `UnregisterFailed`, `ForgejoAPIUnavailable`, `PodSecurityBlocked`.
 
 ### Metrics and alert
 
@@ -254,7 +279,7 @@ Labels: `namespace`, `name` (the `Forgejo`) and `runner` (the `ForgejoRunner`).
 | `forgejo_operator_runners_desired` | `spec.replicas` |
 | `forgejo_operator_runners_registered` | Runners recorded as registered (without the missing ones) |
 | `forgejo_operator_runners_online` | Runners Forgejo reports online; absent while its API cannot be read |
-| `forgejo_operator_runner_jobs_waiting` | Waiting jobs in the runners' scope whose `runs-on` their labels satisfy; absent while the API cannot be read |
+| `forgejo_operator_runner_jobs_waiting` | Waiting jobs in the runners' scope whose `runs-on` their labels satisfy; absent while the API cannot be read. For `scope.organization` naming a user (Forgejo has no per-user jobs endpoint for the admin), the instance's waiting jobs of that owner are counted |
 
 The instance's PrometheusRule has **`ForgejoRunnersOffline`** (warning, for 10m): jobs wait for a
 `ForgejoRunner` with `replicas > 0`, and none of its runners is online.
@@ -289,6 +314,7 @@ $ kubectl get events --field-selector involvedObject.name=ci   # StatefulSet Fai
 | `Registered=False/RegistrationFailed` | The message has the command's error, e.g. `user does not exist` for a wrong `scope.organization` or `repository does not exist`; fix `scope`; a new attempt starts a minute later |
 | Runner log `unauthenticated: unregistered runner` | The runner was deleted in Forgejo; the operator registers it again at its next check, within a minute or two (`RunnerMissing`) |
 | `Ready=False/RunnersOffline` | Forgejo has not heard from the runners for a minute: see the runner log (instance unreachable, DNS, NetworkPolicy) |
+| `RunnerPodStuck` event | A scaled-away pod stayed `Terminating` 2 minutes past its grace period (a lost or unreachable node); its runner was unregistered. Once the node is gone for good, `kubectl delete pod <pod> --force --grace-period=0` |
 | `Degraded=True/ForgejoAPIUnavailable` | The admin credentials do not work for the API (password changed in the UI, 2FA, basic auth off) or the operator cannot reach `<forgejo>-http` |
 | Jobs stay `waiting` | No runner has a label named like `runs-on`, or the repository is outside the runners' `scope`; `forgejo_operator_runner_jobs_waiting` counts them |
 | `actions/checkout` fails with `node: not found` | A Docker label image or `host.image` without node; use a node image |

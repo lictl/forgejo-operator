@@ -120,6 +120,7 @@ spec:
                   image:
                     description: image of the Docker daemon (docker:dind). Defaults
                       to DefaultDindImage.
+                    maxLength: 512
                     type: string
                   mountSocket:
                     description: |-
@@ -372,7 +373,10 @@ spec:
                   the runners register with.
                 properties:
                   name:
+                    description: name of the Forgejo.
+                    maxLength: 56
                     minLength: 1
+                    pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
                     type: string
                 required:
                 - name
@@ -388,15 +392,22 @@ spec:
                       image the runner and the job steps run in. An init container copies the runner binary
                       into it, so it needs no runner of its own; it should have node (for JavaScript actions),
                       git and a shell, and run as a non-root user. Defaults to DefaultRunnerToolchainImage.
+                    maxLength: 512
                     type: string
                 type: object
               image:
                 default: data.forgejo.org/forgejo/runner:13.2.0
                 description: image of Forgejo Runner.
+                maxLength: 512
+                minLength: 1
                 type: string
               imagePullPolicy:
                 description: PullPolicy describes a policy for if/when to pull a container
                   image
+                enum:
+                - Always
+                - Never
+                - IfNotPresent
                 type: string
               imagePullSecrets:
                 items:
@@ -1670,7 +1681,12 @@ spec:
                 description: |-
                   shutdownTimeout is how long a stopping runner (scale-down, rollout, deletion) lets its
                   running jobs finish before it cancels them. Defaults to 10m.
+                maxLength: 32
+                pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+$
                 type: string
+                x-kubernetes-validations:
+                - message: must be a positive Go duration such as 30s, 5m or 1h
+                  rule: duration(self) > duration('0s')
             required:
             - executor
             - forgejoRef
@@ -1682,6 +1698,16 @@ spec:
             - message: labels of the Docker executor have the form name:docker://image
               rule: '!has(self.labels) || self.executor != ''Docker'' || self.labels.all(l,
                 l.matches(''^[^:,]+:docker://[^,]+$''))'
+            - fieldPath: .docker
+              message: docker settings apply to the Docker executor only
+              reason: FieldValueForbidden
+              rule: self.executor == 'Docker' || !has(self.docker) || (!has(self.docker.image)
+                && !has(self.docker.args) && !has(self.docker.storageSizeLimit) &&
+                (!has(self.docker.mountSocket) || !self.docker.mountSocket))
+            - fieldPath: .host.image
+              message: host.image applies to the Host executor only
+              reason: FieldValueForbidden
+              rule: self.executor == 'Host' || !has(self.host) || !has(self.host.image)
           status:
             description: status defines the observed state of ForgejoRunner
             properties:
@@ -1825,6 +1851,13 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: 'metadata.name must be at most 52 characters: the runner pods carry
+            it in labels limited to 63 characters'
+          rule: size(self.metadata.name) <= 52
+        - message: 'metadata.name must contain only lowercase letters, digits and
+            ''-'' (no ''.''): the runner pods'' host names are "<name>-<index>"'
+          rule: self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
     served: true
     storage: true
     subresources:

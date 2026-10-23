@@ -25,6 +25,15 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const (
+	testSize20Gi        = "20Gi"
+	testBackupsPVC      = "fb-backups"
+	testClassExpandable = "expandable"
+	testClassFixed      = "fixed"
+	testSize200Gi       = "200Gi"
+	testSize50Gi        = "50Gi"
+)
+
 func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -199,7 +208,7 @@ func TestMaintenanceRestore(t *testing.T) {
 	t0 := time.Now().Add(-time.Hour)
 	at := func(m int) time.Time { return t0.Add(time.Duration(m) * time.Minute) }
 	released := restore("released", at(0), forgejov1.RestorePhaseFailed, Modified)
-	released.Annotations = map[string]string{AnnotationReleaseMaintenance: "true"}
+	released.Annotations = map[string]string{AnnotationReleaseMaintenance: valueTrue}
 
 	cases := []struct {
 		name     string
@@ -252,10 +261,15 @@ func scheduledBackup(name string, created time.Time, phase forgejov1.BackupPhase
 }
 
 func TestPruneCandidates(t *testing.T) {
-	t0 := time.Now().Add(-24 * time.Hour)
+	now := time.Now()
+	t0 := now.Add(-24 * time.Hour)
+	uploading := func(b *forgejov1.ForgejoBackup, phase forgejov1.RemoteBackupPhase) *forgejov1.ForgejoBackup {
+		b.Status.Remote = &forgejov1.RemoteBackupStatus{Phase: phase, Location: "s3://backups/x/"}
+		return b
+	}
 	at := func(h int) time.Time { return t0.Add(time.Duration(h) * time.Hour) }
 	names := func(bs []*forgejov1.ForgejoBackup) []string {
-		var out []string
+		out := make([]string, 0, len(bs))
 		for _, b := range bs {
 			out = append(out, b.Name)
 		}
@@ -300,10 +314,39 @@ func TestPruneCandidates(t *testing.T) {
 			},
 			want: []string{"c1"},
 		},
+		{
+			name: "uploading beyond retention stays until its upload settles",
+			keep: 1,
+			input: []*forgejov1.ForgejoBackup{
+				scheduledBackup("c3", at(22), forgejov1.BackupPhaseCompleted),
+				uploading(scheduledBackup("c2", at(21), forgejov1.BackupPhaseCompleted), forgejov1.RemoteBackupUploading),
+				uploading(scheduledBackup("c1", at(20), forgejov1.BackupPhaseCompleted), forgejov1.RemoteBackupPending),
+			},
+			want: nil,
+		},
+		{
+			name: "uploaded or failed upload beyond retention goes",
+			keep: 1,
+			input: []*forgejov1.ForgejoBackup{
+				scheduledBackup("c3", at(22), forgejov1.BackupPhaseCompleted),
+				uploading(scheduledBackup("c2", at(21), forgejov1.BackupPhaseCompleted), forgejov1.RemoteBackupUploaded),
+				uploading(scheduledBackup("c1", at(20), forgejov1.BackupPhaseCompleted), forgejov1.RemoteBackupFailed),
+			},
+			want: []string{"c2", "c1"},
+		},
+		{
+			name: "upload pending longer than RemoteIncompleteAge goes",
+			keep: 1,
+			input: []*forgejov1.ForgejoBackup{
+				uploading(scheduledBackup("c2", now.Add(-time.Hour), forgejov1.BackupPhaseCompleted), forgejov1.RemoteBackupUploaded),
+				uploading(scheduledBackup("c1", now.Add(-RemoteIncompleteAge-time.Hour), forgejov1.BackupPhaseCompleted), forgejov1.RemoteBackupPending),
+			},
+			want: []string{"c1"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := names(pruneCandidates(tc.input, tc.keep))
+			got := names(pruneCandidates(tc.input, tc.keep, now))
 			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
@@ -317,24 +360,24 @@ func TestBackupPVCGrowsButNeverShrinks(t *testing.T) {
 	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: "ns"}}
 	claim := func(size, class string) *corev1.PersistentVolumeClaim {
 		return &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{Name: "fb-backups", Namespace: "ns"},
+			ObjectMeta: metav1.ObjectMeta{Name: testBackupsPVC, Namespace: "ns"},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				StorageClassName: ptr.To(class),
 				Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)}},
 			},
 		}
 	}
-	expandable := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: "expandable"}, AllowVolumeExpansion: ptr.To(true)}
-	fixed := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: "fixed"}}
+	expandable := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: testClassExpandable}, AllowVolumeExpansion: ptr.To(true)}
+	fixed := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: testClassFixed}}
 
 	cases := []struct {
 		name, current, class, spec, want string
 		grown, warned                    bool
 	}{
-		{name: "grows", current: "20Gi", class: "expandable", spec: "200Gi", want: "200Gi", grown: true},
-		{name: "never shrinks", current: "50Gi", class: "expandable", spec: "20Gi", want: "50Gi"},
-		{name: "default size never shrinks a grown claim", current: "50Gi", class: "expandable", spec: "", want: "50Gi"},
-		{name: "class without expansion", current: "20Gi", class: "fixed", spec: "200Gi", want: "20Gi", warned: true},
+		{name: "grows", current: testSize20Gi, class: testClassExpandable, spec: testSize200Gi, want: testSize200Gi, grown: true},
+		{name: "never shrinks", current: testSize50Gi, class: testClassExpandable, spec: testSize20Gi, want: testSize50Gi},
+		{name: "default size never shrinks a grown claim", current: testSize50Gi, class: testClassExpandable, spec: "", want: testSize50Gi},
+		{name: "class without expansion", current: testSize20Gi, class: testClassFixed, spec: testSize200Gi, want: testSize20Gi, warned: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -349,7 +392,7 @@ func TestBackupPVCGrowsButNeverShrinks(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := &corev1.PersistentVolumeClaim{}
-			if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "fb-backups"}, got); err != nil {
+			if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: testBackupsPVC}, got); err != nil {
 				t.Fatal(err)
 			}
 			size := got.Spec.Resources.Requests[corev1.ResourceStorage]

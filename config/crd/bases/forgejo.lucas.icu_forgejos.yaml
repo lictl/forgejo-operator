@@ -73,6 +73,8 @@ spec:
                 properties:
                   email:
                     default: forgejo_admin@forgejo.local
+                    maxLength: 254
+                    pattern: ^[^@\s]+@[^@\s]+$
                     type: string
                   existingSecret:
                     description: |-
@@ -84,7 +86,26 @@ spec:
                     type: string
                   username:
                     default: forgejo_admin
+                    description: |-
+                      username of the administrator: letters, digits, "-", "_" and ".", starting and ending
+                      with a letter or digit, without two of "-", "_" and "." in a row, and none of the names
+                      Forgejo reserves (e.g. "admin").
+                    maxLength: 40
+                    minLength: 1
+                    pattern: ^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$
                     type: string
+                    x-kubernetes-validations:
+                    - message: must not contain two of '-', '_' and '.' in a row (Forgejo
+                        user names)
+                      rule: '!self.matches(''[-_.]{2}'')'
+                    - message: is a name Forgejo reserves; the administrator could
+                        not be created
+                      rule: '!(self.lowerAscii() in [''admin'', ''api'', ''assets'',
+                        ''attachments'', ''avatar'', ''avatars'', ''captcha'', ''commits'',
+                        ''debug'', ''error'', ''explore'', ''ghost'', ''issues'',
+                        ''login'', ''metrics'', ''milestones'', ''new'', ''notifications'',
+                        ''org'', ''pulls'', ''raw'', ''repo'', ''repo-avatars'', ''search'',
+                        ''user'', ''v2''])'
                 type: object
               autoPilot:
                 default: {}
@@ -192,11 +213,21 @@ spec:
                       targetCPUUtilizationPercentage:
                         default: 75
                         format: int32
+                        minimum: 1
                         type: integer
                       targetMemoryUtilizationPercentage:
+                        description: targetMemoryUtilizationPercentage adds a memory
+                          metric to the HPA.
                         format: int32
+                        minimum: 1
                         type: integer
                     type: object
+                    x-kubernetes-validations:
+                    - fieldPath: .minReplicas
+                      message: minReplicas must not be greater than maxReplicas
+                      reason: FieldValueInvalid
+                      rule: '!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas
+                        <= self.maxReplicas'
                   vertical:
                     description: |-
                       VerticalAutoscalingSpec lets the operator right-size the Forgejo container from observed
@@ -228,6 +259,8 @@ spec:
                         description: targetUtilizationPercentage of requests the operator
                           aims for.
                         format: int32
+                        maximum: 100
+                        minimum: 1
                         type: integer
                     type: object
                 type: object
@@ -410,8 +443,20 @@ spec:
                     type: integer
                   schedule:
                     default: 0 3 * * *
-                    description: schedule in cron format.
+                    description: |-
+                      schedule in cron format: five fields (minute hour day-of-month month day-of-week), or
+                      a descriptor such as @daily or "@every 6h", optionally preceded by "CRON_TZ=<zone> ".
+                      The API server checks the form; the operator reports a value it cannot parse as
+                      BackupHealthy=False/InvalidSchedule.
+                    maxLength: 128
                     type: string
+                    x-kubernetes-validations:
+                    - message: must be a cron expression with five fields (minute
+                        hour day-of-month month day-of-week), or @yearly, @monthly,
+                        @weekly, @daily, @hourly or @every <duration>, optionally
+                        preceded by CRON_TZ=<zone>
+                      rule: self.matches('^((CRON_TZ|TZ)=[^[:space:]]+ +)?(@(yearly|annually|monthly|weekly|daily|midnight|hourly)|@every
+                        ([0-9]+([.][0-9]+)?(ns|us|µs|μs|ms|s|m|h))+|[^@[:space:]][^[:space:]]*([[:space:]]+[^[:space:]]+){4})$')
                   storage:
                     default: {}
                     description: |-
@@ -427,6 +472,10 @@ spec:
                         - type: integer
                         - type: string
                         default: 20Gi
+                        description: |-
+                          size of the backup volume. The operator only grows the claim (when its StorageClass
+                          allows expansion): a lower size is ignored. The operator does not resize an
+                          existingClaim.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
                       storageClassName:
@@ -503,6 +552,8 @@ spec:
                         default: ghcr.io/cloudnative-pg/postgresql:17
                         description: imageName is the PostgreSQL operand image. Also
                           used for backup/restore jobs.
+                        maxLength: 512
+                        minLength: 1
                         type: string
                       instances:
                         default: 1
@@ -578,13 +629,17 @@ spec:
                         type: object
                       storage:
                         default: {}
-                        description: VolumeSpec describes a PVC.
+                        description: |-
+                          storage of each PostgreSQL instance. The operator only grows its size: a lower size is
+                          ignored.
                         properties:
                           size:
                             anyOf:
                             - type: integer
                             - type: string
                             default: 5Gi
+                            description: 'size of the volume. The operator only grows
+                              the volume: a lower size is ignored.'
                             pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                             x-kubernetes-int-or-string: true
                           storageClassName:
@@ -621,6 +676,8 @@ spec:
                       port:
                         default: 5432
                         format: int32
+                        maximum: 65535
+                        minimum: 1
                         type: integer
                       sslMode:
                         default: disable
@@ -642,6 +699,26 @@ spec:
                     - External
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - fieldPath: .external
+                  message: type External requires external (host and credentialsSecret)
+                  reason: FieldValueRequired
+                  rule: '!has(self.type) || self.type != ''External'' || has(self.external)'
+                - fieldPath: .type
+                  message: external requires type External
+                  reason: FieldValueInvalid
+                  rule: '!has(self.external) || (has(self.type) && self.type == ''External'')'
+                - fieldPath: .cnpg
+                  message: cnpg settings apply to type CNPG only; with type External
+                    only cnpg.imageName (the image of backup and restore Jobs) is
+                    used
+                  reason: FieldValueForbidden
+                  rule: '!has(self.type) || self.type != ''External'' || !has(self.cnpg)
+                    || ((!has(self.cnpg.instances) || self.cnpg.instances == 1) &&
+                    !has(self.cnpg.parameters) && (!has(self.cnpg.storage) || !has(self.cnpg.storage.storageClassName))
+                    && (!has(self.cnpg.enablePodMonitor) || !self.cnpg.enablePodMonitor)
+                    && (!has(self.cnpg.resources) || (!has(self.cnpg.resources.requests)
+                    && !has(self.cnpg.resources.limits))))'
               env:
                 description: env adds extra environment variables to the Forgejo container.
                 items:
@@ -883,10 +960,25 @@ spec:
                     description: |-
                       path is the path prefix Forgejo is served under, "/" by default. Another prefix becomes
                       part of ROOT_URL, and the HTTPRoute removes it before requests reach Forgejo (URLRewrite,
-                      Gateway API extended support).
+                      Gateway API extended support). The rules of a Gateway API HTTPPathMatch apply: valid
+                      characters and percent escapes only, no "//", "/./", "/../" or "%2F", no "/." or "/.."
+                      at the end.
                     maxLength: 256
-                    pattern: ^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$
+                    pattern: ^/(?:[-A-Za-z0-9/._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*$
                     type: string
+                    x-kubernetes-validations:
+                    - message: must not contain '//' (Gateway API HTTPPathMatch)
+                      rule: '!self.contains(''//'')'
+                    - message: must not contain '/./' (Gateway API HTTPPathMatch)
+                      rule: '!self.contains(''/./'')'
+                    - message: must not contain '/../' (Gateway API HTTPPathMatch)
+                      rule: '!self.contains(''/../'')'
+                    - message: must not contain '%2F' (Gateway API HTTPPathMatch)
+                      rule: '!self.contains(''%2f'') && !self.contains(''%2F'')'
+                    - message: must not end with '/..' (Gateway API HTTPPathMatch)
+                      rule: '!self.endsWith(''/..'')'
+                    - message: must not end with '/.' (Gateway API HTTPPathMatch)
+                      rule: '!self.endsWith(''/.'')'
                   removeRequestHeaders:
                     description: |-
                       removeRequestHeaders are request headers the HTTPRoute removes before requests reach
@@ -991,6 +1083,8 @@ spec:
                     properties:
                       image:
                         default: docker.io/valkey/valkey:8-alpine
+                        maxLength: 512
+                        minLength: 1
                         type: string
                       resources:
                         description: ResourceRequirements describes the compute resource
@@ -1060,11 +1154,18 @@ spec:
                   image is the Forgejo container image. The official root image
                   (codeberg.org/forgejo/forgejo:<version>) and the "-rootless" variant are supported.
                   Changing it triggers an orchestrated upgrade (backup, migrate, verify, auto-rollback).
-                  The default is the current LTS release when the object is created.
+                  The default is the current LTS release when the object is created; it is stored in the
+                  spec, so a later operator release with another default does not change the instance.
+                maxLength: 512
+                minLength: 1
                 type: string
               imagePullPolicy:
                 description: PullPolicy describes a policy for if/when to pull a container
                   image
+                enum:
+                - Always
+                - Never
+                - IfNotPresent
                 type: string
               imagePullSecrets:
                 items:
@@ -1099,11 +1200,33 @@ spec:
                   enabled:
                     type: boolean
                   host:
-                    description: host is the public host name.
+                    description: |-
+                      host is the public host name. Required while enabled, unless server.domain,
+                      server.rootURL or gateway.hostnames gives one.
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                   path:
                     default: /
+                    description: |-
+                      path is the Prefix path of the Ingress rule and part of ROOT_URL. Kubernetes refuses
+                      Prefix paths that contain "//", "/./", "/../" or "%2F", or end in "/." or "/..".
+                    maxLength: 256
+                    pattern: ^/(?:[-A-Za-z0-9/._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*$
                     type: string
+                    x-kubernetes-validations:
+                    - message: must not contain '//' (Kubernetes Ingress Prefix path)
+                      rule: '!self.contains(''//'')'
+                    - message: must not contain '/./' (Kubernetes Ingress Prefix path)
+                      rule: '!self.contains(''/./'')'
+                    - message: must not contain '/../' (Kubernetes Ingress Prefix
+                        path)
+                      rule: '!self.contains(''/../'')'
+                    - message: must not contain '%2F' (Kubernetes Ingress Prefix path)
+                      rule: '!self.contains(''%2f'') && !self.contains(''%2F'')'
+                    - message: must not end with '/.' or '/..' (Kubernetes Ingress
+                        Prefix path)
+                      rule: '!self.endsWith(''/..'') && !self.endsWith(''/.'')'
                   tlsSecretName:
                     description: |-
                       tlsSecretName enables TLS using this Secret. Defaults to "<name>-tls", the Secret of
@@ -2508,7 +2631,8 @@ spec:
                 default: 1
                 description: |-
                   replicas is the desired number of Forgejo pods. Values greater than 1 require
-                  highAvailability.enabled. Ignored while horizontal autoscaling is enabled.
+                  highAvailability.enabled (the API server refuses them otherwise). Ignored while
+                  horizontal autoscaling is enabled.
                 format: int32
                 minimum: 0
                 type: integer
@@ -2747,7 +2871,9 @@ spec:
                     description: |-
                       domain is the public host name (DOMAIN / SSH_DOMAIN). Defaults to ingress.host, the
                       first gateway.hostnames entry that is not a wildcard, or the in-cluster HTTP service DNS
-                      name.
+                      name. A host name only: no scheme, port or path.
+                    maxLength: 253
+                    pattern: ^[A-Za-z0-9]([-A-Za-z0-9.]*[A-Za-z0-9])?$
                     type: string
                   http:
                     default: {}
@@ -2758,14 +2884,20 @@ spec:
                           type: string
                         type: object
                       loadBalancerClass:
+                        description: loadBalancerClass, only for LoadBalancer.
+                        maxLength: 253
                         type: string
                       nodePort:
                         description: nodePort, only for NodePort/LoadBalancer.
                         format: int32
+                        maximum: 65535
+                        minimum: 0
                         type: integer
                       port:
                         description: port is the Service port.
                         format: int32
+                        maximum: 65535
+                        minimum: 0
                         type: integer
                       type:
                         default: ClusterIP
@@ -2777,14 +2909,27 @@ spec:
                         - LoadBalancer
                         type: string
                     type: object
+                    x-kubernetes-validations:
+                    - fieldPath: .nodePort
+                      message: nodePort requires type NodePort or LoadBalancer
+                      reason: FieldValueForbidden
+                      rule: '!has(self.nodePort) || self.nodePort == 0 || (has(self.type)
+                        && self.type != ''ClusterIP'')'
+                    - fieldPath: .loadBalancerClass
+                      message: loadBalancerClass requires type LoadBalancer
+                      reason: FieldValueForbidden
+                      rule: '!has(self.loadBalancerClass) || (has(self.type) && self.type
+                        == ''LoadBalancer'')'
                   requireSignInView:
                     description: requireSignInView forces login to browse anything.
                     type: boolean
                   rootURL:
                     description: |-
-                      rootURL overrides ROOT_URL. Defaults to http(s)://<host><path>/ from the Ingress or the
-                      HTTPRoute, else http(s)://<domain>/; https when the Ingress has a TLS Secret or spec.tls
-                      is set.
+                      rootURL overrides ROOT_URL, an http:// or https:// URL. Defaults to
+                      http(s)://<host><path>/ from the Ingress or the HTTPRoute, else http(s)://<domain>/; https
+                      when the Ingress has a TLS Secret or spec.tls is set.
+                    maxLength: 512
+                    pattern: ^https?://[^/?#\s]+(/[^?#\s]*)?$
                     type: string
                   ssh:
                     default: {}
@@ -2798,6 +2943,8 @@ spec:
                           externalPort is the port shown in clone URLs (SSH_PORT). Defaults to the service port.
                           With spec.gateway.ssh, set it to the port of the Gateway's TCP listener.
                         format: int32
+                        maximum: 65535
+                        minimum: 0
                         type: integer
                       hostKeys:
                         description: |-
@@ -2822,14 +2969,20 @@ spec:
                               type: string
                             type: object
                           loadBalancerClass:
+                            description: loadBalancerClass, only for LoadBalancer.
+                            maxLength: 253
                             type: string
                           nodePort:
                             description: nodePort, only for NodePort/LoadBalancer.
                             format: int32
+                            maximum: 65535
+                            minimum: 0
                             type: integer
                           port:
                             description: port is the Service port.
                             format: int32
+                            maximum: 65535
+                            minimum: 0
                             type: integer
                           type:
                             default: ClusterIP
@@ -2841,6 +2994,17 @@ spec:
                             - LoadBalancer
                             type: string
                         type: object
+                        x-kubernetes-validations:
+                        - fieldPath: .nodePort
+                          message: nodePort requires type NodePort or LoadBalancer
+                          reason: FieldValueForbidden
+                          rule: '!has(self.nodePort) || self.nodePort == 0 || (has(self.type)
+                            && self.type != ''ClusterIP'')'
+                        - fieldPath: .loadBalancerClass
+                          message: loadBalancerClass requires type LoadBalancer
+                          reason: FieldValueForbidden
+                          rule: '!has(self.loadBalancerClass) || (has(self.type) &&
+                            self.type == ''LoadBalancer'')'
                     type: object
                   trustedProxies:
                     description: |-
@@ -2889,6 +3053,10 @@ spec:
                     - type: integer
                     - type: string
                     default: 10Gi
+                    description: |-
+                      size of the data volume. The operator only grows the claim (when its StorageClass
+                      allows expansion): a lower size, or one below what autopilot already grew, is ignored.
+                      The operator does not resize an existingClaim.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
                   storageClassName:
@@ -2943,6 +3111,14 @@ spec:
                         required:
                         - name
                         type: object
+                        x-kubernetes-validations:
+                        - fieldPath: .kind
+                          message: kind must be Issuer or ClusterIssuer (set group
+                            to use an external issuer)
+                          reason: FieldValueInvalid
+                          rule: (has(self.group) && size(self.group) > 0 && self.group
+                            != 'cert-manager.io') || !has(self.kind) || self.kind
+                            == 'Issuer' || self.kind == 'ClusterIssuer'
                     required:
                     - issuerRef
                     type: object
@@ -2995,6 +3171,33 @@ spec:
                 cannot be changed afterwards (it may be removed)
               rule: '!has(self.restoreFrom) || (has(oldSelf.restoreFrom) && self.restoreFrom
                 == oldSelf.restoreFrom)'
+            - fieldPath: .replicas
+              message: replicas greater than 1 require highAvailability.enabled (Valkey
+                for shared cache, sessions and queues)
+              reason: FieldValueForbidden
+              rule: '!has(self.replicas) || self.replicas <= 1 || (has(self.highAvailability.enabled)
+                && self.highAvailability.enabled)'
+            - fieldPath: .autoscaling.horizontal.enabled
+              message: autoscaling.horizontal requires highAvailability.enabled (Valkey
+                for shared cache, sessions and queues)
+              reason: FieldValueForbidden
+              rule: '!has(self.autoscaling.horizontal) || !has(self.autoscaling.horizontal.enabled)
+                || !self.autoscaling.horizontal.enabled || (has(self.highAvailability.enabled)
+                && self.highAvailability.enabled)'
+            - fieldPath: .ingress.host
+              message: 'ingress.enabled requires ingress.host (or server.domain, server.rootURL
+                or gateway.hostnames): without a public host name ROOT_URL would be
+                the in-cluster Service address'
+              reason: FieldValueRequired
+              rule: '!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled
+                || (has(self.ingress.host) && size(self.ingress.host) > 0) || (has(self.server.domain)
+                && size(self.server.domain) > 0) || (has(self.server.rootURL) && size(self.server.rootURL)
+                > 0) || (has(self.gateway) && has(self.gateway.hostnames))'
+            - fieldPath: .gateway.ssh
+              message: gateway.ssh requires server.ssh.enabled
+              reason: FieldValueForbidden
+              rule: '!has(self.gateway) || !has(self.gateway.ssh) || !has(self.server.ssh.enabled)
+                || self.server.ssh.enabled'
           status:
             description: status defines the observed state of Forgejo
             properties:
@@ -3561,6 +3764,18 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: 'metadata.name must start with a lowercase letter and contain only
+            lowercase letters, digits and ''-'' (no ''.''): it names the instance''s
+            Services, which must be DNS-1035 labels'
+          rule: self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')
+        - message: 'metadata.name must be at most 56 characters: Service "<name>-valkey"
+            must fit in 63'
+          rule: size(self.metadata.name) <= 56
+        - message: 'with database.type CNPG, metadata.name must be at most 47 characters:
+            CloudNativePG limits the name of Cluster "<name>-db" to 50'
+          rule: '!has(self.spec.database.type) || self.spec.database.type != ''CNPG''
+            || size(self.metadata.name) <= 47'
     served: true
     storage: true
     subresources:

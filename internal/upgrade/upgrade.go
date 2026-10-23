@@ -270,7 +270,10 @@ func warnTarget(rc *forgejo.ReconcileContext, to string, c comparison) {
 	case forgejo.SupportDeprecated, forgejo.SupportEndOfLife, forgejo.SupportFuture:
 		rc.Event(corev1.EventTypeWarning, reasonUnsupportedVersion, eventAction, "Upgrading to %s anyway: %s", to, s.Message)
 	}
-	if forgejo.Versions.Traits(c.to, c.toOK).StrictDurations && !forgejo.Versions.Traits(c.from, c.fromOK).StrictDurations {
+	// An unknown running version (a digest before Forgejo reported one) counts as lenient: it
+	// may be 15 or 16, and a warning that turns out unnecessary is cheaper than a failed upgrade.
+	fromStrict := c.fromOK && forgejo.Versions.Traits(c.from, true).StrictDurations
+	if forgejo.Versions.Traits(c.to, c.toOK).StrictDurations && !fromStrict {
 		if bad := forgejo.InvalidDurations(rc.Instance.Spec.Config); len(bad) > 0 {
 			rc.Event(corev1.EventTypeWarning, reasonConfigIncompatible, eventAction,
 				"%s refuses to start with %s in spec.config: these must be durations with a unit (e.g. 30s, -1s). "+

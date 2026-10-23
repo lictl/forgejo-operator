@@ -18,11 +18,13 @@ copy until it ends, also across container restarts:
 |----------|------|
 | Default | ed25519, ECDSA P-256 and RSA 3072, generated once into `<name>-ssh-host-keys` |
 | `<name>-ssh-host-keys` exists already (kept by `retainPolicy: Retain`, or created by you) | Used as it is |
+| `<name>-ssh-host-keys` controlled by another controller (a SealedSecret, an ExternalSecret) | Used as it is, and never adopted: the operator adds no labels or owner reference, so `retainPolicy: Delete` does not delete it |
 | `spec.server.ssh.hostKeys.existingSecret` set | Yours, see below |
 
 The Secret follows `spec.storage.retainPolicy` like `<name>-secrets`: with `Retain` (the
 default) it outlives the `Forgejo` resource, and a `Forgejo` recreated with the same name serves
-the same keys.
+the same keys. A `<name>-ssh-host-keys` that another controller controls is the exception: it
+keeps its controller, whatever the policy.
 
 ## Publishing the fingerprints
 
@@ -57,7 +59,11 @@ spec:
 The Secret holds one or more of `ssh_host_ed25519_key`, `ssh_host_ecdsa_key` and
 `ssh_host_rsa_key` (private keys without a passphrase, OpenSSH or PEM format; other entries are
 ignored). Forgejo serves one key per type. A Secret named `<name>-ssh-host-keys` that you create
-before the instance is used as it is, too.
+before the instance is used as it is, too. If a GitOps tool manages the keys (a SealedSecret or
+an ExternalSecret), prefer `existingSecret`: the operator never adopts that Secret. A
+`<name>-ssh-host-keys` that such a tool controls is served as it is as well (`hostKeysSource:
+ExistingSecret`), but never owned by the instance, so `retainPolicy: Delete` leaves it to its
+controller.
 
 To add a key type to the operator's Secret, or to replace a key on purpose, edit the Secret: the
 operator checks the keys, then the pods roll and serve the new set. Running pods never read the
@@ -66,8 +72,10 @@ Secret again, so an edit reaches them only through that rollout. An edit the ope
 rolled out: see `SSHHostKeysUnavailable` below. The operator itself never adds, changes or
 removes keys.
 
-With `[server] SSH_SERVER_HOST_KEYS` in `spec.config`, or SSH disabled, the operator leaves host
-keys alone.
+With `[server] SSH_SERVER_HOST_KEYS` in `spec.config` or in a `spec.configFrom` entry, or SSH
+disabled, the operator leaves host keys alone: it generates, mounts, publishes (`status.ssh`)
+and backs up none, and `app.ini` keeps your value. A `configFrom` entry counts even while its
+optional Secret is missing; Forgejo then uses its own default key on the data volume.
 
 ## Backups and disaster recovery
 

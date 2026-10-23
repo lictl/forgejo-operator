@@ -38,7 +38,7 @@ func remoteFixture(t *testing.T) (*backup.FakeS3, *forgejov1.Forgejo, []client.O
 	objs := make([]client.Object, 0, 3+len(fakeSecrets))
 	objs = append(objs, f,
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fb-secrets", Namespace: ns}, Data: map[string][]byte{"secret-key": []byte("sk")}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fb-admin", Namespace: ns}, Data: map[string][]byte{"password": []byte("pw")}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fb-admin", Namespace: ns}, Data: map[string][]byte{testPasswordField: []byte("pw")}},
 	)
 	for _, s := range fakeSecrets {
 		objs = append(objs, s)
@@ -51,7 +51,7 @@ func uploadPending(name string) *forgejov1.ForgejoBackup {
 	b := runningBackup(name)
 	b.Status.Phase = forgejov1.BackupPhaseCompleted
 	b.Status.CompletionTime = &metav1.Time{Time: time.Now().Add(-time.Minute)}
-	b.Status.ForgejoImage = "codeberg.org/forgejo/forgejo:16"
+	b.Status.ForgejoImage = testImage16
 	path := backup.BackupRemotePath(b)
 	b.Status.Remote = &forgejov1.RemoteBackupStatus{Phase: forgejov1.RemoteBackupPending, Path: path,
 		Location: "s3://" + backup.FakeBucket + "/team/" + path + "/"}
@@ -287,7 +287,7 @@ func TestRestoreOfARemoteBackup(t *testing.T) {
 	store, f, objs := remoteFixture(t)
 	f.Status.Backup.ActiveRestore = "r1"
 	store.PutBackup(t, "team/", "prod/old/b1", backup.RemoteManifest{Backup: "b1", Namespace: "prod", Forgejo: "old",
-		Reason: forgejov1.BackupReasonManual, ForgejoImage: "codeberg.org/forgejo/forgejo:16", IncludesData: true,
+		Reason: forgejov1.BackupReasonManual, ForgejoImage: testImage16, IncludesData: true,
 		SecretKeyFingerprint: "different"},
 		map[string][]byte{"db.dump": []byte("PGDMP"), "data.tar.gz": []byte("tar"), "identity.json": backup.FakeIdentity(t, "x")}, time.Now())
 	rs := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: ns, UID: "r1-uid"}}

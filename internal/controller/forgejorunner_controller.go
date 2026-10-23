@@ -126,15 +126,15 @@ func (r *ForgejoRunnerReconciler) now() time.Time {
 	return time.Now()
 }
 
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorunners,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorunners/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorunners,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorunners/status,verbs=patch
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorunners/finalizers,verbs=update
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejos,verbs=get;list;watch
-// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
@@ -220,8 +220,12 @@ type pass struct {
 	orig    *forgejov1.ForgejoRunner
 	f       *forgejov1.Forgejo
 	desired int32
-	// tokens by index: every runner that is wanted, recorded, being registered or has a pod.
+	// tokens by index: every runner secret of "<name>-tokens", i.e. of every runner that is
+	// wanted, recorded, being registered or has a pod, and of runners pruneTokens has not
+	// dropped yet.
 	tokens map[int32]string
+	// tokensSecret is "<name>-tokens" as reconcileTokens wrote it.
+	tokensSecret *corev1.Secret
 	// api is nil when the instance's API cannot be used (apiErr says why).
 	api    runner.API
 	apiErr error
@@ -277,10 +281,11 @@ func (r *ForgejoRunnerReconciler) sync(ctx context.Context, p *pass) (ctrl.Resul
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if p.tokens, err = r.reconcileTokens(ctx, fr, neededIndices(fr, p.desired, job, pods)); err != nil {
+	need := neededIndices(fr, p.desired, job, pods)
+	if err := r.reconcileTokens(ctx, p, need); err != nil {
 		return ctrl.Result{}, fmt.Errorf("runner secrets: %w", err)
 	}
-	configHash, cfgErr := r.reconcileConfig(ctx, fr, f, p.tokens)
+	configHash, cfgErr := r.reconcileConfig(ctx, fr, f, p.tokens, need)
 	if cfgErr != nil && !errors.Is(cfgErr, errInvalidConfig) {
 		return ctrl.Result{}, fmt.Errorf("runner configuration: %w", cfgErr)
 	}
@@ -302,6 +307,9 @@ func (r *ForgejoRunnerReconciler) sync(ctx context.Context, p *pass) (ctrl.Resul
 		r.refreshFromAPI(ctx, p)
 	}
 	r.unregisterStale(ctx, p, pods)
+	if err := r.pruneTokens(ctx, p, job, pods); err != nil {
+		return ctrl.Result{}, fmt.Errorf("runner secrets: %w", err)
+	}
 	registered, err := r.reconcileRegistration(ctx, p, job)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -397,8 +405,9 @@ func (r *ForgejoRunnerReconciler) runnerPods(ctx context.Context, fr *forgejov1.
 	return out, nil
 }
 
-// neededIndices are the runners that need a secret: the wanted ones, the recorded ones (until
-// they are unregistered), those a registration Job registers and those with a pod.
+// neededIndices are the runners that need a secret and a configuration: the wanted ones, the
+// recorded ones (until they are unregistered), those a registration Job registers and those
+// with a pod. The secrets of the others are dropped by pruneTokens.
 func neededIndices(fr *forgejov1.ForgejoRunner, desired int32, job *batchv1.Job, pods map[int32]*corev1.Pod) []int32 {
 	set := map[int32]bool{}
 	for i := range desired {
@@ -423,45 +432,121 @@ func neededIndices(fr *forgejov1.ForgejoRunner, desired int32, job *batchv1.Job,
 	return out
 }
 
-// reconcileTokens keeps one secret per needed runner in "<name>-tokens" and drops the others.
-// A secret is generated once and kept: it is the runner's identity in Forgejo.
-func (r *ForgejoRunnerReconciler) reconcileTokens(ctx context.Context, fr *forgejov1.ForgejoRunner, need []int32) (map[int32]string, error) {
+// reconcileTokens keeps the runner secrets in "<name>-tokens" (p.tokens): it generates one for
+// every needed runner that has none and keeps every other valid one, which pruneTokens drops
+// once Forgejo does not have its runner. A secret is generated once and kept: it is the
+// runner's identity in Forgejo, and the only way to find a runner registered under it by a
+// Job that failed half-way or whose result was never recorded.
+func (r *ForgejoRunnerReconciler) reconcileTokens(ctx context.Context, p *pass, need []int32) error {
+	fr := p.fr
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: runner.TokensSecretName(fr), Namespace: fr.Namespace}}
 	tokens := map[int32]string{}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, sec, func() error {
 		sec.Labels = mergeStringMaps(sec.Labels, runner.Labels(fr, forgejo.ComponentRunner))
 		sec.Type = corev1.SecretTypeOpaque
+		clear(tokens)
 		data := map[string][]byte{}
-		for _, i := range need {
-			key := runner.TokenKey(i)
-			tok := string(sec.Data[key])
-			if !runner.ValidToken(tok) {
-				var err error
-				if tok, err = runner.NewToken(); err != nil {
-					return err
-				}
+		for key, v := range sec.Data {
+			if i, ok := runner.IndexOfKey(key); ok && key == runner.TokenKey(i) && runner.ValidToken(string(v)) {
+				data[key] = v
+				tokens[i] = string(v)
 			}
-			data[key] = []byte(tok)
+		}
+		for _, i := range need {
+			if _, ok := tokens[i]; ok {
+				continue
+			}
+			tok, err := runner.NewToken()
+			if err != nil {
+				return err
+			}
+			data[runner.TokenKey(i)] = []byte(tok)
 			tokens[i] = tok
 		}
 		sec.Data = data
 		return controllerutil.SetControllerReference(fr, sec, r.Scheme)
 	})
-	return tokens, err
+	if err != nil {
+		return err
+	}
+	p.tokens, p.tokensSecret = tokens, sec
+	return nil
+}
+
+// pruneTokens drops the secrets of the runners no longer needed (neededIndices after this
+// pass's records and unregistrations) once Forgejo is known not to have them. Such a runner
+// has no record, but a registration Job that failed after registering it, or that went before
+// it was collected, may have left it in Forgejo: it is found in Forgejo's list by the UUID its
+// secret gives and deleted first. While the list cannot be read, the secrets are kept.
+func (r *ForgejoRunnerReconciler) pruneTokens(ctx context.Context, p *pass, job *batchv1.Job, pods map[int32]*corev1.Pod) error {
+	fr := p.fr
+	need := map[int32]bool{}
+	for _, i := range neededIndices(fr, p.desired, job, pods) {
+		need[i] = true
+	}
+	var orphans []int32
+	for i := range p.tokens {
+		if !need[i] {
+			orphans = append(orphans, i)
+		}
+	}
+	if len(orphans) == 0 || p.listed == nil {
+		return nil
+	}
+	slices.Sort(orphans)
+	var drop []int32
+	var done []string
+	var errs []error
+	for _, i := range orphans {
+		uuid, name := runner.UUIDOf(p.tokens[i]), runner.RunnerName(fr, i)
+		if a, ok := p.listed[uuid]; ok {
+			deleted, err := p.api.DeleteRunner(ctx, a.ID)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", name, err))
+				continue
+			}
+			delete(p.listed, uuid)
+			if deleted {
+				done = append(done, fmt.Sprintf("%s (id %d)", name, a.ID))
+				logf.FromContext(ctx).Info("Unregistered runner without a record", "runner", name, "uuid", uuid)
+			}
+		}
+		drop = append(drop, i)
+	}
+	if len(done) > 0 {
+		r.event(fr, corev1.EventTypeNormal, "Unregistered", "Unregister", "Unregistered runners %s from Forgejo %s",
+			strings.Join(done, ", "), p.f.Name)
+	}
+	if len(errs) > 0 {
+		p.unregisterErr = errors.Join(p.unregisterErr, errors.Join(errs...))
+		p.wantRequeue(runnerBusyRequeue)
+	}
+	if len(drop) == 0 {
+		return nil
+	}
+	sec := p.tokensSecret
+	before := sec.DeepCopy()
+	for _, i := range drop {
+		delete(sec.Data, runner.TokenKey(i))
+		delete(p.tokens, i)
+	}
+	// A merge patch that removes only these keys: nothing else writes them.
+	return r.Patch(ctx, sec, client.MergeFrom(before))
 }
 
 var errInvalidConfig = errors.New("invalid spec.config")
 
-// reconcileConfig writes the configuration file of every runner with a secret into
-// "<name>-runner" and returns the digest of the shared configuration.
-func (r *ForgejoRunnerReconciler) reconcileConfig(ctx context.Context, fr *forgejov1.ForgejoRunner, f *forgejov1.Forgejo, tokens map[int32]string) (string, error) {
+// reconcileConfig writes the configuration file of every needed runner into "<name>-runner"
+// and returns the digest of the shared configuration. A secret kept only until pruneTokens
+// drops it gets no configuration.
+func (r *ForgejoRunnerReconciler) reconcileConfig(ctx context.Context, fr *forgejov1.ForgejoRunner, f *forgejov1.Forgejo, tokens map[int32]string, need []int32) (string, error) {
 	hash, err := runner.ConfigHash(fr, f)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", errInvalidConfig, err)
 	}
 	data := map[string][]byte{}
-	for i, tok := range tokens {
-		b, err := runner.RenderConfig(fr, f, i, runner.UUIDOf(tok))
+	for _, i := range need {
+		b, err := runner.RenderConfig(fr, f, i, runner.UUIDOf(tokens[i]))
 		if err != nil {
 			return "", fmt.Errorf("%w: %v", errInvalidConfig, err)
 		}
@@ -667,7 +752,8 @@ func (r *ForgejoRunnerReconciler) refreshFromAPI(ctx context.Context, p *pass) {
 }
 
 // unregisterStale unregisters the recorded runners that are no longer wanted (their index is
-// scaled away and their pod is gone) or whose secret was replaced (a new UUID).
+// scaled away and their pod is gone, or stuck Terminating, see podStopWait) or whose secret
+// was replaced (a new UUID).
 //
 // A runner is deleted by its id (from Forgejo's list, else the recorded one): Forgejo answers
 // 404 for one that is gone already, so a list that missed it does not leave it behind. A
@@ -675,12 +761,16 @@ func (r *ForgejoRunnerReconciler) refreshFromAPI(ctx context.Context, p *pass) {
 func (r *ForgejoRunnerReconciler) unregisterStale(ctx context.Context, p *pass, pods map[int32]*corev1.Pod) {
 	fr := p.fr
 	var stale []forgejov1.RegisteredRunner
+	stuck := map[int32]*corev1.Pod{}
 	for _, rec := range fr.Status.Runners {
 		switch {
 		case rec.Index >= p.desired:
-			if _, running := pods[rec.Index]; running {
-				p.wantRequeue(runnerBusyRequeue) // the pod is still finishing its jobs
-				continue
+			if pod, exists := pods[rec.Index]; exists {
+				if wait := r.podStopWait(pod); wait > 0 {
+					p.wantRequeue(wait) // the pod is still finishing its jobs
+					continue
+				}
+				stuck[rec.Index] = pod
 			}
 			stale = append(stale, rec)
 		case rec.UUID != runner.UUIDOf(p.tokens[rec.Index]):
@@ -727,7 +817,19 @@ func (r *ForgejoRunnerReconciler) unregisterStale(ctx context.Context, p *pass, 
 			continue // registered a moment ago and not listed yet: wait for its id
 		}
 		removeRecord(fr, rec.Index)
+		if listed != nil {
+			delete(listed, rec.UUID) // Forgejo no longer has it (see pruneTokens)
+		}
 		logf.FromContext(ctx).Info("Unregistered runner", "runner", rec.Name, "uuid", rec.UUID)
+		if pod := stuck[rec.Index]; pod != nil {
+			node := pod.Spec.NodeName
+			if node == "" {
+				node = "(none)"
+			}
+			r.event(fr, corev1.EventTypeWarning, "RunnerPodStuck", "Unregister",
+				"Pod %s on node %s has been stuck Terminating for %s after its grace period; unregistered its runner %s from Forgejo %s",
+				pod.Name, node, r.now().Sub(pod.DeletionTimestamp.Time).Round(time.Second), rec.Name, p.f.Name)
+		}
 	}
 	if len(done) > 0 {
 		r.event(fr, corev1.EventTypeNormal, "Unregistered", "Unregister", "Unregistered runners %s from Forgejo %s",
@@ -736,6 +838,23 @@ func (r *ForgejoRunnerReconciler) unregisterStale(ctx context.Context, p *pass, 
 	if len(errs) > 0 {
 		p.unregisterErr = errors.Join(errs...)
 	}
+}
+
+// podStopWait is how much longer the pod of a scaled-away runner is waited for before the
+// runner is unregistered anyway (0: not at all). A pod that is not being deleted yet, or that
+// stops within its grace period, may be finishing a job. Its deletionTimestamp already
+// includes the grace period: a pod still there podStopMargin later is stuck (e.g. on a lost
+// node, until someone force-deletes it), as in finalize. The pod's deletion is watched, so a
+// stopping pod is checked again at the deadline or at the next resync, whichever is first.
+func (r *ForgejoRunnerReconciler) podStopWait(pod *corev1.Pod) time.Duration {
+	if pod.DeletionTimestamp.IsZero() {
+		return runnerBusyRequeue
+	}
+	left := pod.DeletionTimestamp.Add(podStopMargin).Sub(r.now())
+	if left <= 0 {
+		return 0
+	}
+	return min(left, runnerResync)
 }
 
 func recordNames(recs []forgejov1.RegisteredRunner) string {
@@ -774,6 +893,10 @@ func (r *ForgejoRunnerReconciler) reconcileRegistration(ctx context.Context, p *
 	var pending []runner.Slot
 	for _, s := range slotsFor(fr, p.desired, p.tokens) {
 		if !current(fr, s, scope) {
+			// Registering writes the runner's version: pass on the one it declared (a
+			// scope change re-registers runners whose pods keep running). A new or lost
+			// runner has none, and declares it when its pod connects.
+			s.Version = p.listed[s.UUID()].Version
 			pending = append(pending, s)
 		}
 	}
@@ -815,7 +938,7 @@ func (r *ForgejoRunnerReconciler) reconcileRegistration(ctx context.Context, p *
 					finished = c.LastTransitionTime.Time
 				}
 			}
-			if wait := registrationRetry - time.Since(finished); wait > 0 {
+			if wait := registrationRetry - r.now().Sub(finished); wait > 0 {
 				p.wantRequeue(wait)
 				return false, nil
 			}

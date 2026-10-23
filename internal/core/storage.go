@@ -62,7 +62,7 @@ func expansionAllowed(ctx context.Context, rc *forgejo.ReconcileContext, pvc *co
 		return false
 	}
 	if sc.AllowVolumeExpansion == nil || !*sc.AllowVolumeExpansion {
-		warnEvery(rc, "resize-unsupported/"+pvc.Name+"/"+want.String(), warnInterval, "StorageResizeUnsupported", "ResizeVolume",
+		warnEvery(rc, "resize-unsupported/"+pvc.Name+"/"+want.String(), "StorageResizeUnsupported", "ResizeVolume",
 			"cannot grow PVC %s to %s: StorageClass %s does not allow volume expansion", pvc.Name, want.String(), sc.Name)
 		return false
 	}

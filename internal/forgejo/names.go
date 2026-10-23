@@ -35,8 +35,9 @@ const (
 	// AnnotationSSHHostKeysSource on "<name>-ssh-host-keys" records that the operator generated
 	// its keys (Generated). A Secret without it was created by the user.
 	AnnotationSSHHostKeysSource = "forgejo.lucas.icu/ssh-host-keys-source"
-	// AnnotationObjectStorage on the pod template is a digest of the object storage
-	// credentials and CA certificate, so that changing them rolls the pods.
+	// AnnotationObjectStorage on the pod template is a keyed digest (HMAC with the
+	// pod-digest-salt of "<name>-secrets") of the object storage credentials and CA
+	// certificate, so that changing them rolls the pods without exposing a hash of them.
 	AnnotationObjectStorage = "forgejo.lucas.icu/object-storage"
 	// AnnotationBackupKey on "<name>-backup-key" records that the operator generated the key
 	// (Generated). A Secret without it was created by the user.

@@ -135,11 +135,14 @@ The access key never appears in `app.ini`, in pod arguments, logs, events or sta
   environment: the `forgejo` and `bootstrap` containers get `AWS_ACCESS_KEY_ID` and
   `AWS_SECRET_ACCESS_KEY` as `secretKeyRef`s to `credentialsSecret`, so the pod spec holds only
   references. (Forgejo has no file or `*_URI` variant of these settings.)
-- The operator reads the Secret to check the bucket and to compute a digest of the key and the CA
-  certificate, which it puts on the pod template (annotation
-  `forgejo.lucas.icu/object-storage`). Environment variables are only read when a
-  container starts, so **changing the Secret rolls the pods** within a minute (the operator
-  re-reads it on every pass, at least every 60 s).
+- The operator reads the Secret to check the bucket and to compute a keyed digest of the key and
+  the CA certificate (HMAC-SHA256 with a per-instance secret, `pod-digest-salt` in
+  `<name>-secrets`), which it puts on the pod template (annotation
+  `forgejo.lucas.icu/object-storage`). Whoever can read Deployments or Pods sees the
+  annotation, but cannot test guesses of the secret key against it without reading
+  `<name>-secrets`. Environment variables are only read when a container starts, so **changing
+  the Secret rolls the pods** within a minute (the operator re-reads it on every pass, at least
+  every 60 s).
 - Forgejo's admin page masks the key, and Forgejo does not log it.
 
 While the Secret, one of its keys, or the CA Secret is missing, `ObjectStorageReady` is

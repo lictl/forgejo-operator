@@ -49,7 +49,7 @@ func (f *failAfter) Read(p []byte) (int, error) {
 }
 
 func TestScanStats(t *testing.T) {
-	want := map[string]int64{"issues": 42, "organizations": 3, "repositories": 1200000, "users": 7}
+	want := map[string]int64{statIssues: 42, statOrganizations: 3, statRepositories: 1200000, statUsers: 7}
 	check := func(t *testing.T, got map[string]int64, err error) {
 		t.Helper()
 		if err != nil {

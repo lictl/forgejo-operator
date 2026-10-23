@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"sort"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -23,6 +22,7 @@ import (
 
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch;create;delete
 
 // ReconcileMaintenance sets rc.Maintenance while a ForgejoRestore targets this instance and
 // records it in status.backup.activeRestore. The restore controller waits for that
@@ -194,7 +194,7 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	rc.Requeue(time.Until(due) + time.Second)
 
 	scheduled := scheduledBackups(backups)
-	if err := prune(ctx, rc, scheduled); err != nil {
+	if err := prune(ctx, rc, scheduled, now); err != nil {
 		return forgejo.StepResult{}, err
 	}
 	pruneRemote(ctx, rc, backups, now)
@@ -319,12 +319,12 @@ func scheduledBackups(backups []forgejov1.ForgejoBackup) []*forgejov1.ForgejoBac
 
 // prune removes the scheduled backups that pruneCandidates selects. Manual and pre-upgrade
 // backups are never pruned. Deleting a ForgejoBackup removes its files (finalizer).
-func prune(ctx context.Context, rc *forgejo.ReconcileContext, scheduled []*forgejov1.ForgejoBackup) error {
+func prune(ctx context.Context, rc *forgejo.ReconcileContext, scheduled []*forgejov1.ForgejoBackup, now time.Time) error {
 	keep := int(rc.Instance.Spec.Backup.Retention)
 	if keep < 1 {
 		keep = 7
 	}
-	for _, b := range pruneCandidates(scheduled, keep) {
+	for _, b := range pruneCandidates(scheduled, keep, now) {
 		if inUse, err := RestoreUsing(ctx, rc.Client, b); err != nil || inUse != "" {
 			if err != nil {
 				return err
@@ -344,7 +344,12 @@ func prune(ctx context.Context, rc *forgejo.ReconcileContext, scheduled []*forge
 // BackupHealthy can report it) only while no completed backup is newer. Failed backups are
 // removed whether or not a newer success exists, so failed runs cannot pile up on a full
 // volume; completed backups within retention are never removed to make room.
-func pruneCandidates(scheduled []*forgejov1.ForgejoBackup, keep int) []*forgejov1.ForgejoBackup {
+//
+// A completed backup beyond keep whose upload has not settled yet (uploadUnsettled) is kept
+// until it has: deleting it would stop its upload Job (finalizer), so with a short retention and
+// uploads slower than the schedule no off-cluster copy would ever complete. The next pass after
+// the upload ends prunes it.
+func pruneCandidates(scheduled []*forgejov1.ForgejoBackup, keep int, now time.Time) []*forgejov1.ForgejoBackup {
 	var completed, failed []*forgejov1.ForgejoBackup
 	for _, b := range scheduled {
 		switch b.Status.Phase {
@@ -354,11 +359,15 @@ func pruneCandidates(scheduled []*forgejov1.ForgejoBackup, keep int) []*forgejov
 			failed = append(failed, b)
 		}
 	}
-	sort.SliceStable(completed, func(i, j int) bool { return finishedAt(completed[j]).Before(finishedAt(completed[i])) })
+	slices.SortStableFunc(completed, func(a, b *forgejov1.ForgejoBackup) int { return finishedAt(b).Compare(finishedAt(a)) })
 
 	var doomed []*forgejov1.ForgejoBackup
 	if len(completed) > keep {
-		doomed = append(doomed, completed[keep:]...)
+		for _, b := range completed[keep:] {
+			if !uploadUnsettled(b, now) {
+				doomed = append(doomed, b)
+			}
+		}
 	}
 	for i, b := range failed {
 		if i == 0 && (len(completed) == 0 || !b.CreationTimestamp.Before(&completed[0].CreationTimestamp)) {
@@ -367,6 +376,17 @@ func pruneCandidates(scheduled []*forgejov1.ForgejoBackup, keep int) []*forgejov
 		doomed = append(doomed, b)
 	}
 	return doomed
+}
+
+// uploadUnsettled reports whether b's upload is Pending or Uploading and b finished less than
+// RemoteIncompleteAge ago. An upload Job runs at most jobActiveDeadline, so an older one is
+// stuck (e.g. Pending on a missing Secret) and must not pin backup-volume space forever.
+func uploadUnsettled(b *forgejov1.ForgejoBackup, now time.Time) bool {
+	r := b.Status.Remote
+	if r == nil || (r.Phase != forgejov1.RemoteBackupPending && r.Phase != forgejov1.RemoteBackupUploading) {
+		return false
+	}
+	return now.Sub(finishedAt(b)) < RemoteIncompleteAge
 }
 
 func finishedAt(b *forgejov1.ForgejoBackup) time.Time {

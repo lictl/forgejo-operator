@@ -22,13 +22,13 @@ import (
 // and is not a step failure.
 func TestPipelineNamespaceTerminatingEndsPass(t *testing.T) {
 	st, ran := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-		if name == "storage" {
+		if name == stepStorage {
 			return forgejo.StepResult{}, fmt.Errorf("creating PVC: %w", forgejo.NewNamespaceTerminatingError("persistentvolumeclaims", "fj-data", "ns"))
 		}
 		return forgejo.StepResult{}, nil
 	})
 	p := runPipeline(context.Background(), newRC(), st)
-	if !p.terminating || p.err() != nil || len(p.failed) != 0 || (*ran)[len(*ran)-1] != "storage" {
+	if !p.terminating || p.err() != nil || len(p.failed) != 0 || (*ran)[len(*ran)-1] != stepStorage {
 		t.Errorf("terminating %v err %v failed %v ran %v", p.terminating, p.err(), p.failed, *ran)
 	}
 }

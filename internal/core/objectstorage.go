@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -77,7 +78,7 @@ func ReconcileObjectStorage(ctx context.Context, rc *forgejo.ReconcileContext) (
 	notReady := func(reason, msg string) (forgejo.StepResult, error) {
 		rc.ObjectStorageUnavailable = true
 		rc.SetCondition(forgejov1.ConditionObjectStorageReady, metav1.ConditionFalse, reason, msg)
-		warnEvery(rc, "object-storage/"+reason, warnInterval, "ObjectStorageUnavailable", "ObjectStorage", "%s", msg)
+		warnEvery(rc, "object-storage/"+reason, "ObjectStorageUnavailable", "ObjectStorage", "%s", msg)
 		return forgejo.StepResult{Stop: true, RequeueAfter: objectStorageRetryInterval}, nil
 	}
 	ep, err := forgejo.ParseS3Endpoint(c.Endpoint)
@@ -107,10 +108,10 @@ func ReconcileObjectStorage(ctx context.Context, rc *forgejo.ReconcileContext) (
 			return notReady(reasonCredentialsUnavailable, fmt.Sprintf("CA certificate: key %q of Secret %q holds no PEM certificate", ref.Key, ref.Name))
 		}
 	}
-	rc.ObjectStorage = &forgejo.ObjectStorage{Digest: digest(accessKey, secretAccessKey, string(caPEM))}
+	rc.ObjectStorage = &forgejo.ObjectStorage{ContentDigest: contentDigest(accessKey, secretAccessKey, string(caPEM))}
 
 	inputs := digest(c.Endpoint, c.Bucket, forgejo.S3Region(c), forgejo.S3Prefix(c), strconv.FormatBool(forgejo.S3VirtualHostStyle(c)),
-		strconv.FormatBool(forgejo.S3InsecureSkipVerify(c)), rc.ObjectStorage.Digest)
+		strconv.FormatBool(forgejo.S3InsecureSkipVerify(c)), rc.ObjectStorage.ContentDigest)
 	now := time.Now()
 	check, _ := objectStorageChecks.Load(key)
 	last, _ := check.(*objectStorageCheck)
@@ -173,7 +174,7 @@ func reportObjectStorage(rc *forgejo.ReconcileContext, c *forgejov1.S3Connection
 		msg = fmt.Sprintf("%s at %s with the credentials of Secret %q. Forgejo does not start while this fails", r.Message, c.Endpoint, c.CredentialsSecret.Name)
 	}
 	rc.SetCondition(forgejov1.ConditionObjectStorageReady, metav1.ConditionFalse, reason, msg)
-	warnEvery(rc, "object-storage/"+reason, warnInterval, "ObjectStorageUnavailable", "ObjectStorage", "%s", msg)
+	warnEvery(rc, "object-storage/"+reason, "ObjectStorageUnavailable", "ObjectStorage", "%s", msg)
 }
 
 // ForgetObjectStorage drops the bucket check of a deleted instance.
@@ -197,13 +198,33 @@ func secretKey(ctx context.Context, rc *forgejo.ReconcileContext, name, key stri
 	return string(v), nil
 }
 
-// digest identifies a list of values without revealing them.
+// digest identifies a list of values (16 hex digits). It is unkeyed: for values that may be
+// guessed, such as human-chosen keys, it stays in memory, and objects carry podDigest.
 func digest(values ...string) string {
+	return contentDigest(values...)[:16]
+}
+
+// contentDigest is the full unkeyed SHA-256 of a list of values (length-prefixed).
+func contentDigest(values ...string) string {
 	h := sha256.New()
 	for _, v := range values {
 		_, _ = fmt.Fprintf(h, "%d:%s\n", len(v), v)
 	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// podDigest is the keyed digest of content for the pod template annotation of purpose:
+// HMAC-SHA256 with the instance's PodDigestSalt (from "<name>-secrets"), 16 hex digits. It
+// changes whenever content changes, but cannot be recomputed from guessed values without the
+// salt, which only readers of that Secret have.
+func podDigest(rc *forgejo.ReconcileContext, purpose, content string) (string, error) {
+	if rc.PodDigestSalt == "" {
+		return "", fmt.Errorf("the key %q of Secret %s is not known (the secrets step has not run)",
+			secretKeyPodDigestSalt, forgejo.SecretsName(rc.Instance))
+	}
+	mac := hmac.New(sha256.New, []byte(rc.PodDigestSalt))
+	mac.Write([]byte(purpose + "\x00" + content))
+	return hex.EncodeToString(mac.Sum(nil))[:16], nil
 }
 
 // objectStorageConfig renders spec.objectStorage into app.ini: [storage] points every storage

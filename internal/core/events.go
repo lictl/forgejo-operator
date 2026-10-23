@@ -24,10 +24,10 @@ type eventLimiter struct {
 
 var warnings = &eventLimiter{last: map[string]time.Time{}}
 
-func (l *eventLimiter) allow(key string, every time.Duration, now time.Time) bool {
+func (l *eventLimiter) allow(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if t, ok := l.last[key]; ok && now.Sub(t) < every {
+	if t, ok := l.last[key]; ok && now.Sub(t) < warnInterval {
 		return false
 	}
 	if len(l.last) > 4096 {
@@ -41,11 +41,11 @@ func (l *eventLimiter) allow(key string, every time.Duration, now time.Time) boo
 	return true
 }
 
-// warnEvery emits a Warning event for the instance at most once per interval for key. Put
-// what identifies the problem (e.g. a requested size) into key, so that a different problem
-// is reported at once.
-func warnEvery(rc *forgejo.ReconcileContext, key string, every time.Duration, reason, action, note string, args ...any) {
-	if warnings.allow(string(rc.Instance.UID)+"/"+key, every, time.Now()) {
+// warnEvery emits a Warning event for the instance at most once per warnInterval for key.
+// Put what identifies the problem (e.g. a requested size) into key, so that a different
+// problem is reported at once.
+func warnEvery(rc *forgejo.ReconcileContext, key, reason, action, note string, args ...any) {
+	if warnings.allow(string(rc.Instance.UID)+"/"+key, time.Now()) {
 		rc.Event(corev1.EventTypeWarning, reason, action, note, args...)
 	}
 }

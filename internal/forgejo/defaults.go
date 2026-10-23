@@ -27,6 +27,9 @@ func DurationOr(d *metav1.Duration, def time.Duration) time.Duration {
 	return d.Duration
 }
 
+// Image is spec.image. The API server always stores one (the CRD defaults it and refuses an
+// empty string, so an instance never follows DefaultImage of a later operator release); the
+// fallback only serves objects built without API-server defaulting, such as in unit tests.
 func Image(f *forgejov1.Forgejo) string {
 	if f.Spec.Image != "" {
 		return f.Spec.Image
@@ -57,14 +60,25 @@ func DatabaseType(f *forgejov1.Forgejo) forgejov1.DatabaseType {
 
 func SSHEnabled(f *forgejov1.Forgejo) bool { return BoolOr(f.Spec.Server.SSH.Enabled, true) }
 
-// SSHHostKeysOverridden reports whether spec.config sets [server] SSH_SERVER_HOST_KEYS. The
-// user then manages the host keys, and the operator leaves them alone.
+// sshHostKeysKey is the app.ini key ([server]) that lists the SSH host keys.
+const sshHostKeysKey = "SSH_SERVER_HOST_KEYS"
+
+// SSHHostKeysOverridden reports whether spec.config or an entry of spec.configFrom sets
+// [server] SSH_SERVER_HOST_KEYS (the section matches case-insensitively, the key exactly). The
+// user then manages the host keys, and the operator leaves them alone: it neither generates,
+// mounts, publishes nor backs them up, and app.ini keeps the user's value. A configFrom entry
+// counts even while its (optional) Secret is missing; Forgejo then uses its own default key.
 func SSHHostKeysOverridden(f *forgejov1.Forgejo) bool {
 	for section, kv := range f.Spec.Config {
 		if !strings.EqualFold(section, "server") {
 			continue
 		}
-		if _, ok := kv["SSH_SERVER_HOST_KEYS"]; ok {
+		if _, ok := kv[sshHostKeysKey]; ok {
+			return true
+		}
+	}
+	for _, from := range f.Spec.ConfigFrom {
+		if strings.EqualFold(from.Section, "server") && from.Key == sshHostKeysKey {
 			return true
 		}
 	}
@@ -72,7 +86,7 @@ func SSHHostKeysOverridden(f *forgejov1.Forgejo) bool {
 }
 
 // SSHHostKeysManaged reports whether the operator manages the SSH host keys: SSH is enabled
-// and spec.config does not set SSH_SERVER_HOST_KEYS.
+// and neither spec.config nor spec.configFrom sets SSH_SERVER_HOST_KEYS.
 func SSHHostKeysManaged(f *forgejov1.Forgejo) bool {
 	return SSHEnabled(f) && !SSHHostKeysOverridden(f)
 }

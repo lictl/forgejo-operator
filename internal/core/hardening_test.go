@@ -22,6 +22,8 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const testReasonReplicaSetUpdated = "ReplicaSetUpdated"
+
 const (
 	img15 = "codeberg.org/forgejo/forgejo:15"
 	img16 = "codeberg.org/forgejo/forgejo:16"
@@ -108,7 +110,7 @@ func TestReconcileStatusReportsReplicaFailure(t *testing.T) {
 	msg := `pods "fj-abc" is forbidden: violates PodSecurity "restricted:latest": runAsNonRoot != true`
 	dep := statusDeployment(f, img16, 1, appsv1.DeploymentStatus{
 		Conditions: []appsv1.DeploymentCondition{
-			{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "ReplicaSetUpdated"},
+			{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: testReasonReplicaSetUpdated},
 			{Type: appsv1.DeploymentReplicaFailure, Status: corev1.ConditionTrue, Reason: "FailedCreate", Message: msg},
 		},
 	})
@@ -176,7 +178,7 @@ func TestReconcileStatusUpgradeReporting(t *testing.T) {
 	dep.Spec.Replicas = ptr.To[int32](1)
 	dep.Spec.Template.Spec.Containers[0].Image = img16
 	updateDeployment(t, rc, dep, appsv1.DeploymentStatus{ObservedGeneration: 10, Replicas: 1, UpdatedReplicas: 1,
-		Conditions: []appsv1.DeploymentCondition{{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "ReplicaSetUpdated"}}})
+		Conditions: []appsv1.DeploymentCondition{{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: testReasonReplicaSetUpdated}}})
 	if _, err := ReconcileStatus(ctx, rc); err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +276,7 @@ func TestReconcileWorkloadClampsReplicasWithoutHA(t *testing.T) {
 	rc.Recorder = rec
 	rc.TargetImage = img16
 	rc.Layout = forgejo.LayoutForImage(img16)
-	rc.ConfigHash, rc.ConfigSecretName = "abc", "fj-config"
+	rc.ConfigHash, rc.ConfigSecretName = "abc", testConfigSecret
 	key := types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}
 
 	for range 2 {
@@ -323,7 +325,7 @@ func TestReconcileWorkloadClampsReplicasWithoutHA(t *testing.T) {
 // container is opt-in.
 func TestPodSpecSecurity(t *testing.T) {
 	f := testInstance()
-	rc := &forgejo.ReconcileContext{Instance: f, TargetImage: img16, Layout: forgejo.LayoutForImage(img16), ConfigSecretName: "fj-config"}
+	rc := &forgejo.ReconcileContext{Instance: f, TargetImage: img16, Layout: forgejo.LayoutForImage(img16), ConfigSecretName: testConfigSecret}
 
 	spec := podSpec(rc)
 	if len(spec.InitContainers) != 1 || spec.InitContainers[0].Name != "bootstrap" {
@@ -343,7 +345,7 @@ func TestPodSpecSecurity(t *testing.T) {
 		t.Fatalf("startup budget %ds, want at least an hour", p.PeriodSeconds*p.FailureThreshold)
 	}
 
-	f.Annotations = map[string]string{AnnotationFixPermissions: "true"}
+	f.Annotations = map[string]string{AnnotationFixPermissions: valueTrue}
 	spec = podSpec(rc)
 	if len(spec.InitContainers) != 2 || spec.InitContainers[0].Name != initPermissionsContainer ||
 		ptr.Deref(spec.InitContainers[0].SecurityContext.RunAsUser, -1) != 0 {

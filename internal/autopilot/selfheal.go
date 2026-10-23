@@ -25,8 +25,7 @@ const (
 	// path between the operator and the Service. The kubelet's readiness probe calls the same
 	// endpoint (3 × 10s, 5s timeout), so a Forgejo that really stopped answering is NotReady
 	// well within this time.
-	unreachableAfter     = time.Minute
-	unreachableWarnEvery = time.Hour
+	unreachableAfter = time.Minute
 	// healthReasonUnreachable is the Healthy condition reason the health step sets for a
 	// probe that got no answer from Forgejo (observability.ReasonUnreachable).
 	healthReasonUnreachable = "Unreachable"
@@ -87,7 +86,7 @@ func reportProbeUnreachable(rc *forgejo.ReconcileContext, st *instanceState, pod
 		c.Status != metav1.ConditionTrue || c.Reason == ReasonHealthProbeUnreachable {
 		setDegraded(rc, ReasonHealthProbeUnreachable, msg)
 	}
-	warnEvery(rc, st, "health-probe-unreachable", unreachableWarnEvery, ReasonHealthProbeUnreachable, "%s", msg)
+	warnEvery(rc, st, "health-probe-unreachable", ReasonHealthProbeUnreachable, "%s", msg)
 }
 
 // restartUnhealthy remediates a hung Forgejo: the process is alive (the tcpSocket liveness

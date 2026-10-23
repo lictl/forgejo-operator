@@ -51,6 +51,8 @@ const (
 	scaleDownTimeout = 15 * time.Minute
 	// scaleUpTimeout bounds how long a finished restore waits for Forgejo to become available.
 	scaleUpTimeout = 15 * time.Minute
+	// eventActionRestore is the action of every event the restore controller emits.
+	eventActionRestore = "Restore"
 )
 
 // ForgejoRestoreReconciler reconciles a ForgejoRestore object
@@ -94,11 +96,11 @@ func (r *ForgejoRestoreReconciler) reader() client.Reader {
 	return r.Client
 }
 
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores,verbs=get;list;watch;update
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores/status,verbs=patch
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores/finalizers,verbs=update
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
@@ -229,7 +231,7 @@ func (r *ForgejoRestoreReconciler) validateRemote(ctx context.Context, rs *forge
 	sec := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err == nil {
 		if have := backup.SecretKeyFingerprint(sec.Data); m.SecretKeyFingerprint != "" && have != "" && have != m.SecretKeyFingerprint {
-			r.eventOn(rs, corev1.EventTypeWarning, "IdentityMismatch", "Restore",
+			r.eventOn(rs, corev1.EventTypeWarning, "IdentityMismatch",
 				"The backup was taken by %s/%s, whose SECRET_KEY differs from this instance's: two-factor secrets, Actions secrets and "+
 					"mirror credentials of the restored database cannot be decrypted. To recreate that instance with its identity, "+
 					"create a new Forgejo with spec.restoreFrom instead", m.Namespace, m.Forgejo)
@@ -242,8 +244,24 @@ func (r *ForgejoRestoreReconciler) validateRemote(ctx context.Context, rs *forge
 	return r.begin(ctx, rs, f, restoreDB, restoreData, m.ForgejoImage, remote)
 }
 
-// begin starts a validated restore: it waits for other restores and for the SSH host keys,
-// refuses a Job name taken by something else, and moves to ScalingDown.
+// objectStorageUnusable returns the ObjectStorageReady message when the object-storage step
+// stopped the Forgejo pipeline because the Secrets of spec.objectStorage are missing or
+// unusable, or the spec is invalid (the reasons core sets then). An endpoint that does not
+// answer does not count: pods start without it.
+func objectStorageUnusable(f *forgejov1.Forgejo) (string, bool) {
+	if !forgejo.ObjectStorageEnabled(f) {
+		return "", false
+	}
+	c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionObjectStorageReady)
+	if c == nil || c.Status != metav1.ConditionFalse || (c.Reason != "CredentialsUnavailable" && c.Reason != "InvalidSpec") {
+		return "", false
+	}
+	return c.Message, true
+}
+
+// begin starts a validated restore: it waits for other restores, for the SSH host keys and for
+// the Secrets of spec.objectStorage, refuses a Job name taken by something else, and moves to
+// ScalingDown.
 func (r *ForgejoRestoreReconciler) begin(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo,
 	restoreDB, restoreData bool, backupImage string, remote *forgejov1.RestoreRemoteStatus) (ctrl.Result, error) {
 	if !restoreDB && !restoreData {
@@ -265,6 +283,12 @@ func (r *ForgejoRestoreReconciler) begin(ctx context.Context, rs *forgejov1.Forg
 	if ssh := f.Status.SSH; ssh != nil && ssh.Message != "" {
 		return r.wait(ctx, rs, "Waiting for the SSH host keys: "+ssh.Message)
 	}
+	// Likewise for the Secrets of spec.objectStorage, which every pod references: the Forgejo
+	// pipeline stops before its workload step, so it would not scale down either. Pending is no
+	// maintenance, so the instance keeps serving meanwhile.
+	if msg, unusable := objectStorageUnusable(f); unusable {
+		return r.wait(ctx, rs, "Waiting for spec.objectStorage: "+msg)
+	}
 
 	// Refuse a Job name taken by something else before maintenance mode is turned on.
 	existing := &batchv1.Job{}
@@ -278,7 +302,7 @@ func (r *ForgejoRestoreReconciler) begin(ctx context.Context, rs *forgejov1.Forg
 
 	if from, ok := forgejo.ImageVersion(backupImage); ok {
 		if to, ok := forgejo.ImageVersion(backup.CurrentImage(f)); ok && from.Compare(to) > 0 {
-			r.eventOn(rs, corev1.EventTypeWarning, "NewerBackup", "Restore",
+			r.eventOn(rs, corev1.EventTypeWarning, "NewerBackup",
 				"Backup was taken with %s but %s is deployed; Forgejo cannot start on a database migrated by a newer version",
 				backupImage, backup.CurrentImage(f))
 		}
@@ -295,8 +319,8 @@ func (r *ForgejoRestoreReconciler) begin(ctx context.Context, rs *forgejov1.Forg
 		return ctrl.Result{}, err
 	}
 	src := backup.RestoreSource(rs)
-	r.eventOn(rs, corev1.EventTypeNormal, "RestoreStarted", "Restore", "Restoring %s (database: %t, data: %t)", src, restoreDB, restoreData)
-	r.eventOn(f, corev1.EventTypeNormal, "RestoreStarted", "Restore", "ForgejoRestore %s is restoring %s", rs.Name, src)
+	r.eventOn(rs, corev1.EventTypeNormal, "RestoreStarted", "Restoring %s (database: %t, data: %t)", src, restoreDB, restoreData)
+	r.eventOn(f, corev1.EventTypeNormal, "RestoreStarted", "ForgejoRestore %s is restoring %s", rs.Name, src)
 	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 }
 
@@ -367,7 +391,7 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 	if err := r.patchStatus(ctx, rs, orig); err != nil {
 		return ctrl.Result{}, err
 	}
-	r.eventOn(rs, corev1.EventTypeNormal, "Restoring", "Restore", "Started job %s", job.Name)
+	r.eventOn(rs, corev1.EventTypeNormal, "Restoring", "Started job %s", job.Name)
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
 }
 
@@ -567,7 +591,7 @@ func (r *ForgejoRestoreReconciler) track(ctx context.Context, rs *forgejov1.Forg
 	if err := r.patchStatus(ctx, rs, orig); err != nil {
 		return ctrl.Result{}, err
 	}
-	r.eventOn(rs, corev1.EventTypeNormal, "Restored", "Restore", "Restored %s", backup.RestoreSource(rs))
+	r.eventOn(rs, corev1.EventTypeNormal, "Restored", "Restored %s", backup.RestoreSource(rs))
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
@@ -611,7 +635,7 @@ func (r *ForgejoRestoreReconciler) scaleUp(ctx context.Context, rs *forgejov1.Fo
 		since = job.Status.CompletionTime.Time
 	}
 	if time.Since(since) > scaleUpTimeout {
-		r.eventOn(rs, corev1.EventTypeWarning, "ScaleUpTimeout", "Restore", "Forgejo did not become available within %s after the restore", scaleUpTimeout)
+		r.eventOn(rs, corev1.EventTypeWarning, "ScaleUpTimeout", "Forgejo did not become available within %s after the restore", scaleUpTimeout)
 		return ctrl.Result{}, r.complete(ctx, rs, f, fmt.Sprintf("Backup restored, but Forgejo was not available %s later", scaleUpTimeout))
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -643,9 +667,9 @@ func (r *ForgejoRestoreReconciler) complete(ctx context.Context, rs *forgejov1.F
 		return err
 	}
 	forgejo.RestoreTotal.WithLabelValues(rs.Namespace, rs.Spec.ForgejoRef.Name, "succeeded").Inc()
-	r.eventOn(rs, corev1.EventTypeNormal, "RestoreCompleted", "Restore", "%s", msg)
+	r.eventOn(rs, corev1.EventTypeNormal, "RestoreCompleted", "%s", msg)
 	if f != nil {
-		r.eventOn(f, corev1.EventTypeNormal, "RestoreCompleted", "Restore", "ForgejoRestore %s completed: %s", rs.Name, msg)
+		r.eventOn(f, corev1.EventTypeNormal, "RestoreCompleted", "ForgejoRestore %s completed: %s", rs.Name, msg)
 	}
 	return r.releaseJobs(ctx, rs)
 }
@@ -681,18 +705,18 @@ func (r *ForgejoRestoreReconciler) fail(ctx context.Context, rs *forgejov1.Forge
 		return err
 	}
 	forgejo.RestoreTotal.WithLabelValues(rs.Namespace, rs.Spec.ForgejoRef.Name, "failed").Inc()
-	r.eventOn(rs, corev1.EventTypeWarning, "RestoreFailed", "Restore", "%s", msg)
+	r.eventOn(rs, corev1.EventTypeWarning, "RestoreFailed", "%s", msg)
 	if f != nil {
-		r.eventOn(f, corev1.EventTypeWarning, "RestoreFailed", "Restore", "ForgejoRestore %s failed: %s", rs.Name, msg)
+		r.eventOn(f, corev1.EventTypeWarning, "RestoreFailed", "ForgejoRestore %s failed: %s", rs.Name, msg)
 	}
 	// Message and DataModified keep what the Job did; a Job that is still running is left
 	// alone (see releaseJobs).
 	return r.releaseJobs(ctx, rs)
 }
 
-func (r *ForgejoRestoreReconciler) eventOn(obj runtime.Object, eventType, reason, action, note string, args ...any) {
+func (r *ForgejoRestoreReconciler) eventOn(obj runtime.Object, eventType, reason, note string, args ...any) {
 	if r.Recorder != nil {
-		r.Recorder.Eventf(obj, nil, eventType, reason, action, note, args...)
+		r.Recorder.Eventf(obj, nil, eventType, reason, eventActionRestore, note, args...)
 	}
 }
 
@@ -739,7 +763,7 @@ func (r *ForgejoRestoreReconciler) finalize(ctx context.Context, rs *forgejov1.F
 	if rs.Status.Phase == forgejov1.RestorePhaseRestoring && backup.RecordedModification(rs) != backup.Unmodified {
 		f := &forgejov1.Forgejo{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Spec.ForgejoRef.Name}, f); err == nil {
-			r.eventOn(f, corev1.EventTypeWarning, "RestoreAborted", "Restore",
+			r.eventOn(f, corev1.EventTypeWarning, "RestoreAborted",
 				"ForgejoRestore %s was deleted while restoring; the database or the data volume may be partially restored", rs.Name)
 		}
 	}

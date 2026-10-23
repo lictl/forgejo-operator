@@ -26,6 +26,12 @@ import (
 	"github.com/lictl/forgejo-operator/internal/controller"
 )
 
+const (
+	testImage16               = "codeberg.org/forgejo/forgejo:16"
+	testReasonJobNameConflict = "JobNameConflict"
+	testPasswordField         = "password"
+)
+
 const ns = "regression"
 
 func scheme(t *testing.T) *runtime.Scheme {
@@ -42,7 +48,7 @@ func scheme(t *testing.T) *runtime.Scheme {
 
 func instance(activeRestore string) *forgejov1.Forgejo {
 	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: ns, UID: "forgejo-uid"}}
-	f.Spec.Image = "codeberg.org/forgejo/forgejo:16"
+	f.Spec.Image = testImage16
 	f.Status.Backup = &forgejov1.BackupStatusSummary{ActiveRestore: activeRestore}
 	return f
 }
@@ -51,9 +57,9 @@ func completedBackup(name string) *forgejov1.ForgejoBackup {
 	b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: "backup-uid"}}
 	b.Spec.ForgejoRef.Name = "fb"
 	b.Status.Phase = forgejov1.BackupPhaseCompleted
-	b.Status.PVCName = "fb-backups"
+	b.Status.PVCName = testBackupsPVC
 	b.Status.IncludesData = true
-	b.Status.ForgejoImage = "codeberg.org/forgejo/forgejo:16"
+	b.Status.ForgejoImage = testImage16
 	return b
 }
 
@@ -145,7 +151,7 @@ func TestRestoreRefusesForeignJob(t *testing.T) {
 				WithObjects(instance(rs.Name), b, rs, foreign).Build()
 
 			got := reconcileRestore(t, c, s, rs.Name, 3)
-			if got.Status.Phase != forgejov1.RestorePhaseFailed || reason(got.Status.Conditions) != "JobNameConflict" {
+			if got.Status.Phase != forgejov1.RestorePhaseFailed || reason(got.Status.Conditions) != testReasonJobNameConflict {
 				t.Fatalf("phase %s reason %s (%s), want Failed/JobNameConflict", got.Status.Phase, reason(got.Status.Conditions), got.Status.Message)
 			}
 			if got.Status.JobName != "" {
@@ -172,7 +178,7 @@ func TestRestoreTrackingForeignJobDoesNotSucceed(t *testing.T) {
 	if got.Status.Phase == forgejov1.RestorePhaseScalingUp || got.Status.Phase == forgejov1.RestorePhaseCompleted {
 		t.Fatalf("restore reached %s from a Job it does not control", got.Status.Phase)
 	}
-	if reason(got.Status.Conditions) != "JobNameConflict" {
+	if reason(got.Status.Conditions) != testReasonJobNameConflict {
 		t.Errorf("reason %s (%s), want JobNameConflict", reason(got.Status.Conditions), got.Status.Message)
 	}
 }
@@ -187,7 +193,7 @@ func TestBackupRefusesForeignJob(t *testing.T) {
 	b.Spec.ForgejoRef.Name = "fb"
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "fb-db-app", Namespace: ns},
-		Data:       map[string][]byte{"username": []byte("forgejo"), "password": []byte("x")},
+		Data:       map[string][]byte{"username": []byte("forgejo"), testPasswordField: []byte("x")},
 	}
 	c := fake.NewClientBuilder().WithScheme(s).
 		WithStatusSubresource(&forgejov1.ForgejoRestore{}, &forgejov1.ForgejoBackup{}).
@@ -203,7 +209,7 @@ func TestBackupRefusesForeignJob(t *testing.T) {
 	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "y"}, got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Status.Phase != forgejov1.BackupPhaseFailed || reason(got.Status.Conditions) != "JobNameConflict" {
+	if got.Status.Phase != forgejov1.BackupPhaseFailed || reason(got.Status.Conditions) != testReasonJobNameConflict {
 		t.Fatalf("phase %s reason %s (%s), want Failed/JobNameConflict", got.Status.Phase, reason(got.Status.Conditions), got.Status.Message)
 	}
 }

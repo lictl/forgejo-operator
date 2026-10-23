@@ -9,6 +9,8 @@ supported, and the notes for each major upgrade, are in [versions.md](versions.m
 
 ```yaml
 spec:
+  # A floating tag can pull a patch release that an advisory names (17.0.0): pin the minimum
+  # patch that docs/versions.md's support matrix names (N.0.P) once it is published.
   image: codeberg.org/forgejo/forgejo:17
   upgrade:
     backupBeforeUpgrade: true   # default

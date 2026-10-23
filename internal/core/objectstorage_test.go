@@ -21,6 +21,11 @@ import (
 )
 
 const (
+	testStorageLocal = "STORAGE_TYPE = local\n"
+	testForgejoName  = "forgejo"
+)
+
+const (
 	img17          = "codeberg.org/forgejo/forgejo:17"
 	testAccessKey  = "GKa1b2c3d4e5f6a7b8c9d0e1f2"
 	testSecretKey  = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
@@ -32,7 +37,7 @@ func objectStorageInstance(image string) *forgejov1.Forgejo {
 	f := testInstance()
 	f.Spec.Image = image
 	f.Spec.ObjectStorage = &forgejov1.ObjectStorageSpec{S3: forgejov1.S3Connection{
-		Endpoint: testS3Endpoint, Bucket: "forgejo", Region: "garage",
+		Endpoint: testS3Endpoint, Bucket: testForgejoName, Region: "garage",
 		CredentialsSecret: forgejov1.S3CredentialsSecretRef{Name: testS3Secret},
 	}}
 	return f
@@ -53,7 +58,7 @@ func renderInstanceConfig(t *testing.T, f *forgejov1.Forgejo) string {
 	rc.Recorder = events.NewFakeRecorder(10)
 	rc.TargetImage = forgejo.Image(f)
 	rc.Layout = forgejo.LayoutForImage(rc.TargetImage)
-	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: "forgejo", User: "forgejo", Password: "pw", SSLMode: "disable"}
+	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: testForgejoName, User: testForgejoName, Password: "pw", SSLMode: testSSLModeDisable}
 	if _, err := ReconcileConfig(ctx, rc); err != nil {
 		t.Fatal(err)
 	}
@@ -131,9 +136,9 @@ func TestObjectStorageConfigOptions(t *testing.T) {
 	// Subsystems kept on the volume become their own (local) target; the others inherit.
 	for sec, want := range map[string]string{
 		"lfs":                 "PATH = /data/git/lfs\nSTORAGE_TYPE = local\n",
-		"avatar":              "STORAGE_TYPE = local\n",
-		"storage.actions_log": "STORAGE_TYPE = local\n",
-		"actions.artifacts":   "STORAGE_TYPE = local\n",
+		"avatar":              testStorageLocal,
+		"storage.actions_log": testStorageLocal,
+		"actions.artifacts":   testStorageLocal,
 		"attachment":          "",
 		"repo-avatar":         "",
 		"packages":            "",
@@ -173,7 +178,7 @@ func secretRefKey(e corev1.EnvVar) string {
 
 func TestObjectStoragePodSpecCredentials(t *testing.T) {
 	f := objectStorageInstance(img17)
-	rc := &forgejo.ReconcileContext{Instance: f, TargetImage: img17, Layout: forgejo.LayoutForImage(img17), ConfigSecretName: "fj-config"}
+	rc := &forgejo.ReconcileContext{Instance: f, TargetImage: img17, Layout: forgejo.LayoutForImage(img17), ConfigSecretName: testConfigSecret}
 	for _, c := range s3Containers(podSpec(rc)) {
 		env := envOf(c)
 		if secretRefKey(env["AWS_ACCESS_KEY_ID"]) != "AWS_ACCESS_KEY_ID" || secretRefKey(env["AWS_SECRET_ACCESS_KEY"]) != "AWS_SECRET_ACCESS_KEY" {
@@ -201,7 +206,7 @@ func TestObjectStoragePodSpecCA(t *testing.T) {
 	f.Spec.ObjectStorage.S3.Endpoint = "https://s3.example.com"
 	f.Spec.ObjectStorage.S3.CredentialsSecret.AccessKeyIDKey = "id"
 	f.Spec.ObjectStorage.S3.TLS = &forgejov1.S3TLSSpec{CASecret: &forgejov1.SecretKeyRef{Name: "s3-ca"}}
-	rc := &forgejo.ReconcileContext{Instance: f, TargetImage: img17, Layout: forgejo.LayoutForImage(img17), ConfigSecretName: "fj-config"}
+	rc := &forgejo.ReconcileContext{Instance: f, TargetImage: img17, Layout: forgejo.LayoutForImage(img17), ConfigSecretName: testConfigSecret}
 	spec := podSpec(rc)
 	i := slices.IndexFunc(spec.Volumes, func(v corev1.Volume) bool { return v.Name == objectStorageCAVolume })
 	if i < 0 {
@@ -293,16 +298,16 @@ func TestReconcileObjectStorageCheck(t *testing.T) {
 	creds := s3CredentialsSecret(f, testAccessKey, testSecretKey)
 	e := newOSStepEnv(t, creds)
 
-	if res := e.run(t); res.Stop || e.rc.ObjectStorage == nil || e.rc.ObjectStorage.Digest == "" || e.rc.ObjectStorageUnavailable || len(e.calls) != 1 {
+	if res := e.run(t); res.Stop || e.rc.ObjectStorage == nil || e.rc.ObjectStorage.ContentDigest == "" || e.rc.ObjectStorageUnavailable || len(e.calls) != 1 {
 		t.Fatalf("reachable: %+v %+v %d", res, e.rc.ObjectStorage, len(e.calls))
 	}
 	b := e.calls[0]
-	if b.Scheme != "http" || b.Host != "garage.s3-lab.svc.cluster.local:3900" || b.Name != "forgejo" || b.Region != "garage" ||
+	if b.Scheme != schemeHTTP || b.Host != "garage.s3-lab.svc.cluster.local:3900" || b.Name != testForgejoName || b.Region != "garage" ||
 		b.VirtualHost || b.AccessKeyID != testAccessKey || b.SecretAccessKey != testSecretKey || b.DialContext == nil {
 		t.Fatalf("checked %+v", b)
 	}
 	e.wantCondition(t, metav1.ConditionTrue, s3.ReasonReachable)
-	digest1 := e.rc.ObjectStorage.Digest
+	digest1 := e.rc.ObjectStorage.ContentDigest
 
 	// Within the interval and with the same inputs, the bucket is not checked again.
 	if e.run(t); len(e.calls) != 1 {
@@ -317,8 +322,8 @@ func TestReconcileObjectStorageCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.result = s3.Result{Reason: s3.ReasonUnreachable, Message: "garage.s3-lab.svc.cluster.local:3900: i/o timeout"}
-	if res := e.run(t); res.Stop || len(e.calls) != 2 || e.rc.ObjectStorage.Digest == digest1 || e.rc.ObjectStorageUnavailable {
-		t.Fatalf("rotated: %+v %d %s unavailable=%t", res, len(e.calls), e.rc.ObjectStorage.Digest, e.rc.ObjectStorageUnavailable)
+	if res := e.run(t); res.Stop || len(e.calls) != 2 || e.rc.ObjectStorage.ContentDigest == digest1 || e.rc.ObjectStorageUnavailable {
+		t.Fatalf("rotated: %+v %d %s unavailable=%t", res, len(e.calls), e.rc.ObjectStorage.ContentDigest, e.rc.ObjectStorageUnavailable)
 	}
 	if c := e.wantCondition(t, metav1.ConditionFalse, reasonUnreachableFromOperator); !strings.Contains(c.Message, "i/o timeout") {
 		t.Fatalf("unreachable: %s", c.Message)
@@ -335,26 +340,71 @@ func TestReconcileObjectStorageCheck(t *testing.T) {
 	}
 }
 
-// The pod template carries the digest, so that rotated credentials (read from the environment
-// at start) roll the pods.
+// The pod template carries a digest of the credentials, so that rotated credentials (read
+// from the environment at start) roll the pods. Readers of Deployments and Pods see it, so it
+// is keyed with the instance's salt from "<name>-secrets": it cannot test guesses of a
+// human-chosen key without that Secret.
 func TestReconcileWorkloadObjectStorageDigest(t *testing.T) {
 	ctx := context.Background()
+	annotation := func(t *testing.T, f *forgejov1.Forgejo, secretKey string) string {
+		t.Helper()
+		secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace}}
+		rc := testContext(t, f, secrets, s3CredentialsSecret(f, testAccessKey, secretKey))
+		rc.Recorder = events.NewFakeRecorder(20)
+		rc.TargetImage = img17
+		rc.Layout = forgejo.LayoutForImage(img17)
+		rc.ConfigHash, rc.ConfigSecretName = "h", testConfigSecret
+		old := checkBucket
+		checkBucket = func(context.Context, s3.Bucket) s3.Result { return s3.Result{OK: true, Reason: s3.ReasonReachable} }
+		t.Cleanup(func() { checkBucket = old; ForgetObjectStorage(f.Namespace, f.Name) })
+		for _, step := range []forgejo.Step{ReconcileSecrets, ReconcileObjectStorage, ReconcileWorkload} {
+			if _, err := step(ctx, rc); err != nil {
+				t.Fatal(err)
+			}
+		}
+		dep := &appsv1.Deployment{}
+		if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep); err != nil {
+			t.Fatal(err)
+		}
+		got := dep.Spec.Template.Annotations[forgejo.AnnotationObjectStorage]
+		if len(got) != 16 || got == digest(testAccessKey, secretKey, "") || strings.HasPrefix(contentDigest(testAccessKey, secretKey, ""), got) {
+			t.Fatalf("annotation %q is not a keyed digest", got)
+		}
+		// The same salt and credentials give the same digest on every pass (no rollout).
+		sec := &corev1.Secret{}
+		if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err != nil {
+			t.Fatal(err)
+		}
+		if salt := string(sec.Data[secretKeyPodDigestSalt]); salt == "" || rc.PodDigestSalt != salt {
+			t.Fatalf("salt %q, rc %q", salt, rc.PodDigestSalt)
+		}
+		again, err := podDigest(rc, "object-storage", contentDigest(testAccessKey, secretKey, ""))
+		if err != nil || again != got {
+			t.Fatalf("not stable: %q != %q (%v)", again, got, err)
+		}
+		// A rotated secret key changes it under the same salt (the pods roll).
+		if rotated, _ := podDigest(rc, "object-storage", contentDigest(testAccessKey, "rotated-"+secretKey, "")); rotated == got {
+			t.Fatal("the digest did not change with the secret key")
+		}
+		return got
+	}
+
+	a := annotation(t, objectStorageInstance(img17), testSecretKey)
+	// Another instance with the same credentials has its own salt.
+	other := objectStorageInstance(img17)
+	other.Name, other.UID = "other", "uid-other"
+	if b := annotation(t, other, testSecretKey); b == a {
+		t.Fatal("two instances with the same credentials share the digest")
+	}
+
+	// Without the salt the workload refuses to write an unkeyed digest.
 	f := objectStorageInstance(img17)
 	rc := testContext(t, f)
-	rc.TargetImage = img17
-	rc.Layout = forgejo.LayoutForImage(img17)
-	rc.ConfigHash, rc.ConfigSecretName = "h", "fj-config"
-	rc.ObjectStorage = &forgejo.ObjectStorage{Digest: "d1"}
-	if _, err := ReconcileWorkload(ctx, rc); err != nil {
-		t.Fatal(err)
-	}
-	dep := &appsv1.Deployment{}
-	if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep); err != nil {
-		t.Fatal(err)
-	}
-	got := dep.Spec.Template.Annotations
-	if got[forgejo.AnnotationObjectStorage] != "d1" {
-		t.Fatalf("annotations %v", got)
+	rc.TargetImage, rc.Layout = img17, forgejo.LayoutForImage(img17)
+	rc.ConfigHash, rc.ConfigSecretName = "h", testConfigSecret
+	rc.ObjectStorage = &forgejo.ObjectStorage{ContentDigest: contentDigest(testAccessKey, testSecretKey, "")}
+	if _, err := ReconcileWorkload(ctx, rc); err == nil || !strings.Contains(err.Error(), secretKeyPodDigestSalt) {
+		t.Fatalf("workload without the salt: %v", err)
 	}
 }
 

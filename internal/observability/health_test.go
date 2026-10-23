@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ import (
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
+
+const testVersion170 = "17.0.0"
 
 // useFastClient shortens the probe timeouts for the duration of a test.
 func useFastClient(t *testing.T) {
@@ -233,5 +236,34 @@ func TestUnreachableDoesNotFeedSelfHealing(t *testing.T) {
 	c = meta.FindStatusCondition(rc.Instance.Status.Conditions, forgejov1.ConditionHealthy)
 	if c.Status != metav1.ConditionTrue || h.ConsecutiveFailures != 0 || !h.Healthy {
 		t.Fatalf("after recovery: condition %+v health %+v", c, h)
+	}
+}
+
+// With a floating tag, nodes that hold different patch releases make the reported version
+// alternate: VersionDetected is emitted once per version and status.image.
+func TestVersionDetectedOncePerImageAndVersion(t *testing.T) {
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "detect", UID: "u1"},
+		Status: forgejov1.ForgejoStatus{Image: "codeberg.org/forgejo/forgejo:17"}}
+	t.Cleanup(func() { ForgetInstance("ns", "detect") })
+	reports := []string{testVersion170, "17.0.1", testVersion170, "17.0.1", testVersion170}
+	got := make([]bool, 0, len(reports))
+	for _, v := range reports {
+		got = append(got, newVersionFor(f, v))
+	}
+	if want := []bool{true, true, false, false, false}; !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	// Another image (or a re-created instance) starts afresh.
+	f.Status.Image = "codeberg.org/forgejo/forgejo:17-rootless"
+	if !newVersionFor(f, "17.0.1") || newVersionFor(f, "17.0.1") {
+		t.Fatal("new image")
+	}
+	f.UID = "u2"
+	if !newVersionFor(f, "17.0.1") {
+		t.Fatal("re-created instance")
+	}
+	ForgetInstance("ns", "detect")
+	if !newVersionFor(f, "17.0.1") {
+		t.Fatal("ForgetInstance kept the versions")
 	}
 }

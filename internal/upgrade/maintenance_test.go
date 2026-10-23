@@ -96,7 +96,7 @@ func TestSucceedsOnlyOnceDeploymentRolledOut(t *testing.T) {
 func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 	t.Run("pending", func(t *testing.T) {
 		f := fixture(&forgejov1.UpgradeStatus{
-			Phase: forgejov1.UpgradePhasePending, FromImage: imgA, ToImage: imgB, BackupName: "pre", StartTime: ago(time.Minute),
+			Phase: forgejov1.UpgradePhasePending, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(time.Minute),
 		})
 		c := newClient(t)
 		rc := reconcileInMaintenance(t, c, f)
@@ -111,7 +111,7 @@ func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 
 	t.Run("no backup is taken", func(t *testing.T) {
 		f := fixture(&forgejov1.UpgradeStatus{
-			Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: "pre", StartTime: ago(time.Minute),
+			Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(time.Minute),
 		})
 		c := newClient(t)
 		rc := reconcileInMaintenance(t, c, f)
@@ -125,7 +125,7 @@ func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 
 	t.Run("stop timeout does not fire", func(t *testing.T) {
 		f := fixture(&forgejov1.UpgradeStatus{
-			Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: "pre", StartTime: ago(16 * time.Minute),
+			Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(16 * time.Minute),
 		})
 		stuck := serverPod(f, "stuck", imgA, ago(time.Hour), corev1.ContainerState{}, 0)
 		stuck.Status.Phase = corev1.PodRunning
@@ -137,10 +137,10 @@ func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 
 	t.Run("completed backup does not start the rollout", func(t *testing.T) {
 		f := fixture(&forgejov1.UpgradeStatus{
-			Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: "pre", StartTime: ago(time.Minute),
+			Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(time.Minute),
 		})
 		bk := &forgejov1.ForgejoBackup{
-			ObjectMeta: metav1.ObjectMeta{Name: "pre", Namespace: "ns"},
+			ObjectMeta: metav1.ObjectMeta{Name: testPreBackup, Namespace: "ns"},
 			Status:     forgejov1.ForgejoBackupStatus{Phase: forgejov1.BackupPhaseCompleted},
 		}
 		c := newClient(t, bk)
@@ -156,7 +156,7 @@ func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 
 	t.Run("cancellation still applies", func(t *testing.T) {
 		f := fixture(&forgejov1.UpgradeStatus{
-			Phase: forgejov1.UpgradePhasePending, FromImage: imgA, ToImage: imgB, BackupName: "pre", StartTime: ago(time.Minute),
+			Phase: forgejov1.UpgradePhasePending, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(time.Minute),
 		})
 		f.Spec.Image = imgA
 		rc := reconcileInMaintenance(t, newClient(t), f)
@@ -169,7 +169,7 @@ func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 func TestMaintenancePausesRolloutTimeout(t *testing.T) {
 	// The timeout (15m) would have expired five minutes ago.
 	f := fixture(&forgejov1.UpgradeStatus{
-		Phase: forgejov1.UpgradePhaseVerifying, FromImage: imgA, ToImage: imgB, BackupName: "pre",
+		Phase: forgejov1.UpgradePhaseVerifying, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup,
 		StartTime: ago(30 * time.Minute), RolloutStartTime: ago(20 * time.Minute),
 	})
 	c := newClient(t)
@@ -196,7 +196,7 @@ func TestMaintenancePausesRolloutTimeout(t *testing.T) {
 func TestMaintenancePausesRollback(t *testing.T) {
 	rollingBack := func() *forgejov1.Forgejo {
 		f := fixture(&forgejov1.UpgradeStatus{
-			Phase: forgejov1.UpgradePhaseRollingBack, FromImage: imgA, ToImage: imgB, BackupName: "pre", RestoreName: "rollback",
+			Phase: forgejov1.UpgradePhaseRollingBack, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, RestoreName: testRollbackRestore,
 			StartTime: ago(time.Hour), RolloutStartTime: ago(50 * time.Minute), FailureReason: "crashed",
 		})
 		f.Status.Backup = &forgejov1.BackupStatusSummary{ActiveRestore: "manual"}
@@ -238,7 +238,7 @@ func TestMaintenancePausesRollback(t *testing.T) {
 
 	t.Run("own restore does not pause", func(t *testing.T) {
 		f := rollingBack()
-		f.Status.Backup.ActiveRestore = "rollback" // the failed restore holds maintenance
+		f.Status.Backup.ActiveRestore = testRollbackRestore // the failed restore holds maintenance
 		c := newClient(t, restore("rollback", forgejov1.RestorePhaseFailed, ago(40*time.Minute)))
 		rc := reconcileInMaintenance(t, c, f)
 		if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseFailed || !u.RollbackRestoreFailed || rc.TargetImage != imgA {

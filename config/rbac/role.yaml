@@ -8,15 +8,12 @@ rules:
   - ""
   resources:
   - configmaps
-  - persistentvolumeclaims
-  - secrets
   - services
   verbs:
   - create
   - delete
   - get
   - list
-  - patch
   - update
   - watch
 - apiGroups:
@@ -37,6 +34,17 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - persistentvolumeclaims
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
   - delete
@@ -46,29 +54,36 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods/exec
-  verbs:
-  - create
-  - get
-- apiGroups:
-  - ""
-  - events.k8s.io
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - apps
-  resources:
-  - deployments
-  - statefulsets
+  - secrets
   verbs:
   - create
   - delete
   - get
   - list
   - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
   - update
   - watch
 - apiGroups:
@@ -80,7 +95,6 @@ rules:
   - delete
   - get
   - list
-  - patch
   - update
   - watch
 - apiGroups:
@@ -92,8 +106,6 @@ rules:
   - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - cert-manager.io
@@ -103,17 +115,18 @@ rules:
   - create
   - delete
   - get
-  - list
-  - patch
   - update
-  - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - forgejo.lucas.icu
   resources:
   - forgejobackups
-  - forgejorestores
-  - forgejorunners
-  - forgejos
   verbs:
   - create
   - delete
@@ -139,9 +152,27 @@ rules:
   - forgejorunners/status
   - forgejos/status
   verbs:
-  - get
   - patch
+- apiGroups:
+  - forgejo.lucas.icu
+  resources:
+  - forgejorestores
+  verbs:
+  - create
+  - get
+  - list
   - update
+  - watch
+- apiGroups:
+  - forgejo.lucas.icu
+  resources:
+  - forgejorunners
+  - forgejos
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
 - apiGroups:
   - gateway.networking.k8s.io
   resources:
@@ -152,16 +183,12 @@ rules:
   - create
   - delete
   - get
-  - list
-  - patch
   - update
-  - watch
 - apiGroups:
   - metrics.k8s.io
   resources:
   - pods
   verbs:
-  - get
   - list
 - apiGroups:
   - monitoring.coreos.com
@@ -172,10 +199,7 @@ rules:
   - create
   - delete
   - get
-  - list
-  - patch
   - update
-  - watch
 - apiGroups:
   - networking.k8s.io
   resources:
@@ -185,7 +209,6 @@ rules:
   - delete
   - get
   - list
-  - patch
   - update
   - watch
 - apiGroups:
@@ -197,7 +220,6 @@ rules:
   - delete
   - get
   - list
-  - patch
   - update
   - watch
 - apiGroups:
@@ -206,7 +228,6 @@ rules:
   - clusters
   verbs:
   - create
-  - delete
   - get
   - list
   - patch

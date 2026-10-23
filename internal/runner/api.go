@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+const (
+	statusIdle    = "idle"
+	statusWaiting = "waiting"
+)
+
 // APIRunner is a runner as Forgejo's API reports it (structs.ActionRunner, Forgejo 15 and 17).
 type APIRunner struct {
 	ID      int64  `json:"id"`
@@ -26,7 +31,7 @@ type APIRunner struct {
 }
 
 // Online reports whether Forgejo heard from the runner within the last minute.
-func (r APIRunner) Online() bool { return r.Status == "idle" || r.Status == "active" }
+func (r APIRunner) Online() bool { return r.Status == statusIdle || r.Status == "active" }
 
 // API is what the operator asks Forgejo about runners.
 type API interface {
@@ -40,8 +45,8 @@ type API interface {
 	// DeleteRunner unregisters a runner and reports whether it existed; one that does not
 	// exist is not an error.
 	DeleteRunner(ctx context.Context, id int64) (bool, error)
-	// WaitingJobs counts the jobs of the scope ("" instance, "<org>", "<owner>/<repo>") that
-	// wait for a runner with the given label names.
+	// WaitingJobs counts the jobs of the scope ("" instance, "<owner>" (an organization or
+	// a user), "<owner>/<repo>") that wait for a runner with the given label names.
 	WaitingJobs(ctx context.Context, scope string, labels []string) (int, error)
 }
 
@@ -216,26 +221,56 @@ func (a *httpAPI) DeleteRunner(ctx context.Context, id int64) (bool, error) {
 	return err == nil && code != http.StatusNotFound, err
 }
 
+// WaitingJobs counts the waiting jobs of the scope. Forgejo (15 and 17) returns every waiting
+// and running job that matches, without pages. An owner scope is an organization's or a
+// user's: /orgs/{owner}/... answers 404 for a user, and Forgejo has no such endpoint for a
+// user other than the caller, so a user's jobs are the instance's filtered by owner id.
 func (a *httpAPI) WaitingJobs(ctx context.Context, scope string, labels []string) (int, error) {
-	path := "/admin/actions/runners/jobs"
+	query := "?labels=" + url.QueryEscape(strings.Join(labels, ","))
 	if owner, repo, ok := strings.Cut(scope, "/"); ok {
-		path = "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) + "/actions/runners/jobs"
-	} else if scope != "" {
-		path = "/orgs/" + url.PathEscape(scope) + "/actions/runners/jobs"
+		return a.waitingJobs(ctx, "/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/actions/runners/jobs", query, 0)
 	}
+	if scope == "" {
+		return a.waitingJobs(ctx, "/admin/actions/runners/jobs", query, 0)
+	}
+	n, err := a.waitingJobs(ctx, "/orgs/"+url.PathEscape(scope)+"/actions/runners/jobs", query, 0)
+	if !errors.Is(err, errNotFound) {
+		return n, err
+	}
+	// Not an organization: a user, or no owner at all.
+	var user struct {
+		ID int64 `json:"id"`
+	}
+	code, _, err := a.do(ctx, http.MethodGet, "/users/"+url.PathEscape(scope), &user)
+	if err != nil {
+		return 0, err
+	}
+	if code == http.StatusNotFound || user.ID == 0 {
+		return 0, fmt.Errorf("owner %q does not exist", scope)
+	}
+	return a.waitingJobs(ctx, "/admin/actions/runners/jobs", query, user.ID)
+}
+
+// errNotFound: the endpoint answered 404.
+var errNotFound = errors.New("HTTP 404")
+
+// waitingJobs counts the jobs of path with status "waiting", of owner ownerID when it is not 0.
+// A 404 is an error wrapping errNotFound.
+func (a *httpAPI) waitingJobs(ctx context.Context, path, query string, ownerID int64) (int, error) {
 	var jobs []struct {
-		Status string `json:"status"`
+		Status  string `json:"status"`
+		OwnerID int64  `json:"owner_id"`
 	}
-	code, _, err := a.do(ctx, http.MethodGet, path+"?labels="+url.QueryEscape(strings.Join(labels, ",")), &jobs)
+	code, _, err := a.do(ctx, http.MethodGet, path+query, &jobs)
 	if err != nil {
 		return 0, err
 	}
 	if code == http.StatusNotFound {
-		return 0, fmt.Errorf("GET %s: HTTP 404", path)
+		return 0, fmt.Errorf("GET %s: %w", path, errNotFound)
 	}
 	n := 0
 	for _, j := range jobs {
-		if j.Status == "waiting" {
+		if j.Status == statusWaiting && (ownerID == 0 || j.OwnerID == ownerID) {
 			n++
 		}
 	}

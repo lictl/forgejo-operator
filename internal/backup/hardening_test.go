@@ -24,8 +24,13 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const (
+	testForgejoUID            = "forgejo-uid"
+	testReasonBackupSucceeded = "BackupSucceeded"
+)
+
 func ownedInstance(policy forgejov1.RetainPolicy) *forgejov1.Forgejo {
-	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: "ns", UID: "forgejo-uid"}}
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: "ns", UID: testForgejoUID}}
 	f.Spec.Storage.RetainPolicy = policy
 	return f
 }
@@ -50,11 +55,11 @@ func TestReconcileOwnershipFollowsRetainPolicy(t *testing.T) {
 
 	// Created under Delete: scheduled and pre-upgrade backups and the PVC are owned.
 	deleteF := ownedInstance(forgejov1.RetainPolicyDelete)
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "fb-backups", Namespace: "ns"}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: testBackupsPVC, Namespace: "ns"}}
 	if err := controllerutil.SetControllerReference(deleteF, pvc, s); err != nil {
 		t.Fatal(err)
 	}
-	objs := []client.Object{pvc}
+	objs := append(make([]client.Object, 0, 1+len(reasons)), pvc)
 	for name, reason := range reasons {
 		b := reasonBackup(name, reason)
 		if err := controllerutil.SetOwnerReference(deleteF, b, s); err != nil { // even a manual one
@@ -72,7 +77,7 @@ func TestReconcileOwnershipFollowsRetainPolicy(t *testing.T) {
 	}
 	pvcController := func() *metav1.OwnerReference {
 		got := &corev1.PersistentVolumeClaim{}
-		if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "fb-backups"}, got); err != nil {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: testBackupsPVC}, got); err != nil {
 			t.Fatal(err)
 		}
 		return metav1.GetControllerOf(got)
@@ -101,12 +106,12 @@ func TestReconcileOwnershipFollowsRetainPolicy(t *testing.T) {
 	}
 	for name, reason := range reasons {
 		refs := refsOf(name)
-		owned := len(refs) == 1 && refs[0].UID == "forgejo-uid"
+		owned := len(refs) == 1 && refs[0].UID == testForgejoUID
 		if want := reason != forgejov1.BackupReasonManual; owned != want {
 			t.Errorf("Delete: backup %s owned=%v, want %v (%v)", name, owned, want, refs)
 		}
 	}
-	if ref := pvcController(); ref == nil || ref.UID != "forgejo-uid" {
+	if ref := pvcController(); ref == nil || ref.UID != testForgejoUID {
 		t.Errorf("Delete: backup PVC controller = %v, want the instance", ref)
 	}
 
@@ -145,9 +150,9 @@ func node(name string) *corev1.Node {
 	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{corev1.LabelHostname: name}}}
 }
 
-func serverPod(f *forgejov1.Forgejo, nodeName string) *corev1.Pod {
+func serverPod(f *forgejov1.Forgejo) *corev1.Pod {
 	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "fb-0", Namespace: "ns", Labels: forgejo.SelectorLabels(f)}}
-	p.Spec.NodeName = nodeName
+	p.Spec.NodeName = "n1"
 	p.Status.Phase = corev1.PodRunning
 	return p
 }
@@ -181,29 +186,29 @@ func TestPlacement(t *testing.T) {
 		conflict   bool
 	}{{
 		name:       "RWO data with pods: join the pods",
-		objs:       []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f, "n1"), boundClaim("fb-backups", "")},
+		objs:       []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f), boundClaim("fb-backups", "")},
 		mountsData: true, podAff: true,
 	}, {
 		name: "RWX data with pods: no pod affinity",
-		objs: []client.Object{boundClaim("fb-data", "pv-data", rwx), hostPV("pv-data", "", rwx), serverPod(f, "n1"),
+		objs: []client.Object{boundClaim("fb-data", "pv-data", rwx), hostPV("pv-data", "", rwx), serverPod(f),
 			boundClaim("fb-backups", "pv-b"), hostPV("pv-b", "n2"), node("n1"), node("n2")},
 		mountsData: true, nodes: "n2",
 	}, {
 		name:       "database-only first bind lands next to the data",
-		objs:       []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f, "n1"), boundClaim("fb-backups", "")},
+		objs:       []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f), boundClaim("fb-backups", "")},
 		mountsData: false, podAff: true,
 	}, {
 		name:       "cleanup of a bound backup volume: no data constraint",
-		objs:       []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f, "n1"), boundClaim("fb-backups", "pv-b"), hostPV("pv-b", "n2")},
+		objs:       []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f), boundClaim("fb-backups", "pv-b"), hostPV("pv-b", "n2")},
 		mountsData: false,
 	}, {
 		name: "backup volume on another node than the running pods",
-		objs: []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f, "n1"),
+		objs: []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f),
 			boundClaim("fb-backups", "pv-b"), hostPV("pv-b", "n2"), node("n1"), node("n2")},
 		mountsData: true, conflict: true,
 	}, {
 		name: "backup volume next to the running pods",
-		objs: []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f, "n1"),
+		objs: []client.Object{boundClaim("fb-data", "pv-data"), hostPV("pv-data", "n1"), serverPod(f),
 			boundClaim("fb-backups", "pv-b"), hostPV("pv-b", "n1"), node("n1"), node("n2")},
 		mountsData: true, podAff: true, nodes: "n1",
 	}, {
@@ -238,10 +243,10 @@ func TestPlacement(t *testing.T) {
 	}
 }
 
-func gaugeValue(t *testing.T, ns, name string) float64 {
+func gaugeValue(t *testing.T, ns string) float64 {
 	t.Helper()
 	m := &dto.Metric{}
-	g, err := forgejo.BackupLastSuccess.GetMetricWithLabelValues(ns, name)
+	g, err := forgejo.BackupLastSuccess.GetMetricWithLabelValues(ns, "fb")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,19 +266,19 @@ func TestLastSuccessGaugeIsExportedFromStatus(t *testing.T) {
 		return g
 	}
 	ExportLastSuccess(withSuccess(&t2))
-	if v := gaugeValue(t, "gauge", "fb"); v != float64(t2.Unix()) {
+	if v := gaugeValue(t, "gauge"); v != float64(t2.Unix()) {
 		t.Errorf("gauge = %v, want %v", v, t2.Unix())
 	}
 	// A summary from a lagging cache never moves the gauge back.
 	ExportLastSuccess(withSuccess(&t1))
-	if v := gaugeValue(t, "gauge", "fb"); v != float64(t2.Unix()) {
+	if v := gaugeValue(t, "gauge"); v != float64(t2.Unix()) {
 		t.Errorf("gauge went back to %v", v)
 	}
 	// Called on every reconcile: an instance without a recorded success (status not written
 	// yet, or the step that writes it skipped) does not remove the series.
 	ExportLastSuccess(f)
 	ExportLastSuccess(withSuccess(nil))
-	if v := gaugeValue(t, "gauge", "fb"); v != float64(t2.Unix()) {
+	if v := gaugeValue(t, "gauge"); v != float64(t2.Unix()) {
 		t.Errorf("gauge = %v after exporting an empty status, want %v", v, t2.Unix())
 	}
 	// No successful backup left: the series is removed, and a later success starts afresh.
@@ -282,7 +287,7 @@ func TestLastSuccessGaugeIsExportedFromStatus(t *testing.T) {
 		t.Error("series still exported without a successful backup")
 	}
 	ExportLastSuccess(withSuccess(&t1))
-	if v := gaugeValue(t, "gauge", "fb"); v != float64(t1.Unix()) {
+	if v := gaugeValue(t, "gauge"); v != float64(t1.Unix()) {
 		t.Errorf("gauge = %v after forgetting, want %v", v, t1.Unix())
 	}
 	ForgetLastSuccess("gauge", "fb")
@@ -307,7 +312,7 @@ func TestReconcileScheduleExportsLastSuccessAndDefersDuringUpgrade(t *testing.T)
 	if _, err := ReconcileSchedule(ctx, rc); err != nil {
 		t.Fatal(err)
 	}
-	if v := gaugeValue(t, "ns", "fb"); v != float64(done.Unix()) {
+	if v := gaugeValue(t, "ns"); v != float64(done.Unix()) {
 		t.Errorf("last-success gauge = %v, want %v", v, done.Unix())
 	}
 	list := &forgejov1.ForgejoBackupList{}
@@ -318,7 +323,7 @@ func TestReconcileScheduleExportsLastSuccessAndDefersDuringUpgrade(t *testing.T)
 		t.Errorf("a scheduled backup was started during an upgrade: %d backups", len(list.Items))
 	}
 	// The run became due 29h ago, when the last backup was 1h old: not stale.
-	if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionBackupHealthy); c == nil || c.Reason != "BackupSucceeded" {
+	if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionBackupHealthy); c == nil || c.Reason != testReasonBackupSucceeded {
 		t.Errorf("BackupHealthy = %+v, want BackupSucceeded while deferred", c)
 	}
 
@@ -369,7 +374,7 @@ func TestRestoreJobResetsAdminSyncAfterDatabaseOnlyRestore(t *testing.T) {
 	s := testScheme(t)
 	f := ownedInstance(forgejov1.RetainPolicyRetain)
 	b := reasonBackup("b", forgejov1.BackupReasonManual)
-	b.Status.PVCName = "fb-backups"
+	b.Status.PVCName = testBackupsPVC
 	rs := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns"}}
 	in := JobInput{Scheme: s, Instance: f, InstanceName: "fb", ForgejoImage: forgejov1.DefaultImage, PostgresImage: forgejov1.DefaultPostgresImage,
 		DB: &forgejo.DBConnection{Host: "db", Port: 5432, Name: "app", SSLMode: "verify-full", SecretName: "s", UsernameKey: "u", PasswordKey: "p"}}
@@ -436,11 +441,11 @@ func TestResizeWarningIsRateLimited(t *testing.T) {
 	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: "ratelimit"}}
 	f.Spec.Backup.Storage.Size = resource.MustParse("50Gi")
 	pvc := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "fb-backups", Namespace: "ratelimit"},
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupsPVC, Namespace: "ratelimit"},
 		Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: ptr.To("fixed"),
 			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("20Gi")}}},
 	}
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(pvc, &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: "fixed"}}).Build()
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(pvc, &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: testClassFixed}}).Build()
 	warnings := 0
 	warn := func(string, string) { warnings++ }
 	for range 3 {

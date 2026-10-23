@@ -19,6 +19,8 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const keySourceGenerated = "Generated"
+
 const (
 	// remoteRetentionInterval is how often remote retention runs without a new upload.
 	remoteRetentionInterval = time.Hour
@@ -48,8 +50,15 @@ func forgetRemoteRetention(namespace, name string) {
 	remoteRetentionRuns.Delete(types.NamespacedName{Namespace: namespace, Name: name})
 }
 
-// ForgetRemote drops what the operator remembers of a deleted instance's remote backups.
+// ForgetRemote drops what the operator remembers of a deleted instance's remote backups and of
+// its reads of spec.restoreFrom.
 func ForgetRemote(namespace, name string) {
+	forgetRemoteBackups(namespace, name)
+	forgetIdentityReadFailure(namespace, name)
+}
+
+// forgetRemoteBackups drops what the operator remembers of the instance's remote backups.
+func forgetRemoteBackups(namespace, name string) {
 	forgetRemoteRetention(namespace, name)
 	ForgetLastUpload(namespace, name)
 }
@@ -67,7 +76,9 @@ func summarizeRemote(ctx context.Context, rc *forgejo.ReconcileContext, backups 
 		if f.Status.Backup != nil {
 			f.Status.Backup.Remote = nil
 		}
-		ForgetRemote(f.Namespace, f.Name)
+		// Not ForgetRemote: the backoff of spec.restoreFrom reads has nothing to do with
+		// spec.backup.remote.
+		forgetRemoteBackups(f.Namespace, f.Name)
 		return keyProblem{}
 	}
 	st := summary(f)
@@ -136,7 +147,7 @@ func backupKeyProblem(ctx context.Context, rc *forgejo.ReconcileContext, ref for
 	if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: ref.Name}, sec); err != nil {
 		return keyProblem{}
 	}
-	if sec.Annotations[forgejo.AnnotationBackupKey] != "Generated" || sec.Annotations[forgejo.AnnotationBackupKeyExported] == "true" {
+	if sec.Annotations[forgejo.AnnotationBackupKey] != keySourceGenerated || sec.Annotations[forgejo.AnnotationBackupKeyExported] == valueTrue {
 		return keyProblem{}
 	}
 	return keyProblem{reason: "BackupKeyNotExported", message: fmt.Sprintf("The generated backup key in Secret %s (fingerprint %s) has "+
@@ -321,8 +332,14 @@ func cachedManifest(ctx context.Context, store *Store, path string) (*RemoteMani
 }
 
 // protectedRemoteDirs are the backup directories of the instance that retention must not
-// touch: uploads in progress, backups an unfinished restore reads, and the source of
-// spec.restoreFrom while the instance is being created from it.
+// touch: uploads in progress, backups an unfinished restore of any namespace reads, and the
+// spec.restoreFrom source of every Forgejo in the cluster that is being created from it (also
+// before its ForgejoRestore exists: while it restores the identity and waits for the
+// database).
+//
+// A source counts when it names the same bucket and prefix, whatever its endpoint: the same
+// endpoint has many spellings (case, port, scheme, a short Service name resolved in the
+// restore's namespace), and a false match only keeps a backup a little longer.
 func protectedRemoteDirs(ctx context.Context, rc *forgejo.ReconcileContext, backups []forgejov1.ForgejoBackup) (map[string]bool, error) {
 	f := rc.Instance
 	conn := &f.Spec.Backup.Remote.S3
@@ -334,23 +351,34 @@ func protectedRemoteDirs(ctx context.Context, rc *forgejo.ReconcileContext, back
 		}
 	}
 	sameBucket := func(c *forgejov1.S3Connection) bool {
-		return strings.TrimSuffix(c.Endpoint, "/") == strings.TrimSuffix(conn.Endpoint, "/") && c.Bucket == conn.Bucket &&
-			forgejo.S3Prefix(c) == forgejo.S3Prefix(conn)
+		return c.Bucket == conn.Bucket && forgejo.S3Prefix(c) == forgejo.S3Prefix(conn)
 	}
 	protect := func(src *forgejov1.RemoteBackupSource) {
-		if src != nil && sameBucket(&src.S3) && strings.HasPrefix(src.Path, base) {
-			out[strings.TrimPrefix(src.Path, base)] = true
+		if src == nil || !sameBucket(&src.S3) {
+			return
+		}
+		if dir, ok := strings.CutPrefix(strings.Trim(src.Path, "/")+"/", base); ok && dir != "" {
+			out[strings.TrimSuffix(dir, "/")] = true
 		}
 	}
 	if Bootstrapping(f) {
 		protect(&f.Spec.RestoreFrom.Remote)
 	}
-	list := &forgejov1.ForgejoRestoreList{}
-	if err := rc.Client.List(ctx, list); err != nil {
+	instances := &forgejov1.ForgejoList{}
+	if err := rc.Client.List(ctx, instances); err != nil {
+		return nil, fmt.Errorf("listing instances: %w", err)
+	}
+	for i := range instances.Items {
+		if o := &instances.Items[i]; Bootstrapping(o) {
+			protect(&o.Spec.RestoreFrom.Remote)
+		}
+	}
+	restores := &forgejov1.ForgejoRestoreList{}
+	if err := rc.Client.List(ctx, restores); err != nil {
 		return nil, fmt.Errorf("listing restores: %w", err)
 	}
-	for i := range list.Items {
-		if r := &list.Items[i]; IsRestoreActive(r) {
+	for i := range restores.Items {
+		if r := &restores.Items[i]; IsRestoreActive(r) {
 			protect(r.Spec.Remote)
 		}
 	}

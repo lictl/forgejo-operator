@@ -1,0 +1,8 @@
+# Binds ClusterRole volume-usage (pods/exec, defined in config/rbac) to the operator's
+# ServiceAccount in every namespace, for volume measurement and automatic expansion
+# (docs/autopilot.md#storage). Included by config/default; leave it out to keep pods/exec
+# away from the operator, or bind the ClusterRole per namespace (config/namespaced).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+- volume_usage_role_binding.yaml

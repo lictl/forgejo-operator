@@ -87,7 +87,8 @@ type ReconcileContext struct {
 	DesiredConfigHash string
 	// SSHHostKeys are the host keys the SSH server serves from a Secret, set by the
 	// ssh-host-keys step; nil while they are not managed (SSH disabled, or
-	// SSH_SERVER_HOST_KEYS in spec.config). app.ini and the workload serve them.
+	// SSH_SERVER_HOST_KEYS in spec.config or spec.configFrom: SSHHostKeysOverridden). app.ini
+	// and the workload serve them.
 	SSHHostKeys *SSHHostKeys
 	// SSHHostKeysUnavailable is set by the ssh-host-keys step while the Secret the running
 	// pods serve their host keys from is missing or unusable (SSHHostKeys then holds the live
@@ -95,8 +96,12 @@ type ReconcileContext struct {
 	// Deployment as it is, and restarts, resizes, config rollbacks and upgrades wait.
 	SSHHostKeysUnavailable bool
 	// ObjectStorage is set by the object-storage step while spec.objectStorage is set and its
-	// Secrets resolve; the workload puts its digest on the pod template.
+	// Secrets resolve; the workload puts a keyed digest of it on the pod template.
 	ObjectStorage *ObjectStorage
+	// PodDigestSalt keys the digests of secret values that the pod template carries (HMAC),
+	// so that readers of Deployments and Pods cannot test guesses of those values against
+	// them. Set by the secrets step from the generated key of "<name>-secrets" as applied.
+	PodDigestSalt string
 	// ObjectStorageUnavailable is set by the object-storage step while spec.objectStorage is
 	// set and its Secrets are unusable or the operator's last check of the bucket failed
 	// (ObjectStorageReady is not True). Forgejo does not start without its bucket, so

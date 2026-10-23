@@ -44,7 +44,7 @@ func TestObserveRolloutStartingAfterScaleUp(t *testing.T) {
 }
 
 func TestObserveRolloutRollingUpdateKeepsServing(t *testing.T) {
-	progressing := appsv1.DeploymentCondition{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "ReplicaSetUpdated"}
+	progressing := appsv1.DeploymentCondition{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: testReasonReplicaSetUpdated}
 	// 2 desired, 1 updated, 3 pods (one surge), 2 ready: an old pod still serves.
 	ro := observeRollout(deploymentWith(2, 2, 1, 3, progressing), true)
 	if !ro.inFlight || ro.upToDate {

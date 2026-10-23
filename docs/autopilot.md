@@ -110,8 +110,11 @@ Observe: `kubectl get deploy,svc <name>-valkey`, `Degraded` condition, events
 - **First install.** The HPA is created only after the first rollout has completed
   (`status.image` is set). Until then the Deployment runs one pod, because the first pod's
   `bootstrap` init container migrates the empty database and must not run twice at once.
-- **Horizontal scaling without HA.** The HPA is not created. `Degraded=True` with reason
-  `HorizontalScalingRequiresHA` and an hourly Warning event explain why.
+- **Horizontal scaling without HA.** The API server refuses it, as it refuses
+  `spec.replicas` greater than 1 without HA (also through `kubectl scale`) and `minReplicas`
+  greater than `maxReplicas`. (Should such a spec
+  reach the operator anyway, it creates no HPA, and `Degraded=True` with reason
+  `HorizontalScalingRequiresHA` and an hourly Warning event explain why.)
 - **Upgrades and restores.** The HPA is removed during [migration holds](#auto-pilot-capability-level-v)
   and restores, because those run with one or zero replicas, and re-created afterwards.
 - **PDB.** PDB `<name>` (`minAvailable: 1`, `unhealthyPodEvictionPolicy: AlwaysAllow`)
@@ -341,8 +344,12 @@ during maintenance, and it is the only place the storage pass runs.
     reported by a later one (requeued after 30s). Failed attempts back off exponentially
     (df from 1 minute, du from 5 minutes, both up to 1 hour). Until a new measurement
     succeeds, the last one is reported.
-  - Without `pods/exec` permission in the namespace, nothing can be measured:
-    `StorageHealthy=Unknown`/`MeasurementUnavailable` says so and the operator logs it once.
+  - `pods/exec` is not part of the operator's main ClusterRole: it is ClusterRole
+    `forgejo-operator-volume-usage`, bound cluster-wide by the kustomize component
+    `config/components/volume-usage` (included in `config/default`) or per namespace (see
+    [permissions.md](permissions.md#volume-measurement-podsexec)). Where it is not bound,
+    nothing can be measured or expanded: `StorageHealthy=Unknown`/`MeasurementUnavailable` says
+    so and the operator logs it once per claim.
 - **Report.** `status.storage.volumes[]` (`usedBytes`, `capacityBytes`, `usedPercent`,
   `requestedSize`, `expansionSupported`, `lastExpansionTime`), the metric
   `forgejo_operator_volume_used_ratio{namespace,name,claim}`, and the `StorageHealthy`
@@ -391,10 +398,15 @@ during maintenance, and it is the only place the storage pass runs.
 
 On top of the core permissions, the autopilot needs:
 - `nodes` get/list, to count schedulable nodes and find the largest allocatable memory.
-- `pods/exec` create/get, to measure volumes with df and du. This is the only use; without
-  it storage reporting degrades to `MeasurementUnavailable`. The operator does not use
-  `nodes/proxy` (kubelet stats), which would open every node's kubelet API.
-- `metrics.k8s.io` pods get/list.
+- `pods/exec` create/get, to measure volumes with df and du, in the separate ClusterRole
+  `forgejo-operator-volume-usage` (optional, see [permissions.md](permissions.md)). This is
+  the only use; without it storage reporting degrades to `MeasurementUnavailable`. The operator
+  does not use `nodes/proxy` (kubelet stats), which would open every node's kubelet API.
+- `metrics.k8s.io` pods list.
 - `storageclasses` get/list/watch.
 - `persistentvolumeclaims` patch.
 - CNPG `clusters` patch.
+- `horizontalpodautoscalers` and `poddisruptionbudgets` get/list/watch/create/update/delete.
+- `deployments` patch (restarts, vertical sizing) and `pods` delete (hung pods).
+
+[permissions.md](permissions.md) lists every permission of the operator.

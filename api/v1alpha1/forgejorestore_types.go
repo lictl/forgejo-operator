@@ -37,12 +37,14 @@ const (
 // While a restore is active the instance is scaled to zero (maintenance mode).
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.backupName) != has(self.remote)",message="set exactly one of backupName and remote"
+// +kubebuilder:validation:XValidation:rule="!has(self.restoreDatabase) || self.restoreDatabase || !has(self.restoreData) || self.restoreData",message="restoreDatabase and restoreData are both false: nothing would be restored"
 type ForgejoRestoreSpec struct {
 	// forgejoRef is the instance to restore into.
 	ForgejoRef ForgejoRef `json:"forgejoRef"`
 
 	// backupName is a completed ForgejoBackup in the same namespace.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	BackupName string `json:"backupName,omitempty"`
 

@@ -24,6 +24,12 @@ import (
 )
 
 const (
+	testCheckPass     = "pass"
+	testCheckDatabase = "database"
+	testCheckFail     = "fail"
+)
+
+const (
 	testHash    = "currenthash0123456789"
 	testOldHash = "oldhash0123456789"
 )
@@ -164,7 +170,7 @@ func TestServerPodsSkipsTerminalPods(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(pods) != 1 || pods[0].Name != "fj-live" {
-		names := []string{}
+		names := make([]string, 0, len(pods))
 		for _, p := range pods {
 			names = append(names, p.Name)
 		}
@@ -176,7 +182,7 @@ func TestServerPodsSkipsTerminalPods(t *testing.T) {
 // instance-level restart.
 func TestEvictedPodDoesNotBlockLastKnownGood(t *testing.T) {
 	f := testInstance()
-	f.Status.Health = &forgejov1.HealthStatus{Healthy: true, Checks: map[string]string{"database": "pass"}}
+	f.Status.Health = &forgejov1.HealthStatus{Healthy: true, Checks: map[string]string{testCheckDatabase: testCheckPass}}
 	dep := testDeployment(f, 1)
 	env := newTestEnv(t, f, dep, configSecret(f),
 		readyPod(f, "fj-live", testHash, 2*lkgSoak),
@@ -208,7 +214,7 @@ func TestEvictedPodDoesNotBlockLastKnownGood(t *testing.T) {
 // Fewer listed pods than desired replicas (cache lag) must not pass the soak check vacuously.
 func TestLastKnownGoodNeedsEveryReplicaListed(t *testing.T) {
 	f := testInstance()
-	f.Status.Health = &forgejov1.HealthStatus{Healthy: true, Checks: map[string]string{"database": "pass"}}
+	f.Status.Health = &forgejov1.HealthStatus{Healthy: true, Checks: map[string]string{testCheckDatabase: testCheckPass}}
 	dep := testDeployment(f, 2)
 	env := newTestEnv(t, f, dep, configSecret(f), readyPod(f, "fj-a", testHash, 2*lkgSoak))
 	pods, err := serverPods(context.Background(), env.rc)
@@ -328,13 +334,13 @@ func TestUnreachableProbeDoesNotRestart(t *testing.T) {
 			}
 			for _, e := range env.events() {
 				if strings.HasPrefix(e, "Warning "+ReasonHealthProbeUnreachable) {
-					t.Fatalf("warning repeated within %s: %q", unreachableWarnEvery, e)
+					t.Fatalf("warning repeated within %s: %q", warnInterval, e)
 				}
 			}
 
 			// Once the probe gets through again, Degraded is cleared.
 			now := metav1.Now()
-			f.Status.Health = &forgejov1.HealthStatus{Healthy: true, LastCheckTime: &now, LastHealthyTime: &now, Checks: map[string]string{"database": "pass"}}
+			f.Status.Health = &forgejov1.HealthStatus{Healthy: true, LastCheckTime: &now, LastHealthyTime: &now, Checks: map[string]string{testCheckDatabase: testCheckPass}}
 			meta.SetStatusCondition(&f.Status.Conditions, metav1.Condition{
 				Type: forgejov1.ConditionHealthy, Status: metav1.ConditionTrue, Reason: "HealthCheckPassed",
 			})
@@ -374,7 +380,7 @@ func TestAnsweredFailuresRestart(t *testing.T) {
 	now := metav1.Now()
 	f.Status.Health = &forgejov1.HealthStatus{
 		LastCheckTime: &now, ConsecutiveFailures: 5,
-		Message: "status fail: database=fail", Checks: map[string]string{"cache": "pass", "database": "fail"},
+		Message: "status fail: database=fail", Checks: map[string]string{"cache": testCheckPass, testCheckDatabase: testCheckFail},
 	}
 	dep := testDeployment(f, 1)
 	env := newTestEnv(t, f, dep, readyPod(f, "fj-live", testHash, time.Hour))
@@ -429,7 +435,7 @@ func TestUnreachableNeedsReadyPods(t *testing.T) {
 	}
 	// Failures Forgejo answered itself are not unanswered.
 	f.Status.Conditions = nil
-	f.Status.Health = &forgejov1.HealthStatus{ConsecutiveFailures: 9, Checks: map[string]string{"database": "fail"}}
+	f.Status.Health = &forgejov1.HealthStatus{ConsecutiveFailures: 9, Checks: map[string]string{testCheckDatabase: testCheckFail}}
 	if probeUnanswered(f) {
 		t.Fatal("answered failures classified as unanswered")
 	}

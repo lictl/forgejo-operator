@@ -18,10 +18,11 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// +kubebuilder:rbac:groups=core,resources=secrets;services;persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets;persistentvolumeclaims,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores,verbs=get;list;watch
@@ -77,10 +78,13 @@ func mergeMaps(maps ...map[string]string) map[string]string {
 	return out
 }
 
-// randomBase64 returns n random bytes in unpadded base64url, the format of
+// randomSecretBytes is the number of random bytes of a generated secret.
+const randomSecretBytes = 32
+
+// randomBase64 returns randomSecretBytes random bytes in unpadded base64url, the format of
 // "forgejo generate secret SECRET_KEY|JWT_SECRET|LFS_JWT_SECRET".
-func randomBase64(n int) (string, error) {
-	b := make([]byte, n)
+func randomBase64() (string, error) {
+	b := make([]byte, randomSecretBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}

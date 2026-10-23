@@ -23,8 +23,10 @@ package backup
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,14 +42,45 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores,verbs=get;list;watch;create
 
 const (
 	// bootstrapRetry is how often a bootstrap step that waits is retried.
 	bootstrapRetry = 30 * time.Second
 	// remoteReadTimeout bounds the operator's reads of a remote backup in one pass.
 	remoteReadTimeout = 30 * time.Second
+	// identityRetryMax caps the backoff between reads of spec.restoreFrom after transient
+	// failures; it starts at bootstrapRetry and doubles.
+	identityRetryMax = 5 * time.Minute
 )
+
+// identityReadFailure is the last transient failure to read spec.restoreFrom of an instance.
+// Until retryAt the step answers with it instead of reading the bucket again, so an endpoint
+// that does not answer does not hold the Forgejo controller's worker on every pass.
+type identityReadFailure struct {
+	// source identifies spec.restoreFrom.remote as it was read; another source reads at once.
+	source      string
+	reason, msg string
+	backoff     time.Duration
+	retryAt     time.Time
+}
+
+// identityReadFailures maps types.NamespacedName to *identityReadFailure.
+var identityReadFailures sync.Map
+
+func forgetIdentityReadFailure(namespace, name string) {
+	identityReadFailures.Delete(types.NamespacedName{Namespace: namespace, Name: name})
+}
+
+// restoreFromSource identifies src for identityReadFailure: every field that changes where or
+// how the backup is read (endpoint, bucket, prefix, path, Secrets, CA).
+func restoreFromSource(src *forgejov1.RemoteBackupSource) string {
+	data, err := json.Marshal(src)
+	if err != nil {
+		return fmt.Sprintf("%+v", *src)
+	}
+	return string(data)
+}
 
 // Bootstrapping reports whether f is still being created from spec.restoreFrom. Until the
 // bootstrap completes no backup of the instance is taken.
@@ -178,7 +211,7 @@ func markRestored(ctx context.Context, rc *forgejo.ReconcileContext) error {
 // annotation forgejo.lucas.icu/restore-from-overwrite=true on the Forgejo overrides it.
 func targetInUse(ctx context.Context, rc *forgejo.ReconcileContext, marker string) (string, error) {
 	f := rc.Instance
-	if f.Annotations[forgejo.AnnotationRestoreFromOverwrite] == "true" {
+	if f.Annotations[forgejo.AnnotationRestoreFromOverwrite] == valueTrue {
 		return "", nil
 	}
 	if marker != "" {
@@ -224,11 +257,13 @@ func targetInUse(ctx context.Context, rc *forgejo.ReconcileContext, marker strin
 func ReconcileRestoreIdentity(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	if f.Spec.RestoreFrom == nil {
+		forgetIdentityReadFailure(f.Namespace, f.Name)
 		meta.RemoveStatusCondition(&f.Status.Conditions, forgejov1.ConditionRestoredFromBackup)
 		return forgejo.StepResult{}, nil
 	}
 	st := f.Status.RestoredFrom
 	if !Bootstrapping(f) || (st != nil && st.IdentityRestoredTime != nil) {
+		forgetIdentityReadFailure(f.Namespace, f.Name)
 		return forgejo.StepResult{}, nil
 	}
 	src := &f.Spec.RestoreFrom.Remote
@@ -247,20 +282,50 @@ func ReconcileRestoreIdentity(ctx context.Context, rc *forgejo.ReconcileContext)
 		rc.SetCondition(forgejov1.ConditionRestoredFromBackup, metav1.ConditionFalse, reason, msg)
 		return forgejo.StepResult{Stop: true, RequeueAfter: bootstrapRetry}
 	}
+	// After a transient failure the bucket is read again only once the backoff has run out
+	// (30 s doubling to 5 min); meanwhile the step reports that failure unchanged.
+	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
+	source := restoreFromSource(src)
+	readAt := time.Now()
+	var last *identityReadFailure
+	if v, ok := identityReadFailures.Load(key); ok && v.(*identityReadFailure).source == source {
+		last = v.(*identityReadFailure)
+		if readAt.Before(last.retryAt) {
+			res := wait(last.reason, last.msg)
+			res.RequeueAfter = last.retryAt.Sub(readAt)
+			return res, nil
+		}
+	}
+	failed := func(reason, msg string, err error) forgejo.StepResult {
+		if !TransientRemoteError(err) {
+			identityReadFailures.Delete(key)
+			return wait(reason, msg)
+		}
+		backoff := bootstrapRetry
+		if last != nil {
+			backoff = min(2*last.backoff, identityRetryMax)
+		}
+		identityReadFailures.Store(key, &identityReadFailure{source: source, reason: reason, msg: msg,
+			backoff: backoff, retryAt: readAt.Add(backoff)})
+		res := wait(reason, msg)
+		res.RequeueAfter = backoff
+		return res
+	}
 	cctx, cancel := context.WithTimeout(ctx, remoteReadTimeout)
 	defer cancel()
 	store, err := OpenStore(cctx, rc.Client, f.Namespace, &src.S3, SourceKeyRef(f, src))
 	if err != nil {
-		return wait("RemoteBackupUnavailable", fmt.Sprintf("Cannot read the backup at %s: %v", st.Location, err)), nil
+		return failed("RemoteBackupUnavailable", fmt.Sprintf("Cannot read the backup at %s: %v", st.Location, err), err), nil
 	}
 	m, err := store.ReadManifest(cctx, src.Path)
 	if err != nil {
-		return wait("RemoteBackupUnavailable", fmt.Sprintf("Cannot read the backup at %s: %v", st.Location, err)), nil
+		return failed("RemoteBackupUnavailable", fmt.Sprintf("Cannot read the backup at %s: %v", st.Location, err), err), nil
 	}
 	id, err := store.ReadIdentity(cctx, src.Path, m)
 	if err != nil {
-		return wait("RemoteBackupUnavailable", fmt.Sprintf("Cannot read the identity of the backup at %s: %v", st.Location, err)), nil
+		return failed("RemoteBackupUnavailable", fmt.Sprintf("Cannot read the identity of the backup at %s: %v", st.Location, err), err), nil
 	}
+	identityReadFailures.Delete(key)
 	st.BackupName, st.ForgejoImage, st.InstanceUID = m.Backup, m.ForgejoImage, m.ForgejoUID
 	if t := m.CompletedTime(); !t.IsZero() {
 		st.BackupCompletionTime = &metav1.Time{Time: t}

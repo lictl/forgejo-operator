@@ -94,15 +94,23 @@ const (
 
 // ForgejoSpec defines the desired state of a Forgejo instance.
 // +kubebuilder:validation:XValidation:rule="!has(self.restoreFrom) || (has(oldSelf.restoreFrom) && self.restoreFrom == oldSelf.restoreFrom)",message="restoreFrom can only be set when the Forgejo is created and cannot be changed afterwards (it may be removed)"
+// +kubebuilder:validation:XValidation:rule="!has(self.replicas) || self.replicas <= 1 || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="replicas greater than 1 require highAvailability.enabled (Valkey for shared cache, sessions and queues)",fieldPath=".replicas",reason="FieldValueForbidden"
+// +kubebuilder:validation:XValidation:rule="!has(self.autoscaling.horizontal) || !has(self.autoscaling.horizontal.enabled) || !self.autoscaling.horizontal.enabled || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="autoscaling.horizontal requires highAvailability.enabled (Valkey for shared cache, sessions and queues)",fieldPath=".autoscaling.horizontal.enabled",reason="FieldValueForbidden"
+// +kubebuilder:validation:XValidation:rule="!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || (has(self.ingress.host) && size(self.ingress.host) > 0) || (has(self.server.domain) && size(self.server.domain) > 0) || (has(self.server.rootURL) && size(self.server.rootURL) > 0) || (has(self.gateway) && has(self.gateway.hostnames))",message="ingress.enabled requires ingress.host (or server.domain, server.rootURL or gateway.hostnames): without a public host name ROOT_URL would be the in-cluster Service address",fieldPath=".ingress.host",reason="FieldValueRequired"
+// +kubebuilder:validation:XValidation:rule="!has(self.gateway) || !has(self.gateway.ssh) || !has(self.server.ssh.enabled) || self.server.ssh.enabled",message="gateway.ssh requires server.ssh.enabled",fieldPath=".gateway.ssh",reason="FieldValueForbidden"
 type ForgejoSpec struct {
 	// image is the Forgejo container image. The official root image
 	// (codeberg.org/forgejo/forgejo:<version>) and the "-rootless" variant are supported.
 	// Changing it triggers an orchestrated upgrade (backup, migrate, verify, auto-rollback).
-	// The default is the current LTS release when the object is created.
+	// The default is the current LTS release when the object is created; it is stored in the
+	// spec, so a later operator release with another default does not change the instance.
 	// +kubebuilder:default="codeberg.org/forgejo/forgejo:15"
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
 	// +optional
 	Image string `json:"image,omitempty"`
 
+	// +kubebuilder:validation:Enum=Always;Never;IfNotPresent
 	// +optional
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 
@@ -110,7 +118,8 @@ type ForgejoSpec struct {
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 
 	// replicas is the desired number of Forgejo pods. Values greater than 1 require
-	// highAvailability.enabled. Ignored while horizontal autoscaling is enabled.
+	// highAvailability.enabled (the API server refuses them otherwise). Ignored while
+	// horizontal autoscaling is enabled.
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0
 	// +optional
@@ -258,13 +267,17 @@ type ServerSpec struct {
 
 	// domain is the public host name (DOMAIN / SSH_DOMAIN). Defaults to ingress.host, the
 	// first gateway.hostnames entry that is not a wildcard, or the in-cluster HTTP service DNS
-	// name.
+	// name. A host name only: no scheme, port or path.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9.]*[A-Za-z0-9])?$`
 	// +optional
 	Domain string `json:"domain,omitempty"`
 
-	// rootURL overrides ROOT_URL. Defaults to http(s)://<host><path>/ from the Ingress or the
-	// HTTPRoute, else http(s)://<domain>/; https when the Ingress has a TLS Secret or spec.tls
-	// is set.
+	// rootURL overrides ROOT_URL, an http:// or https:// URL. Defaults to
+	// http(s)://<host><path>/ from the Ingress or the HTTPRoute, else http(s)://<domain>/; https
+	// when the Ingress has a TLS Secret or spec.tls is set.
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^https?://[^/?#\s]+(/[^?#\s]*)?$`
 	// +optional
 	RootURL string `json:"rootURL,omitempty"`
 
@@ -303,6 +316,8 @@ type ServerSpec struct {
 }
 
 // ServiceSpec configures a Kubernetes Service.
+// +kubebuilder:validation:XValidation:rule="!has(self.nodePort) || self.nodePort == 0 || (has(self.type) && self.type != 'ClusterIP')",message="nodePort requires type NodePort or LoadBalancer",fieldPath=".nodePort",reason="FieldValueForbidden"
+// +kubebuilder:validation:XValidation:rule="!has(self.loadBalancerClass) || (has(self.type) && self.type == 'LoadBalancer')",message="loadBalancerClass requires type LoadBalancer",fieldPath=".loadBalancerClass",reason="FieldValueForbidden"
 type ServiceSpec struct {
 	// +kubebuilder:default=ClusterIP
 	// +kubebuilder:validation:Enum=ClusterIP;NodePort;LoadBalancer
@@ -310,16 +325,22 @@ type ServiceSpec struct {
 	Type corev1.ServiceType `json:"type,omitempty"`
 
 	// port is the Service port.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	Port int32 `json:"port,omitempty"`
 
 	// nodePort, only for NodePort/LoadBalancer.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	NodePort int32 `json:"nodePort,omitempty"`
 
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
 
+	// loadBalancerClass, only for LoadBalancer.
+	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	LoadBalancerClass *string `json:"loadBalancerClass,omitempty"`
 }
@@ -332,6 +353,8 @@ type SSHSpec struct {
 
 	// externalPort is the port shown in clone URLs (SSH_PORT). Defaults to the service port.
 	// With spec.gateway.ssh, set it to the port of the Gateway's TCP listener.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	ExternalPort int32 `json:"externalPort,omitempty"`
 
@@ -366,11 +389,23 @@ type IngressSpec struct {
 	// +optional
 	ClassName *string `json:"className,omitempty"`
 
-	// host is the public host name.
+	// host is the public host name. Required while enabled, unless server.domain,
+	// server.rootURL or gateway.hostnames gives one.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +optional
 	Host string `json:"host,omitempty"`
 
+	// path is the Prefix path of the Ingress rule and part of ROOT_URL. Kubernetes refuses
+	// Prefix paths that contain "//", "/./", "/../" or "%2F", or end in "/." or "/..".
 	// +kubebuilder:default="/"
+	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:Pattern=`^/(?:[-A-Za-z0-9/._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*$`
+	// +kubebuilder:validation:XValidation:rule="!self.contains('//')",message="must not contain '//' (Kubernetes Ingress Prefix path)"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('/./')",message="must not contain '/./' (Kubernetes Ingress Prefix path)"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('/../')",message="must not contain '/../' (Kubernetes Ingress Prefix path)"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('%2f') && !self.contains('%2F')",message="must not contain '%2F' (Kubernetes Ingress Prefix path)"
+	// +kubebuilder:validation:XValidation:rule="!self.endsWith('/..') && !self.endsWith('/.')",message="must not end with '/.' or '/..' (Kubernetes Ingress Prefix path)"
 	// +optional
 	Path string `json:"path,omitempty"`
 
@@ -410,10 +445,18 @@ type GatewaySpec struct {
 
 	// path is the path prefix Forgejo is served under, "/" by default. Another prefix becomes
 	// part of ROOT_URL, and the HTTPRoute removes it before requests reach Forgejo (URLRewrite,
-	// Gateway API extended support).
+	// Gateway API extended support). The rules of a Gateway API HTTPPathMatch apply: valid
+	// characters and percent escapes only, no "//", "/./", "/../" or "%2F", no "/." or "/.."
+	// at the end.
 	// +kubebuilder:default="/"
 	// +kubebuilder:validation:MaxLength=256
-	// +kubebuilder:validation:Pattern=`^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$`
+	// +kubebuilder:validation:Pattern=`^/(?:[-A-Za-z0-9/._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*$`
+	// +kubebuilder:validation:XValidation:rule="!self.contains('//')",message="must not contain '//' (Gateway API HTTPPathMatch)"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('/./')",message="must not contain '/./' (Gateway API HTTPPathMatch)"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('/../')",message="must not contain '/../' (Gateway API HTTPPathMatch)"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('%2f') && !self.contains('%2F')",message="must not contain '%2F' (Gateway API HTTPPathMatch)"
+	// +kubebuilder:validation:XValidation:rule="!self.endsWith('/..')",message="must not end with '/..' (Gateway API HTTPPathMatch)"
+	// +kubebuilder:validation:XValidation:rule="!self.endsWith('/.')",message="must not end with '/.' (Gateway API HTTPPathMatch)"
 	// +optional
 	Path string `json:"path,omitempty"`
 
@@ -540,6 +583,7 @@ type CertManagerTLSSpec struct {
 }
 
 // CertManagerIssuerRef references a cert-manager issuer.
+// +kubebuilder:validation:XValidation:rule="(has(self.group) && size(self.group) > 0 && self.group != 'cert-manager.io') || !has(self.kind) || self.kind == 'Issuer' || self.kind == 'ClusterIssuer'",message="kind must be Issuer or ClusterIssuer (set group to use an external issuer)",fieldPath=".kind",reason="FieldValueInvalid"
 type CertManagerIssuerRef struct {
 	// name of the issuer.
 	// +kubebuilder:validation:MinLength=1
@@ -569,6 +613,9 @@ const (
 )
 
 // DatabaseSpec selects the PostgreSQL backend.
+// +kubebuilder:validation:XValidation:rule="!has(self.type) || self.type != 'External' || has(self.external)",message="type External requires external (host and credentialsSecret)",fieldPath=".external",reason="FieldValueRequired"
+// +kubebuilder:validation:XValidation:rule="!has(self.external) || (has(self.type) && self.type == 'External')",message="external requires type External",fieldPath=".type",reason="FieldValueInvalid"
+// +kubebuilder:validation:XValidation:rule="!has(self.type) || self.type != 'External' || !has(self.cnpg) || ((!has(self.cnpg.instances) || self.cnpg.instances == 1) && !has(self.cnpg.parameters) && (!has(self.cnpg.storage) || !has(self.cnpg.storage.storageClassName)) && (!has(self.cnpg.enablePodMonitor) || !self.cnpg.enablePodMonitor) && (!has(self.cnpg.resources) || (!has(self.cnpg.resources.requests) && !has(self.cnpg.resources.limits))))",message="cnpg settings apply to type CNPG only; with type External only cnpg.imageName (the image of backup and restore Jobs) is used",fieldPath=".cnpg",reason="FieldValueForbidden"
 type DatabaseSpec struct {
 	// +kubebuilder:default=CNPG
 	// +optional
@@ -594,9 +641,13 @@ type CNPGSpec struct {
 
 	// imageName is the PostgreSQL operand image. Also used for backup/restore jobs.
 	// +kubebuilder:default="ghcr.io/cloudnative-pg/postgresql:17"
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
 	// +optional
 	ImageName string `json:"imageName,omitempty"`
 
+	// storage of each PostgreSQL instance. The operator only grows its size: a lower size is
+	// ignored.
 	// +kubebuilder:default={}
 	// +optional
 	Storage VolumeSpec `json:"storage,omitempty"`
@@ -621,6 +672,8 @@ type ExternalDatabaseSpec struct {
 	Host string `json:"host"`
 
 	// +kubebuilder:default=5432
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	Port int32 `json:"port,omitempty"`
 
@@ -653,6 +706,7 @@ type SecretCredentialsRef struct {
 
 // VolumeSpec describes a PVC.
 type VolumeSpec struct {
+	// size of the volume. The operator only grows the volume: a lower size is ignored.
 	// +kubebuilder:default="5Gi"
 	// +optional
 	Size resource.Quantity `json:"size,omitempty"`
@@ -672,6 +726,9 @@ const (
 
 // StorageSpec configures the Forgejo data volume.
 type StorageSpec struct {
+	// size of the data volume. The operator only grows the claim (when its StorageClass
+	// allows expansion): a lower size, or one below what autopilot already grew, is ignored.
+	// The operator does not resize an existingClaim.
 	// +kubebuilder:default="10Gi"
 	// +optional
 	Size resource.Quantity `json:"size,omitempty"`
@@ -849,11 +906,21 @@ type S3CredentialsSecretRef struct {
 
 // AdminSpec configures the bootstrap administrator.
 type AdminSpec struct {
+	// username of the administrator: letters, digits, "-", "_" and ".", starting and ending
+	// with a letter or digit, without two of "-", "_" and "." in a row, and none of the names
+	// Forgejo reserves (e.g. "admin").
 	// +kubebuilder:default="forgejo_admin"
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=40
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$`
+	// +kubebuilder:validation:XValidation:rule="!self.matches('[-_.]{2}')",message="must not contain two of '-', '_' and '.' in a row (Forgejo user names)"
+	// +kubebuilder:validation:XValidation:rule="!(self.lowerAscii() in ['admin', 'api', 'assets', 'attachments', 'avatar', 'avatars', 'captcha', 'commits', 'debug', 'error', 'explore', 'ghost', 'issues', 'login', 'metrics', 'milestones', 'new', 'notifications', 'org', 'pulls', 'raw', 'repo', 'repo-avatars', 'search', 'user', 'v2'])",message="is a name Forgejo reserves; the administrator could not be created"
 	// +optional
 	Username string `json:"username,omitempty"`
 
 	// +kubebuilder:default="forgejo_admin@forgejo.local"
+	// +kubebuilder:validation:MaxLength=254
+	// +kubebuilder:validation:Pattern=`^[^@\s]+@[^@\s]+$`
 	// +optional
 	Email string `json:"email,omitempty"`
 
@@ -903,8 +970,13 @@ type BackupSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// schedule in cron format.
+	// schedule in cron format: five fields (minute hour day-of-month month day-of-week), or
+	// a descriptor such as @daily or "@every 6h", optionally preceded by "CRON_TZ=<zone> ".
+	// The API server checks the form; the operator reports a value it cannot parse as
+	// BackupHealthy=False/InvalidSchedule.
 	// +kubebuilder:default="0 3 * * *"
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:XValidation:rule="self.matches('^((CRON_TZ|TZ)=[^[:space:]]+ +)?(@(yearly|annually|monthly|weekly|daily|midnight|hourly)|@every ([0-9]+([.][0-9]+)?(ns|us|µs|μs|ms|s|m|h))+|[^@[:space:]][^[:space:]]*([[:space:]]+[^[:space:]]+){4})$')",message="must be a cron expression with five fields (minute hour day-of-month month day-of-week), or @yearly, @monthly, @weekly, @daily, @hourly or @every <duration>, optionally preceded by CRON_TZ=<zone>"
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
 
@@ -982,6 +1054,9 @@ type BackupKeySecretRef struct {
 
 // BackupStorageSpec configures where backups are written.
 type BackupStorageSpec struct {
+	// size of the backup volume. The operator only grows the claim (when its StorageClass
+	// allows expansion): a lower size is ignored. The operator does not resize an
+	// existingClaim.
 	// +kubebuilder:default="20Gi"
 	// +optional
 	Size resource.Quantity `json:"size,omitempty"`
@@ -1075,6 +1150,8 @@ type HighAvailabilitySpec struct {
 // ValkeySpec configures the Valkey (Redis-compatible) instance used for cache, sessions and queues.
 type ValkeySpec struct {
 	// +kubebuilder:default="docker.io/valkey/valkey:8-alpine"
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -1092,6 +1169,7 @@ type AutoscalingSpec struct {
 }
 
 // HorizontalAutoscalingSpec creates a HorizontalPodAutoscaler. Requires highAvailability.enabled.
+// +kubebuilder:validation:XValidation:rule="!has(self.minReplicas) || !has(self.maxReplicas) || self.minReplicas <= self.maxReplicas",message="minReplicas must not be greater than maxReplicas",fieldPath=".minReplicas",reason="FieldValueInvalid"
 type HorizontalAutoscalingSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
@@ -1107,9 +1185,12 @@ type HorizontalAutoscalingSpec struct {
 	MaxReplicas int32 `json:"maxReplicas,omitempty"`
 
 	// +kubebuilder:default=75
+	// +kubebuilder:validation:Minimum=1
 	// +optional
 	TargetCPUUtilizationPercentage int32 `json:"targetCPUUtilizationPercentage,omitempty"`
 
+	// targetMemoryUtilizationPercentage adds a memory metric to the HPA.
+	// +kubebuilder:validation:Minimum=1
 	// +optional
 	TargetMemoryUtilizationPercentage *int32 `json:"targetMemoryUtilizationPercentage,omitempty"`
 }
@@ -1130,6 +1211,8 @@ type VerticalAutoscalingSpec struct {
 
 	// targetUtilizationPercentage of requests the operator aims for.
 	// +kubebuilder:default=70
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
 	// +optional
 	TargetUtilizationPercentage int32 `json:"targetUtilizationPercentage,omitempty"`
 }
@@ -1596,6 +1679,9 @@ type AutoPilotStatus struct {
 // +kubebuilder:printcolumn:name="Support",type=string,JSONPath=`.status.conditions[?(@.type=="VersionSupported")].reason`,priority=1
 // +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.status.url`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must start with a lowercase letter and contain only lowercase letters, digits and '-' (no '.'): it names the instance's Services, which must be DNS-1035 labels"
+// +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 56",message="metadata.name must be at most 56 characters: Service \"<name>-valkey\" must fit in 63"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.database.type) || self.spec.database.type != 'CNPG' || size(self.metadata.name) <= 47",message="with database.type CNPG, metadata.name must be at most 47 characters: CloudNativePG limits the name of Cluster \"<name>-db\" to 50"
 
 // Forgejo is a managed Forgejo software forge instance.
 type Forgejo struct {

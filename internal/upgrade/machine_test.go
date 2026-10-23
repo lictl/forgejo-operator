@@ -19,6 +19,11 @@ import (
 )
 
 const (
+	testPreBackup       = "pre"
+	testRollbackRestore = "rollback"
+)
+
+const (
 	imgA = "codeberg.org/forgejo/forgejo:15"
 	imgB = "codeberg.org/forgejo/forgejo:16"
 )
@@ -66,7 +71,7 @@ func reconcileWith(t *testing.T, c client.Client, s *runtime.Scheme, f *forgejov
 func restore(name string, phase forgejov1.RestorePhase, created *metav1.Time) *forgejov1.ForgejoRestore {
 	return &forgejov1.ForgejoRestore{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", CreationTimestamp: *created},
-		Spec:       forgejov1.ForgejoRestoreSpec{ForgejoRef: forgejov1.ForgejoRef{Name: "fj"}, BackupName: "pre"},
+		Spec:       forgejov1.ForgejoRestoreSpec{ForgejoRef: forgejov1.ForgejoRef{Name: "fj"}, BackupName: testPreBackup},
 		Status:     forgejov1.ForgejoRestoreStatus{Phase: phase},
 	}
 }
@@ -86,7 +91,7 @@ func serverPod(f *forgejov1.Forgejo, name, image string, created *metav1.Time, i
 
 func TestFailedRollbackRestoreKeepsForgejoStopped(t *testing.T) {
 	f := fixture(&forgejov1.UpgradeStatus{
-		Phase: forgejov1.UpgradePhaseRollingBack, FromImage: imgA, ToImage: imgB, BackupName: "pre", RestoreName: "rollback",
+		Phase: forgejov1.UpgradePhaseRollingBack, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, RestoreName: testRollbackRestore,
 		StartTime: ago(time.Hour), RolloutStartTime: ago(50 * time.Minute),
 	})
 	rc, c := reconcile(t, f, restore("rollback", forgejov1.RestorePhaseFailed, ago(40*time.Minute)))
@@ -123,7 +128,7 @@ func TestFailedRollbackRestoreKeepsForgejoStopped(t *testing.T) {
 
 func TestFailedRollbackRestoreReleasedBySpecImage(t *testing.T) {
 	f := fixture(&forgejov1.UpgradeStatus{
-		Phase: forgejov1.UpgradePhaseFailed, FromImage: imgA, ToImage: imgB, BackupName: "pre", RestoreName: "rollback",
+		Phase: forgejov1.UpgradePhaseFailed, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, RestoreName: testRollbackRestore,
 		StartTime: ago(time.Hour), RolloutStartTime: ago(50 * time.Minute), CompletionTime: ago(time.Minute),
 		FailedImage: imgB, RollbackRestoreFailed: true,
 	})
@@ -160,7 +165,7 @@ func TestKeptFailureHoldsSingleReplica(t *testing.T) {
 
 func TestBackingUpGivesUpOnPodsThatDoNotStop(t *testing.T) {
 	f := fixture(&forgejov1.UpgradeStatus{
-		Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: "pre", StartTime: ago(16 * time.Minute),
+		Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(16 * time.Minute),
 	})
 	stuck := serverPod(f, "stuck", imgA, ago(time.Hour), corev1.ContainerState{}, 0)
 	stuck.Status.Phase = corev1.PodRunning
@@ -187,7 +192,7 @@ func TestFreshUpgradeDeploysWithRolloutStartTime(t *testing.T) {
 func TestCancelBeforeDeploy(t *testing.T) {
 	pending := func() *forgejov1.Forgejo {
 		f := fixture(&forgejov1.UpgradeStatus{
-			Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: "pre", StartTime: ago(time.Minute),
+			Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(time.Minute),
 		})
 		f.Spec.Image = imgA
 		return f
@@ -200,7 +205,7 @@ func TestCancelBeforeDeploy(t *testing.T) {
 		}
 	}
 	bk := &forgejov1.ForgejoBackup{
-		ObjectMeta: metav1.ObjectMeta{Name: "pre", Namespace: "ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: testPreBackup, Namespace: "ns"},
 		Status:     forgejov1.ForgejoBackupStatus{Phase: forgejov1.BackupPhaseRunning},
 	}
 

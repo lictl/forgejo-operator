@@ -42,7 +42,7 @@ func TestSelectorImplies(t *testing.T) {
 	}
 }
 
-func scopedTestReader(t *testing.T) (client.Reader, *runtime.Scheme) {
+func scopedTestReader(t *testing.T) client.Reader {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -65,11 +65,11 @@ func scopedTestReader(t *testing.T) (client.Reader, *runtime.Scheme) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return r, scheme
+	return r
 }
 
 func TestScopedReaderGet(t *testing.T) {
-	r, _ := scopedTestReader(t)
+	r := scopedTestReader(t)
 	ctx := context.Background()
 	for _, name := range []string{"fj-secrets", "smtp"} {
 		if err := r.Get(ctx, client.ObjectKey{Namespace: "ns", Name: name}, &corev1.Secret{}); err != nil {
@@ -85,7 +85,7 @@ func TestScopedReaderGet(t *testing.T) {
 }
 
 func TestScopedReaderList(t *testing.T) {
-	r, _ := scopedTestReader(t)
+	r := scopedTestReader(t)
 	ctx := context.Background()
 	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fj"}}
 

@@ -43,7 +43,10 @@ const (
 
 // ForgejoRef points at a Forgejo instance in the same namespace.
 type ForgejoRef struct {
+	// name of the Forgejo.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=56
+	// +kubebuilder:validation:Pattern=`^[a-z]([-a-z0-9]*[a-z0-9])?$`
 	Name string `json:"name"`
 }
 

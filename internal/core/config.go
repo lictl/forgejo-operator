@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -19,6 +19,8 @@ import (
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
+
+const settingRedis = "redis"
 
 // rootSection is the name used in spec.config for app.ini keys outside any section.
 const rootSection = "DEFAULT"
@@ -64,7 +66,7 @@ func (c iniFile) render() string {
 		for k := range kv {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		for _, k := range keys {
 			fmt.Fprintf(&b, "%s = %s\n", k, quoteINI(kv[k]))
 		}
@@ -76,7 +78,7 @@ func (c iniFile) render() string {
 			sections = append(sections, s)
 		}
 	}
-	sort.Strings(sections)
+	slices.Sort(sections)
 	for _, s := range sections {
 		fmt.Fprintf(&b, "\n[%s]\n", s)
 		writeKeys(c[s])
@@ -128,11 +130,15 @@ func ReconcileConfig(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		}
 	}
 
-	if rc.Layout.Traits.StrictDurations {
+	if strict, known := strictDurations(rc); strict {
 		if bad := forgejo.InvalidDurations(cfg); len(bad) > 0 {
-			warnEvery(rc, "invalid-durations/"+strings.Join(bad, ","), warnInterval, "ConfigIncompatible", "Config",
+			what := rc.TargetImage
+			if !known {
+				what = fmt.Sprintf("If %s is Forgejo %d or newer, it", rc.TargetImage, forgejo.Versions.StrictDurationsSince())
+			}
+			warnEvery(rc, "invalid-durations/"+strings.Join(bad, ","), "ConfigIncompatible", "Config",
 				"%s refuses to start with %s: these must be durations with a unit (e.g. 30s, -1s). Fix them "+
-					"in spec.config or configFrom.", rc.TargetImage, strings.Join(bad, ", "))
+					"in spec.config or configFrom.", what, strings.Join(bad, ", "))
 		}
 	}
 
@@ -158,6 +164,24 @@ func ReconcileConfig(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		rc.ConfigSecretName = forgejo.ConfigSecretName(f)
 	}
 	return forgejo.StepResult{}, nil
+}
+
+// strictDurations reports whether the deployed image refuses unparsable durations
+// (forgejo.Traits.StrictDurations), and whether its version is known. An image whose tag
+// carries no version (a digest, a custom tag) gets CompatTraits, which are strict so that a
+// digest-pinned 17 is warned about; once it runs (status.image) and Forgejo has reported its
+// version, that version decides, so that a digest-pinned 15 or 16 is not.
+func strictDurations(rc *forgejo.ReconcileContext) (strict, known bool) {
+	strict = rc.Layout.Traits.StrictDurations
+	if _, ok := forgejo.ImageVersion(rc.TargetImage); ok {
+		return strict, true
+	}
+	if st := rc.Instance.Status; rc.TargetImage == st.Image {
+		if v, ok := forgejo.InstanceVersion(rc.TargetImage, st.Version); ok {
+			return forgejo.Versions.Traits(v, true).StrictDurations, true
+		}
+	}
+	return strict, false
 }
 
 // configHash identifies a rendered app.ini (the pod template's config-hash annotation).
@@ -282,9 +306,9 @@ func defaultConfig(rc *forgejo.ReconcileContext, secrets map[string][]byte) iniF
 func haConfig(valkeyURL string) map[string]map[string]string {
 	db := func(n int) string { return strings.TrimRight(valkeyURL, "/") + "/" + strconv.Itoa(n) }
 	return map[string]map[string]string{
-		"cache":   {"ADAPTER": "redis", "HOST": db(0)},
-		"session": {"PROVIDER": "redis", "PROVIDER_CONFIG": db(1)},
-		"queue":   {"TYPE": "redis", "CONN_STR": db(2)},
+		"cache":   {"ADAPTER": settingRedis, "HOST": db(0)},
+		"session": {"PROVIDER": settingRedis, "PROVIDER_CONFIG": db(1)},
+		"queue":   {"TYPE": settingRedis, "CONN_STR": db(2)},
 		"indexer": {"ISSUE_INDEXER_TYPE": "db", "REPO_INDEXER_ENABLED": "false"},
 	}
 }
@@ -303,11 +327,34 @@ func appName(f *forgejov1.Forgejo) string {
 	return "Forgejo"
 }
 
+// sshExternalPort is SSH_PORT, the port of clone URLs: spec.server.ssh.externalPort, else
+// the port that every spec.gateway.ssh parent reference names (the Gateway's TCP listener),
+// else the SSH Service's port. The operator does not read Gateways, so parent references by
+// sectionName only, or with different ports, need externalPort.
 func sshExternalPort(f *forgejov1.Forgejo) int32 {
 	if p := f.Spec.Server.SSH.ExternalPort; p != 0 {
 		return p
 	}
+	if p := gatewaySSHPort(f); p != 0 {
+		return p
+	}
 	return forgejo.SSHServicePort(f)
+}
+
+// gatewaySSHPort is the port all spec.gateway.ssh parent references name, or 0 when one of
+// them names none or they name different ones.
+func gatewaySSHPort(f *forgejov1.Forgejo) int32 {
+	if !forgejo.GatewaySSHEnabled(f) {
+		return 0
+	}
+	var port int32
+	for _, r := range f.Spec.Gateway.SSH.ParentRefs {
+		if r.Port == nil || *r.Port == 0 || (port != 0 && *r.Port != port) {
+			return 0
+		}
+		port = *r.Port
+	}
+	return port
 }
 
 // trustedProxies is REVERSE_PROXY_TRUSTED_PROXIES: spec.server.trustedProxies, else only

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -20,8 +19,8 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;delete
 
 const scaleDownStabilization = 300
 
@@ -45,7 +44,7 @@ func ReconcileScaling(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 	if h := f.Spec.Autoscaling.Horizontal; h != nil && h.Enabled && !f.Spec.HighAvailability.Enabled {
 		msg := "autoscaling.horizontal requires highAvailability.enabled (shared cache, sessions and queues); the HPA is not created"
 		setDegraded(rc, ReasonHorizontalScalingRequiresHA, msg)
-		warnEvery(rc, st, "hpa-requires-ha", time.Hour, ReasonHorizontalScalingRequiresHA, "%s", msg)
+		warnEvery(rc, st, "hpa-requires-ha", ReasonHorizontalScalingRequiresHA, "%s", msg)
 	} else {
 		clearDegraded(rc, ReasonHorizontalScalingRequiresHA)
 	}
@@ -140,7 +139,7 @@ func checkHPARequests(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 		c.Status != metav1.ConditionTrue || c.Reason == ReasonHPAMissingResourceRequests {
 		setDegraded(rc, ReasonHPAMissingResourceRequests, msg)
 	}
-	warnEvery(rc, st, "hpa-requests", time.Hour, ReasonHPAMissingResourceRequests, "%s", msg)
+	warnEvery(rc, st, "hpa-requests", ReasonHPAMissingResourceRequests, "%s", msg)
 	return nil
 }
 

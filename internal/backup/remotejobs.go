@@ -17,6 +17,11 @@ import (
 )
 
 const (
+	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
+	envAWSSecretAccessKey = "AWS_SECRET_ACCESS_KEY"
+)
+
+const (
 	// ContainerUpload uploads a backup (UploadJob); ContainerDownload fetches a remote backup
 	// before a restore (RemoteRestoreJob).
 	ContainerUpload   = "upload"
@@ -91,8 +96,8 @@ func rcloneEnv(t RemoteTarget) []corev1.EnvVar {
 		encEnv("REMOTE", rcloneS3Remote+":"+root),
 		encEnv("FILENAME_ENCRYPTION", "off"),
 		encEnv("DIRECTORY_NAME_ENCRYPTION", "false"),
-		{Name: "AWS_ACCESS_KEY_ID", ValueFrom: secretRef(c.CredentialsSecret.Name, forgejo.S3AccessKeyIDKey(c))},
-		{Name: "AWS_SECRET_ACCESS_KEY", ValueFrom: secretRef(c.CredentialsSecret.Name, forgejo.S3SecretAccessKeyKey(c))},
+		{Name: envAWSAccessKeyID, ValueFrom: secretRef(c.CredentialsSecret.Name, forgejo.S3AccessKeyIDKey(c))},
+		{Name: envAWSSecretAccessKey, ValueFrom: secretRef(c.CredentialsSecret.Name, forgejo.S3SecretAccessKeyKey(c))},
 		{Name: "BACKUP_KEY", ValueFrom: secretRef(t.Key.Name, t.Key.Key)},
 		{Name: "REMOTE_PATH", Value: t.Path},
 		{Name: "LOCATION", Value: RemoteLocation(c, t.Path)},
@@ -104,7 +109,7 @@ func rcloneEnv(t RemoteTarget) []corev1.EnvVar {
 		env = append(env, corev1.EnvVar{Name: "RCLONE_CA_CERT", Value: remoteCAMount + "/ca.crt"})
 	}
 	if forgejo.S3InsecureSkipVerify(c) {
-		env = append(env, corev1.EnvVar{Name: "RCLONE_NO_CHECK_CERTIFICATE", Value: "true"})
+		env = append(env, corev1.EnvVar{Name: "RCLONE_NO_CHECK_CERTIFICATE", Value: valueTrue})
 	}
 	return env
 }
@@ -129,14 +134,14 @@ func remoteCAVolume(c *forgejov1.S3Connection) (*corev1.Volume, *corev1.VolumeMo
 // operator's part of the manifest (ManifestHead).
 func UploadJob(in JobInput, b *forgejov1.ForgejoBackup, t RemoteTarget, identitySecret, manifestHead string) (*batchv1.Job, error) {
 	env := append(rcloneEnv(t),
-		corev1.EnvVar{Name: "BACKUP_DIR", Value: BackupDir(b.Name)},
+		corev1.EnvVar{Name: envBackupDir, Value: BackupDir(b.Name)},
 		corev1.EnvVar{Name: "INCLUDES_DATA", Value: strconv.FormatBool(b.Status.IncludesData)},
 		corev1.EnvVar{Name: "IDENTITY_FILE", Value: identityMount + "/" + IdentityFile},
 		corev1.EnvVar{Name: "MANIFEST_HEAD", Value: manifestHead},
 	)
 	mounts := []corev1.VolumeMount{
 		{Name: volBackups, MountPath: BackupMountPath, ReadOnly: true},
-		{Name: volTmp, MountPath: "/tmp"},
+		{Name: volTmp, MountPath: tmpPath},
 		{Name: volIdentity, MountPath: identityMount, ReadOnly: true},
 	}
 	volumes := []corev1.Volume{
@@ -187,13 +192,13 @@ func RemoteRestoreJob(in JobInput, r *forgejov1.ForgejoRestore, src RemoteSource
 	need := resource.NewQuantity(size+size/10+64<<20, resource.BinarySI)
 
 	env := append(rcloneEnv(src.RemoteTarget),
-		corev1.EnvVar{Name: "BACKUP_DIR", Value: downloadMount},
+		corev1.EnvVar{Name: envBackupDir, Value: downloadMount},
 		corev1.EnvVar{Name: "RESTORE_DATABASE", Value: strconv.FormatBool(restoreDB)},
 		corev1.EnvVar{Name: "RESTORE_DATA", Value: strconv.FormatBool(restoreData)},
 		corev1.EnvVar{Name: "DB_SHA256", Value: want[DBDumpFile]},
 		corev1.EnvVar{Name: "DATA_SHA256", Value: want[DataArchiveFile]},
 	)
-	mounts := []corev1.VolumeMount{{Name: volDownload, MountPath: downloadMount}, {Name: volTmp, MountPath: "/tmp"}}
+	mounts := []corev1.VolumeMount{{Name: volDownload, MountPath: downloadMount}, {Name: volTmp, MountPath: tmpPath}}
 	extra := []corev1.Volume{{Name: volDownload, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: need}}}}
 	if v, m := remoteCAVolume(src.Conn); v != nil {
 		extra = append(extra, *v)
@@ -205,7 +210,7 @@ func RemoteRestoreJob(in JobInput, r *forgejov1.ForgejoRestore, src RemoteSource
 	return restoreJob(in, r, restoreSteps{
 		dir:     downloadMount,
 		volumes: extra,
-		mounts:  []corev1.VolumeMount{{Name: volDownload, MountPath: downloadMount, ReadOnly: true}, {Name: volTmp, MountPath: "/tmp"}},
+		mounts:  []corev1.VolumeMount{{Name: volDownload, MountPath: downloadMount, ReadOnly: true}, {Name: volTmp, MountPath: tmpPath}},
 		first:   &dl,
 	}, restoreDB, restoreData)
 }

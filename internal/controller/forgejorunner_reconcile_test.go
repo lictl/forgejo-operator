@@ -31,6 +31,8 @@ import (
 	"github.com/lictl/forgejo-operator/internal/runner"
 )
 
+const testRegisterJob = "ci-register"
+
 const runnerTestNS = "runner-test"
 
 // fakeRunnerAPI is Forgejo's runner API in memory. Registration Jobs are simulated by
@@ -333,7 +335,7 @@ func TestRunnerRegistersBeforeStartingPods(t *testing.T) {
 		t.Fatalf("pods started before their runners were registered: replicas %d", *sts.Spec.Replicas)
 	}
 	job := &batchv1.Job{}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "ci-register"}, job); err != nil {
+	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, job); err != nil {
 		t.Fatalf("no registration job: %v", err)
 	}
 	if c := job.Spec.Template.Spec.Containers[0]; c.Image != "codeberg.org/forgejo/forgejo:17" {
@@ -350,7 +352,7 @@ func TestRunnerRegistersBeforeStartingPods(t *testing.T) {
 		fr.Status.Runners[1].UUID != runner.UUIDOf(string(tokens["token-1"])) || fr.Status.Runners[0].ID == 0 {
 		t.Fatalf("records %+v", fr.Status.Runners)
 	}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "ci-register"}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
+	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the finished registration Job was kept: %v", err)
 	}
 	if sts := fx.statefulSet("ci"); *sts.Spec.Replicas != 2 {
@@ -372,7 +374,7 @@ func TestRunnerRegistersBeforeStartingPods(t *testing.T) {
 	}
 	// A further pass registers nothing again.
 	fx.reconcile("ci")
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "ci-register"}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
+	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
 		t.Errorf("registered again: %v", err)
 	}
 }
@@ -382,7 +384,7 @@ func TestRunnerWaitsForForgejo(t *testing.T) {
 	f.Status.Phase = forgejov1.PhaseUpgrading
 	fx := newRunnerFixture(t, f, testForgejoRunner("ci", 1))
 	fx.reconcile("ci")
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "ci-register"}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
+	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("registered with an upgrading instance: %v", err)
 	}
 	if c := fx.condition("ci", forgejov1.ConditionRunnerRegistered); c == nil || c.Reason != reasonWaitingForForgejo || !strings.Contains(c.Message, "upgrading") {
@@ -504,7 +506,7 @@ func TestRunnerMissingInForgejoIsRegisteredAgain(t *testing.T) {
 	// The Job has registered the runner but has not finished: Forgejo lists it again, and it
 	// is recorded (with its event) when the Job is collected.
 	job := &batchv1.Job{}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "ci-register"}, job); err != nil {
+	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, job); err != nil {
 		t.Fatal(err)
 	}
 	fx.api.register(ci0.UUID, "ci-0", "idle")
@@ -794,7 +796,7 @@ func TestRunnerSecretsStayInTheTokensSecret(t *testing.T) {
 	fx := newRunnerFixture(t, readyForgejo(), testForgejoRunner("ci", 2))
 	fx.reconcile("ci")
 	job := &batchv1.Job{}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "ci-register"}, job); err != nil {
+	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, job); err != nil {
 		t.Fatal(err)
 	}
 	jobJSON, _ := json.Marshal(job)

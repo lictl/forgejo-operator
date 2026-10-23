@@ -23,6 +23,11 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const (
+	valkeyName = "valkey"
+	volData    = "data"
+)
+
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list
 
 const (
@@ -160,7 +165,7 @@ func ensureValkeyService(ctx context.Context, rc *forgejo.ReconcileContext) erro
 		svc.Spec.Type = corev1.ServiceTypeClusterIP
 		svc.Spec.Selector = valkeySelector(f)
 		svc.Spec.Ports = []corev1.ServicePort{{
-			Name:        "valkey",
+			Name:        valkeyName,
 			Port:        valkeyPort,
 			TargetPort:  intstr.FromString("valkey"),
 			Protocol:    corev1.ProtocolTCP,
@@ -239,9 +244,9 @@ func ensureValkeyDeployment(ctx context.Context, rc *forgejo.ReconcileContext, p
 			RunAsNonRoot:   ptr.To(true),
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		}
-		ps.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
+		ps.Volumes = []corev1.Volume{{Name: volData, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
 		ps.Containers = []corev1.Container{{
-			Name:            "valkey",
+			Name:            valkeyName,
 			Image:           image,
 			ImagePullPolicy: pullPolicy(f, image),
 			Command:         []string{"valkey-server"},
@@ -250,7 +255,7 @@ func ensureValkeyDeployment(ctx context.Context, rc *forgejo.ReconcileContext, p
 				{Name: "VALKEY_PASSWORD", ValueFrom: secretRef},
 				{Name: "REDISCLI_AUTH", ValueFrom: secretRef},
 			},
-			Ports:     []corev1.ContainerPort{{Name: "valkey", ContainerPort: valkeyPort, Protocol: corev1.ProtocolTCP}},
+			Ports:     []corev1.ContainerPort{{Name: valkeyName, ContainerPort: valkeyPort, Protocol: corev1.ProtocolTCP}},
 			Resources: res,
 			ReadinessProbe: &corev1.Probe{
 				ProbeHandler:  corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: probeCmd}},
@@ -260,7 +265,7 @@ func ensureValkeyDeployment(ctx context.Context, rc *forgejo.ReconcileContext, p
 				ProbeHandler:        corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("valkey")}},
 				InitialDelaySeconds: 10, PeriodSeconds: 10, TimeoutSeconds: 3, FailureThreshold: 6, SuccessThreshold: 1,
 			},
-			VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: valkeyDataPath}},
+			VolumeMounts: []corev1.VolumeMount{{Name: volData, MountPath: valkeyDataPath}},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				ReadOnlyRootFilesystem:   ptr.To(true),
@@ -312,31 +317,9 @@ func cleanupValkey(ctx context.Context, rc *forgejo.ReconcileContext, st *instan
 		return nil
 	}
 
-	keep, why := "", ""
-	switch {
-	case rc.ConfigHash == "" || rc.ConfigHash != rc.DesiredConfigHash:
-		keep, why = "rollback", "the pods run a rolled-back app.ini that may still use it"
-	case f.Status.AutoPilot != nil && f.Status.AutoPilot.RejectedConfigHash != "":
-		keep, why = "rejected", "a config rollback is pending"
-	case dep != nil && !fullyRolledOut(dep, rc.ConfigHash) && ptr.Deref(dep.Spec.Replicas, 1) > 0:
-		keep, why = "rollout", "the non-HA app.ini is still rolling out"
-	}
-	if keep == "" {
-		for i := range pods {
-			if pods[i].Annotations[forgejo.AnnotationConfigHash] != rc.DesiredConfigHash {
-				keep, why = "rollout", fmt.Sprintf("pod %s still runs an earlier app.ini", pods[i].Name)
-				break
-			}
-		}
-	}
-	if keep == "" && configRollbackEnabled(f) {
-		lkg, err := currentLKG(ctx, rc)
-		if err != nil {
-			return err
-		}
-		if lkg != nil && lkgUsesValkey(f, lkg) {
-			keep, why = "lkg", "the last known good app.ini, which a config rollback would deploy, still uses it; it is replaced once the non-HA app.ini has run healthy"
-		}
+	keep, why, err := valkeyKeepReason(ctx, rc, dep, pods)
+	if err != nil {
+		return err
 	}
 	if keep != "" {
 		if st.allow("valkey-kept/"+keep, time.Hour) {
@@ -358,6 +341,39 @@ func cleanupValkey(ctx context.Context, rc *forgejo.ReconcileContext, st *instan
 		rc.Event(corev1.EventTypeNormal, "ValkeyDeleted", "HighAvailability", "removed Valkey %s: highAvailability is disabled", key.Name)
 	}
 	return nil
+}
+
+// valkeyKeepReason says why Valkey must stay although HA is disabled: a short key for the
+// reason (empty when nothing needs Valkey any more) and the explanation for the event.
+func valkeyKeepReason(ctx context.Context, rc *forgejo.ReconcileContext, dep *appsv1.Deployment, pods []corev1.Pod) (string, string, error) {
+	f := rc.Instance
+	keep, why := "", ""
+	switch {
+	case rc.ConfigHash == "" || rc.ConfigHash != rc.DesiredConfigHash:
+		keep, why = "rollback", "the pods run a rolled-back app.ini that may still use it"
+	case f.Status.AutoPilot != nil && f.Status.AutoPilot.RejectedConfigHash != "":
+		keep, why = "rejected", "a config rollback is pending"
+	case dep != nil && !fullyRolledOut(dep, rc.ConfigHash) && ptr.Deref(dep.Spec.Replicas, 1) > 0:
+		keep, why = "rollout", "the non-HA app.ini is still rolling out"
+	}
+	if keep == "" {
+		for i := range pods {
+			if pods[i].Annotations[forgejo.AnnotationConfigHash] != rc.DesiredConfigHash {
+				keep, why = "rollout", fmt.Sprintf("pod %s still runs an earlier app.ini", pods[i].Name)
+				break
+			}
+		}
+	}
+	if keep == "" && configRollbackEnabled(f) {
+		lkg, err := currentLKG(ctx, rc)
+		if err != nil {
+			return "", "", err
+		}
+		if lkg != nil && lkgUsesValkey(f, lkg) {
+			keep, why = "lkg", "the last known good app.ini, which a config rollback would deploy, still uses it; it is replaced once the non-HA app.ini has run healthy"
+		}
+	}
+	return keep, why, nil
 }
 
 // deleteOwned deletes the named object when it exists and is controlled by the instance.
@@ -405,7 +421,7 @@ func checkSharedStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *i
 	msg := fmt.Sprintf("up to %d Forgejo replicas share the ReadWriteOnce data volume %s on a %d-node cluster; "+
 		"pods on other nodes cannot mount it. Use a ReadWriteMany storage class (spec.storage.accessModes)", maxPods(f), dataClaimName(f), nodes)
 	setDegraded(rc, ReasonHARequiresSharedStorage, msg)
-	warnEvery(rc, st, "ha-storage", time.Hour, ReasonHARequiresSharedStorage, "%s", msg)
+	warnEvery(rc, st, "ha-storage", ReasonHARequiresSharedStorage, "%s", msg)
 	return nil
 }
 

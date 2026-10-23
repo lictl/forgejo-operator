@@ -9,6 +9,10 @@ resources:
 - role_binding.yaml
 - leader_election_role.yaml
 - leader_election_role_binding.yaml
+# pods/exec for volume measurement, in a ClusterRole of its own that grants nothing until it
+# is bound: config/components/volume-usage binds it cluster-wide (config/default includes it),
+# config/namespaced per watched namespace. See docs/permissions.md.
+- volume_usage_role.yaml
 # The following RBAC configurations are used to protect
 # the metrics endpoint with authn/authz. These configurations
 # ensure that only authorized users and service accounts

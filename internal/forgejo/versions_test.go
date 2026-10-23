@@ -122,9 +122,11 @@ func TestClassify(t *testing.T) {
 		{"15", SupportSupported, []string{"current LTS", "2027-07-15"}},
 		{"15.0.10", SupportSupported, nil},
 		{"17.0.1", SupportSupported, []string{"latest release", "2027-01-28"}},
-		{"16.0.6", SupportDeprecated, []string{"2026-10-29", "Upgrade to 17 before 2026-10-29"}},
-		{"14", SupportEndOfLife, []string{"Upgrade to 15 (LTS) or 17 (through 15 first) now"}},
-		{"11.0.16", SupportEndOfLife, []string{"Upgrade to 15 (LTS) or 17 (through 15 first) now"}},
+		// The advice names the minimum patch of a target with an advisory: a floating :17 may
+		// still pull 17.0.0.
+		{"16.0.6", SupportDeprecated, []string{"2026-10-29", "Upgrade to 17 (17.0.1 or newer) before 2026-10-29"}},
+		{"14", SupportEndOfLife, []string{"Upgrade to 15 (LTS, 15.0.10 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
+		{"11.0.16", SupportEndOfLife, []string{"Upgrade to 15 (LTS, 15.0.10 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
 		{"18", SupportFuture, []string{"newest verified: 17", "2027-01-14"}},
 		{"21", SupportFuture, []string{"update the operator"}},
 		{"latest", SupportUnknown, nil},
@@ -212,8 +214,13 @@ func TestDirectUpgrade(t *testing.T) {
 		{11, 15, true, 0},
 		{7, 15, false, 11},
 		{11, 18, false, 15}, // upcoming rows count too
-		{17, 99, true, 0},   // unknown targets are not restricted
-		{17, 15, true, 0},   // downgrades are the version gate's business
+		// Majors beyond every row are held to the newest row's UpgradeFrom (19's: 15), so that
+		// 14 -> 20 is refused like 14 -> 17.
+		{14, 20, false, 15},
+		{15, 20, true, 0},
+		{17, 99, true, 0},
+		{5, 7, true, 0},   // majors older than the table are not restricted
+		{17, 15, true, 0}, // downgrades are the version gate's business
 	} {
 		ok, via := Versions.DirectUpgrade(tc.from, tc.to)
 		if ok != tc.ok || via != tc.via {
@@ -231,11 +238,13 @@ func TestTraits(t *testing.T) {
 		{"codeberg.org/forgejo/forgejo:15", legacy},
 		{"codeberg.org/forgejo/forgejo:16-rootless", legacy},
 		{"codeberg.org/forgejo/forgejo:17.0.0", Traits{InternalToken: true, StrictDurations: true}},
-		// Not verified yet: runs like the newest verified release.
-		{"codeberg.org/forgejo/forgejo:18", Traits{InternalToken: true, StrictDurations: true}},
+		// Not verified yet: the newest verified release's traits plus the prepared app.ini
+		// traits of 18 (the per-pod socket), but not its CLI traits.
+		{"codeberg.org/forgejo/forgejo:18", Traits{InternalToken: true, InternalSocket: true, StrictDurations: true}},
+		{"codeberg.org/forgejo/forgejo:21-rootless", Traits{InternalToken: true, InternalSocket: true, StrictDurations: true}},
 		{"codeberg.org/forgejo/forgejo:11", legacy},
-		// Unknown version: what works on every verified release.
-		{digestImage, Traits{InternalToken: true, StrictDurations: true}},
+		// Unknown version: what works on every verified and upcoming major.
+		{digestImage, Traits{InternalToken: true, InternalSocket: true, StrictDurations: true}},
 	} {
 		if got := LayoutForImage(tc.image).Traits; got != tc.want {
 			t.Errorf("%s: %+v, want %+v", tc.image, got, tc.want)

@@ -2,11 +2,13 @@ package forgejo
 
 import (
 	"context"
+	"errors"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
@@ -26,12 +28,63 @@ func (rc *ReconcileContext) CreateOrUpdate(ctx context.Context, obj client.Objec
 
 // HasAPI reports whether the cluster serves the given group/version/kind (e.g. CNPG
 // Cluster, ServiceMonitor). Optional integrations must check this before creating objects.
+// Any discovery error counts as not served; APIServed tells the two apart.
 func (rc *ReconcileContext) HasAPI(gvk schema.GroupVersionKind) bool {
 	if rc.RESTMapper == nil {
 		return false
 	}
 	_, err := rc.RESTMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	return err == nil
+}
+
+// APIServed reports whether the cluster serves the given group/version/kind. It answers
+// false only when API discovery says so (a NoMatch answer); any other discovery error, such
+// as a failed or timed-out discovery request, is returned, so that the caller retries instead
+// of acting on an absence it does not know about.
+func (rc *ReconcileContext) APIServed(gvk schema.GroupVersionKind) (bool, error) {
+	if rc.RESTMapper == nil {
+		return false, nil
+	}
+	_, err := rc.RESTMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	switch {
+	case err == nil:
+		return true, nil
+	case notServed(err):
+		return false, nil
+	}
+	return false, err
+}
+
+// notServed reports whether a RESTMapping error says that the kind is not served. A
+// *apiutil.ErrResourceDiscoveryFailed wraps one error per group version, and errors.Is (thus
+// meta.IsNoMatchError) matches when any one of them does; it only counts when every entry
+// is NotFound or NoMatch.
+func notServed(err error) bool {
+	var failed *apiutil.ErrResourceDiscoveryFailed
+	if errors.As(err, &failed) {
+		for _, e := range *failed {
+			if !apierrors.IsNotFound(e) && !meta.IsNoMatchError(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return meta.IsNoMatchError(err)
+}
+
+// FirstServedAPI returns the first of gvks that the cluster serves (see APIServed); ok is
+// false when discovery says that none is served, and err is set when discovery failed.
+func (rc *ReconcileContext) FirstServedAPI(gvks ...schema.GroupVersionKind) (gvk schema.GroupVersionKind, ok bool, err error) {
+	for _, gvk := range gvks {
+		served, err := rc.APIServed(gvk)
+		if err != nil {
+			return schema.GroupVersionKind{}, false, err
+		}
+		if served {
+			return gvk, true, nil
+		}
+	}
+	return schema.GroupVersionKind{}, false, nil
 }
 
 // FirstAPI returns the first of gvks that the cluster serves, for kinds whose version

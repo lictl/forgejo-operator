@@ -17,11 +17,21 @@ import (
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 )
 
+const (
+	testAppIniSecret = "git-config"
+	testForgejoName  = "git"
+	testPool         = "git"
+	testOther        = "other"
+	testImage17      = "codeberg.org/forgejo/forgejo:17"
+	testSlotName     = "ci-0"
+	testTaintKey     = "dedicated"
+)
+
 func testRunner(mutate ...func(*forgejov1.ForgejoRunner)) *forgejov1.ForgejoRunner {
 	r := &forgejov1.ForgejoRunner{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "ns"},
 		Spec: forgejov1.ForgejoRunnerSpec{
-			ForgejoRef: forgejov1.ForgejoRef{Name: "git"},
+			ForgejoRef: forgejov1.ForgejoRef{Name: testForgejoName},
 			Replicas:   ptr.To[int32](2),
 			Capacity:   1,
 			Executor:   forgejov1.RunnerExecutorDocker,
@@ -35,7 +45,7 @@ func testRunner(mutate ...func(*forgejov1.ForgejoRunner)) *forgejov1.ForgejoRunn
 }
 
 func testForgejo() *forgejov1.Forgejo {
-	return &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "git", Namespace: "ns", UID: "fj-uid"}}
+	return &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: testForgejoName, Namespace: "ns", UID: "fj-uid"}}
 }
 
 // Observed on Forgejo 17.0.0: "forgejo-cli actions register" printed this UUID for a secret
@@ -72,7 +82,7 @@ func TestIndexOfKey(t *testing.T) {
 			t.Errorf("IndexOfKey(%q) = %d, %v", key, got, ok)
 		}
 	}
-	for _, key := range []string{"token-", "token-01", "token--1", "config-1", "other", "token-x"} {
+	for _, key := range []string{"token-", "token-01", "token--1", "config-1", testOther, "token-x"} {
 		if _, ok := IndexOfKey(key); ok {
 			t.Errorf("IndexOfKey(%q) accepted", key)
 		}
@@ -83,10 +93,10 @@ func TestScope(t *testing.T) {
 	if s := Scope(testRunner()); s != "" {
 		t.Errorf("instance scope %q", s)
 	}
-	if s := Scope(testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Scope.Organization = "acme" })); s != "acme" {
+	if s := Scope(testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Scope.Organization = testOrg })); s != testOrg {
 		t.Errorf("organization scope %q", s)
 	}
-	if s := Scope(testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Scope.Repository = "acme/app" })); s != "acme/app" {
+	if s := Scope(testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Scope.Repository = testRepo })); s != testRepo {
 		t.Errorf("repository scope %q", s)
 	}
 }
@@ -157,7 +167,7 @@ func TestRenderConfigUserConfigMergedOperatorKeysWin(t *testing.T) {
 	})
 	m := renderMap(t, r, 0, "u")
 	if path(m, "runner", "envs", "A") != "b" || path(m, "runner", "timeout") != "1h" || path(m, "log", "level") != "debug" ||
-		path(m, "log", "job_level") != "info" || path(m, "container", "options") != "--memory=1g" {
+		path(m, "log", "job_level") != logLevelInfo || path(m, "container", "options") != "--memory=1g" {
 		t.Errorf("user keys not merged: %v", m)
 	}
 	if path(m, "container", "docker_host") != "automount" {
@@ -181,7 +191,7 @@ func TestRenderConfigHostHasNoContainerSection(t *testing.T) {
 	if m["container"] != nil {
 		t.Errorf("container section %v", m["container"])
 	}
-	if l := path(m, "runner", "labels").([]any); len(l) != 1 || l[0] != "host:host" {
+	if l := path(m, "runner", "labels").([]any); len(l) != 1 || l[0] != labelHost {
 		t.Errorf("default host labels %v", l)
 	}
 }
@@ -211,7 +221,7 @@ func TestConfigHashIgnoresRunnerIdentity(t *testing.T) {
 }
 
 func TestLabelNames(t *testing.T) {
-	got := LabelNames([]string{"docker:docker://node:22", "host:host", "bare"})
+	got := LabelNames([]string{"docker:docker://node:22", labelHost, "bare"})
 	if strings.Join(got, ",") != "docker,host,bare" {
 		t.Fatalf("LabelNames = %v", got)
 	}
@@ -246,7 +256,7 @@ func restrictedViolations(spec corev1.PodSpec) []string {
 		if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
 			out = append(out, c.Name+": allowPrivilegeEscalation")
 		}
-		if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" || len(sc.Capabilities.Add) > 0 {
+		if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != capDropAll || len(sc.Capabilities.Add) > 0 {
 			out = append(out, c.Name+": capabilities")
 		}
 		if !podNonRoot && (sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot) {
@@ -330,13 +340,13 @@ func TestDockerPod(t *testing.T) {
 }
 
 func TestRegisterJobKeepsSecretsOutOfTheSpec(t *testing.T) {
-	r := testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Scope.Organization = "acme" })
+	r := testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Scope.Organization = testOrg })
 	f := testForgejo()
 	t0, _ := NewToken()
 	t1, _ := NewToken()
 	job := RegisterJob(RegisterJobInput{
-		Runner: r, Forgejo: f, Image: "codeberg.org/forgejo/forgejo:17", AppIniSecret: "git-config",
-		Slots: []Slot{{Index: 0, Name: "ci-0", Token: t0}, {Index: 1, Name: "ci-1", Token: t1}},
+		Runner: r, Forgejo: f, Image: testImage17, AppIniSecret: testAppIniSecret,
+		Slots: []Slot{{Index: 0, Name: testSlotName, Token: t0, Version: "13.2.0"}, {Index: 1, Name: "ci-1", Token: t1, Version: "1.0 $(id)"}},
 	})
 	b, _ := json.Marshal(job)
 	for _, tok := range []string{t0, t1, t0[16:], t1[16:]} {
@@ -349,34 +359,113 @@ func TestRegisterJobKeepsSecretsOutOfTheSpec(t *testing.T) {
 	for _, e := range c.Env {
 		env[e.Name] = e.Value
 	}
-	if env["RUNNERS"] != "0:ci-0 1:ci-1" || env["RUNNER_SCOPE"] != "acme" {
+	// The listed version is passed on; one that is not a plain version string is not.
+	if env["RUNNERS"] != "0:13.2.0:ci-0 1::ci-1" || env["RUNNER_SCOPE"] != testOrg {
 		t.Errorf("env %v", env)
 	}
-	if c.Image != "codeberg.org/forgejo/forgejo:17" || *c.SecurityContext.RunAsUser != 1000 || !*c.SecurityContext.ReadOnlyRootFilesystem {
+	if c.Image != testImage17 || *c.SecurityContext.RunAsUser != 1000 || !*c.SecurityContext.ReadOnlyRootFilesystem {
 		t.Errorf("container %+v", c)
 	}
 	var tokensVol, configVol *corev1.Volume
 	for i := range job.Spec.Template.Spec.Volumes {
 		v := &job.Spec.Template.Spec.Volumes[i]
 		switch v.Name {
-		case "tokens":
+		case volTokens:
 			tokensVol = v
-		case "config":
+		case volConfig:
 			configVol = v
 		}
 	}
-	if configVol == nil || configVol.Secret.SecretName != "git-config" {
+	if configVol == nil || configVol.Secret.SecretName != testAppIniSecret {
 		t.Errorf("app.ini volume %+v", configVol)
 	}
 	if tokensVol == nil || len(tokensVol.Secret.Items) != 2 || tokensVol.Secret.Items[1].Key != "token-1" {
 		t.Errorf("tokens volume %+v", tokensVol)
 	}
 	got := ParseRegistrationAnnotation(job.Annotations[AnnotationRegistrationRunners])
-	if got[0] != UUIDOf(t0) || got[1] != UUIDOf(t1) || job.Annotations[AnnotationRegistrationScope] != "acme" {
+	if got[0] != UUIDOf(t0) || got[1] != UUIDOf(t1) || job.Annotations[AnnotationRegistrationScope] != testOrg {
 		t.Errorf("annotations %v", job.Annotations)
 	}
 	if v := restrictedViolations(job.Spec.Template.Spec); len(v) > 0 {
 		t.Errorf("registration pod violates restricted: %v", v)
+	}
+	// The controller deletes the Job once it is recorded: a TTL could remove a succeeded Job,
+	// the only trace of its registrations, before that.
+	if job.Spec.TTLSecondsAfterFinished != nil {
+		t.Errorf("registration Job has a TTL of %d s", *job.Spec.TTLSecondsAfterFinished)
+	}
+}
+
+func TestSafeVersion(t *testing.T) {
+	for _, v := range []string{"13.2.0", "v12.7.0-rc1", "1.0+dev_2", "dev"} {
+		if SafeVersion(v) != v {
+			t.Errorf("SafeVersion(%q) = %q", v, SafeVersion(v))
+		}
+	}
+	for _, v := range []string{"", "1.0 2", "1:2", "$(id)", "-1", ".1", "1;2", "a\nb", strings.Repeat("1", 65)} {
+		if got := SafeVersion(v); got != "" {
+			t.Errorf("SafeVersion(%q) = %q, want \"\"", v, got)
+		}
+	}
+}
+
+// The registration pod is placed like the instance's pods (node selector, tolerations, node
+// affinity, priority class, service account for image pulls), without the instance's pod
+// (anti-)affinity and without a service account token.
+func TestRegisterJobInstancePlacement(t *testing.T) {
+	f := testForgejo()
+	nodeAffinity := &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+		NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{
+			Key: "kubernetes.io/arch", Operator: corev1.NodeSelectorOpIn, Values: []string{"arm64"},
+		}}}},
+	}}
+	f.Spec.PodTemplate = forgejov1.PodTemplateSpec{
+		NodeSelector:       map[string]string{"pool": testPool},
+		Tolerations:        []corev1.Toleration{{Key: testTaintKey, Value: testPool, Effect: corev1.TaintEffectNoSchedule}},
+		PriorityClassName:  "git-critical",
+		ServiceAccountName: "git-pull",
+		Affinity: &corev1.Affinity{
+			NodeAffinity: nodeAffinity,
+			PodAntiAffinity: &corev1.PodAntiAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				TopologyKey: "kubernetes.io/hostname", LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "forgejo"}},
+			}}},
+			PodAffinity: &corev1.PodAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				TopologyKey: "kubernetes.io/hostname", LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"cnpg.io/cluster": "git-db"}},
+			}}},
+		},
+	}
+	tok, _ := NewToken()
+	job := RegisterJob(RegisterJobInput{Runner: testRunner(), Forgejo: f, Image: testImage17,
+		AppIniSecret: testAppIniSecret, Slots: []Slot{{Index: 0, Name: testSlotName, Token: tok}}})
+	spec := job.Spec.Template.Spec
+	if spec.NodeSelector["pool"] != testPool || len(spec.Tolerations) != 1 || spec.Tolerations[0].Key != testTaintKey ||
+		spec.PriorityClassName != "git-critical" || spec.ServiceAccountName != "git-pull" {
+		t.Errorf("placement: nodeSelector %v, tolerations %v, priorityClass %q, serviceAccount %q",
+			spec.NodeSelector, spec.Tolerations, spec.PriorityClassName, spec.ServiceAccountName)
+	}
+	if spec.Affinity == nil || spec.Affinity.NodeAffinity == nil ||
+		spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Values[0] != "arm64" {
+		t.Errorf("node affinity %+v", spec.Affinity)
+	}
+	if spec.Affinity != nil && (spec.Affinity.PodAffinity != nil || spec.Affinity.PodAntiAffinity != nil) {
+		t.Errorf("the instance's pod (anti-)affinity was copied: %+v", spec.Affinity)
+	}
+	if spec.AutomountServiceAccountToken == nil || *spec.AutomountServiceAccountToken {
+		t.Error("the service account token is mounted")
+	}
+	// Copies, not aliases of the Forgejo's spec.
+	spec.NodeSelector["pool"] = testOther
+	spec.Tolerations[0].Key = testOther
+	if f.Spec.PodTemplate.NodeSelector["pool"] != testPool || f.Spec.PodTemplate.Tolerations[0].Key != testTaintKey {
+		t.Error("the Job shares the Forgejo's node selector or tolerations")
+	}
+
+	// Without a pod template: no constraints, the namespace's default service account.
+	job = RegisterJob(RegisterJobInput{Runner: testRunner(), Forgejo: testForgejo(), Image: testImage17,
+		AppIniSecret: testAppIniSecret, Slots: []Slot{{Index: 0, Name: testSlotName, Token: tok}}})
+	if spec := job.Spec.Template.Spec; spec.NodeSelector != nil || spec.Tolerations != nil || spec.Affinity != nil ||
+		spec.ServiceAccountName != "" || spec.PriorityClassName != "" {
+		t.Errorf("placement without a pod template: %+v", spec)
 	}
 }
 
@@ -400,11 +489,11 @@ func TestRegisterScript(t *testing.T) {
 	}
 	cli := filepath.Join(dir, "forgejo")
 	fake := `#!/bin/sh
-# args: --config C forgejo-cli actions register --secret-file F --scope S --name N --keep-labels
-name=""; file=""
-while [ $# -gt 0 ]; do case "$1" in --name) name=$2; shift;; --secret-file) file=$2; shift;; esac; shift; done
+# args: --config C forgejo-cli actions register --secret-file F --scope S --name N --version V --keep-labels
+name=""; file=""; version="unset"
+while [ $# -gt 0 ]; do case "$1" in --name) name=$2; shift;; --secret-file) file=$2; shift;; --version) version=$2; shift;; esac; shift; done
 if [ "$name" = "fail-1" ]; then echo "error while registering runner: can't update the runner {Token:$(cat "$file") Name:$name}" >&2; exit 1; fi
-printf "uuid-of-%s" "$name"
+printf "uuid-of-%s@%s" "$name" "$version"
 `
 	if err := os.WriteFile(cli, []byte(fake), 0o700); err != nil {
 		t.Fatal(err)
@@ -420,11 +509,12 @@ printf "uuid-of-%s" "$name"
 		err := cmd.Run()
 		return stdout.String(), stderr.String(), err
 	}
-	out, _, err := run("0:ok-0 1:ok-1")
-	if err != nil || !strings.Contains(out, "Registered runner ok-0 (uuid-of-ok-0)") || !strings.Contains(out, "Registered runner ok-1") {
+	// Each runner is registered with its own secret file, name and version (empty: none).
+	out, _, err := run("0:13.2.0:ok-0 1::ok-1")
+	if err != nil || !strings.Contains(out, "Registered runner ok-0 (uuid-of-ok-0@13.2.0)") || !strings.Contains(out, "Registered runner ok-1 (uuid-of-ok-1@)") {
 		t.Fatalf("success run: %v %q", err, out)
 	}
-	out, errOut, err := run("0:ok-0 1:fail-1")
+	out, errOut, err := run("0::ok-0 1::fail-1")
 	if err == nil {
 		t.Fatal("a failed registration exited 0")
 	}

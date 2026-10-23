@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -17,12 +18,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes;tcproutes;referencegrants,verbs=get;list;watch;create;update;patch;delete
+const filterRequestHeaderModifier = "RequestHeaderModifier"
+
+// Gateway API objects are read live (never listed or watched), written with CreateOrUpdate and
+// deleted by deleteOptional; ReferenceGrants are written by the tls step.
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes;tcproutes;referencegrants,verbs=get;create;update;delete
 
 // Reasons of the RoutesReady condition.
 const (
@@ -33,6 +39,9 @@ const (
 	reasonGatewayAPIUnavailable = "GatewayAPIUnavailable"
 	reasonTCPRouteUnavailable   = "TCPRouteUnavailable"
 	reasonNoHostnames           = "NoHostnames"
+	// reasonNameConflict (RoutesReady, TLSReady): an object of the name the operator would use
+	// exists, but the instance does not control it.
+	reasonNameConflict = "NameConflict"
 )
 
 // notReadyRequeue is how soon a route or certificate that is not ready yet is looked at again;
@@ -135,7 +144,8 @@ type tcpRouteRule struct {
 // the RoutesReady condition. Without the Gateway API CRDs nothing is created, and RoutesReady
 // says so while spec.gateway is set. Without a host name (RouteHostnames) there is no
 // HTTPRoute: one without host names would take every host name of the listeners it attaches
-// to, also other applications' on a shared Gateway.
+// to, also other applications' on a shared Gateway. A route of the same name that the instance
+// does not control is left alone (RoutesReady=False/NameConflict, see applyOptional).
 func ReconcileGateway(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	if !forgejo.GatewayEnabled(f) {
@@ -149,7 +159,9 @@ func ReconcileGateway(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		return forgejo.StepResult{}, nil
 	}
 
-	if !rc.HasAPI(forgejo.HTTPRouteGVK) {
+	if served, err := rc.APIServed(forgejo.HTTPRouteGVK); err != nil {
+		return forgejo.StepResult{}, fmt.Errorf("discovering HTTPRoute: %w", err)
+	} else if !served {
 		setRoutesReady(rc, metav1.ConditionFalse, reasonGatewayAPIUnavailable,
 			"spec.gateway is set, but the cluster does not serve HTTPRoute "+forgejo.HTTPRouteGVK.GroupVersion().String()+
 				": install the Gateway API CRDs (and a Gateway controller)")
@@ -157,6 +169,9 @@ func ReconcileGateway(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 	}
 
 	var routes []routeStatus
+	// conflicts are routes the operator would create, whose name another object has: the
+	// other route is still reconciled.
+	var conflicts []string
 	hostnames := RouteHostnames(f)
 	if len(hostnames) == 0 {
 		if err := deleteOptional(ctx, rc, forgejo.HTTPRouteName(f), forgejo.HTTPRouteGVK); err != nil {
@@ -164,20 +179,34 @@ func ReconcileGateway(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		}
 	} else {
 		route, err := applyRoute(ctx, rc, forgejo.HTTPRouteGVK, forgejo.HTTPRouteName(f), httpRoute(f, hostnames))
-		if err != nil {
+		var conflict *nameConflictError
+		switch {
+		case errors.As(err, &conflict):
+			conflicts = append(conflicts, conflict.Error())
+		case err != nil:
 			return forgejo.StepResult{}, fmt.Errorf("HTTPRoute %s: %w", forgejo.HTTPRouteName(f), err)
+		default:
+			routes = append(routes, routeStatus{kind: "HTTPRoute", obj: route, parents: parentRefs(f, f.Spec.Gateway.ParentRefs)})
 		}
-		routes = append(routes, routeStatus{kind: "HTTPRoute", obj: route, parents: parentRefs(f, f.Spec.Gateway.ParentRefs)})
 	}
 
 	tcpMissing := false
 	if forgejo.GatewaySSHEnabled(f) {
-		if tcpGVK, ok := rc.FirstAPI(forgejo.TCPRouteGVKs...); ok {
+		tcpGVK, ok, err := rc.FirstServedAPI(forgejo.TCPRouteGVKs...)
+		if err != nil {
+			return forgejo.StepResult{}, fmt.Errorf("discovering TCPRoute: %w", err)
+		}
+		if ok {
 			route, err := applyRoute(ctx, rc, tcpGVK, forgejo.SSHRouteName(f), tcpRoute(f))
-			if err != nil {
+			var conflict *nameConflictError
+			switch {
+			case errors.As(err, &conflict):
+				conflicts = append(conflicts, conflict.Error())
+			case err != nil:
 				return forgejo.StepResult{}, fmt.Errorf("TCPRoute %s: %w", forgejo.SSHRouteName(f), err)
+			default:
+				routes = append(routes, routeStatus{kind: "TCPRoute", obj: route, parents: parentRefs(f, f.Spec.Gateway.SSH.ParentRefs)})
 			}
-			routes = append(routes, routeStatus{kind: "TCPRoute", obj: route, parents: parentRefs(f, f.Spec.Gateway.SSH.ParentRefs)})
 		} else {
 			tcpMissing = true
 		}
@@ -202,6 +231,16 @@ func ReconcileGateway(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 			noHosts += "; " + msg
 		}
 		status, reason, msg = metav1.ConditionFalse, reasonNoHostnames, noHosts
+	}
+	if len(conflicts) > 0 {
+		m := strings.Join(conflicts, "; ")
+		switch {
+		case len(routes) > 0 || len(hostnames) == 0:
+			m += "; " + msg
+		case tcpMissing:
+			m += "; no TCPRoute version is served (" + gvkVersions(forgejo.TCPRouteGVKs) + ")"
+		}
+		status, reason, msg = metav1.ConditionFalse, reasonNameConflict, m
 	}
 	setRoutesReady(rc, status, reason, msg)
 	if status != metav1.ConditionTrue {
@@ -369,7 +408,7 @@ func httpRoute(f *forgejov1.Forgejo, hostnames []string) *httpRouteSpec {
 		}},
 	}
 	rule.Filters = append(rule.Filters, httpRouteFilter{
-		Type:                  "RequestHeaderModifier",
+		Type:                  filterRequestHeaderModifier,
 		RequestHeaderModifier: &httpHeaderModifier{Remove: removedHeaders(g)},
 	})
 	if prefix != "/" {
@@ -409,9 +448,46 @@ func applyRoute(ctx context.Context, rc *forgejo.ReconcileContext, gvk schema.Gr
 	return applyOptional(ctx, rc, gvk, name, spec, annotations)
 }
 
+// nameConflictError reports an object of an optional integration that has the name the
+// operator would use, but that the instance does not control. The operator neither adopts nor
+// changes it; callers report it in a condition (NameConflict) instead of failing the step.
+type nameConflictError struct {
+	kind, name string
+	// controller is the object's controller reference, nil when it has none.
+	controller *metav1.OwnerReference
+}
+
+func (e *nameConflictError) Error() string {
+	by := "it has no controller"
+	if c := e.controller; c != nil {
+		by = fmt.Sprintf("it is controlled by %s %s", c.Kind, c.Name)
+	}
+	return fmt.Sprintf("%s %s already exists and does not belong to this Forgejo (%s): the operator does not take "+
+		"over or change it. Delete it (or have its owner delete it) for the operator to create its own", e.kind, e.name, by)
+}
+
+// controlledBy reports whether the instance may write an existing optional object: it is the
+// object's controller, or the object has no controller and carries the instance's labels (it
+// was left behind when an earlier instance of this name was deleted with orphaning).
+func controlledBy(f *forgejov1.Forgejo, obj client.Object) (bool, *metav1.OwnerReference) {
+	c := metav1.GetControllerOf(obj)
+	if c != nil {
+		return c.UID == f.UID, c
+	}
+	labels := obj.GetLabels()
+	for k, v := range forgejo.Labels(f, forgejo.ComponentServer) {
+		if labels[k] != v {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // applyOptional creates or updates a namespaced object of an optional integration (Gateway
 // API, cert-manager), owned by the instance, whose spec is rendered from a typed mirror (a
-// pointer to a struct). It returns the object as stored, status included.
+// pointer to a struct). It returns the object as stored, status included. An existing object
+// is only updated while the instance controls it (controlledBy); otherwise nothing is
+// written, and the error is a *nameConflictError.
 func applyOptional(ctx context.Context, rc *forgejo.ReconcileContext, gvk schema.GroupVersionKind, name string,
 	spec any, annotations map[string]string) (*unstructured.Unstructured, error) {
 	f := rc.Instance
@@ -425,6 +501,11 @@ func applyOptional(ctx context.Context, rc *forgejo.ReconcileContext, gvk schema
 	obj.SetName(name)
 	optionalAbsent.Delete(optionalKey(f, gvk.GroupKind(), name))
 	err = apply(ctx, rc, obj, true, func() error {
+		if obj.GetResourceVersion() != "" {
+			if ok, c := controlledBy(f, obj); !ok {
+				return &nameConflictError{kind: gvk.Kind, name: name, controller: c}
+			}
+		}
 		obj.SetLabels(mergeMaps(obj.GetLabels(), forgejo.Labels(f, forgejo.ComponentServer)))
 		if a := mergeMaps(obj.GetAnnotations(), annotations); len(a) > 0 {
 			obj.SetAnnotations(a)
@@ -450,14 +531,19 @@ func optionalKey(f *forgejov1.Forgejo, gk schema.GroupKind, name string) string 
 }
 
 // deleteOptional deletes an optional child the instance controls, in the first of gvks (the
-// versions of one kind) that the cluster serves. Once it is gone, or the kind is not served,
-// it is not looked up again in this process until applyOptional creates it.
+// versions of one kind) that the cluster serves. Once it is gone, or discovery says that the
+// kind is not served, it is not looked up again in this process until applyOptional creates
+// it. A failed discovery is returned, and nothing is remembered, so that the pass retries.
 func deleteOptional(ctx context.Context, rc *forgejo.ReconcileContext, name string, gvks ...schema.GroupVersionKind) error {
 	key := optionalKey(rc.Instance, gvks[0].GroupKind(), name)
 	if _, ok := optionalAbsent.Load(key); ok {
 		return nil
 	}
-	if gvk, served := rc.FirstAPI(gvks...); served {
+	gvk, served, err := rc.FirstServedAPI(gvks...)
+	if err != nil {
+		return fmt.Errorf("discovering %s: %w", gvks[0].Kind, err)
+	}
+	if served {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(gvk)
 		if err := deleteOwned(ctx, rc, obj, name); err != nil {
@@ -471,12 +557,14 @@ func deleteOptional(ctx context.Context, rc *forgejo.ReconcileContext, name stri
 // ForgetInstance drops the in-memory state of a deleted instance.
 func ForgetInstance(namespace, name string) {
 	prefix := namespace + "/" + name + "/"
-	optionalAbsent.Range(func(k, _ any) bool {
-		if strings.HasPrefix(k.(string), prefix) {
-			optionalAbsent.Delete(k)
-		}
-		return true
-	})
+	for _, m := range []*sync.Map{&optionalAbsent, &foreignHostKeys} {
+		m.Range(func(k, _ any) bool {
+			if strings.HasPrefix(k.(string), prefix) {
+				m.Delete(k)
+			}
+			return true
+		})
+	}
 }
 
 // routeStatus is one route and the parents its spec names.

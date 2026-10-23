@@ -62,6 +62,23 @@ import (
 	"github.com/lictl/forgejo-operator/internal/upgrade"
 )
 
+const (
+	stepSecrets          = "secrets"
+	stepDatabase         = "database"
+	stepHighAvailability = "high-availability"
+	stepStorage          = "storage"
+	stepSSHHostKeys      = "ssh-host-keys"
+	stepTuning           = "tuning"
+	stepConfig           = "config"
+	stepWorkload         = "workload"
+	stepNetwork          = "network"
+	stepGateway          = "gateway"
+	stepTLS              = "tls"
+	stepMonitoring       = "monitoring"
+	stepHealth           = "health"
+	stepAutopilot        = "autopilot"
+)
+
 // defaultResync bounds how long the operator goes without re-checking an instance, which
 // drives health probing, statistics sampling and autopilot decisions.
 const defaultResync = 60 * time.Second
@@ -131,48 +148,48 @@ var steps = []namedStep{
 	// spec.restoreFrom: the identity Secrets come from the backup, before the secrets and
 	// ssh-host-keys steps would generate new ones (a no-op otherwise).
 	{name: stepRestoreIdentity, fn: backup.ReconcileRestoreIdentity, needs: []string{stepRestoreGuard}},
-	{name: "secrets", fn: core.ReconcileSecrets, needs: []string{stepRestoreIdentity}},
+	{name: stepSecrets, fn: core.ReconcileSecrets, needs: []string{stepRestoreIdentity}},
 	// Owner references of the ForgejoBackups and the backup PVC follow
 	// spec.storage.retainPolicy. It reads only the instance and its backups, so a database
 	// or Valkey that is down must not delay it (the instance may be deleted meanwhile).
 	{name: stepBackupOwnership, fn: backup.ReconcileOwnership},
-	{name: "database", fn: core.ReconcileDatabase, needs: []string{"secrets"}},
-	{name: "high-availability", fn: autopilot.ReconcileHA, needs: []string{"database"}},
-	{name: "storage", fn: core.ReconcileStorage, needs: []string{"high-availability"}},
+	{name: stepDatabase, fn: core.ReconcileDatabase, needs: []string{stepSecrets}},
+	{name: stepHighAvailability, fn: autopilot.ReconcileHA, needs: []string{stepDatabase}},
+	{name: stepStorage, fn: core.ReconcileStorage, needs: []string{stepHighAvailability}},
 	// spec.restoreFrom: once the identity is restored and the database and the data volume
 	// exist, a ForgejoRestore restores them from the backup.
-	{name: stepRestoreFrom, fn: backup.ReconcileBootstrap, needs: []string{"storage"}},
+	{name: stepRestoreFrom, fn: backup.ReconcileBootstrap, needs: []string{stepStorage}},
 	// The SSH host keys are identity, like the secrets: independent of the database, Valkey
 	// and storage. The config step consumes them; the upgrade step waits while they are
 	// unavailable (rc.SSHHostKeysUnavailable), so it runs first.
-	{name: "ssh-host-keys", fn: core.ReconcileSSHHostKeys, needs: []string{"secrets"}},
+	{name: stepSSHHostKeys, fn: core.ReconcileSSHHostKeys, needs: []string{stepSecrets}},
 	// spec.objectStorage: its Secrets (which pods reference) and the bucket check
 	// (ObjectStorageReady). It stops only while the Secrets are unusable, which no pod could
 	// start without; an unreachable bucket is only reported. No prerequisites, so the
 	// condition stays current while the database is down.
 	{name: stepObjectStorage, fn: core.ReconcileObjectStorage},
-	{name: stepUpgrade, fn: upgrade.Reconcile, needs: []string{"storage", stepObjectStorage}},
-	{name: "tuning", fn: autopilot.ReconcileTuning, needs: []string{stepUpgrade}},
-	{name: "config", fn: core.ReconcileConfig, needs: []string{"tuning", "ssh-host-keys"}},
-	{name: "config-guard", fn: autopilot.ReconcileConfigGuard, needs: []string{"config"}},
-	{name: "workload", fn: core.ReconcileWorkload, needs: []string{"config-guard"}},
+	{name: stepUpgrade, fn: upgrade.Reconcile, needs: []string{stepStorage, stepObjectStorage}},
+	{name: stepTuning, fn: autopilot.ReconcileTuning, needs: []string{stepUpgrade}},
+	{name: stepConfig, fn: core.ReconcileConfig, needs: []string{stepTuning, stepSSHHostKeys}},
+	{name: "config-guard", fn: autopilot.ReconcileConfigGuard, needs: []string{stepConfig}},
+	{name: stepWorkload, fn: core.ReconcileWorkload, needs: []string{"config-guard"}},
 	// Spec-only objects.
-	{name: "network", fn: core.ReconcileNetwork},
+	{name: stepNetwork, fn: core.ReconcileNetwork},
 	// Optional integrations (Gateway API, cert-manager): created only when their CRDs exist;
 	// their status becomes RoutesReady and TLSReady. Independent of everything else.
-	{name: "gateway", fn: core.ReconcileGateway},
-	{name: "tls", fn: core.ReconcileTLS},
+	{name: stepGateway, fn: core.ReconcileGateway},
+	{name: stepTLS, fn: core.ReconcileTLS},
 	// rc.Maintenance, rc.Upgrading, rc.HPAManaged and rc.ResourcesOverride.
-	{name: "scaling", fn: autopilot.ReconcileScaling, needs: []string{"tuning"}},
-	{name: "monitoring", fn: observability.ReconcileMonitoring},
+	{name: "scaling", fn: autopilot.ReconcileScaling, needs: []string{stepTuning}},
+	{name: stepMonitoring, fn: observability.ReconcileMonitoring},
 	// Creates and prunes ForgejoBackup objects; the backup controller itself waits for the
 	// database. rc.Maintenance comes from the guard; rc.Upgrading from the upgrade step, or
 	// from status.upgrade when that step was skipped.
 	{name: stepBackupSchedule, fn: backup.ReconcileSchedule, needs: []string{stepRestoreGuard}},
 	// rc.Maintenance suspends probing during a restore.
-	{name: "health", fn: observability.ReconcileHealth, needs: []string{stepRestoreGuard}},
+	{name: stepHealth, fn: observability.ReconcileHealth, needs: []string{stepRestoreGuard}},
 	// Self-healing, LKG bookkeeping and right-sizing must never act on a partial pass.
-	{name: "autopilot", fn: autopilot.Reconcile, needs: []string{"workload", "health"}},
+	{name: stepAutopilot, fn: autopilot.Reconcile, needs: []string{stepWorkload, stepHealth}},
 	// Volume measurement, StorageHealthy and PVC auto-expansion. No needs: a full CNPG
 	// volume is a common reason why the database step stops, and growing it must not wait
 	// for that step. Last, so that it sees this pass's rc.Maintenance, rc.Upgrading and
@@ -293,18 +310,19 @@ func firstMissing(needs []string, completed map[string]bool) string {
 	return ""
 }
 
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejos,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejos/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejos,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejos/status,verbs=patch
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejos/finalizers,verbs=update
-// +kubebuilder:rbac:groups=core,resources=secrets;services;persistentvolumeclaims;configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=services;configmaps,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
 
 // Reconcile drives a Forgejo instance towards its spec.

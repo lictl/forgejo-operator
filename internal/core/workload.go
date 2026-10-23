@@ -19,6 +19,12 @@ import (
 )
 
 const (
+	portNameSSH  = "ssh"
+	valueTrue    = "true"
+	portNameHTTP = "http"
+)
+
+const (
 	containerName     = "forgejo"
 	dataVolume        = "data"
 	configVolume      = "config"
@@ -65,6 +71,12 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	if err != nil {
 		return forgejo.StepResult{}, err
 	}
+	objectStorageDigest := ""
+	if rc.ObjectStorage != nil && forgejo.ObjectStorageEnabled(f) {
+		if objectStorageDigest, err = podDigest(rc, "object-storage", rc.ObjectStorage.ContentDigest); err != nil {
+			return forgejo.StepResult{}, err
+		}
+	}
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: forgejo.DeploymentName(f), Namespace: f.Namespace}}
 	err = apply(ctx, rc, dep, true, func() error {
 		exists := dep.ResourceVersion != ""
@@ -92,8 +104,8 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 		if servingHostKeys(rc) {
 			annotations[forgejo.AnnotationSSHHostKeys] = rc.SSHHostKeys.Digest
 		}
-		if rc.ObjectStorage != nil && forgejo.ObjectStorageEnabled(f) {
-			annotations[forgejo.AnnotationObjectStorage] = rc.ObjectStorage.Digest
+		if objectStorageDigest != "" {
+			annotations[forgejo.AnnotationObjectStorage] = objectStorageDigest
 		}
 		dep.Spec.Template.ObjectMeta = metav1.ObjectMeta{
 			Labels:      podLabels(rc, f.Spec.PodTemplate.Labels),
@@ -161,7 +173,7 @@ func reportReplicasRequireHA(rc *forgejo.ReconcileContext) {
 	}
 	msg := fmt.Sprintf("spec.replicas=%d requires highAvailability.enabled (shared queues, cache and indexers); running 1 replica", n)
 	setDegraded(rc, ReasonReplicasRequireHA, msg)
-	warnEvery(rc, fmt.Sprintf("replicas-require-ha/%d", n), warnInterval, ReasonReplicasRequireHA, "Scale", "%s", msg)
+	warnEvery(rc, fmt.Sprintf("replicas-require-ha/%d", n), ReasonReplicasRequireHA, "Scale", "%s", msg)
 }
 
 // deploymentStrategy rolls HA instances without downtime, except while a migration must run
@@ -260,9 +272,9 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		{Name: "GITEA_TEMP", Value: l.TmpPath},
 	}
 
-	ports := []corev1.ContainerPort{{Name: "http", ContainerPort: l.HTTPContainerPort, Protocol: corev1.ProtocolTCP}}
+	ports := []corev1.ContainerPort{{Name: portNameHTTP, ContainerPort: l.HTTPContainerPort, Protocol: corev1.ProtocolTCP}}
 	if forgejo.SSHEnabled(f) {
-		ports = append(ports, corev1.ContainerPort{Name: "ssh", ContainerPort: l.SSHContainerPort, Protocol: corev1.ProtocolTCP})
+		ports = append(ports, corev1.ContainerPort{Name: portNameSSH, ContainerPort: l.SSHContainerPort, Protocol: corev1.ProtocolTCP})
 	}
 	healthz := corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 		Path: healthzPath, Port: intstr.FromString("http"), Scheme: corev1.URISchemeHTTP,
@@ -426,7 +438,7 @@ func nonRootSecurityContext(l forgejo.ImageLayout) *corev1.SecurityContext {
 const initPermissionsContainer = "init-permissions"
 
 func fixPermissions(f *forgejov1.Forgejo) bool {
-	return f.Annotations[AnnotationFixPermissions] == "true"
+	return f.Annotations[AnnotationFixPermissions] == valueTrue
 }
 
 // dataDirs are the top-level directories Forgejo writes on the data volume.

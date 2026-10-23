@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -14,7 +15,9 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
+// Certificates are read live (never listed or watched), written with CreateOrUpdate and deleted
+// by deleteOptional.
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;create;update;delete
 
 // Reasons of the TLSReady condition.
 const (
@@ -61,12 +64,13 @@ type referenceGrantTo struct {
 // Secret "<name>-tls") and lets the Gateways of spec.tls.gatewayNamespaces read that Secret
 // (ReferenceGrant "<name>-tls"). Objects the spec no longer asks for are deleted. The
 // Certificate's Ready condition becomes TLSReady. Without the CRDs nothing is created, and
-// TLSReady says so.
+// TLSReady says so. A Certificate or ReferenceGrant of the same name that the instance does
+// not control is left alone (TLSReady=False/NameConflict, see applyOptional).
 func ReconcileTLS(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	name := forgejo.TLSSecretName(f)
 
-	grantProblem, err := reconcileReferenceGrant(ctx, rc)
+	grantReason, grantProblem, err := reconcileReferenceGrant(ctx, rc)
 	if err != nil {
 		return forgejo.StepResult{}, err
 	}
@@ -78,7 +82,7 @@ func ReconcileTLS(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.St
 		namespaces := grantNamespaces(f)
 		switch {
 		case grantProblem != "":
-			setTLSReady(rc, metav1.ConditionFalse, reasonReferenceGrantUnavailable, grantProblem)
+			setTLSReady(rc, metav1.ConditionFalse, grantReason, grantProblem)
 			return forgejo.StepResult{RequeueAfter: notReadyRequeue}, nil
 		case len(namespaces) > 0:
 			setTLSReady(rc, metav1.ConditionTrue, reasonTLSReady, grantMessage(f, namespaces))
@@ -88,7 +92,9 @@ func ReconcileTLS(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.St
 		return forgejo.StepResult{}, nil
 	}
 
-	if !rc.HasAPI(forgejo.CertificateGVK) {
+	if served, err := rc.APIServed(forgejo.CertificateGVK); err != nil {
+		return forgejo.StepResult{}, fmt.Errorf("discovering Certificate: %w", err)
+	} else if !served {
 		setTLSReady(rc, metav1.ConditionFalse, reasonCertManagerUnavailable,
 			"spec.tls.certManager is set, but the cluster does not serve Certificate "+
 				forgejo.CertificateGVK.GroupVersion().String()+": install cert-manager")
@@ -102,6 +108,19 @@ func ReconcileTLS(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.St
 		return forgejo.StepResult{}, nil
 	}
 	cert, err := applyOptional(ctx, rc, forgejo.CertificateGVK, name, certificate(f, dnsNames), nil)
+	if conflict := (*nameConflictError)(nil); errors.As(err, &conflict) {
+		msg := conflict.Error()
+		if c := conflict.controller; c != nil && c.Kind == "Ingress" {
+			msg += ". cert-manager's ingress-shim created it for Ingress " + c.Name + " from a cert-manager.io/issuer or " +
+				"cert-manager.io/cluster-issuer annotation: remove that annotation from spec.ingress.annotations, since " +
+				"spec.tls.certManager requests the certificate"
+		}
+		if grantProblem != "" {
+			msg += "; " + grantProblem
+		}
+		setTLSReady(rc, metav1.ConditionFalse, reasonNameConflict, msg)
+		return forgejo.StepResult{RequeueAfter: notReadyRequeue}, nil
+	}
 	if err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("certificate %s: %w", name, err)
 	}
@@ -109,7 +128,7 @@ func ReconcileTLS(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.St
 	status, reason, msg := certificateCondition(cert, dnsNames)
 	if grantProblem != "" {
 		if status == metav1.ConditionTrue {
-			status, reason, msg = metav1.ConditionFalse, reasonReferenceGrantUnavailable, grantProblem
+			status, reason, msg = metav1.ConditionFalse, grantReason, grantProblem
 		} else {
 			msg += "; " + grantProblem
 		}
@@ -217,25 +236,33 @@ func grantMessage(f *forgejov1.Forgejo, namespaces []string) string {
 }
 
 // reconcileReferenceGrant creates, updates or deletes ReferenceGrant "<name>-tls". It returns
-// a problem to report when the grant is wanted but the cluster has no ReferenceGrant API.
-func reconcileReferenceGrant(ctx context.Context, rc *forgejo.ReconcileContext) (string, error) {
+// a problem to report, with its TLSReady reason, when the grant is wanted but the cluster has
+// no ReferenceGrant API, or another object has its name.
+func reconcileReferenceGrant(ctx context.Context, rc *forgejo.ReconcileContext) (reason, problem string, err error) {
 	f := rc.Instance
 	name := forgejo.TLSSecretName(f)
 	namespaces := grantNamespaces(f)
 	if len(namespaces) == 0 {
-		return "", deleteOptional(ctx, rc, name, forgejo.ReferenceGrantGVKs...)
+		return "", "", deleteOptional(ctx, rc, name, forgejo.ReferenceGrantGVKs...)
 	}
-	gvk, served := rc.FirstAPI(forgejo.ReferenceGrantGVKs...)
+	gvk, served, err := rc.FirstServedAPI(forgejo.ReferenceGrantGVKs...)
+	if err != nil {
+		return "", "", fmt.Errorf("discovering ReferenceGrant: %w", err)
+	}
 	if !served {
-		return "spec.tls.gatewayNamespaces is set, but the cluster does not serve ReferenceGrant (" +
+		return reasonReferenceGrantUnavailable, "spec.tls.gatewayNamespaces is set, but the cluster does not serve ReferenceGrant (" +
 			gvkVersions(forgejo.ReferenceGrantGVKs) + "): install the Gateway API CRDs", nil
 	}
 	spec := referenceGrantSpec{To: []referenceGrantTo{{Group: "", Kind: "Secret", Name: name}}}
 	for _, ns := range namespaces {
 		spec.From = append(spec.From, referenceGrantFrom{Group: forgejo.GatewayAPIGroup, Kind: kindGateway, Namespace: ns})
 	}
-	if _, err := applyOptional(ctx, rc, gvk, name, &spec, nil); err != nil {
-		return "", fmt.Errorf("ReferenceGrant %s: %w", name, err)
+	_, err = applyOptional(ctx, rc, gvk, name, &spec, nil)
+	if conflict := (*nameConflictError)(nil); errors.As(err, &conflict) {
+		return reasonNameConflict, conflict.Error(), nil
 	}
-	return "", nil
+	if err != nil {
+		return "", "", fmt.Errorf("ReferenceGrant %s: %w", name, err)
+	}
+	return "", "", nil
 }

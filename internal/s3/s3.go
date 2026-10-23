@@ -23,6 +23,8 @@ import (
 	"time"
 )
 
+const schemeHTTP = "http"
+
 // emptyPayloadHash is the SHA-256 of an empty body.
 const emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -150,19 +152,29 @@ func IsNotFound(err error) bool { return ReasonOf(err) == ReasonNotFound }
 // connection, timeout); TLS errors are configuration errors and do not count.
 func IsUnreachable(err error) bool { return ReasonOf(err) == ReasonUnreachable }
 
+// The operator only reads small objects (manifests, identity files) and probes buckets
+// itself; backup data moves through rclone Jobs. These bounds keep a stalled endpoint from
+// holding a reconcile worker even when the caller's context has no deadline.
+var (
+	responseHeaderTimeout = 10 * time.Second
+	requestTimeout        = 30 * time.Second
+)
+
 // httpClient talks to the endpoint as configured in b.
 func (b Bucket) httpClient() *http.Client {
 	transport := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		TLSClientConfig:     &tls.Config{RootCAs: b.RootCAs, InsecureSkipVerify: b.InsecureSkipVerify, MinVersion: tls.VersionTLS12}, //nolint:gosec // opt-in for tests
-		TLSHandshakeTimeout: 5 * time.Second,
-		DisableKeepAlives:   true,
+		Proxy:                 http.ProxyFromEnvironment,
+		TLSClientConfig:       &tls.Config{RootCAs: b.RootCAs, InsecureSkipVerify: b.InsecureSkipVerify, MinVersion: tls.VersionTLS12}, //nolint:gosec // opt-in for tests
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		DisableKeepAlives:     true,
 	}
 	if b.DialContext != nil {
 		transport.DialContext = b.DialContext
 	}
 	return &http.Client{
 		Transport: transport,
+		Timeout:   requestTimeout,
 		// A redirect (e.g. Amazon S3's PermanentRedirect to the bucket's region) is the answer.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
@@ -172,7 +184,7 @@ func (b Bucket) httpClient() *http.Client {
 // or virtual-host style ("<bucket>.<host>/<key>"), as minio-go builds it. The path is sent
 // encoded exactly as Sign encodes it.
 func (b Bucket) request(ctx context.Context, method, key string, q url.Values) (*http.Request, error) {
-	if b.Scheme != "http" && b.Scheme != "https" {
+	if b.Scheme != schemeHTTP && b.Scheme != "https" {
 		return nil, fmt.Errorf("unsupported scheme %q", b.Scheme)
 	}
 	host, path := b.Host, "/"+b.Name+"/"+key

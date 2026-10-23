@@ -10,18 +10,23 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/streaming/pkg/httpstream"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 // pods/exec is used only to measure volume usage (df, du) in containers that mount an
 // instance's claims. Kubelet stats (nodes/proxy) are deliberately not used: that permission
 // opens the whole kubelet API of every node, including exec into any pod.
-// +kubebuilder:rbac:groups=core,resources=pods/exec,verbs=get;create
+//
+// It is deliberately not a +kubebuilder:rbac marker, so manager-role does not carry it: it is
+// ClusterRole volume-usage (config/rbac/volume_usage_role.yaml), bound only where volume
+// measurement is wanted (cluster-wide by the kustomize component config/components/volume-usage,
+// or per namespace; see docs/permissions.md). Without it every measurement is refused and
+// StorageHealthy is Unknown/MeasurementUnavailable.
 
 // The manager's cached client cannot exec into pods or read aggregated APIs, so this package
 // keeps an uncached clientset for those calls.

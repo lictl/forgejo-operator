@@ -20,8 +20,11 @@ release is in the table and its release date arrives, the release it replaces be
 been verified with the operator are in the table (`Releases`); releases known from the upstream
 schedule but not verified yet are listed under `Upcoming` and reported as `Future`.
 
-Unsupported versions are **never blocked**. They run, they can be upgraded to, and they are
-reported through a condition, events, a metric and an alert.
+Unsupported versions are **not blocked**: they keep running, they can be upgraded to, and they
+are reported through a condition, events, a metric and an alert. The operator refuses only an
+upgrade that skips more majors than the table allows (`UpgradePathUnsupported`, see
+[Upgrading between majors](#upgrading-between-majors)) and a downgrade (`DowngradeRefused`),
+whatever the support of the versions involved.
 
 New instances get the current LTS release: `spec.image` defaults to
 `codeberg.org/forgejo/forgejo:15`. The API server stores the default when the object is
@@ -35,7 +38,8 @@ As of 2026-10-22 (dates from the upstream
 
 | Major | LTS | Released | Upstream end of life | Operator | Notes |
 |-------|-----|----------|----------------------|----------|-------|
-| 14 and older | | | passed | `EndOfLife` | Upgrade to 15 first (`UpgradePathUnsupported` otherwise) |
+| 11 to 14 | | | passed | `EndOfLife` | Upgrade to 15 first, then to 17 if you want it (`UpgradePathUnsupported` otherwise) |
+| 10 and older | | | passed | `EndOfLife` | Upgrade to 11 first, then to 15: 15 is upgraded to from 11 or newer (`UpgradePathUnsupported` otherwise) |
 | **15** | yes | 2026-04-16 | 2027-07-15 | `Supported`, the default image | Use 15.0.10 or newer: 15.0.8 and 15.0.9 fix critical security issues |
 | 16 | no | 2026-07-16 | 2026-10-29 | `Deprecated`, `EndOfLife` from 2026-10-29 | Upgrade to 17 |
 | **17** | no | 2026-10-15 | 2027-01-28 | `Supported` | Upstream advises against 17.0.0 (pushes and merges can fail, forgejo#14866): use 17.0.1 or newer once it is out |
@@ -55,7 +59,14 @@ Both image flavors are supported: `codeberg.org/forgejo/forgejo:<tag>` and `<tag
 Upstream publishes the tags `N`, `N.0` and `N.0.P` (there is no `latest`). With a floating tag
 (`17`) and the default `imagePullPolicy: IfNotPresent`, a node keeps the patch release it pulled
 first; pin `N.0.P` (or use `imagePullPolicy: Always`) to control patch updates. The operator
-reads the exact patch release from Forgejo's `/api/v1/version` (`status.version`).
+reads the exact patch release from Forgejo's `/api/v1/version` (`status.version`). It probes
+through the Service, so when the nodes of a multi-replica instance hold different patch
+releases, `status.version` alternates between them, and with it an advisory in the
+`VersionSupported` message; the `VersionDetected` and `VersionAdvisory` events are not repeated
+for that (see [Events](#events)). Pinning `N.0.P` or `imagePullPolicy: Always` avoids it. A
+floating tag can also pull a patch release that an advisory names (17.0.0): the condition and
+the `ForgejoVersionAdvisory` alert report it, and the support matrix above names the patch to
+pin.
 
 ## Status
 
@@ -83,7 +94,7 @@ b      Running   16.0.6+gitea-1.22.0   True    1          Deprecated   ...   9d
 
 $ kubectl get fj b -o jsonpath='{.status.conditions[?(@.type=="VersionSupported")].message}'
 Forgejo 16 is outside this operator's support policy (supported: 15 (LTS) and 17) and reaches
-its upstream end of life on 2026-10-29. Upgrade to 17 before 2026-10-29.
+its upstream end of life on 2026-10-29. Upgrade to 17 (17.0.1 or newer) before 2026-10-29.
 ```
 
 ### Events
@@ -91,14 +102,14 @@ its upstream end of life on 2026-10-29. Upgrade to 17 before 2026-10-29.
 | Event | Type | When |
 |-------|------|------|
 | `UnsupportedVersion` | Warning | The classification changes to `Deprecated`, `EndOfLife` or `Future`; also when an upgrade starts towards such a version ("Upgrading to ... anyway") |
-| `VersionAdvisory` | Warning | A supported major runs a patch release with an advisory ("The running patch release 17.0.0 is older than recommended: use 17.0.1 or newer (...)") |
+| `VersionAdvisory` | Warning | A supported major runs a patch release with an advisory ("The running patch release 17.0.0 is older than recommended: use 17.0.1 or newer (...)"). Emitted once per `status.image` and patch release, and repeated at most daily, so that a `status.version` that alternates between nodes does not repeat it |
 | `SupportedVersion` | Normal | The instance is supported again after `Deprecated`, `EndOfLife` or `Future` |
+| `ConfigIncompatible` | Warning | `spec.config` or `configFrom` has values the target major refuses to start with (see [16 → 17](#16--17)). When the upgrade starts, only `spec.config` is checked. Values from `configFrom` are checked once `app.ini` is rendered for the new image, that is during the rollout; this check repeats at most hourly while the values stay |
+| `UpgradePathUnsupported` | Warning | An upgrade skips more majors than the table allows (see [Upgrading between majors](#upgrading-between-majors)) |
 
-Events are emitted when the reason or the message of the condition changes. The message names
-the major only (the patch release appears only in an advisory), so it does not change when
-Forgejo reports its exact version.
-| `ConfigIncompatible` | Warning | `spec.config`/`configFrom` has values the target major refuses to start with (see [16 → 17](#16--17)); at upgrade start and at most hourly while rendering `app.ini` |
-| `UpgradePathUnsupported` | Warning | An upgrade skips more majors than the table allows (see below) |
+Apart from the upgrade start, `UnsupportedVersion`, `VersionAdvisory` and `SupportedVersion`
+are emitted when the reason or the message of the condition changes. The message names the major only (the patch release
+appears only in an advisory), so it does not change when Forgejo reports its exact version.
 
 ### Metrics and alert
 
@@ -106,9 +117,14 @@ Forgejo reports its exact version.
 |--------|--------|---------|
 | `forgejo_operator_version_supported` | `major`, `support` | 1 when `Supported`, else 0; `support` is the reason. One series per instance |
 | `forgejo_operator_version_end_of_life_timestamp_seconds` | `major` | Upstream end of life of the running major (when it is in the table) |
+| `forgejo_operator_version_advisory` | `major` | 1 when the running patch release is older than the one an advisory of the table recommends (`Advisory` in the condition), else 0; absent while the version is unknown |
 
 The per-instance PrometheusRule has **`ForgejoVersionUnsupported`** (warning, for 1h):
-`max by (namespace, name, major, support) (forgejo_operator_version_supported) == 0`.
+`max by (namespace, name, major, support) (forgejo_operator_version_supported) == 0`, and
+**`ForgejoVersionAdvisory`** (warning, for 1h):
+`max by (namespace, name, major) (forgejo_operator_version_advisory) == 1`. A supported major
+that misses critical security fixes (15.0.7) or runs a patch upstream advises against (17.0.0)
+alerts through the latter.
 
 ## Upgrading between majors
 
@@ -117,11 +133,16 @@ The version gate of [upgrades.md](upgrades.md) applies, with two rules from the 
 - **Skipping majors** is allowed when the target's `UpgradeFrom` is at most the running
   major. Forgejo's migrations are cumulative and its upgrade guide says to upgrade straight to
   the latest release; for 15 (LTS) → 17 that is verified (15.0.10 → 17.0.0 migrated, then
-  served pushes and merges). Today 16 and 17 accept upgrades from 15 or newer, and 15 from 11 or
-  newer. An instance on 14 that asks for 17 is refused with `UpgradePathUnsupported` (Degraded,
-  one Warning event, the current image keeps running) and must go to 15 first.
+  served pushes and merges). Today 16, 17 and the upcoming 18 and 19 accept upgrades from 15 or
+  newer, and 15 from 11 or newer. An instance on 14 that asks for 17 is refused with
+  `UpgradePathUnsupported` (Degraded, one Warning event, the current image keeps running) and
+  must go to 15 first; one on 10 or older goes to 11 first, then to 15. Majors older than the
+  table are not restricted among themselves (10 → 11 is allowed).
 - **Majors newer than the table** (`Future`) are allowed, with an `UnsupportedVersion` warning.
-  They run with the traits of the newest verified release.
+  An upcoming major is held to its row's `UpgradeFrom`; a major newer than every row to the
+  newest row's, so that 14 → 20 is refused like 14 → 17. They run with the traits of the
+  newest verified release plus the prepared `app.ini` traits of the upcoming rows up to their
+  major (see [Per-major differences](#per-major-differences)).
 
 Both rules, and the downgrade check, also apply to an instance whose image carries no version
 (a digest or a custom tag): its version is then the one Forgejo reports (`status.version`).
@@ -145,7 +166,9 @@ one migrated. Going back always means restoring the pre-upgrade backup (see
    `[moderation] KEEP_RESOLVED_REPORTS_FOR`; `[service] USER_DELETE_WITH_COMMENTS_MAX_TIME`;
    `[actions]` `ZOMBIE_TASK_TIMEOUT`, `ENDLESS_TASK_TIMEOUT`, `ABANDONED_JOB_TIMEOUT`;
    `[authorized_integration]` `REQUEST_TIMEOUT`, `CACHE_TTL`. The operator's own values are
-   valid.
+   valid. When the upgrade starts it checks `spec.config` only; values from `configFrom` are
+   checked once `app.ini` is rendered for 17, when the rollout has already begun, so check the
+   `configFrom` Secrets yourself before changing the image.
 2. **Unencrypted mirrors are refused on 17** (forgejo#13490): migrations and mirrors over
    `http://` and `git://` need `[migrations] ALLOW_UNENCRYPTED = true`; in-cluster sources also
    need `ALLOW_LOCALNETWORKS = true`.
@@ -203,8 +226,8 @@ Differences between majors are **traits** of a table row (`forgejo.Traits`). Cod
 | Trait | Majors | What the operator does |
 |-------|--------|------------------------|
 | `InternalToken` | 15, 16, 17 | Renders `[security] INTERNAL_TOKEN`. Without it Forgejo 17 and older generate one and try to write it into the read-only `app.ini`, and crash. The token is kept in `<name>-secrets` for every major, so that a rollback finds it |
-| `InternalSocket` | 18 (prepared) | Renders `[server] INTERNAL_LISTENER_PATH = /tmp/forgejo-run/forgejo.sock`: git hooks, the SSH server and `forgejo manager` reach Forgejo 18 over this UNIX socket, and its default (`run/forgejo.sock` under `WORK_PATH`) is on the shared data volume, where the pods of a multi-replica instance would replace each other's socket. `/tmp` is a per-pod emptyDir; Forgejo creates `forgejo-run` itself |
-| `StrictDurations` | 17, 18 | `ConfigIncompatible` warnings (see [16 → 17](#16--17)) |
+| `InternalSocket` | 18 (prepared) and newer, images of unknown version | Renders `[server] INTERNAL_LISTENER_PATH = /tmp/forgejo-run/forgejo.sock`: git hooks, the SSH server and `forgejo manager` reach Forgejo 18 over this UNIX socket, and its default (`run/forgejo.sock` under `WORK_PATH`) is on the shared data volume, where the pods of a multi-replica instance would replace each other's socket. `/tmp` is a per-pod emptyDir; Forgejo creates `forgejo-run` itself |
+| `StrictDurations` | 17 and newer, images of unknown version | `ConfigIncompatible` warnings (see [16 → 17](#16--17)) |
 | `PasswordFromStdin` | 18 (prepared) | The `bootstrap` init container pipes the admin password into `admin user change-password` instead of passing `--password`, so it is not visible in the process list |
 
 The prepared 18 traits were smoke-tested with `codeberg.org/forgejo-experimental/forgejo:18.0-test`
@@ -213,15 +236,30 @@ The prepared 18 traits were smoke-tested with `codeberg.org/forgejo-experimental
 `/tmp/forgejo-run/forgejo.sock`. The union `app.ini` (token and socket) also ran on 17.0.0
 (the socket key is ignored) and on 18 (one error line about the deprecated token).
 
+- **Majors newer than the verified releases** (`Future`: 18 before it is verified, or 21) get
+  the newest verified release's traits plus the `app.ini` traits (`InternalToken`,
+  `InternalSocket`, `StrictDurations`) of every upcoming row up to their major. `app.ini` then
+  carries what both need, so a multi-replica instance on 18 gets its per-pod socket before the
+  operator is updated. CLI traits (`PasswordFromStdin`) stay those of the newest verified
+  release.
 - **Images of unknown version** (digest only, custom tags) get the union of what the verified
-  majors and the majors older than the table need in `app.ini` (each key is ignored, or only
-  logged, by the others) and only CLI features all of them have.
+  majors, the upcoming majors and the majors older than the table need in `app.ini` (each key
+  is ignored, or only logged, by the others) and only CLI features that every verified major
+  and the older majors have. For the `ConfigIncompatible` warning about durations, the version
+  Forgejo reports (`status.version`) decides once the instance runs the image, so a
+  digest-pinned 15 or 16 is not warned about; before that the warning is conditional ("If
+  `<image>` is Forgejo 17 or newer, it refuses to start with ..."). An upgrade from such an
+  image whose version is not known yet counts as one from a lenient major, so its start warns
+  about the values the target refuses.
 - **Majors older than the table** run with fixed legacy traits (`INTERNAL_TOKEN`), whatever
   the oldest row is.
 - **The last known good `app.ini`** (config rollback, see [autopilot.md](autopilot.md)) records
   the profile it was rendered for (`forgejo.lucas.icu/config-profile`: `internal-token`,
   `internal-socket` or both). It is only mounted for an image with the same profile, so an
-  `app.ini` rendered for 18 never reaches a 17 pod.
+  `app.ini` rendered for 18 never reaches a 17 pod. An 18 image that runs as `Future` (both
+  keys) changes profile when 18 is verified (socket only): its last known good `app.ini` no
+  longer matches, and config rollback reports `ConfigRollbackUnavailable` until a new one is
+  recorded.
 - Verified to be the same on 15, 16 and 17 (and on the 18 development branch): the image
   layout (`/app/gitea/gitea`, uid 1000 `git`, root and rootless), the CLI the bootstrap uses
   (`migrate`, `admin user list/create/change-password`), `/api/healthz`, `/api/v1/version`,
@@ -238,8 +276,17 @@ The prepared 18 traits were smoke-tested with `codeberg.org/forgejo-experimental
 `make forgejo-versions` (`go run ./hack/forgejo-versions`) compares the table with upstream and
 needs no credentials: the release schedule JSON, the Codeberg releases API and the container
 registry (anonymous token). It prints the matrix and findings, and exits with 1 when the table
-is stale (a `STALE` line), 2 when upstream cannot be read. `WARN` and `INFO` lines need a look
-but do not fail it. Run it on a schedule.
+is stale (a `STALE` line), and 2 when upstream cannot be read or the arguments are invalid (it
+then prints its usage). `WARN` and `INFO` lines need a look but do not fail it. Through `go run`
+or make the status is not passed on: `go run` exits with 1 and make with 2 whenever the tool
+fails, after printing the tool's `exit status N`. Read that line, or build the tool to get its
+own status:
+
+```sh
+go build -o bin/forgejo-versions ./hack/forgejo-versions && bin/forgejo-versions; echo "exit=$?"
+```
+
+Run it on a schedule.
 
 The procedure below is automated by the Claude Code workflow
 [`.claude/workflows/forgejo-new-version.js`](../.claude/workflows/forgejo-new-version.js) (run the
@@ -275,7 +322,11 @@ Finding: `STALE Forgejo N.0 was released on ... but is not a verified release`.
 
 1. Check the release for an upstream advisory (the tool's `WARN ... advise against`, open
    *release blocker* issues). If the first release is advised against, set an `Advisory`
-   (`FixedIn: 1`) and verify with the fixed patch once it is out.
+   (`FixedIn: 1`) and verify with the fixed patch once it is out. The tool reads the notes of
+   the newest patch of each major sentence by sentence: a sentence that says "advise against"
+   and names that patch's own version is a `WARN` with the `FixedIn` to set; any other such
+   sentence (for example "we no longer advise against 17.0.0" in the 17.0.1 notes) is an
+   `INFO` that quotes it and needs no edit unless reading it says otherwise.
 2. Verify on a cluster with the e2e checklist: fresh installs (root and rootless), the upgrade
    from the current LTS and from the previous release, a refused downgrade, backup and restore.
 3. Move the row from `Upcoming` to `Releases`.

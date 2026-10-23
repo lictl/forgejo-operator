@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +24,8 @@ import (
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
+
+const valueTrue = "true"
 
 // Files written into "<backup-pvc>/<backup-name>/".
 const (
@@ -196,7 +198,7 @@ func HoldsMaintenance(r *forgejov1.ForgejoRestore) bool {
 	return r.Status.Phase == forgejov1.RestorePhaseFailed &&
 		RecordedModification(r) != Unmodified &&
 		r.DeletionTimestamp.IsZero() &&
-		r.Annotations[AnnotationReleaseMaintenance] != "true"
+		r.Annotations[AnnotationReleaseMaintenance] != valueTrue
 }
 
 // BlocksBackups reports whether a restore must finish before a backup of the instance starts.
@@ -216,7 +218,7 @@ func ListBackups(ctx context.Context, c client.Client, namespace, instance strin
 			out = append(out, b)
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return olderThan(&out[i].ObjectMeta, &out[j].ObjectMeta) })
+	slices.SortStableFunc(out, func(a, b forgejov1.ForgejoBackup) int { return compareAge(&a.ObjectMeta, &b.ObjectMeta) })
 	return out, nil
 }
 
@@ -232,15 +234,16 @@ func ListRestores(ctx context.Context, c client.Client, namespace, instance stri
 			out = append(out, r)
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return olderThan(&out[i].ObjectMeta, &out[j].ObjectMeta) })
+	slices.SortStableFunc(out, func(a, b forgejov1.ForgejoRestore) int { return compareAge(&a.ObjectMeta, &b.ObjectMeta) })
 	return out, nil
 }
 
-func olderThan(a, b *metav1.ObjectMeta) bool {
-	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
-		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+// compareAge orders objects oldest first, by creation time and then by name.
+func compareAge(a, b *metav1.ObjectMeta) int {
+	if c := a.CreationTimestamp.Compare(b.CreationTimestamp.Time); c != 0 {
+		return c
 	}
-	return a.Name < b.Name
+	return strings.Compare(a.Name, b.Name)
 }
 
 // DatabaseReady reports whether the instance's database can be dumped or restored. Before

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -23,12 +24,25 @@ import (
 	"github.com/lictl/forgejo-operator/internal/s3"
 )
 
+const (
+	testImage17           = "codeberg.org/forgejo/forgejo:17"
+	testBackupKeySecret   = "fj-backup-key"
+	testOwnSecret         = "mine"
+	testOldName           = "old"
+	testSecretsSecret     = "fj-secrets"
+	testSSHHostKeysSecret = "fj-ssh-host-keys"
+	testRemotePath        = "dr/old/b1"
+	testRemoteLocation    = "s3://backups/team/dr/old/b1/"
+	testDataPVC           = "fj-data"
+	testScheduledBackup   = "fj-scheduled-1"
+)
+
 const remoteNS = "dr"
 
 func remoteInstance(store *FakeS3) *forgejov1.Forgejo {
 	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: remoteNS, UID: "fj-uid"}}
-	f.Spec.Image = "codeberg.org/forgejo/forgejo:17"
-	conn := forgejov1.S3Connection{Endpoint: "http://garage:3900", Bucket: FakeBucket, CredentialsSecret: forgejov1.S3CredentialsSecretRef{Name: "creds"}}
+	f.Spec.Image = testImage17
+	conn := forgejov1.S3Connection{Endpoint: "http://garage:3900", Bucket: FakeBucket, CredentialsSecret: forgejov1.S3CredentialsSecretRef{Name: testCredsSecret}}
 	if store != nil {
 		conn = store.FakeConnection("team")
 	}
@@ -46,19 +60,19 @@ func secretObjects(secrets []*corev1.Secret) []client.Object {
 
 func TestRemoteNamesAndKeys(t *testing.T) {
 	f := remoteInstance(nil)
-	if got := BackupKeyRef(f); got.Name != "fj-backup-key" || got.Key != "key" {
+	if got := BackupKeyRef(f); got.Name != testBackupKeySecret || got.Key != testKeyField {
 		t.Errorf("default key: %+v", got)
 	}
-	f.Spec.Backup.Remote.Encryption.KeySecret = &forgejov1.BackupKeySecretRef{Name: "mine"}
-	if got := BackupKeyRef(f); got.Name != "mine" || got.Key != "key" {
+	f.Spec.Backup.Remote.Encryption.KeySecret = &forgejov1.BackupKeySecretRef{Name: testOwnSecret}
+	if got := BackupKeyRef(f); got.Name != testOwnSecret || got.Key != testKeyField {
 		t.Errorf("own key: %+v", got)
 	}
 	src := &forgejov1.RemoteBackupSource{Path: "a/b/c"}
-	if got := SourceKeyRef(f, src); got.Name != "mine" {
+	if got := SourceKeyRef(f, src); got.Name != testOwnSecret {
 		t.Errorf("source without a key uses the instance's: %+v", got)
 	}
-	src.KeySecret = &forgejov1.BackupKeySecretRef{Name: "old", Key: "k"}
-	if got := SourceKeyRef(f, src); got.Name != "old" || got.Key != "k" {
+	src.KeySecret = &forgejov1.BackupKeySecretRef{Name: testOldName, Key: "k"}
+	if got := SourceKeyRef(f, src); got.Name != testOldName || got.Key != "k" {
 		t.Errorf("source key: %+v", got)
 	}
 	b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: "nightly", Namespace: "prod", UID: "0F8E2C4A-91B2-4c3d-8e5f-0123456789ab"}}
@@ -86,7 +100,7 @@ func TestRemoteNamesAndKeys(t *testing.T) {
 // operator reads back.
 func TestManifestHeadCompletesToValidManifest(t *testing.T) {
 	head, err := ManifestHead(RemoteManifest{Backup: "b1", Namespace: "ns", Forgejo: "fj", Reason: forgejov1.BackupReasonScheduled,
-		ForgejoImage: "codeberg.org/forgejo/forgejo:17", IncludesData: true, CompletedAt: "2026-10-22T03:00:00Z", KeyFingerprint: "abc"})
+		ForgejoImage: testImage17, IncludesData: true, CompletedAt: "2026-10-22T03:00:00Z", KeyFingerprint: "abc"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +144,7 @@ func TestStoreReadsAndDeletesRemoteBackups(t *testing.T) {
 	ctx := context.Background()
 	at := time.Now().Add(-time.Hour)
 	store.PutBackup(t, "team/", "dr/fj/b1", RemoteManifest{Backup: "b1", Namespace: "dr", Forgejo: "fj", Reason: forgejov1.BackupReasonManual},
-		map[string][]byte{"db.dump": []byte("PGDMP..."), "identity.json": FakeIdentity(t, "the-secret-key")}, at)
+		map[string][]byte{DBDumpFile: []byte("PGDMP..."), IdentityFile: FakeIdentity(t, "the-secret-key")}, at)
 	store.Put("team/dr/fj/partial/db.dump.bin", []byte("x"), at)
 
 	st, err := OpenStore(ctx, c, remoteNS, &f.Spec.Backup.Remote.S3, BackupKeyRef(f))
@@ -235,7 +249,7 @@ func remoteJobFixture(t *testing.T) (*forgejov1.Forgejo, *forgejov1.ForgejoBacku
 	b := completedBackup(t, "b1")
 	target := RemoteTarget{Conn: &f.Spec.Backup.Remote.S3, Key: BackupKeyRef(f), Image: RcloneImage(f), Path: BackupRemotePath(b)}
 	in := JobInput{Scheme: testScheme(t), Instance: f, InstanceName: f.Name, ForgejoImage: f.Spec.Image, PostgresImage: forgejov1.DefaultPostgresImage,
-		DB: &forgejo.DBConnection{Host: "db", Port: 5432, Name: "forgejo", SecretName: "fj-db-app", UsernameKey: "username", PasswordKey: "password"}}
+		DB: &forgejo.DBConnection{Host: "db", Port: 5432, Name: "forgejo", SecretName: "fj-db-app", UsernameKey: "username", PasswordKey: testPasswordField}}
 	return f, b, target, in
 }
 
@@ -259,7 +273,7 @@ func TestUploadJobKeepsSecretsOutOfThePodSpec(t *testing.T) {
 		t.Fatalf("containers %+v", pod.Containers)
 	}
 	env := envOf(pod.Containers[0])
-	for name, secret := range map[string]string{"AWS_ACCESS_KEY_ID": "creds", "AWS_SECRET_ACCESS_KEY": "creds", "BACKUP_KEY": "fj-backup-key"} {
+	for name, secret := range map[string]string{envAWSAccessKeyID: testCredsSecret, envAWSSecretAccessKey: testCredsSecret, "BACKUP_KEY": testBackupKeySecret} {
 		e := env[name]
 		if e.Value != "" || e.ValueFrom == nil || e.ValueFrom.SecretKeyRef == nil || e.ValueFrom.SecretKeyRef.Name != secret {
 			t.Errorf("%s is not a reference to Secret %s: %+v", name, secret, e)
@@ -268,7 +282,7 @@ func TestUploadJobKeepsSecretsOutOfThePodSpec(t *testing.T) {
 	for name, want := range map[string]string{
 		"RCLONE_CONFIG_ENC_REMOTE":              "s3:" + FakeBucket + "/team",
 		"RCLONE_CONFIG_ENC_FILENAME_ENCRYPTION": "off",
-		"RCLONE_CONFIG_S3_ENV_AUTH":             "true",
+		"RCLONE_CONFIG_S3_ENV_AUTH":             valueTrue,
 		"RCLONE_CONFIG_S3_REGION":               "us-east-1",
 		"REMOTE_PATH":                           "regression/fb/b1",
 		"RCLONE_CA_CERT":                        remoteCAMount + "/ca.crt",
@@ -337,7 +351,7 @@ func completedBackup(t *testing.T, name string) *forgejov1.ForgejoBackup {
 	b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
 	b.Spec.ForgejoRef.Name = "fb"
 	b.Status.Phase = forgejov1.BackupPhaseCompleted
-	b.Status.PVCName = "fb-backups"
+	b.Status.PVCName = testBackupsPVC
 	b.Status.IncludesData = true
 	return b
 }
@@ -348,11 +362,11 @@ func TestBuildIdentity(t *testing.T) {
 	f := remoteInstance(nil)
 	f.Annotations = map[string]string{corev1.LastAppliedConfigAnnotation: "{...}", "team": "a"}
 	objs := []client.Object{
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fj-secrets", Namespace: remoteNS}, Data: map[string][]byte{"secret-key": []byte("k")}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fj-admin", Namespace: remoteNS}, Data: map[string][]byte{"password": []byte("pw")}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fj-ssh-host-keys", Namespace: remoteNS,
-			Annotations: map[string]string{forgejo.AnnotationSSHHostKeysSource: "Generated", "other": "x"}},
-			Data: map[string][]byte{"ssh_host_ed25519_key": []byte("key")}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsSecret, Namespace: remoteNS}, Data: map[string][]byte{testSecretKeyField: []byte("k")}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fj-admin", Namespace: remoteNS}, Data: map[string][]byte{testPasswordField: []byte("pw")}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSSHHostKeysSecret, Namespace: remoteNS,
+			Annotations: map[string]string{forgejo.AnnotationSSHHostKeysSource: keySourceGenerated, "other": "x"}},
+			Data: map[string][]byte{testHostKeyFile: []byte("key")}},
 	}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).Build()
 	id, err := BuildIdentity(context.Background(), c, f)
@@ -360,7 +374,7 @@ func TestBuildIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(id.Secrets) != 3 || id.Secret(IdentityRoleSSHHostKeys).Annotations["other"] != "" ||
-		id.Secret(IdentityRoleSSHHostKeys).Annotations[forgejo.AnnotationSSHHostKeysSource] != "Generated" {
+		id.Secret(IdentityRoleSSHHostKeys).Annotations[forgejo.AnnotationSSHHostKeysSource] != keySourceGenerated {
 		t.Errorf("secrets %+v", id.Secrets)
 	}
 	if _, ok := id.Instance.Metadata.Annotations[corev1.LastAppliedConfigAnnotation]; ok || id.Instance.Metadata.Annotations["team"] != "a" {
@@ -381,16 +395,16 @@ func TestBuildIdentity(t *testing.T) {
 // restoreFromInstance is a new instance created from the backup at "dr/old/b1".
 func restoreFromInstance(store *FakeS3) *forgejov1.Forgejo {
 	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: remoteNS, UID: "fj-uid"}}
-	f.Spec.Image = "codeberg.org/forgejo/forgejo:17"
-	f.Spec.RestoreFrom = &forgejov1.RestoreFromSpec{Remote: forgejov1.RemoteBackupSource{S3: store.FakeConnection("team"), Path: "dr/old/b1"}}
+	f.Spec.Image = testImage17
+	f.Spec.RestoreFrom = &forgejov1.RestoreFromSpec{Remote: forgejov1.RemoteBackupSource{S3: store.FakeConnection("team"), Path: testRemotePath}}
 	return f
 }
 
 func putOldBackup(t *testing.T, store *FakeS3) {
 	t.Helper()
-	store.PutBackup(t, "team/", "dr/old/b1", RemoteManifest{Backup: "b1", Namespace: "dr", Forgejo: "old", Reason: forgejov1.BackupReasonScheduled,
-		ForgejoImage: "codeberg.org/forgejo/forgejo:17"},
-		map[string][]byte{"db.dump": []byte("PGDMP"), "identity.json": FakeIdentity(t, "old-secret-key")}, time.Now())
+	store.PutBackup(t, "team/", "dr/old/b1", RemoteManifest{Backup: "b1", Namespace: "dr", Forgejo: testOldName, Reason: forgejov1.BackupReasonScheduled,
+		ForgejoImage: testImage17},
+		map[string][]byte{DBDumpFile: []byte("PGDMP"), IdentityFile: FakeIdentity(t, "old-secret-key")}, time.Now())
 }
 
 func TestReconcileRestoreIdentity(t *testing.T) {
@@ -419,10 +433,10 @@ func TestReconcileRestoreIdentity(t *testing.T) {
 	}
 	st := f.Status.RestoredFrom
 	if st.Phase != forgejov1.RestoredFromRestoringData || st.IdentityRestoredTime == nil || st.BackupName != "b1" ||
-		st.Location != "s3://backups/team/dr/old/b1/" {
+		st.Location != testRemoteLocation {
 		t.Errorf("status %+v", st)
 	}
-	for name, key := range map[string]string{"fj-secrets": "secret-key", "fj-admin": "password", "fj-ssh-host-keys": "ssh_host_ed25519_key"} {
+	for name, key := range map[string]string{testSecretsSecret: testSecretKeyField, "fj-admin": testPasswordField, testSSHHostKeysSecret: testHostKeyFile} {
 		sec := &corev1.Secret{}
 		if err := c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: name}, sec); err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -432,8 +446,8 @@ func TestReconcileRestoreIdentity(t *testing.T) {
 		}
 	}
 	keys := &corev1.Secret{}
-	_ = c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: "fj-ssh-host-keys"}, keys)
-	if keys.Annotations[forgejo.AnnotationSSHHostKeysSource] != "Generated" {
+	_ = c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: testSSHHostKeysSecret}, keys)
+	if keys.Annotations[forgejo.AnnotationSSHHostKeysSource] != keySourceGenerated {
 		t.Errorf("host keys annotations %v", keys.Annotations)
 	}
 	// Done once: later passes do not read the backup again.
@@ -443,14 +457,98 @@ func TestReconcileRestoreIdentity(t *testing.T) {
 	}
 }
 
+// An unreachable or failing bucket is read again only after a backoff (30 s doubling to 5 min),
+// so a hung endpoint does not hold the Forgejo controller's worker on every pass.
+func TestRestoreIdentityBacksOffTransientFailures(t *testing.T) {
+	store := NewFakeS3(t)
+	putOldBackup(t, store)
+	s := testScheme(t)
+	ctx := context.Background()
+	f := restoreFromInstance(store)
+	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
+	t.Cleanup(func() { ForgetRemote(f.Namespace, f.Name) })
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(secretObjects(FakeSecrets(remoteNS, "fj-backup-key"))...).Build()
+	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
+
+	store.Down = true
+	res, err := ReconcileRestoreIdentity(ctx, rc)
+	if err != nil || !res.Stop || res.RequeueAfter != bootstrapRetry {
+		t.Fatalf("first failure: %+v %v", res, err)
+	}
+	msg, reads := f.Status.RestoredFrom.Message, store.RequestCount()
+	if reads == 0 || !strings.Contains(msg, "Cannot read the backup") {
+		t.Fatalf("reads %d, message %q", reads, msg)
+	}
+	// Within the backoff nothing is read, and the step reports the failure unchanged.
+	res, err = ReconcileRestoreIdentity(ctx, rc)
+	if err != nil || !res.Stop || res.RequeueAfter <= 0 || res.RequeueAfter > bootstrapRetry ||
+		store.RequestCount() != reads || f.Status.RestoredFrom.Message != msg {
+		t.Fatalf("within the backoff: %+v %v, %d reads, %q", res, err, store.RequestCount()-reads, f.Status.RestoredFrom.Message)
+	}
+	if cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionRestoredFromBackup); cond == nil ||
+		cond.Reason != "RemoteBackupUnavailable" || cond.Message != msg {
+		t.Errorf("condition %+v", cond)
+	}
+	// Once it runs out the bucket is read again, and the backoff doubles up to 5 min.
+	want := []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, identityRetryMax, identityRetryMax}
+	for _, backoff := range want {
+		expireIdentityBackoff(t, key)
+		res, err = ReconcileRestoreIdentity(ctx, rc)
+		if err != nil || !res.Stop || res.RequeueAfter != backoff || store.RequestCount() == reads {
+			t.Fatalf("after the backoff: %+v %v, want requeue %s", res, err, backoff)
+		}
+		reads = store.RequestCount()
+	}
+	// Another source is read at once.
+	f.Spec.RestoreFrom.Remote.Path = "dr/old/b2"
+	if res, err = ReconcileRestoreIdentity(ctx, rc); err != nil || !res.Stop || res.RequeueAfter != bootstrapRetry || store.RequestCount() == reads {
+		t.Fatalf("changed source: %+v %v", res, err)
+	}
+	// A success forgets the failure.
+	f.Spec.RestoreFrom.Remote.Path = testRemotePath
+	store.Down = false
+	if res, err = ReconcileRestoreIdentity(ctx, rc); err != nil || res.Stop {
+		t.Fatalf("restore: %+v %v (%s)", res, err, f.Status.RestoredFrom.Message)
+	}
+	if _, ok := identityReadFailures.Load(key); ok {
+		t.Error("the failure is still recorded after a success")
+	}
+
+	checkConfigurationErrorIsNotBackedOff(t, store, key)
+}
+
+// expireIdentityBackoff lets the recorded identity read failure of key retry at once.
+func expireIdentityBackoff(t *testing.T, key types.NamespacedName) {
+	t.Helper()
+	v, ok := identityReadFailures.Load(key)
+	if !ok {
+		t.Fatal("no failure recorded")
+	}
+	v.(*identityReadFailure).retryAt = time.Now().Add(-time.Second)
+}
+
+// Failures that do not go away by themselves (here a missing key Secret) are not backed off.
+func checkConfigurationErrorIsNotBackedOff(t *testing.T, store *FakeS3, key types.NamespacedName) {
+	t.Helper()
+	s := testScheme(t)
+	f := restoreFromInstance(store)
+	rc := &forgejo.ReconcileContext{Client: fake.NewClientBuilder().WithScheme(s).Build(), Scheme: s, Instance: f}
+	if res, err := ReconcileRestoreIdentity(context.Background(), rc); err != nil || !res.Stop {
+		t.Fatalf("missing key: %+v %v", res, err)
+	}
+	if _, ok := identityReadFailures.Load(key); ok {
+		t.Error("a configuration error was backed off")
+	}
+}
+
 func TestRestoreIdentityNeverOverwritesSecrets(t *testing.T) {
 	store := NewFakeS3(t)
 	putOldBackup(t, store)
 	s := testScheme(t)
 	ctx := context.Background()
 	f := restoreFromInstance(store)
-	same := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fj-secrets", Namespace: remoteNS},
-		Data: map[string][]byte{"secret-key": []byte("old-secret-key"), "internal-token": []byte("tok"), "extra": []byte("x")}}
+	same := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsSecret, Namespace: remoteNS},
+		Data: map[string][]byte{testSecretKeyField: []byte("old-secret-key"), "internal-token": []byte("tok"), "extra": []byte("x")}}
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(append(secretObjects(FakeSecrets(remoteNS, "fj-backup-key")), same)...).Build()
 	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
 	if res, err := ReconcileRestoreIdentity(ctx, rc); err != nil || res.Stop {
@@ -468,7 +566,7 @@ func TestRestoreIdentityNeverOverwritesSecrets(t *testing.T) {
 		t.Fatalf("conflict: %+v %v %+v", res, err, f.Status.RestoredFrom)
 	}
 	got := &corev1.Secret{}
-	_ = c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: "fj-secrets"}, got)
+	_ = c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: testSecretsSecret}, got)
 	if string(got.Data["secret-key"]) != "a new key" {
 		t.Error("the existing Secret was overwritten")
 	}
@@ -501,8 +599,8 @@ func TestMaintenanceHoldsUntilBootstrapRestored(t *testing.T) {
 			}
 			var objs []client.Object
 			if tc.marked {
-				objs = append(objs, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fj-secrets", Namespace: remoteNS,
-					Annotations: map[string]string{forgejo.AnnotationRestoredFrom: "s3://backups/team/dr/old/b1/"}}})
+				objs = append(objs, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsSecret, Namespace: remoteNS,
+					Annotations: map[string]string{forgejo.AnnotationRestoredFrom: testRemoteLocation}}})
 			}
 			if tc.phase != "" {
 				r := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: BootstrapRestoreName(f), Namespace: remoteNS}}
@@ -528,8 +626,8 @@ func TestReconcileBootstrapCreatesAndFollowsTheRestore(t *testing.T) {
 	ctx := context.Background()
 	f := restoreFromInstance(store)
 	f.Status.RestoredFrom = &forgejov1.RestoredFromStatus{Phase: forgejov1.RestoredFromRestoringData, IdentityRestoredTime: &metav1.Time{Time: time.Now()},
-		Location: "s3://backups/team/dr/old/b1/", BackupName: "b1"}
-	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fj-secrets", Namespace: remoteNS}}
+		Location: testRemoteLocation, BackupName: "b1"}
+	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsSecret, Namespace: remoteNS}}
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, secrets).Build()
 	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
 
@@ -549,7 +647,7 @@ func TestReconcileBootstrapCreatesAndFollowsTheRestore(t *testing.T) {
 	if err := c.Get(ctx, key, rs); err != nil {
 		t.Fatal(err)
 	}
-	if rs.Spec.Remote == nil || rs.Spec.Remote.Path != "dr/old/b1" || rs.Spec.Remote.KeySecret == nil || rs.Spec.Remote.KeySecret.Name != "fj-backup-key" ||
+	if rs.Spec.Remote == nil || rs.Spec.Remote.Path != testRemotePath || rs.Spec.Remote.KeySecret == nil || rs.Spec.Remote.KeySecret.Name != testBackupKeySecret ||
 		!metav1.IsControlledBy(rs, f) || rs.Spec.BackupName != "" {
 		t.Errorf("restore %+v", rs)
 	}
@@ -573,8 +671,8 @@ func TestReconcileBootstrapCreatesAndFollowsTheRestore(t *testing.T) {
 		!meta.IsStatusConditionTrue(f.Status.Conditions, forgejov1.ConditionRestoredFromBackup) || Bootstrapping(f) {
 		t.Errorf("completed: %+v", f.Status.RestoredFrom)
 	}
-	_ = c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: "fj-secrets"}, secrets)
-	if secrets.Annotations[forgejo.AnnotationRestoredFrom] != "s3://backups/team/dr/old/b1/" {
+	_ = c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: testSecretsSecret}, secrets)
+	if secrets.Annotations[forgejo.AnnotationRestoredFrom] != testRemoteLocation {
 		t.Errorf("restore not recorded on the Secret: %v", secrets.Annotations)
 	}
 }
@@ -586,10 +684,10 @@ func TestBootstrapNeverRestoresOverLiveData(t *testing.T) {
 	store := NewFakeS3(t)
 	s := testScheme(t)
 	ctx := context.Background()
-	where := "s3://backups/team/dr/old/b1/"
+	where := testRemoteLocation
 	created := metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second))
 	marked := func(loc string) *corev1.Secret {
-		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fj-secrets", Namespace: remoteNS,
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsSecret, Namespace: remoteNS,
 			Annotations: map[string]string{forgejo.AnnotationRestoredFrom: loc}}}
 	}
 	restoring := func() *forgejov1.Forgejo {
@@ -643,16 +741,16 @@ func TestBootstrapNeverRestoresOverLiveData(t *testing.T) {
 	}{
 		{name: "restored from another backup", objs: []client.Object{marked("s3://backups/team/dr/old/b0/")}, want: "was restored from s3://backups/team/dr/old/b0/"},
 		{name: "data volume older than the instance", objs: []client.Object{&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
-			Name: "fj-data", Namespace: remoteNS, CreationTimestamp: metav1.NewTime(created.Add(-time.Hour))}}}, want: "PVC fj-data"},
+			Name: testDataPVC, Namespace: remoteNS, CreationTimestamp: metav1.NewTime(created.Add(-time.Hour))}}}, want: "PVC fj-data"},
 		{name: "overwrite allowed", objs: []client.Object{&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
-			Name: "fj-data", Namespace: remoteNS, CreationTimestamp: metav1.NewTime(created.Add(-time.Hour))}}}, overwrite: true},
+			Name: testDataPVC, Namespace: remoteNS, CreationTimestamp: metav1.NewTime(created.Add(-time.Hour))}}}, overwrite: true},
 		{name: "fresh volume", objs: []client.Object{&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
-			Name: "fj-data", Namespace: remoteNS, CreationTimestamp: metav1.NewTime(created.Add(time.Second))}}}},
+			Name: testDataPVC, Namespace: remoteNS, CreationTimestamp: metav1.NewTime(created.Add(time.Second))}}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := restoring()
 			if tc.overwrite {
-				f.Annotations = map[string]string{forgejo.AnnotationRestoreFromOverwrite: "true"}
+				f.Annotations = map[string]string{forgejo.AnnotationRestoreFromOverwrite: valueTrue}
 			}
 			c := fake.NewClientBuilder().WithScheme(s).WithObjects(append(tc.objs, f)...).Build()
 			rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f, DatabaseReady: true}
@@ -680,6 +778,62 @@ func TestBootstrapNeverRestoresOverLiveData(t *testing.T) {
 	}
 }
 
+// Remote retention protects what restores read whatever the endpoint is called (bucket and
+// prefix decide), and the spec.restoreFrom source of every bootstrapping instance in the
+// cluster, also before its ForgejoRestore exists.
+func TestProtectedRemoteDirs(t *testing.T) {
+	s := testScheme(t)
+	ctx := context.Background()
+	f := remoteInstance(nil) // endpoint http://garage:3900, prefix ""
+	source := func(endpoint, prefix, path string) forgejov1.RemoteBackupSource {
+		c := f.Spec.Backup.Remote.S3
+		c.Endpoint, c.Prefix = endpoint, prefix
+		return forgejov1.RemoteBackupSource{S3: c, Path: path}
+	}
+	restore := func(name string, src forgejov1.RemoteBackupSource, phase forgejov1.RestorePhase) *forgejov1.ForgejoRestore {
+		r := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "elsewhere"}}
+		r.Spec.Remote = &src
+		r.Status.Phase = phase
+		return r
+	}
+	bootstrapping := func(namespace, name string, src forgejov1.RemoteBackupSource, phase forgejov1.RestoredFromPhase) *forgejov1.Forgejo {
+		o := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
+		o.Spec.RestoreFrom = &forgejov1.RestoreFromSpec{Remote: src}
+		if phase != "" {
+			o.Status.RestoredFrom = &forgejov1.RestoredFromStatus{Phase: phase}
+		}
+		return o
+	}
+	objs := []client.Object{
+		restore("case", source("http://GARAGE:3900/", "", "dr/fj/b-case"), forgejov1.RestorePhaseRestoring),
+		restore("port", source("http://garage.dr.svc:3900", "", "dr/fj/b-port/"), forgejov1.RestorePhaseScalingDown),
+		restore("default-port", source("http://garage", "", "dr/fj/b-default-port"), forgejov1.RestorePhasePending),
+		restore("done", source("http://garage:3900", "", "dr/fj/b-done"), forgejov1.RestorePhaseCompleted),
+		restore("other-prefix", source("http://garage:3900", "team", "dr/fj/b-prefix"), forgejov1.RestorePhaseRestoring),
+		restore("other-instance", source("http://garage:3900", "", "dr/other/b-other"), forgejov1.RestorePhaseRestoring),
+		// A DR instance in another namespace that restores its identity or waits for its
+		// database: no ForgejoRestore yet.
+		bootstrapping("recovery", "fj", source("https://Garage.dr.svc.cluster.local:443", "", "dr/fj/b-dr"), forgejov1.RestoredFromRestoringIdentity),
+		bootstrapping("waiting", "fj", source("http://garage:3900", "", "dr/fj/b-dr-new"), ""),
+		bootstrapping("finished", "fj", source("http://garage:3900", "", "dr/fj/b-dr-done"), forgejov1.RestoredFromCompleted),
+	}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
+	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
+	got, err := protectedRemoteDirs(ctx, rc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirs := make([]string, 0, len(got))
+	for d := range got {
+		dirs = append(dirs, d)
+	}
+	slices.Sort(dirs)
+	want := []string{"b-case", "b-default-port", "b-dr", "b-dr-new", "b-port"}
+	if !slices.Equal(dirs, want) {
+		t.Errorf("protected %v, want %v", dirs, want)
+	}
+}
+
 func TestRemoteRetentionPrunesOnlyScheduledBackups(t *testing.T) {
 	store := NewFakeS3(t)
 	s := testScheme(t)
@@ -687,7 +841,7 @@ func TestRemoteRetentionPrunesOnlyScheduledBackups(t *testing.T) {
 	f := remoteInstance(store)
 	f.Spec.Backup.Enabled, f.Spec.Backup.Retention = true, 2
 	day := func(d int) time.Time { return time.Date(2026, 10, d, 3, 0, 0, 0, time.UTC) }
-	files := map[string][]byte{"db.dump": []byte("PGDMP"), "identity.json": FakeIdentity(t, "k")}
+	files := map[string][]byte{DBDumpFile: []byte("PGDMP"), IdentityFile: FakeIdentity(t, "k")}
 	putBy := func(uid, name string, reason forgejov1.BackupReason, d int) {
 		store.PutBackup(t, "team/", "dr/fj/"+name, RemoteManifest{Backup: name, Namespace: remoteNS, Forgejo: "fj", ForgejoUID: uid,
 			Reason: reason, CompletedAt: day(d).Format(time.RFC3339)}, files, day(d))
@@ -705,7 +859,7 @@ func TestRemoteRetentionPrunesOnlyScheduledBackups(t *testing.T) {
 	store.Put("team/dr/fj/broken/db.dump.bin", []byte("x"), time.Now().Add(-48*time.Hour))
 	store.Put("team/dr/fj/uploading/db.dump.bin", []byte("x"), time.Now().Add(-time.Hour))
 	// Another instance's backups are not this instance's to prune.
-	store.PutBackup(t, "team/", "dr/other/fj-scheduled-1", RemoteManifest{Backup: "fj-scheduled-1", Namespace: remoteNS, Forgejo: "other",
+	store.PutBackup(t, "team/", "dr/other/fj-scheduled-1", RemoteManifest{Backup: testScheduledBackup, Namespace: remoteNS, Forgejo: "other",
 		Reason: forgejov1.BackupReasonScheduled}, files, day(1))
 	// Neither are those of an instance of the same namespace and name in another cluster (a
 	// disaster recovery drill), however old, ...
@@ -771,11 +925,11 @@ func TestBackupHealthReportsUploads(t *testing.T) {
 		reason string
 		inMsg  string
 	}{
-		{forgejov1.RemoteBackupUploaded, metav1.ConditionTrue, "BackupSucceeded", "uploaded to s3://"},
-		{forgejov1.RemoteBackupUploading, metav1.ConditionTrue, "BackupSucceeded", "uploading to s3://"},
+		{forgejov1.RemoteBackupUploaded, metav1.ConditionTrue, testReasonBackupSucceeded, "uploaded to s3://"},
+		{forgejov1.RemoteBackupUploading, metav1.ConditionTrue, testReasonBackupSucceeded, "uploading to s3://"},
 		{forgejov1.RemoteBackupFailed, metav1.ConditionFalse, "UploadFailed", "but its upload to s3://backups/x/ failed: denied"},
 	} {
-		b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: "fj-scheduled-1"}}
+		b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: testScheduledBackup}}
 		b.Spec.Reason = forgejov1.BackupReasonScheduled
 		b.Status.Phase = forgejov1.BackupPhaseCompleted
 		b.Status.CompletionTime = &metav1.Time{Time: done}
@@ -799,12 +953,12 @@ func TestBackupKeyProblemsAreReported(t *testing.T) {
 	sched, _ := cron.ParseStandard("0 3 * * *")
 	creds := FakeSecrets(remoteNS, "fj-backup-key")
 	generated := creds[1].DeepCopy()
-	generated.Annotations = map[string]string{forgejo.AnnotationBackupKey: "Generated"}
+	generated.Annotations = map[string]string{forgejo.AnnotationBackupKey: keySourceGenerated}
 	exported := generated.DeepCopy()
-	exported.Annotations[forgejo.AnnotationBackupKeyExported] = "true"
+	exported.Annotations[forgejo.AnnotationBackupKeyExported] = valueTrue
 	own := creds[1].DeepCopy() // created by the user, e.g. restored from the offline copy
 
-	ok := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: "fj-scheduled-1"}}
+	ok := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: testScheduledBackup}}
 	ok.Spec.Reason = forgejov1.BackupReasonScheduled
 	ok.Status.Phase = forgejov1.BackupPhaseCompleted
 	ok.Status.CompletionTime = &metav1.Time{Time: time.Now().Add(-time.Hour)}
@@ -820,8 +974,8 @@ func TestBackupKeyProblemsAreReported(t *testing.T) {
 		inMsg       string
 	}{
 		{name: "generated, not exported", key: generated, latest: ok, reason: "BackupKeyNotExported", inMsg: "backup-key-exported=true"},
-		{name: "generated and exported", key: exported, latest: ok, reason: "BackupSucceeded"},
-		{name: "the user's own key", key: own, latest: ok, reason: "BackupSucceeded"},
+		{name: "generated and exported", key: exported, latest: ok, reason: testReasonBackupSucceeded},
+		{name: "the user's own key", key: own, latest: ok, reason: testReasonBackupSucceeded},
 		{name: "missing, fingerprint known", fingerprint: "0123456789abcdef", latest: ok, reason: "BackupKeyMissing",
 			inMsg: "backup-key-lost=0123456789abcdef"},
 		{name: "a failed backup says more", key: generated, latest: failed, reason: "BackupFailed"},
@@ -830,7 +984,7 @@ func TestBackupKeyProblemsAreReported(t *testing.T) {
 			f := remoteInstance(nil)
 			f.Spec.Backup.Enabled = true
 			if tc.fingerprint != "" {
-				f.Status.Backup = &forgejov1.BackupStatusSummary{Remote: &forgejov1.RemoteBackupSummary{KeySecretName: "fj-backup-key",
+				f.Status.Backup = &forgejov1.BackupStatusSummary{Remote: &forgejov1.RemoteBackupSummary{KeySecretName: testBackupKeySecret,
 					KeyFingerprint: tc.fingerprint}}
 			}
 			objs := []client.Object{creds[0]}

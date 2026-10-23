@@ -25,6 +25,15 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const (
+	testPodDB1          = "db-1"
+	testDomain          = "git.example.com"
+	testConfigSecret    = "fj-config"
+	testPhaseNewReplica = "Creating a new replica"
+	testPodDB2          = "db-2"
+	testClusterPodDB1   = "fj-db-1"
+)
+
 func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -54,7 +63,7 @@ func testContext(t *testing.T, f *forgejov1.Forgejo, objs ...client.Object) *for
 func TestReconcileIngressKeepsAdmissionClass(t *testing.T) {
 	ctx := context.Background()
 	f := testInstance()
-	f.Spec.Ingress = &forgejov1.IngressSpec{Enabled: true, Host: "git.example.com"}
+	f.Spec.Ingress = &forgejov1.IngressSpec{Enabled: true, Host: testDomain}
 	// As created by the API server's DefaultIngressClass admission plugin.
 	existing := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{Name: forgejo.IngressName(f), Namespace: f.Namespace},
@@ -77,7 +86,7 @@ func TestReconcileIngressKeepsAdmissionClass(t *testing.T) {
 	if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != "nginx" {
 		t.Fatalf("className unset: want the admission-set class nginx kept, got %v", ing.Spec.IngressClassName)
 	}
-	if len(ing.Spec.Rules) != 1 || ing.Spec.Rules[0].Host != "git.example.com" {
+	if len(ing.Spec.Rules) != 1 || ing.Spec.Rules[0].Host != testDomain {
 		t.Fatalf("rules not reconciled: %+v", ing.Spec.Rules)
 	}
 
@@ -93,7 +102,7 @@ func TestReconcileIngressKeepsAdmissionClass(t *testing.T) {
 func TestReconcileIngressCreateWithoutClass(t *testing.T) {
 	ctx := context.Background()
 	f := testInstance()
-	f.Spec.Ingress = &forgejov1.IngressSpec{Enabled: true, Host: "git.example.com"}
+	f.Spec.Ingress = &forgejov1.IngressSpec{Enabled: true, Host: testDomain}
 	rc := testContext(t, f)
 	if err := reconcileIngress(ctx, rc); err != nil {
 		t.Fatal(err)
@@ -110,7 +119,7 @@ func TestReconcileIngressCreateWithoutClass(t *testing.T) {
 func TestDesiredReplicas(t *testing.T) {
 	hpa := func(minR, maxR int32) *forgejov1.Forgejo {
 		f := testInstance()
-		f.Status.Image = "codeberg.org/forgejo/forgejo:16"
+		f.Status.Image = img16
 		f.Spec.Replicas = ptr.To[int32](3)
 		f.Spec.HighAvailability.Enabled = true
 		f.Spec.Autoscaling.Horizontal = &forgejov1.HorizontalAutoscalingSpec{Enabled: true, MinReplicas: minR, MaxReplicas: maxR}
@@ -118,7 +127,7 @@ func TestDesiredReplicas(t *testing.T) {
 	}
 	plain := func(replicas int32) *forgejov1.Forgejo {
 		f := testInstance()
-		f.Status.Image = "codeberg.org/forgejo/forgejo:16"
+		f.Status.Image = img16
 		f.Spec.Replicas = ptr.To(replicas)
 		return f
 	}
@@ -170,8 +179,8 @@ func withHA(f *forgejov1.Forgejo) *forgejov1.Forgejo {
 func heldUpgrade(f *forgejov1.Forgejo) *forgejov1.Forgejo {
 	f.Status.Image = "codeberg.org/forgejo/forgejo:15"
 	f.Status.Upgrade = &forgejov1.UpgradeStatus{
-		Phase: forgejov1.UpgradePhaseFailed, FromImage: f.Status.Image, ToImage: "codeberg.org/forgejo/forgejo:16",
-		FailedImage: "codeberg.org/forgejo/forgejo:16", RolloutStartTime: ptr.To(metav1.Now()),
+		Phase: forgejov1.UpgradePhaseFailed, FromImage: f.Status.Image, ToImage: img16,
+		FailedImage: img16, RolloutStartTime: ptr.To(metav1.Now()),
 	}
 	return f
 }
@@ -232,7 +241,7 @@ func TestReconcileWorkloadHoldsSingleReplicaWhileRestoredDBMigrates(t *testing.T
 	f := testInstance()
 	f.Spec.Replicas = ptr.To[int32](3)
 	f.Spec.HighAvailability.Enabled = true
-	f.Status.Image = "codeberg.org/forgejo/forgejo:16"
+	f.Status.Image = img16
 	restore := &forgejov1.ForgejoRestore{
 		ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: f.Namespace},
 		Spec:       forgejov1.ForgejoRestoreSpec{ForgejoRef: forgejov1.ForgejoRef{Name: f.Name}, BackupName: "b1"},
@@ -242,7 +251,7 @@ func TestReconcileWorkloadHoldsSingleReplicaWhileRestoredDBMigrates(t *testing.T
 	rc.RestoreMigrating = true // set by the maintenance step while r1 is in ScalingUp
 	rc.TargetImage = f.Status.Image
 	rc.Layout = forgejo.LayoutForImage(rc.TargetImage)
-	rc.ConfigHash, rc.ConfigSecretName = "abc", "fj-config"
+	rc.ConfigHash, rc.ConfigSecretName = "abc", testConfigSecret
 
 	key := types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}
 	run := func() *appsv1.Deployment {
@@ -341,14 +350,14 @@ func TestCNPGPrimaryUnavailable(t *testing.T) {
 		ready                        int64
 		available                    bool
 	}{
-		{"replica missing", "Creating a new replica", "db-1", "db-1", 2, true},
-		{"healthy phase, replica down", cnpgHealthyPhase, "db-1", "db-1", 2, true},
-		{"not provisioned", "Waiting for the instances to become active", "", "db-1", 0, false},
-		{"switchover", "Switchover in progress", "db-1", "db-2", 2, false},
-		{"failing over", "Failing over", "db-1", "db-1", 2, false},
-		{"primary not ready", "Creating a new replica", "db-2", "db-2", 1, false},
-		{"primary pod gone", "Creating a new replica", "db-3", "db-3", 1, false},
-		{"nothing ready", "Creating a new replica", "db-1", "db-1", 0, false},
+		{"replica missing", testPhaseNewReplica, testPodDB1, testPodDB1, 2, true},
+		{"healthy phase, replica down", cnpgHealthyPhase, testPodDB1, testPodDB1, 2, true},
+		{"not provisioned", "Waiting for the instances to become active", "", testPodDB1, 0, false},
+		{"switchover", "Switchover in progress", testPodDB1, testPodDB2, 2, false},
+		{"failing over", "Failing over", testPodDB1, testPodDB1, 2, false},
+		{"primary not ready", testPhaseNewReplica, testPodDB2, testPodDB2, 1, false},
+		{"primary pod gone", testPhaseNewReplica, "db-3", "db-3", 1, false},
+		{"nothing ready", testPhaseNewReplica, testPodDB1, testPodDB1, 0, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -367,13 +376,13 @@ func TestReconcileCNPGDegradedKeepsPipelineRunning(t *testing.T) {
 	ctx := context.Background()
 	f := testInstance()
 	f.Spec.Database.CNPG.Instances = 3
-	f.Status.Image = "codeberg.org/forgejo/forgejo:16"
+	f.Status.Image = img16
 	appSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: forgejo.CNPGAppSecretName(f), Namespace: f.Namespace},
 		Data:       map[string][]byte{"username": []byte("forgejo"), "password": []byte("pw")},
 	}
 	primary := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "fj-db-1", Namespace: f.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterPodDB1, Namespace: f.Namespace},
 		Status:     corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
 	}
 	cluster := &unstructured.Unstructured{}
@@ -381,8 +390,8 @@ func TestReconcileCNPGDegradedKeepsPipelineRunning(t *testing.T) {
 	cluster.SetName(forgejo.DatabaseClusterName(f))
 	cluster.SetNamespace(f.Namespace)
 	cluster.Object["status"] = map[string]any{
-		"phase": "Creating a new replica", "readyInstances": int64(2),
-		"currentPrimary": "fj-db-1", "targetPrimary": "fj-db-1",
+		"phase": testPhaseNewReplica, "readyInstances": int64(2),
+		"currentPrimary": testClusterPodDB1, "targetPrimary": testClusterPodDB1,
 	}
 
 	s := testScheme(t)
@@ -408,7 +417,7 @@ func TestReconcileCNPGDegradedKeepsPipelineRunning(t *testing.T) {
 	if res, err := ReconcileDatabase(ctx, rc); err != nil || !res.Stop {
 		t.Fatalf("first install with a degraded cluster: want stop, got stop=%v err=%v", res.Stop, err)
 	}
-	f.Status.Image = "codeberg.org/forgejo/forgejo:16"
+	f.Status.Image = img16
 
 	// The primary goes away: stop as before.
 	primary.Status.Conditions[0].Status = corev1.ConditionFalse

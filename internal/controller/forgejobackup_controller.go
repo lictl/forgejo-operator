@@ -70,15 +70,15 @@ type ForgejoBackupReconciler struct {
 	Recorder  events.EventRecorder
 }
 
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups/status,verbs=patch
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups/finalizers,verbs=update
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejos,verbs=get;list;watch
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile runs a backup Job for each ForgejoBackup and removes the backup files when the

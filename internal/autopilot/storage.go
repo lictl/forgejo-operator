@@ -112,28 +112,10 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 		return nil
 	}
 
-	claims, err := instanceClaims(ctx, rc)
+	claims, err := startMeasurements(ctx, rc, st)
 	if err != nil {
 		return err
 	}
-	pods, err := mountingPods(ctx, rc, claims)
-	if err != nil {
-		return err
-	}
-	names := make([]string, 0, len(claims))
-	var started []<-chan struct{}
-	for _, c := range claims {
-		names = append(names, c.pvc.Name)
-		if ch := m.start(logger(ctx), pods, c.pvc); ch != nil {
-			started = append(started, ch)
-		}
-	}
-	m.prune(names)
-	waitFor(ctx, started, measureWait)
-	if m.anyRunning() {
-		rc.Requeue(measureRequeue)
-	}
-	st.lastStorageCheck = time.Now()
 
 	prev := map[string]forgejov1.VolumeUsage{}
 	if f.Status.Storage != nil {
@@ -166,22 +148,9 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 		vu := forgejov1.VolumeUsage{ClaimName: pvc.Name, RequestedSize: req.String(), LastExpansionTime: prev[pvc.Name].LastExpansionTime}
 		vu.ExpansionSupported = expansionSupported(ctx, rc, pvc, scCache)
 
-		pending := resizePending(pvc)
-		if pending {
-			since := resizePendingSince(st, pvc, prev[pvc.Name], req)
-			if time.Since(since) >= expansionStallAfter {
-				msg := fmt.Sprintf("resizing %s to %s has been pending since %s%s",
-					pvc.Name, req.String(), since.UTC().Format(time.RFC3339), resizeDetail(pvc))
-				addProblem(ReasonExpansionStalled, msg)
-				warnEvery(rc, st, "storage-stalled/"+pvc.Name, time.Hour, ReasonExpansionStalled, "%s", msg)
-			}
-			if c.role == roleData && fsResizeOnly(pvc) && time.Since(since) >= fsResizeRestartAfter {
-				if err := restartForFilesystemResize(ctx, rc, st, dep, pvc, since); err != nil {
-					return err
-				}
-			}
-		} else {
-			delete(st.resizeSeen, pvc.Name)
+		pending, err := trackPendingResize(ctx, rc, st, dep, c, prev[pvc.Name], req, addProblem)
+		if err != nil {
+			return err
 		}
 
 		res, ok := m.result(pvc.Name)
@@ -203,15 +172,15 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 			switch {
 			case !autoExpand:
 				addProblem(ReasonAutoExpandDisabled, fmt.Sprintf("%s is %d%% full and storage auto-expansion is disabled", pvc.Name, vu.UsedPercent))
-				warnEvery(rc, st, "storage-disabled/"+pvc.Name, time.Hour, ReasonAutoExpandDisabled,
+				warnEvery(rc, st, "storage-disabled/"+pvc.Name, ReasonAutoExpandDisabled,
 					"PVC %s is %d%% full (threshold %d%%) and autoPilot.storageAutoExpand is disabled; grow it manually", pvc.Name, vu.UsedPercent, threshold)
 			case !vu.ExpansionSupported:
 				addProblem(ReasonExpansionUnsupported, fmt.Sprintf("%s is %d%% full and its StorageClass does not allow volume expansion", pvc.Name, vu.UsedPercent))
-				warnEvery(rc, st, "storage-unsupported/"+pvc.Name, time.Hour, ReasonExpansionUnsupported,
+				warnEvery(rc, st, "storage-unsupported/"+pvc.Name, ReasonExpansionUnsupported,
 					"PVC %s is %d%% full (threshold %d%%) but its StorageClass does not allow expansion; grow it manually", pvc.Name, vu.UsedPercent, threshold)
 			case req.Cmp(maxSize) >= 0:
 				addProblem(ReasonMaxSizeReached, fmt.Sprintf("%s is %d%% full at the autoPilot.storageAutoExpand.maxSize %s", pvc.Name, vu.UsedPercent, maxSize.String()))
-				warnEvery(rc, st, "storage-max/"+pvc.Name, time.Hour, ReasonMaxSizeReached,
+				warnEvery(rc, st, "storage-max/"+pvc.Name, ReasonMaxSizeReached,
 					"PVC %s is %d%% full and already at maxSize %s", pvc.Name, vu.UsedPercent, maxSize.String())
 			case pending || (vu.LastExpansionTime != nil && time.Since(vu.LastExpansionTime.Time) < expansionSettle) || expandedRoles[c.role]:
 				expanding = true
@@ -229,7 +198,7 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 					msg := fmt.Sprintf("%s is %d%% full but CNPG Cluster %s, through which it is grown, does not exist",
 						pvc.Name, vu.UsedPercent, forgejo.DatabaseClusterName(f))
 					addProblem(ReasonDatabaseClusterMissing, msg)
-					warnEvery(rc, st, "storage-nocluster/"+pvc.Name, time.Hour, ReasonDatabaseClusterMissing, "%s", msg)
+					warnEvery(rc, st, "storage-nocluster/"+pvc.Name, ReasonDatabaseClusterMissing, "%s", msg)
 					break
 				}
 				expandedRoles[c.role] = true
@@ -245,6 +214,68 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 
 	now := metav1.Now()
 	f.Status.Storage = &forgejov1.StorageStatus{Volumes: volumes, LastCheckTime: &now}
+	setStorageHealthy(rc, m, volumes, problems, problemReason, expanding, threshold)
+	return nil
+}
+
+// startMeasurements finds the instance's claims, starts measuring them in the background and
+// waits briefly for the results. A measurement that is still running requests a requeue.
+func startMeasurements(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState) ([]instanceClaim, error) {
+	m := st.measure
+	claims, err := instanceClaims(ctx, rc)
+	if err != nil {
+		return nil, err
+	}
+	pods, err := mountingPods(ctx, rc, claims)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(claims))
+	var started []<-chan struct{}
+	for _, c := range claims {
+		names = append(names, c.pvc.Name)
+		if ch := m.start(logger(ctx), pods, c.pvc); ch != nil {
+			started = append(started, ch)
+		}
+	}
+	m.prune(names)
+	waitFor(ctx, started, measureWait)
+	if m.anyRunning() {
+		rc.Requeue(measureRequeue)
+	}
+	st.lastStorageCheck = time.Now()
+	return claims, nil
+}
+
+// trackPendingResize records whether the claim has a resize pending. One that stalled is a
+// problem, and a file system resize that only waits for a pod restart gets that restart.
+func trackPendingResize(ctx context.Context, rc *forgejo.ReconcileContext, st *instanceState, dep *appsv1.Deployment,
+	c instanceClaim, prev forgejov1.VolumeUsage, req resource.Quantity, addProblem func(reason, msg string)) (bool, error) {
+	pvc := c.pvc
+	if !resizePending(pvc) {
+		delete(st.resizeSeen, pvc.Name)
+		return false, nil
+	}
+	since := resizePendingSince(st, pvc, prev, req)
+	if time.Since(since) >= expansionStallAfter {
+		msg := fmt.Sprintf("resizing %s to %s has been pending since %s%s",
+			pvc.Name, req.String(), since.UTC().Format(time.RFC3339), resizeDetail(pvc))
+		addProblem(ReasonExpansionStalled, msg)
+		warnEvery(rc, st, "storage-stalled/"+pvc.Name, ReasonExpansionStalled, "%s", msg)
+	}
+	if c.role == roleData && fsResizeOnly(pvc) && time.Since(since) >= fsResizeRestartAfter {
+		if err := restartForFilesystemResize(ctx, rc, st, dep, pvc, since); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
+// setStorageHealthy reports StorageHealthy from what the pass over the volumes found: the
+// most urgent problem, a running expansion, no measurement yet, or all volumes within the
+// threshold.
+func setStorageHealthy(rc *forgejo.ReconcileContext, m *measureState, volumes []forgejov1.VolumeUsage,
+	problems []string, problemReason string, expanding bool, threshold int64) {
 	switch {
 	case len(problems) > 0:
 		rc.SetCondition(forgejov1.ConditionStorageHealthy, metav1.ConditionFalse, problemReason, strings.Join(problems, "; "))
@@ -253,14 +284,14 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 	case !anyMeasured(volumes):
 		msg := "no volume usage could be measured yet"
 		if m.isForbidden() {
-			msg += "; the operator may not exec into the pods that mount the claims (grant pods/exec in this namespace)"
+			msg += "; the operator may not exec into the pods that mount the claims (bind ClusterRole " +
+				"forgejo-operator-volume-usage to its ServiceAccount, cluster-wide or in this namespace)"
 		}
 		rc.SetCondition(forgejov1.ConditionStorageHealthy, metav1.ConditionUnknown, "MeasurementUnavailable", msg)
 	default:
 		rc.SetCondition(forgejov1.ConditionStorageHealthy, metav1.ConditionTrue, "WithinThreshold",
 			fmt.Sprintf("all volumes are below %d%% used", threshold))
 	}
-	return nil
 }
 
 // problemRank orders StorageHealthy=False reasons; the most urgent one names the condition.
@@ -515,16 +546,16 @@ func (m *measureState) logFailure(log logr.Logger, claim, pod string, err error,
 		key = claim + "/forbidden"
 	}
 	if m.logged[key] {
-		log.V(1).Info("cannot measure volume usage", "claim", claim, "pod", pod, "error", err.Error(), "retryIn", retry.String())
+		log.V(1).Info("Could not measure volume usage", "claim", claim, "pod", pod, "error", err.Error(), "retryIn", retry.String())
 		return
 	}
 	m.logged[key] = true
 	if execForbidden(err) {
-		log.Info("cannot measure volume usage: the operator may not exec into the pod; grant pods/exec in this namespace to enable it",
+		log.Info("Could not measure volume usage: the operator may not exec into the pod; bind ClusterRole forgejo-operator-volume-usage to enable it",
 			"claim", claim, "pod", pod, "error", err.Error())
 		return
 	}
-	log.Info("cannot measure volume usage", "claim", claim, "pod", pod, "error", err.Error(), "retryIn", retry.String())
+	log.Info("Could not measure volume usage", "claim", claim, "pod", pod, "error", err.Error(), "retryIn", retry.String())
 }
 
 // result returns the last successful measurement of the claim.

@@ -73,6 +73,15 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 			fmt.Sprintf("%d/%d replicas ready", dep.Status.ReadyReplicas, ro.desired))
 	}
 
+	setProgressingCondition(rc, dep, ro, found, replicaFailure)
+	setPhase(rc, ro, ready, replicaFailure)
+
+	updateInstanceMetrics(rc, ready || (rolling && !rc.Maintenance))
+	return forgejo.StepResult{}, nil
+}
+
+// setProgressingCondition reports the rollout state of the Deployment as Progressing.
+func setProgressingCondition(rc *forgejo.ReconcileContext, dep *appsv1.Deployment, ro rollout, found, replicaFailure bool) {
 	switch {
 	case rc.Maintenance:
 		rc.SetCondition(forgejov1.ConditionProgressing, metav1.ConditionTrue, "Maintenance", rc.MaintenanceReason)
@@ -90,7 +99,12 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	default:
 		rc.SetCondition(forgejov1.ConditionProgressing, metav1.ConditionFalse, "RolledOut", "Deployment is up to date")
 	}
+}
 
+// setPhase derives status.phase from the observed rollout.
+func setPhase(rc *forgejo.ReconcileContext, ro rollout, ready, replicaFailure bool) {
+	f := rc.Instance
+	st := &f.Status
 	switch {
 	case rc.Maintenance:
 		st.Phase = forgejov1.PhaseRestoring
@@ -112,9 +126,6 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	default:
 		st.Phase = forgejov1.PhaseDegraded
 	}
-
-	updateInstanceMetrics(rc, ready || (rolling && !rc.Maintenance))
-	return forgejo.StepResult{}, nil
 }
 
 // startingGrace is how long pods may take to become ready after a scale-up from zero before

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 
 	"golang.org/x/crypto/ssh"
 	appsv1 "k8s.io/api/apps/v1"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
@@ -84,7 +86,7 @@ const (
 // rsaHostKeyBits is the size of generated RSA host keys (a variable for faster tests).
 var rsaHostKeyBits = 3072
 
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update
 
 // ReconcileSSHHostKeys ensures the Secret of SSH host keys and sets rc.SSHHostKeys and
 // status.ssh.
@@ -128,11 +130,12 @@ func ReconcileSSHHostKeys(ctx context.Context, rc *forgejo.ReconcileContext) (fo
 		if perr != nil {
 			return unavailable(rc, live, fmt.Sprintf("Secret %s: %v. Fix the Secret; the operator does not replace host keys", name, perr))
 		}
-		if err := adoptHostKeysSecret(ctx, rc, sec); err != nil {
+		foreign, err := adoptHostKeysSecret(ctx, rc, sec)
+		if err != nil {
 			return forgejo.StepResult{}, err
 		}
 		source := forgejov1.SSHHostKeysExistingSecret
-		if sec.Annotations[AnnotationSSHHostKeysSource] == string(forgejov1.SSHHostKeysGenerated) {
+		if !foreign && sec.Annotations[AnnotationSSHHostKeysSource] == string(forgejov1.SSHHostKeysGenerated) {
 			source = forgejov1.SSHHostKeysGenerated
 		}
 		useHostKeys(rc, name, keys, source)
@@ -196,7 +199,7 @@ func unavailable(rc *forgejo.ReconcileContext, live *forgejo.SSHHostKeys, msg st
 	msg += ". New pods cannot start meanwhile, so the operator leaves Deployment " + forgejo.DeploymentName(rc.Instance) +
 		" as it is (no rollout, restart or resize), and upgrades and restores wait"
 	setDegraded(rc, ReasonSSHHostKeysUnavailable, msg)
-	warnEvery(rc, "ssh-host-keys-unavailable/"+msg, warnInterval, ReasonSSHHostKeysUnavailable, "SSHHostKeys", "%s", msg)
+	warnEvery(rc, "ssh-host-keys-unavailable/"+msg, ReasonSSHHostKeysUnavailable, "SSHHostKeys", "%s", msg)
 	rc.SSHHostKeys = live
 	rc.SSHHostKeysUnavailable = true
 	st := rc.Instance.Status.SSH
@@ -217,9 +220,22 @@ func notFoundMessage(err error) error {
 }
 
 // adoptHostKeysSecret labels the Secret and sets its owner reference per retainPolicy, like
-// "<name>-secrets". Its keys are never changed.
-func adoptHostKeysSecret(ctx context.Context, rc *forgejo.ReconcileContext, sec *corev1.Secret) error {
+// "<name>-secrets". Its keys are never changed. A Secret that another controller controls (a
+// SealedSecret or ExternalSecret of a GitOps setup) is served as it is but never adopted:
+// foreign is then true, and neither its labels nor its owner references are touched, so
+// retainPolicy Delete does not delete it with the instance.
+func adoptHostKeysSecret(ctx context.Context, rc *forgejo.ReconcileContext, sec *corev1.Secret) (foreign bool, err error) {
 	f := rc.Instance
+	if c := metav1.GetControllerOf(sec); c != nil && c.UID != f.UID {
+		key := hostKeysControllerKey(f, sec.Name)
+		if prev, ok := foreignHostKeys.Load(key); !ok || prev != c.UID {
+			foreignHostKeys.Store(key, c.UID)
+			logf.FromContext(ctx).V(1).Info("Serving SSH host keys from a Secret another controller controls, without adopting it",
+				"secret", sec.Name, "controllerKind", c.Kind, "controllerName", c.Name)
+		}
+		return true, nil
+	}
+	foreignHostKeys.Delete(hostKeysControllerKey(f, sec.Name))
 	want := forgejo.Labels(f, forgejo.ComponentServer)
 	owned := slices.ContainsFunc(sec.OwnerReferences, func(r metav1.OwnerReference) bool { return r.UID == f.UID })
 	labelled := true
@@ -229,13 +245,22 @@ func adoptHostKeysSecret(ctx context.Context, rc *forgejo.ReconcileContext, sec 
 		}
 	}
 	if labelled && owned == rc.OwnerRefsEnabled() {
-		return nil
+		return false, nil
 	}
 	obj := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sec.Name, Namespace: sec.Namespace}}
-	return apply(ctx, rc, obj, rc.OwnerRefsEnabled(), func() error {
+	return false, apply(ctx, rc, obj, rc.OwnerRefsEnabled(), func() error {
 		obj.Labels = mergeMaps(obj.Labels, want)
 		return nil
 	})
+}
+
+// foreignHostKeys remembers the Secrets of host keys that another controller controls and
+// that this process has logged about, keyed by hostKeysControllerKey, valued by that
+// controller's UID: the message is logged once per Secret and controller.
+var foreignHostKeys sync.Map
+
+func hostKeysControllerKey(f *forgejov1.Forgejo, secret string) string {
+	return f.Namespace + "/" + f.Name + "/" + string(f.UID) + "/" + secret
 }
 
 func createHostKeysSecret(ctx context.Context, rc *forgejo.ReconcileContext, data map[string][]byte) error {

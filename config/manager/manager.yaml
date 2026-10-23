@@ -68,7 +68,9 @@ spec:
         name: manager
         env:
         # Comma-separated namespaces to watch (same as --watch-namespace); empty watches
-        # every namespace. The ClusterRole stays cluster-wide either way.
+        # every namespace. This only narrows the caches: the overlay config/namespaced also
+        # narrows the permissions to these namespaces (RoleBindings instead of the
+        # ClusterRoleBinding). Keep this the first entry, config/namespaced patches env/0.
         - name: WATCH_NAMESPACE
           value: ""
         # DNS domain of the cluster for in-cluster Service names (same as --cluster-domain);

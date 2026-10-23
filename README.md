@@ -40,7 +40,8 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
 Details are in [docs/design.md](docs/design.md), [docs/versions.md](docs/versions.md), [docs/upgrades.md](docs/upgrades.md),
 [docs/backup-restore.md](docs/backup-restore.md), [docs/observability.md](docs/observability.md),
 [docs/autopilot.md](docs/autopilot.md), [docs/networking.md](docs/networking.md), [docs/ssh.md](docs/ssh.md),
-[docs/object-storage.md](docs/object-storage.md) and [docs/actions-runners.md](docs/actions-runners.md).
+[docs/object-storage.md](docs/object-storage.md), [docs/actions-runners.md](docs/actions-runners.md) and
+[docs/permissions.md](docs/permissions.md).
 
 ## Quick start (local or any other cluster)
 
@@ -69,6 +70,11 @@ On other clusters, push an image and deploy it:
 ```bash
 make docker-build docker-push deploy IMG=<registry>/forgejo-operator:<tag>
 ```
+
+This install manages instances in every namespace, with a ClusterRole that writes Secrets,
+Deployments, Jobs and the like cluster-wide, plus `pods/exec` (only to measure volumes for
+automatic expansion; optional). The overlay `config/namespaced` confines the operator and its
+permissions to chosen namespaces. See [docs/permissions.md](docs/permissions.md).
 
 Create an instance:
 

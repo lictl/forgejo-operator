@@ -14,6 +14,12 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+const (
+	labelHost    = "host:host"
+	logLevelInfo = "info"
+	configRunner = "runner"
+)
+
 // Paths inside the runner container.
 const (
 	// ConfigDir holds the configuration files of all runners of the StatefulSet; pod i reads
@@ -66,7 +72,7 @@ func EffectiveLabels(r *forgejov1.ForgejoRunner) []string {
 		return r.Spec.Labels
 	}
 	if Executor(r) == forgejov1.RunnerExecutorHost {
-		return []string{"host:host"}
+		return []string{labelHost}
 	}
 	return []string{"docker:docker://" + forgejov1.DefaultRunnerJobImage}
 }
@@ -123,7 +129,7 @@ func ConfigHash(r *forgejov1.ForgejoRunner, f *forgejov1.Forgejo) (string, error
 
 func render(r *forgejov1.ForgejoRunner, f *forgejov1.Forgejo, uuid, tokenFile string) ([]byte, error) {
 	cfg := map[string]any{
-		"log": map[string]any{"level": "info", "job_level": "info"},
+		"log": map[string]any{"level": logLevelInfo, "job_level": logLevelInfo},
 		"cache": map[string]any{
 			"enabled": CacheEnabled(r),
 			"dir":     CacheDir,
@@ -145,7 +151,7 @@ func render(r *forgejov1.ForgejoRunner, f *forgejov1.Forgejo, uuid, tokenFile st
 	}
 	labels := EffectiveLabels(r)
 	cfg = merge(cfg, map[string]any{
-		"runner": map[string]any{
+		configRunner: map[string]any{
 			"capacity":         Capacity(r),
 			"labels":           labels,
 			"shutdown_timeout": ShutdownTimeout(r).String(),

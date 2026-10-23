@@ -18,6 +18,12 @@ import (
 )
 
 const (
+	valueTrue              = "true"
+	reasonCrashLoopBackOff = "CrashLoopBackOff"
+	reasonOOMKilled        = "OOMKilled"
+)
+
+const (
 	// lkgSoak is how long every pod must have been Ready before a config counts as good.
 	lkgSoak = time.Minute
 	// notReadyTimeout marks a pod running a new config as failed when it never becomes Ready.
@@ -103,7 +109,7 @@ func currentLKG(ctx context.Context, rc *forgejo.ReconcileContext) (*corev1.Secr
 // in the instance's Valkey. LKG Secrets stored before the annotation existed are recognised
 // by their content.
 func lkgUsesValkey(f *forgejov1.Forgejo, lkg *corev1.Secret) bool {
-	if lkg.Annotations[annotationUsesValkey] == "true" {
+	if lkg.Annotations[annotationUsesValkey] == valueTrue {
 		return true
 	}
 	ini := string(lkg.Data[forgejo.ConfigSecretKey])
@@ -199,7 +205,7 @@ func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep 
 		lkg.Annotations[forgejo.AnnotationConfigHash] = rc.ConfigHash
 		lkg.Annotations[forgejo.AnnotationConfigProfile] = configProfile(src)
 		if rc.ValkeyURL != "" || lkgUsesValkey(f, src) {
-			lkg.Annotations[annotationUsesValkey] = "true"
+			lkg.Annotations[annotationUsesValkey] = valueTrue
 		} else {
 			delete(lkg.Annotations, annotationUsesValkey)
 		}
@@ -265,7 +271,7 @@ func rollbackFailingConfig(ctx context.Context, rc *forgejo.ReconcileContext, st
 	}
 	if why, err := lkgUnusable(ctx, rc, lkg); err != nil || why != "" {
 		if why != "" {
-			warnEvery(rc, st, "lkg-unusable/"+desired, time.Hour, "ConfigRollbackUnavailable",
+			warnEvery(rc, st, "lkg-unusable/"+desired, "ConfigRollbackUnavailable",
 				"app.ini %s: pod %s %s, but %s; not rolling back", short(desired), failed.Name, failure, why)
 		}
 		return err
@@ -303,7 +309,7 @@ func podFailure(p *corev1.Pod, since time.Time) string {
 			continue
 		}
 		// CrashLoopBackOff already shows after the first exit; require a repeated failure.
-		backoff := cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" && cs.RestartCount >= 2
+		backoff := cs.State.Waiting != nil && cs.State.Waiting.Reason == reasonCrashLoopBackOff && cs.RestartCount >= 2
 		if !backoff && cs.RestartCount < crashRestarts {
 			continue
 		}
@@ -347,11 +353,11 @@ func lastExit(cs corev1.ContainerStatus) time.Time {
 }
 
 func oomKilled(cs corev1.ContainerStatus) bool {
-	if t := cs.LastTerminationState.Terminated; t != nil && t.Reason == "OOMKilled" {
+	if t := cs.LastTerminationState.Terminated; t != nil && t.Reason == reasonOOMKilled {
 		return true
 	}
 	t := cs.State.Terminated
-	return t != nil && t.Reason == "OOMKilled"
+	return t != nil && t.Reason == reasonOOMKilled
 }
 
 func podReadyCondition(p *corev1.Pod) *corev1.PodCondition {

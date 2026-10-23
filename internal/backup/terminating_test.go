@@ -61,7 +61,7 @@ func TestBackupFinalizerReleasedInTerminatingNamespace(t *testing.T) {
 		b.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 		return b
 	}
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "fb-backups", Namespace: ns}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: testBackupsPVC, Namespace: ns}}
 	key := types.NamespacedName{Namespace: ns, Name: "manual"}
 
 	rec := events.NewFakeRecorder(10)
@@ -105,7 +105,7 @@ func TestBackupStartInTerminatingNamespace(t *testing.T) {
 			b.Spec.ForgejoRef.Name = "fb"
 			secret := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "fb-db-app", Namespace: ns},
-				Data:       map[string][]byte{"username": []byte("forgejo"), "password": []byte("x")},
+				Data:       map[string][]byte{"username": []byte("forgejo"), testPasswordField: []byte("x")},
 			}
 			rec := events.NewFakeRecorder(10)
 			c := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&forgejov1.ForgejoBackup{}).

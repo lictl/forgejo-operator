@@ -67,7 +67,8 @@ What happens:
   `allowVolumeExpansion: true`. Otherwise a `StorageResizeUnsupported` Warning event is
   recorded on the `Forgejo`, once per hour for the same claim and size. The claim is never
   shrunk; a lower size, or one below what was
-  already grown by hand, is ignored. An `existingClaim` is never resized. Plan for about
+  already grown by hand, is ignored, so setting the size back to the claim's size stops
+  the warning. An `existingClaim` is never resized. Plan for about
   `(retention + 1) ×` the size of one backup, plus manual and pre-upgrade backups, which
   retention does not prune.
 * A Job `<backup>-backup` runs one pod:
@@ -229,7 +230,11 @@ spec:
   `BackupHealthy` can report it, and only while no completed backup is newer. It removes
   the rest whether or not a backup has succeeded since. Completed backups within
   `retention` are never removed to make room. Manual and pre-upgrade backups are never
-  pruned, and neither is a backup that an unfinished restore is reading. Pruning deletes the `ForgejoBackup`, and
+  pruned, and neither is a backup that an unfinished restore is reading. With
+  `spec.backup.remote`, a completed backup beyond `retention` whose upload is still `Pending` or
+  `Uploading` is kept until the upload has finished (25 hours after the backup at most, longer
+  than an upload Job may run), then pruned on the next pass: deleting it would stop the upload.
+  Pruning deletes the `ForgejoBackup`, and
   the finalizer then removes its files. Independently of retention, the files of every
   failed backup are removed right after it fails (see [Files](#files)); its object stays.
 * A tick that falls while the instance is being upgraded (or while a failed upgrade still
@@ -285,7 +290,7 @@ spec:
 
 | Phase | What happens |
 |-------|--------------|
-| `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance (for a remote backup: reads and checks its manifest, see [Restoring a remote backup](#restoring-a-remote-backup)). Fails otherwise. Waits for another restore of the instance to finish, and while the Secret of SSH host keys is missing or unusable (`status.ssh.message` of the instance; Forgejo could not start again, see [ssh.md](ssh.md#when-something-is-wrong)). |
+| `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance (for a remote backup: reads and checks its manifest, see [Restoring a remote backup](#restoring-a-remote-backup)). Fails otherwise. Waits for another restore of the instance to finish, while the Secret of SSH host keys is missing or unusable (`status.ssh.message` of the instance; Forgejo could not start again, see [ssh.md](ssh.md#when-something-is-wrong)), and while the Secrets of `spec.objectStorage` are missing or unusable (`ObjectStorageReady=False/CredentialsUnavailable` or `InvalidSpec`; message `Waiting for spec.objectStorage: ...`): no pod could start without them, and the instance's pipeline would not scale it down. The instance keeps serving meanwhile, and the restore starts once the Secrets are back. A bucket the operator cannot reach does not hold a restore. A restore already in `ScalingDown` when a Secret disappears times out (`ScaleDownTimeout`). |
 | `ScalingDown` | The Forgejo pipeline turns on maintenance mode: `status.backup.activeRestore` is set, the Deployment is scaled to 0, the phase becomes `Restoring` and health checks and autopilot actions are suspended. The restore waits until no Forgejo pod exists, no backup of the instance is running and no Job or pod of another restore of the instance is still running. It fails after 15 minutes if that does not happen, for example because `spec.paused` is set or the reconcile is blocked earlier. |
 | `Restoring` | Job `<restore>-restore` runs (see below); `status.jobStartTime` records when it was created. If its newest pod cannot start within 10 minutes, the Job is stopped and the restore fails. It reports "nothing was changed" only when no earlier pod got past `verify`. Otherwise the failure counts as one that may have changed the instance (see below). A Job that is not found a minute after `jobStartTime` fails the restore with `JobMissing` only after the operator has confirmed with the API server that it is gone. |
 | `ScalingUp` | Maintenance ends and Forgejo is scaled back up. The bootstrap init container runs `forgejo migrate` against the restored database, in a single pod until that pod is available. The restore waits up to 15 minutes for the Deployment to be available. It completes right away when the instance wants no pods (`spec.replicas: 0` without horizontal autoscaling; with an HPA, `minReplicas` applies). |
@@ -615,8 +620,11 @@ scheduled backup and at least hourly. It never deletes:
   own;
 * manual and pre-upgrade backups;
 * a backup whose manifest it cannot read (e.g. encrypted with another key);
-* a backup an unfinished `ForgejoRestore` reads, or the source of `spec.restoreFrom` while
-  the instance is being created from it;
+* a backup an unfinished `ForgejoRestore` of any namespace reads, or the `spec.restoreFrom`
+  source of any `Forgejo` in the cluster that is being created from it (also before its
+  `<name>-restore-from` exists: while it restores the identity and waits for its database). A
+  source counts when it names the same bucket and prefix, whatever its endpoint is called (case,
+  port, scheme, a short Service name): a false match only keeps a backup longer;
 * an incomplete directory (no manifest) younger than 25 hours; older ones are failed uploads
   and are deleted.
 
@@ -731,6 +739,9 @@ What the operator does (`status.restoredFrom`, condition `RestoredFromBackup`):
    (`RestoredFromBackup=False/IdentityConflict`): the operator never overwrites a Secret. While
    the backup cannot be read (missing Secrets, wrong key, unreachable bucket), it retries every
    30 s with `RestoredFromBackup=False/RemoteBackupUnavailable`, and nothing else is created.
+   When the bucket is unreachable or answers with a server error, the retries back off from
+   30 s, doubling up to 5 minutes, and the condition keeps the last error meanwhile; changing
+   `spec.restoreFrom.remote` reads at once.
 3. **Database and data** (`RestoringData`): once the CNPG cluster is ready and the data volume
    exists, the operator creates `ForgejoRestore` `<name>-restore-from` (owned by the instance)
    for the backup, which restores it as described in
@@ -749,6 +760,12 @@ What the operator does (`status.restoredFrom`, condition `RestoredFromBackup`):
    and SSH host keys. `RestoredFromBackup=True/Restored`. Remote retention takes over the
    scheduled backups the lost instance took up to the restored one (see
    [Remote retention](#remote-retention)).
+
+Remote retention of the original instance protects the backup while the recovery runs only
+when both run in the same cluster (see [Remote retention](#remote-retention)). A recovery into
+another cluster, while the original instance still uploads, cannot be protected: pick a backup
+that is not the oldest one kept (a newer upload would then prune it mid-recovery), or rely on
+the bucket's versioning (see [Before a disaster](#before-a-disaster)).
 
 If the `ForgejoRestore` fails, `restoredFrom.phase` is `Failed` and Forgejo stays scaled down.
 Delete `<name>-restore-from` to try again (the operator creates it anew), or remove
