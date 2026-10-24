@@ -276,7 +276,7 @@ func TestUpgradeWaitsForSSHHostKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionUpgrading)
-	if f.Status.Upgrade != nil || rc.Upgrading || rc.TargetImage != imgA || cond == nil || cond.Reason != "WaitingForSSHHostKeys" {
+	if f.Status.Upgrade != nil || rc.Upgrading || rc.TargetImage != imgA || cond == nil || cond.Reason != reasonWaitingForSSHHostKeys {
 		t.Fatalf("upgrade %+v, upgrading %v, target %s, condition %+v", f.Status.Upgrade, rc.Upgrading, rc.TargetImage, cond)
 	}
 	if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade == nil || !inFlight(f.Status.Upgrade.Phase) {

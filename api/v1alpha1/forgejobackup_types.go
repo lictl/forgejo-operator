@@ -87,6 +87,10 @@ type ForgejoBackupStatus struct {
 	// forgejoImage running when the backup was taken (restores must use a compatible image).
 	// +optional
 	ForgejoImage string `json:"forgejoImage,omitempty"`
+	// postgresImage whose pg_dump wrote the database dump: the image of the instance's running
+	// PostgreSQL. A restore into a server of an older major is refused.
+	// +optional
+	PostgresImage string `json:"postgresImage,omitempty"`
 	// +optional
 	DatabaseSizeBytes int64 `json:"databaseSizeBytes,omitempty"`
 	// +optional

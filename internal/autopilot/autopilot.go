@@ -54,6 +54,9 @@ const (
 	ReasonAutoExpandDisabled          = "AutoExpandDisabled"
 	ReasonExpansionStalled            = "ExpansionStalled"
 	ReasonDatabaseClusterMissing      = "DatabaseClusterMissing"
+	// ReasonExpansionDeferred: a CNPG volume above the threshold is grown once the PostgreSQL
+	// major upgrade in flight has finished (CloudNativePG must not resize a cluster it upgrades).
+	ReasonExpansionDeferred = "ExpansionDeferred"
 )
 
 // serverContainerName is the Forgejo container in the server pods.

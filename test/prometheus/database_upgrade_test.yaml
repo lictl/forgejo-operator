@@ -1,0 +1,41 @@
+# promtool unit tests of ForgejoDatabaseUpgradeFailed, the alert on failed PostgreSQL major
+# upgrades of the CNPG cluster, in the PrometheusRule of a default instance (ns/fj). Run with
+# `make test-rules`.
+rule_files:
+  - unit-rules/basic.yaml
+evaluation_interval: 1m
+
+tests:
+  - name: a succeeded database upgrade raises nothing
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_database_upgrades_total{namespace="ns", name="fj", result="succeeded"}'
+        values: '_x10 1x120'
+    alert_rule_test:
+      - {eval_time: 15m, alertname: ForgejoDatabaseUpgradeFailed, exp_alerts: []}
+      - {eval_time: 2h, alertname: ForgejoDatabaseUpgradeFailed, exp_alerts: []}
+
+  - name: a rolled back and a failed database upgrade alert for an hour, also as their first increment
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_database_upgrades_total{namespace="ns", name="fj", result="rolledback"}'
+        values: '_x10 1x200'
+      - series: 'forgejo_operator_database_upgrades_total{namespace="ns", name="fj", result="failed"}'
+        values: '_x120 1x100'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ForgejoDatabaseUpgradeFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: A PostgreSQL major upgrade of Forgejo ns/fj failed
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoDatabaseUpgradeFailed.md
+      - {eval_time: 80m, alertname: ForgejoDatabaseUpgradeFailed, exp_alerts: []}
+      - eval_time: 125m
+        alertname: ForgejoDatabaseUpgradeFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: A PostgreSQL major upgrade of Forgejo ns/fj failed
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoDatabaseUpgradeFailed.md
+      - {eval_time: 200m, alertname: ForgejoDatabaseUpgradeFailed, exp_alerts: []}

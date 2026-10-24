@@ -212,10 +212,13 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	return forgejo.StepResult{}, nil
 }
 
-// upgradeInProgress reports whether the upgrade step is changing the image, or a failed
-// upgrade still holds its new image's migration (see forgejo.UpgradeHoldsWorkload).
+// upgradeInProgress reports whether the upgrade step is changing the image of Forgejo or
+// PostgreSQL, a failed upgrade still holds its new image's migration (see
+// forgejo.UpgradeHoldsWorkload), or a failed PostgreSQL upgrade left a database that may be
+// empty (forgejo.DatabaseUpgradeHoldsWorkload): a scheduled backup of it would count as a good
+// one and let retention prune the backups taken before.
 func upgradeInProgress(rc *forgejo.ReconcileContext) bool {
-	return rc.Upgrading || forgejo.UpgradeHoldsWorkload(rc.Instance)
+	return rc.Upgrading || forgejo.UpgradeHoldsWorkload(rc.Instance) || forgejo.DatabaseUpgradeHoldsWorkload(rc.Instance)
 }
 
 func summary(f *forgejov1.Forgejo) *forgejov1.BackupStatusSummary {

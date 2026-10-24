@@ -111,9 +111,13 @@ func (r *ForgejoBackupReconciler) startUpload(ctx context.Context, b *forgejov1.
 	if err != nil {
 		return ctrl.Result{}, r.uploadFailed(ctx, b, "IdentityUnavailable", "Not uploaded: "+err.Error())
 	}
+	pgImage := b.Status.PostgresImage
+	if pgImage == "" {
+		pgImage = forgejo.RunningPostgresImage(f)
+	}
 	m := backup.RemoteManifest{
 		Backup: b.Name, Namespace: b.Namespace, Forgejo: f.Name, BackupUID: string(b.UID), ForgejoUID: string(f.UID),
-		Reason: backup.Reason(b), ForgejoImage: b.Status.ForgejoImage, PostgresImage: forgejo.PostgresImage(f),
+		Reason: backup.Reason(b), ForgejoImage: b.Status.ForgejoImage, PostgresImage: pgImage,
 		IncludesData: b.Status.IncludesData, KeyFingerprint: cipher.Fingerprint(),
 	}
 	if s := id.Secret(backup.IdentityRoleSecrets); s != nil {

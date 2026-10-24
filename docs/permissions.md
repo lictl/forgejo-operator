@@ -20,7 +20,11 @@ editor and viewer roles of each kind) are for people, not for the operator; noth
 Every verb is used by the code; nothing is granted on `*`, and no rule uses `resourceNames`
 (the names of an instance's objects are not known in advance). The operator never deletes data:
 the data and backup PVCs, the CNPG Cluster and the identity Secrets go only through Kubernetes'
-garbage collection under `spec.storage.retainPolicy: Delete`.
+garbage collection under `spec.storage.retainPolicy: Delete`. The one exception is the rollback
+of a failed PostgreSQL major upgrade, which deletes the CNPG Cluster to create it again on the old
+major, and only while its cold pre-upgrade backup, read again right before, can restore it (it
+exists, is `Completed` with a dump of the old major, and its volume exists); never after a revert
+whose `pg_upgrade` did not start ([upgrades.md](upgrades.md#postgresql-major-upgrades)).
 
 | API group | Resources | Verbs | Used for |
 |-----------|-----------|-------|----------|
@@ -28,19 +32,19 @@ garbage collection under `spec.storage.retainPolicy: Delete`.
 | core | `configmaps` | get, list, watch, create, update, delete | Grafana dashboard `<name>-dashboard` |
 | core | `services` | get, list, watch, create, update, delete | `<name>-http`, `<name>-ssh`, `<name>-valkey` (headless); delete: Valkey when HA is turned off |
 | core | `persistentvolumeclaims` | get, list, watch, create, update, patch | Data and backup PVCs; owner references under `retainPolicy` and automatic expansion (patch). Never deleted |
-| core | `pods` | get, list, watch, delete | Server, CNPG, Job and runner pods; delete: a hung pod (self-healing) or a failing pod of an upgrade's new image |
+| core | `pods` | get, list, watch, delete | Server, CNPG, Job (also CNPG's major upgrade Job) and runner pods; delete: a hung pod (self-healing) or a failing pod of an upgrade's new image |
 | core | `namespaces` | get | The Pod Security label of a `ForgejoRunner`'s namespace (Docker executor) |
 | core | `nodes`, `persistentvolumes` | get, list, watch | Placing backup and restore Jobs where node-local volumes can be attached; schedulable nodes and their memory (HA warnings, vertical sizing); whether nodes carry `topology.kubernetes.io/zone` (HA spreading) |
 | `storage.k8s.io` | `storageclasses` | get, list, watch | `allowVolumeExpansion` before growing a volume |
 | `apps` | `deployments` | get, list, watch, create, update, patch, delete | Forgejo `<name>`; patch: autopilot restarts and vertical sizing |
 | `apps` | `statefulsets` | get, list, watch, create, update, delete | Valkey `<name>-valkey` and the cron runner `<name>-cron` with HA (update: scaling the cron runner down before a new image; delete: both when HA is turned off), and `ForgejoRunner` pods |
-| `batch` | `jobs` | get, list, watch, create, delete | Backup, upload, restore and runner registration Jobs, deleted once their result is recorded |
+| `batch` | `jobs` | get, list, watch, create, delete | Backup, upload, restore and runner registration Jobs, deleted once their result is recorded; CNPG's major upgrade Job is only read |
 | `autoscaling` | `horizontalpodautoscalers` | get, list, watch, create, update, delete | HPA `<name>` |
 | `policy` | `poddisruptionbudgets` | get, list, watch, create, update, delete | PDBs `<name>` and `<name>-valkey` |
 | `networking.k8s.io` | `ingresses` | get, list, watch, create, update, delete | Ingress `<name>` |
 | `events.k8s.io` | `events` | create, patch | Events on the operator's objects |
 | `metrics.k8s.io` | `pods` | list | Usage of the Forgejo pods for vertical sizing |
-| `postgresql.cnpg.io` | `clusters` | get, list, watch, create, update, patch | CNPG Cluster `<name>-db`; patch: storage growth. Never deleted |
+| `postgresql.cnpg.io` | `clusters` | get, list, watch, create, update, patch, delete | CNPG Cluster `<name>-db`; patch: storage growth; delete: only the rollback of a failed PostgreSQL major upgrade (above) |
 | `monitoring.coreos.com` | `servicemonitors`, `prometheusrules` | get, create, update, delete | Read live, never listed or watched |
 | `gateway.networking.k8s.io` | `httproutes`, `tcproutes`, `referencegrants` | get, create, update, delete | Read live, never listed or watched (see [networking.md](networking.md#permissions)) |
 | `cert-manager.io` | `certificates` | get, create, update, delete | Read live, never listed or watched (see [networking.md](networking.md#permissions)) |

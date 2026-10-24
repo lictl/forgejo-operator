@@ -216,6 +216,9 @@ func observeRollout(dep *appsv1.Deployment, found bool) rollout {
 // upgradingMessage names the images of the upgrade in flight. rc.TargetImage alone would
 // name the old image while the pre-upgrade backup or the rollback runs.
 func upgradingMessage(rc *forgejo.ReconcileContext) string {
+	if db := forgejo.DatabaseUpgrade(rc.Instance); rc.DatabaseUpgrading && db != nil {
+		return fmt.Sprintf("Upgrading PostgreSQL from %d to %d (phase %s): %s", db.FromMajor, db.ToMajor, db.Phase, db.Message)
+	}
 	u := rc.Instance.Status.Upgrade
 	if u == nil || u.ToImage == "" || u.FromImage == "" {
 		return "Upgrading to " + rc.TargetImage

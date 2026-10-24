@@ -124,6 +124,7 @@ type namedStep struct {
 const (
 	stepMaintenance      = "maintenance"
 	stepRestoreGuard     = "restore-guard"
+	stepDatabaseUpgrade  = "database-upgrade"
 	stepUpgrade          = "upgrade"
 	stepBackupSchedule   = "backup-schedule"
 	stepBackupOwnership  = "backup-ownership"
@@ -135,7 +136,8 @@ const (
 
 // steps run in order. maintenance → restore-guard → secrets → database → high-availability
 // → storage → upgrade → tuning → config → config-guard → workload form a chain (which
-// ssh-host-keys joins at config): each produces outputs the next ones consume, so a failure or
+// ssh-host-keys joins at config, and database-upgrade at database): each produces outputs the
+// next ones consume, so a failure or
 // Stop skips the rest of the chain
 // (e.g. no app.ini without the database, no rollout onto an unready Valkey). The other steps
 // only need part of the chain, or nothing, and keep running when an unrelated step fails, so
@@ -154,7 +156,11 @@ var steps = []namedStep{
 	// spec.storage.retainPolicy. It reads only the instance and its backups, so a database
 	// or Valkey that is down must not delay it (the instance may be deleted meanwhile).
 	{name: stepBackupOwnership, fn: backup.ReconcileOwnership},
-	{name: stepDatabase, fn: core.ReconcileDatabase, needs: []string{stepSecrets}},
+	// PostgreSQL major upgrades: chooses the image the database step writes (rc.DatabaseImage)
+	// and stops Forgejo around CNPG's pg_upgrade. Not after database, which stops while CNPG
+	// upgrades; it needs only the final maintenance flags (restores and upgrades never overlap).
+	{name: stepDatabaseUpgrade, fn: upgrade.ReconcileDatabase, needs: []string{stepRestoreGuard}},
+	{name: stepDatabase, fn: core.ReconcileDatabase, needs: []string{stepSecrets, stepDatabaseUpgrade}},
 	{name: stepHighAvailability, fn: autopilot.ReconcileHA, needs: []string{stepDatabase}},
 	{name: stepStorage, fn: core.ReconcileStorage, needs: []string{stepHighAvailability}},
 	// spec.restoreFrom: once the identity is restored and the database and the data volume
@@ -258,7 +264,7 @@ func runPipeline(ctx context.Context, rc *forgejo.ReconcileContext, steps []name
 	for _, s := range steps {
 		if missing := firstMissing(s.needs, p.completed); missing != "" {
 			p.skipped[s.name] = missing
-			if s.name == stepUpgrade {
+			if s.name == stepUpgrade || s.name == stepDatabaseUpgrade {
 				inferUpgrading(rc)
 			}
 			continue
@@ -280,7 +286,7 @@ func runPipeline(ctx context.Context, rc *forgejo.ReconcileContext, steps []name
 			p.failed[s.name] = err
 			p.failedOrder = append(p.failedOrder, s.name)
 			log.Error(err, "reconcile step failed", "step", s.name)
-			if s.name == stepUpgrade {
+			if s.name == stepUpgrade || s.name == stepDatabaseUpgrade {
 				inferUpgrading(rc)
 			}
 			continue
@@ -299,11 +305,14 @@ func runPipeline(ctx context.Context, rc *forgejo.ReconcileContext, steps []name
 	return p
 }
 
-// inferUpgrading stands in for the upgrade step when it did not run (or failed): the
-// independent steps after it (backup schedule, status) must not take an instance with an
-// upgrade in flight for an idle one, e.g. start a scheduled backup in the middle of it.
+// inferUpgrading stands in for the upgrade and database-upgrade steps when they did not run
+// (or failed): the independent steps after them (backup schedule, status) must not take an
+// instance with an upgrade in flight for an idle one, e.g. start a scheduled backup in the
+// middle of it.
 func inferUpgrading(rc *forgejo.ReconcileContext) {
-	rc.Upgrading = rc.Upgrading || forgejo.UpgradeInFlight(rc.Instance)
+	db := forgejo.DatabaseUpgradeInFlight(rc.Instance)
+	rc.DatabaseUpgrading = rc.DatabaseUpgrading || db
+	rc.Upgrading = rc.Upgrading || db || forgejo.UpgradeInFlight(rc.Instance)
 }
 
 func firstMissing(needs []string, completed map[string]bool) string {

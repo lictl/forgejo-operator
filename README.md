@@ -32,7 +32,7 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
 | Level | What the operator does |
 |-------|------------------------|
 | **I Basic install** | One `Forgejo` resource provisions a CNPG cluster (or uses an external database), generated secrets, the admin account, the data volume, the Deployment, HTTP/SSH Services, and optionally an Ingress or Gateway API routes (HTTPRoute, TCPRoute for SSH) with a cert-manager certificate. It renders the whole `app.ini` and rolls pods when it changes. |
-| **II Seamless upgrades** | Changing `spec.image` to a newer version is version-gated and preceded by a cold backup. Forgejo is migrated with a single pod and verified. Downgrades are refused, and upgrades can be cancelled or retried. |
+| **II Seamless upgrades** | Changing `spec.image` to a newer version is version-gated and preceded by a cold backup. Forgejo is migrated with a single pod and verified. Downgrades are refused, and upgrades can be cancelled or retried. A newer PostgreSQL major in `spec.database.cnpg.imageName` is upgraded the same way, with CloudNativePG's `pg_upgrade` between a cold database backup and the verification of Forgejo on the new major; one upgrade runs at a time. |
 | **III Full lifecycle** | On-demand and cron-scheduled backups with retention, uploaded encrypted (with the instance's identity) to S3 off the cluster, and restores with maintenance mode, also of remote backups. Disaster recovery recreates a lost instance from a remote backup before it first starts. Data is retained on deletion by default (`retainPolicy`), and CNPG handles database failover. |
 | **IV Deep insights** | Health, version and statistics in status. Conditions and events, operator metrics, Forgejo `/metrics` through a ServiceMonitor, a PrometheusRule with per-instance alerts, and a Grafana dashboard. |
 | **V Auto pilot** | Automatic rollback of failed upgrades and of configs that make Forgejo crash. Restarts hung pods. Vertical right-sizing from OOM kills and usage. HPA with high availability: Valkey with Sentinel failover, a single cron runner, spreading. PVC auto-expansion. Tuning derived from resources (GOMEMLIMIT, DB pool). |
@@ -109,6 +109,12 @@ kubectl apply -n forgejo -f config/samples/forgejo_v1alpha1_forgejorestore.yaml
 kubectl patch fj forgejo-sample -n forgejo --type merge \
   -p '{"spec":{"image":"codeberg.org/forgejo/forgejo:17"}}'
 kubectl get fj forgejo-sample -n forgejo -o jsonpath='{.status.upgrade}'
+
+# PostgreSQL major upgrade (new instances start on 18): cold database backup, CNPG's pg_upgrade,
+# verification, rollback on failure (docs/upgrades.md, "PostgreSQL major upgrades")
+kubectl patch fj forgejo-sample -n forgejo --type merge \
+  -p '{"spec":{"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie"}}}}'
+kubectl get fj forgejo-sample -n forgejo -o jsonpath='{.status.database.upgrade}'
 
 # Change app.ini; the pods roll, and a config that crash-loops is rolled back
 kubectl patch fj forgejo-sample -n forgejo --type merge \

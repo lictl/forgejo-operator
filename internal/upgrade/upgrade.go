@@ -10,7 +10,6 @@ package upgrade
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -19,9 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/backup"
@@ -112,6 +109,16 @@ func idle(rc *forgejo.ReconcileContext, desired, current string, retry bool) {
 	case desired == current:
 		settle(rc, current)
 		return
+	case rc.DatabaseUpgrading || forgejo.DatabaseUpgradeHoldsWorkload(f):
+		// One upgrade at a time: the PostgreSQL major upgrade stops Forgejo and verifies the
+		// running version on the new major. A retry annotation waits as well.
+		if u != nil && u.FailedImage == desired {
+			hold(rc, u)
+			return
+		}
+		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, "WaitingForDatabaseUpgrade",
+			fmt.Sprintf("The change to %s starts after the PostgreSQL major upgrade (status.database.upgrade)", desired))
+		return
 	case u != nil && u.FailedImage == desired && retry:
 		rc.Event(corev1.EventTypeNormal, "UpgradeRetry", eventAction, "Retrying the upgrade to %s (annotation %s)", desired, AnnotationRetry)
 		u.FailedImage = ""
@@ -147,12 +154,12 @@ func idle(rc *forgejo.ReconcileContext, desired, current string, retry bool) {
 		refusePath(rc, current, desired, c)
 	case rc.Maintenance:
 		// A restore owns the instance; the upgrade starts once it is done.
-		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, "WaitingForRestore",
+		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, reasonWaitingForRestore,
 			fmt.Sprintf("The upgrade to %s starts after the running restore: %s", desired, rc.MaintenanceReason))
 	case rc.SSHHostKeysUnavailable:
 		// The pods of the new image could not start (docs/ssh.md): the cold backup would
 		// scale Forgejo down for nothing.
-		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, "WaitingForSSHHostKeys",
+		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, reasonWaitingForSSHHostKeys,
 			fmt.Sprintf("The upgrade to %s starts once the Secret of SSH host keys is usable again (Degraded/SSHHostKeysUnavailable)", desired))
 	case rc.ObjectStorageUnavailable:
 		// Forgejo does not start without its bucket: the new version could not be verified,
@@ -406,17 +413,7 @@ func clearDegraded(rc *forgejo.ReconcileContext) {
 }
 
 func removeRetryAnnotation(ctx context.Context, rc *forgejo.ReconcileContext) error {
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{AnnotationRetry: nil}},
-	})
-	if err != nil {
-		return err
-	}
-	obj := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Namespace: rc.Instance.Namespace, Name: rc.Instance.Name}}
-	if err := rc.Client.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patch)); err != nil {
-		return client.IgnoreNotFound(fmt.Errorf("removing annotation %s: %w", AnnotationRetry, err))
-	}
-	return nil
+	return removeAnnotation(ctx, rc, AnnotationRetry)
 }
 
 type changeKind int

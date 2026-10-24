@@ -201,7 +201,7 @@ func (r *ForgejoRestoreReconciler) validate(ctx context.Context, rs *forgejov1.F
 		return ctrl.Result{}, r.fail(ctx, rs, f, "BackupDeleted", fmt.Sprintf("ForgejoBackup %q is being deleted", b.Name))
 	}
 	restoreDB, restoreData := what(rs, b)
-	return r.begin(ctx, rs, f, restoreDB, restoreData, b.Status.ForgejoImage, nil)
+	return r.begin(ctx, rs, f, restoreDB, restoreData, b.Status.ForgejoImage, b.Status.PostgresImage, nil)
 }
 
 // remoteReadWait is how long a restore of a remote backup waits for the bucket to answer
@@ -241,7 +241,7 @@ func (r *ForgejoRestoreReconciler) validateRemote(ctx context.Context, rs *forge
 		Location: where, BackupName: m.Backup, ForgejoImage: m.ForgejoImage, IncludesData: m.IncludesData,
 		KeyFingerprint: store.KeyFingerprint(), Files: m.Files,
 	}
-	return r.begin(ctx, rs, f, restoreDB, restoreData, m.ForgejoImage, remote)
+	return r.begin(ctx, rs, f, restoreDB, restoreData, m.ForgejoImage, m.PostgresImage, remote)
 }
 
 // objectStorageUnusable returns the ObjectStorageReady message when the object-storage step
@@ -259,14 +259,24 @@ func objectStorageUnusable(f *forgejov1.Forgejo) (string, bool) {
 	return c.Message, true
 }
 
-// begin starts a validated restore: it waits for other restores, for the SSH host keys and for
-// the Secrets of spec.objectStorage, refuses a Job name taken by something else, and moves to
-// ScalingDown.
+// begin starts a validated restore: it refuses a dump of a newer PostgreSQL major than the
+// server's, waits for other restores, for a PostgreSQL major upgrade, for the SSH host keys and
+// for the Secrets of spec.objectStorage, refuses a Job name taken by something else, and moves
+// to ScalingDown. dumpImage is the PostgreSQL image whose pg_dump wrote the backup's dump.
 func (r *ForgejoRestoreReconciler) begin(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo,
-	restoreDB, restoreData bool, backupImage string, remote *forgejov1.RestoreRemoteStatus) (ctrl.Result, error) {
+	restoreDB, restoreData bool, backupImage, dumpImage string, remote *forgejov1.RestoreRemoteStatus) (ctrl.Result, error) {
 	if !restoreDB && !restoreData {
 		return ctrl.Result{}, r.fail(ctx, rs, f, "NothingToRestore",
 			"Neither the database nor data are selected (or the backup has no data archive)")
+	}
+	if restoreDB {
+		if msg := backup.DumpTooNew(f, dumpImage); msg != "" {
+			return ctrl.Result{}, r.fail(ctx, rs, f, "NewerDump", msg+"; nothing was changed")
+		}
+	}
+	if u := forgejo.DatabaseUpgrade(f); forgejo.DatabaseUpgradeInFlight(f) && u.RestoreName != rs.Name {
+		// Only the upgrade's own rollback restore runs meanwhile.
+		return r.wait(ctx, rs, fmt.Sprintf("Waiting for the PostgreSQL major upgrade to %s to finish (phase %s)", u.ToImage, u.Phase))
 	}
 
 	restores, err := backup.ListRestores(ctx, r.Client, f.Namespace, f.Name)
@@ -420,11 +430,12 @@ func (r *ForgejoRestoreReconciler) restoreJob(ctx context.Context, rs *forgejov1
 		backupClaim = b.Status.PVCName
 	}
 	in := backup.JobInput{
-		Scheme:        r.Scheme,
-		Instance:      f,
-		InstanceName:  f.Name,
-		ForgejoImage:  backup.CurrentImage(f),
-		PostgresImage: forgejo.PostgresImage(f),
+		Scheme:       r.Scheme,
+		Instance:     f,
+		InstanceName: f.Name,
+		ForgejoImage: backup.CurrentImage(f),
+		// pg_restore and psql of the running server's major.
+		PostgresImage: forgejo.RunningPostgresImage(f),
 	}
 	if restoreDB {
 		if in.DB, err = forgejo.ResolveDB(ctx, r.Client, f); err != nil {

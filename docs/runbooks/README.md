@@ -31,6 +31,7 @@ working hours). The two burn-rate alerts follow the same split.
 | [ForgejoBackupUploadMissing](ForgejoBackupUploadMissing.md) | warning | instance (RPO) | No off-cluster backup at all for a whole RPO |
 | [ForgejoVolumeAlmostFull](ForgejoVolumeAlmostFull.md) | warning | instance | A PVC of the instance is more than 90% full for 10m |
 | [ForgejoUpgradeFailed](ForgejoUpgradeFailed.md) | warning | instance | An upgrade failed or was rolled back in the last hour |
+| [ForgejoDatabaseUpgradeFailed](ForgejoDatabaseUpgradeFailed.md) | warning | instance (CNPG) | A PostgreSQL major upgrade failed or was rolled back in the last hour |
 | [ForgejoVersionUnsupported](ForgejoVersionUnsupported.md) | warning | instance | The running major is outside the support policy for 1h |
 | [ForgejoVersionAdvisory](ForgejoVersionAdvisory.md) | warning | instance | The running patch release has an advisory for 1h |
 | [ForgejoRunnersOffline](ForgejoRunnersOffline.md) | warning | instance | Jobs wait and none of a `ForgejoRunner`'s runners is online for 10m |

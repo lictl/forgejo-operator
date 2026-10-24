@@ -103,7 +103,7 @@ func TestPipelineValkeyStop(t *testing.T) {
 	})
 	rc := newRC()
 	p := runPipeline(context.Background(), rc, st)
-	want := []string{stepMaintenance, stepRestoreGuard, stepRestoreIdentity, stepSecrets, stepBackupOwnership, stepDatabase, stepHighAvailability,
+	want := []string{stepMaintenance, stepRestoreGuard, stepRestoreIdentity, stepSecrets, stepBackupOwnership, stepDatabaseUpgrade, stepDatabase, stepHighAvailability,
 		stepSSHHostKeys, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepBackupSchedule, stepHealth, stepValkeyStatus,
 		stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
@@ -388,5 +388,43 @@ func TestPipelineBlockedByNamesRootCause(t *testing.T) {
 	}
 	if got := p.blockedBy(stepBackupSchedule); !strings.Contains(got, `step "maintenance" failed: listing restores: forbidden`) {
 		t.Errorf("blockedBy = %q", got)
+	}
+}
+
+// While a PostgreSQL upgrade's rollback deletes the Cluster, the database-upgrade step stops:
+// the database step (and the chain) is skipped, the independent steps run, and the upgrade in
+// flight is visible to the backup schedule. So it is when the step fails.
+func TestPipelineDatabaseUpgradeStopsTheDatabaseStep(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		var upgradingAtSchedule, dbUpgradingAtSchedule bool
+		st, ran := stubSteps(func(name string, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
+			switch name {
+			case stepDatabaseUpgrade:
+				if fail {
+					return forgejo.StepResult{}, errors.New("reading CNPG cluster: timeout")
+				}
+				rc.Upgrading, rc.DatabaseUpgrading = true, true
+				return forgejo.StepResult{Stop: true}, nil
+			case stepBackupSchedule:
+				upgradingAtSchedule, dbUpgradingAtSchedule = rc.Upgrading, rc.DatabaseUpgrading
+			}
+			return forgejo.StepResult{}, nil
+		})
+		rc := newRC()
+		rc.Instance.Status.Database = &forgejov1.DatabaseStatus{Upgrade: &forgejov1.DatabaseUpgradeStatus{Phase: forgejov1.DatabaseUpgradeRollingBack}}
+		runPipeline(context.Background(), rc, st)
+		for _, skipped := range []string{stepDatabase, stepHighAvailability, stepUpgrade, stepWorkload} {
+			if slices.Contains(*ran, skipped) {
+				t.Errorf("fail=%v: %s ran although database-upgrade did not complete", fail, skipped)
+			}
+		}
+		for _, want := range []string{stepBackupSchedule, stepHealth, stepStorageAutopilot} {
+			if !slices.Contains(*ran, want) {
+				t.Errorf("fail=%v: %s did not run", fail, want)
+			}
+		}
+		if !upgradingAtSchedule || !dbUpgradingAtSchedule {
+			t.Errorf("fail=%v: the backup schedule saw upgrading=%v, database upgrading=%v", fail, upgradingAtSchedule, dbUpgradingAtSchedule)
+		}
 	}
 }

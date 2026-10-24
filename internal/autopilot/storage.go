@@ -189,6 +189,10 @@ func reconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext, st *ins
 				// the pods that mount it cannot run (PostgreSQL on a full volume): wait for a
 				// fresh measurement instead of growing it again on stale numbers.
 				expanding = true
+			case c.role != roleData && forgejo.DatabaseUpgradeInFlight(f):
+				// The Cluster is being upgraded, or recreated by a rollback: no spec change meanwhile.
+				addProblem(ReasonExpansionDeferred, fmt.Sprintf("%s is %d%% full; it is grown once the PostgreSQL major upgrade has finished",
+					pvc.Name, vu.UsedPercent))
 			default:
 				newSize := grownSize(req, int64(ae.IncrementPercent), maxSize)
 				if err := expandClaim(ctx, rc, c, newSize); err != nil {
@@ -307,6 +311,8 @@ func problemRank(reason string) int {
 		return 3
 	case ReasonAutoExpandDisabled:
 		return 4
+	case ReasonExpansionDeferred:
+		return 5
 	}
 	return 99
 }

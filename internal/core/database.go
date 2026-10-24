@@ -11,20 +11,18 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
 const (
-	cnpgHealthyPhase = "Cluster in healthy state"
+	cnpgHealthyPhase = forgejo.CNPGHealthyPhase
 	// annotationManagedPGParams remembers which postgresql.parameters came from the spec,
 	// so that removed ones are dropped without touching parameters set by others.
 	annotationManagedPGParams = "forgejo.lucas.icu/managed-pg-parameters"
@@ -124,6 +122,11 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 		SecretName:  forgejo.CNPGAppSecretName(f),
 		Instances:   cnpgInstances(f),
 	}
+	if prev := f.Status.Database; prev != nil {
+		// The database-upgrade step's record, and what is known of the data until the Cluster
+		// reports it again.
+		st.Upgrade, st.Image, st.MajorVersion, st.SystemID = prev.Upgrade, prev.Image, prev.MajorVersion, prev.SystemID
+	}
 	f.Status.Database = st
 
 	if !rc.HasAPI(forgejo.CNPGClusterGVK) {
@@ -137,9 +140,15 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 	cluster.SetName(name)
 	cluster.SetNamespace(f.Namespace)
 	if err := apply(ctx, rc, cluster, rc.OwnerRefsEnabled(), func() error {
-		return mutateCNPGCluster(f, cluster)
+		return mutateCNPGCluster(f, cluster, databaseImage(rc), rc.DatabaseStorageFloor)
 	}); err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("CNPG cluster %s: %w", name, err)
+	}
+	if view := forgejo.ReadCNPGCluster(cluster); view.DataImage != "" {
+		st.Image, st.MajorVersion = view.DataImage, int32(view.DataMajor)
+		if view.SystemID != "" {
+			st.SystemID = view.SystemID
+		}
 	}
 
 	ready, _, _ := unstructured.NestedInt64(cluster.Object, "status", "readyInstances")
@@ -181,7 +190,9 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 			fmt.Sprintf("CNPG cluster %s is healthy (%d/%d instances ready)", name, ready, st.Instances))
 		return forgejo.StepResult{}, nil
 	}
-	if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionDatabaseReady); c == nil || c.Reason != reasonClusterDegraded {
+	// Replicas that are cloned again after a PostgreSQL major upgrade are part of the upgrade.
+	if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionDatabaseReady); !rc.DatabaseUpgrading &&
+		(c == nil || c.Reason != reasonClusterDegraded) {
 		rc.Event(corev1.EventTypeWarning, "DatabaseDegraded", "Database",
 			"%s; the primary %s serves Forgejo, backups and restores", summary, current)
 	}
@@ -190,51 +201,13 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 	return forgejo.StepResult{RequeueAfter: cnpgDegradedRequeue}, nil
 }
 
-// cnpgPrimaryBlockedPhases are CNPG phases during which the primary does not accept
-// connections (or is about to change).
-var cnpgPrimaryBlockedPhases = map[string]bool{
-	"Setting up primary":                                       true,
-	"Failing over":                                             true,
-	"Switchover in progress":                                   true,
-	"Primary instance is being restarted in-place":             true,
-	"Primary instance is being restarted without a switchover": true,
-	"Upgrading Postgres major version":                         true,
-}
-
 // cnpgPrimaryUnavailable explains why the primary of a CNPG cluster that is not fully
-// healthy cannot serve Forgejo, or returns "" when it can.
+// healthy cannot serve Forgejo, or returns "" when it can (forgejo.CNPGPrimaryUnavailable).
 func cnpgPrimaryUnavailable(ctx context.Context, rc *forgejo.ReconcileContext, phase, current, target string, ready int64) (string, error) {
-	switch {
-	case current == "":
-		return "no primary yet", nil
-	case target != current:
-		return fmt.Sprintf("primary changing from %s to %s", current, target), nil
-	case cnpgPrimaryBlockedPhases[phase]:
-		return "primary unavailable", nil
-	case ready < 1:
-		return "no instance ready", nil
-	}
-	pod := &corev1.Pod{}
-	if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: rc.Instance.Namespace, Name: current}, pod); err != nil {
-		if apierrors.IsNotFound(err) {
-			return "primary pod " + current + " not found", nil
-		}
-		return "", fmt.Errorf("primary pod %s: %w", current, err)
-	}
-	if !pod.DeletionTimestamp.IsZero() || !podReady(pod) {
-		return "primary pod " + current + " is not ready", nil
-	}
-	return "", nil
+	return forgejo.CNPGPrimaryUnavailable(ctx, rc.Client, rc.Instance.Namespace, phase, current, target, ready)
 }
 
-func podReady(pod *corev1.Pod) bool {
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
-}
+func podReady(pod *corev1.Pod) bool { return forgejo.PodReady(pod) }
 
 func cnpgInstances(f *forgejov1.Forgejo) int32 {
 	if n := f.Spec.Database.CNPG.Instances; n > 0 {
@@ -243,8 +216,20 @@ func cnpgInstances(f *forgejov1.Forgejo) int32 {
 	return 1
 }
 
+// databaseImage is the PostgreSQL image the database step writes: the database-upgrade step's
+// choice (rc.DatabaseImage), else spec.database.cnpg.imageName.
+func databaseImage(rc *forgejo.ReconcileContext) string {
+	if rc.DatabaseImage != "" {
+		return rc.DatabaseImage
+	}
+	return forgejo.PostgresImage(rc.Instance)
+}
+
 // mutateCNPGCluster sets only the fields the operator manages, leaving CNPG's defaults alone.
-func mutateCNPGCluster(f *forgejov1.Forgejo, c *unstructured.Unstructured) error {
+// image is written as spec.imageName, except a major older than the cluster's data, which
+// CNPG's webhook refuses (the database-upgrade step reports such a downgrade). storageFloor,
+// when set, is the least volume size of a Cluster that is created.
+func mutateCNPGCluster(f *forgejov1.Forgejo, c *unstructured.Unstructured, image, storageFloor string) error {
 	spec := f.Spec.Database.CNPG
 	creating := c.GetResourceVersion() == ""
 	c.SetLabels(mergeMaps(c.GetLabels(), forgejo.Labels(f, forgejo.ComponentDatabase)))
@@ -256,11 +241,21 @@ func mutateCNPGCluster(f *forgejov1.Forgejo, c *unstructured.Unstructured) error
 	if err := set(int64(cnpgInstances(f)), "instances"); err != nil {
 		return err
 	}
-	if err := set(forgejo.PostgresImage(f), "imageName"); err != nil {
+	if cur := forgejo.ReadCNPGCluster(c); !creating && cur.DataMajor > 0 && cur.SpecImage != "" {
+		if ref := forgejo.ParsePostgresImage(image); ref.OK && ref.Major < cur.DataMajor {
+			image = cur.SpecImage
+		}
+	}
+	if err := set(image, "imageName"); err != nil {
 		return err
 	}
 
 	size := forgejo.QuantityOr(spec.Storage.Size, "5Gi")
+	if creating && storageFloor != "" {
+		if floor, err := resource.ParseQuantity(storageFloor); err == nil && size.Cmp(floor) < 0 {
+			size = floor
+		}
+	}
 	if cur, found, _ := unstructured.NestedString(obj, "spec", "storage", "size"); !found || quantityLess(cur, size.String()) {
 		if err := set(size.String(), "storage", "size"); err != nil {
 			return err

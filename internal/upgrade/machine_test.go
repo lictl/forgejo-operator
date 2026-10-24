@@ -243,7 +243,7 @@ func TestRetryKeepsMigratingPodAndDeletesFailingOne(t *testing.T) {
 		StartTime: ago(time.Minute), RolloutStartTime: ago(time.Minute),
 	})
 	running := corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
-	crashing := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}
+	crashing := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: waitingCrashLoopBackOff}}
 	migrating := serverPod(f, "migrating", imgB, ago(time.Hour), running, 5)
 	failed := serverPod(f, "failed", imgB, ago(time.Hour), crashing, 5)
 	_, c := reconcile(t, f, migrating, failed)

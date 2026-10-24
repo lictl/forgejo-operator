@@ -424,3 +424,28 @@ func ServerPodsRunning(ctx context.Context, c client.Client, f *forgejov1.Forgej
 	}
 	return n, nil
 }
+
+// DumpTooNew explains why a database dump that pg_dump of dumpImage wrote cannot be restored
+// into the instance's CNPG cluster: it comes from a newer PostgreSQL major than the server's,
+// and a newer pg_dump's output is not guaranteed to load into an older server. It returns ""
+// when the dump may be restored, also when either major is unknown or the database is external.
+func DumpTooNew(f *forgejov1.Forgejo, dumpImage string) string {
+	if forgejo.DatabaseType(f) != forgejov1.DatabaseTypeCNPG || dumpImage == "" {
+		return ""
+	}
+	dump := forgejo.ParsePostgresImage(dumpImage)
+	if !dump.OK {
+		return ""
+	}
+	server := 0
+	if st := f.Status.Database; st != nil && st.MajorVersion > 0 {
+		server = int(st.MajorVersion)
+	} else if ref := forgejo.ParsePostgresImage(forgejo.RunningPostgresImage(f)); ref.OK {
+		server = ref.Major
+	}
+	if server == 0 || dump.Major <= server {
+		return ""
+	}
+	return fmt.Sprintf("the backup's database dump was written by pg_dump of PostgreSQL %d (%s), and the instance's database runs "+
+		"PostgreSQL %d: a dump does not go back to an older major", dump.Major, dumpImage, server)
+}

@@ -186,6 +186,11 @@ spec:
                 - Completed
                 - Failed
                 type: string
+              postgresImage:
+                description: |-
+                  postgresImage whose pg_dump wrote the database dump: the image of the instance's running
+                  PostgreSQL. A restore into a server of an older major is refused.
+                type: string
               pvcName:
                 description: pvcName holding the backup files.
                 type: string

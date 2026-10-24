@@ -116,6 +116,18 @@ groups:
       forgejo: fj
       namespace: ns
       severity: warning
+  - alert: ForgejoDatabaseUpgradeFailed
+    annotations:
+      runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoDatabaseUpgradeFailed.md
+      summary: A PostgreSQL major upgrade of Forgejo ns/fj failed
+    expr: sum by (namespace, name) (increase(forgejo_operator_database_upgrades_total{namespace="ns",
+      name="fj", result!="succeeded"}[1h]) > 0 or (forgejo_operator_database_upgrades_total{namespace="ns",
+      name="fj", result!="succeeded"} unless forgejo_operator_database_upgrades_total{namespace="ns",
+      name="fj", result!="succeeded"} offset 1h)) > 0
+    labels:
+      forgejo: fj
+      namespace: ns
+      severity: warning
   - alert: ForgejoVersionUnsupported
     annotations:
       runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoVersionUnsupported.md

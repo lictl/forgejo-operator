@@ -86,6 +86,11 @@ var (
 		Help: "Finished upgrades by result (succeeded/failed/rolledback).",
 	}, []string{labelNamespace, labelName, labelResult})
 
+	DatabaseUpgradeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "forgejo_operator_database_upgrades_total",
+		Help: "Finished PostgreSQL major upgrades of the CNPG cluster by result (succeeded/failed/rolledback).",
+	}, []string{labelNamespace, labelName, labelResult})
+
 	AutoPilotActions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "forgejo_operator_autopilot_actions_total",
 		Help: "Autonomous actions taken by the operator, by type.",
@@ -143,7 +148,7 @@ func init() {
 	metrics.Registry.MustRegister(
 		InstanceReady, InstanceInfo, HealthCheckFailures, HealthCheckUnreachable, AvailabilityProbes,
 		BackupLastSuccess, BackupTotal, BackupDuration, BackupSize, BackupUploadTotal, BackupLastUploadSuccess, RestoreTotal,
-		UpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife, VersionAdvisory,
+		UpgradeTotal, DatabaseUpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife, VersionAdvisory,
 		ValkeyMasterAvailable, ValkeyReadyMembers, ValkeyFailovers, CronRunnerReady,
 	)
 }
@@ -157,7 +162,7 @@ func DeleteInstanceMetrics(namespace, name string) {
 		v.DeletePartialMatch(l)
 	}
 	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, AvailabilityProbes, BackupTotal, BackupUploadTotal, RestoreTotal, UpgradeTotal,
-		AutoPilotActions, ValkeyFailovers} {
+		DatabaseUpgradeTotal, AutoPilotActions, ValkeyFailovers} {
 		v.DeletePartialMatch(l)
 	}
 }

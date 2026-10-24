@@ -25,6 +25,11 @@ const (
 	// backOffRestarts fails it earlier while the kubelet is backing off a container that
 	// crashed repeatedly (a single crash may be a blip).
 	backOffRestarts = 2
+
+	// Reasons of waiting containers.
+	waitingImagePullBackOff = "ImagePullBackOff"
+	waitingErrImagePull     = "ErrImagePull"
+	waitingCrashLoopBackOff = "CrashLoopBackOff"
 )
 
 func serverPods(ctx context.Context, rc *forgejo.ReconcileContext) ([]corev1.Pod, error) {
@@ -61,11 +66,11 @@ func newImageFailure(pods []corev1.Pod, image string, now time.Time, ignore func
 				switch w.Reason {
 				case "InvalidImageName", "ErrImageNeverPull":
 					return fmt.Sprintf("image %s cannot be used: %s", image, strings.TrimSpace(w.Reason+" "+w.Message))
-				case "ErrImagePull", "ImagePullBackOff":
+				case waitingErrImagePull, waitingImagePullBackOff:
 					if now.Sub(p.CreationTimestamp.Time) > pullGrace {
 						return fmt.Sprintf("image %s could not be pulled for %s: %s", image, pullGrace, strings.TrimSpace(w.Reason+" "+w.Message))
 					}
-				case "CrashLoopBackOff":
+				case waitingCrashLoopBackOff:
 					if cs.RestartCount >= backOffRestarts {
 						return crashMessage(p, cs)
 					}

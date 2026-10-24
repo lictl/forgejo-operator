@@ -27,8 +27,11 @@ import (
 const (
 	// DefaultImage is the current Forgejo LTS release (see docs/versions.md). Changing it
 	// only affects new instances: existing ones keep the image stored in their spec.
-	DefaultImage          = "codeberg.org/forgejo/forgejo:15"
-	DefaultPostgresImage  = "ghcr.io/cloudnative-pg/postgresql:17"
+	DefaultImage = "codeberg.org/forgejo/forgejo:15"
+	// DefaultPostgresImage is CloudNativePG's current PostgreSQL major on Debian stable, in the
+	// minimal flavour (the database uses the C collation and no extension). Like DefaultImage
+	// it floats over minor releases; pin MM.mm-minimal-trixie or a digest to control them.
+	DefaultPostgresImage  = "ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie"
 	DefaultValkeyImage    = "docker.io/valkey/valkey:8-alpine"
 	DefaultAdminUsername  = "forgejo_admin"
 	DefaultAdminEmail     = "forgejo_admin@forgejo.local"
@@ -79,6 +82,10 @@ const (
 	// Sentinels name one and that pod is Ready. Only reported while highAvailability is
 	// enabled; see docs/high-availability.md.
 	ConditionValkeyReady = "ValkeyReady"
+	// ConditionDatabaseUpgrading is True while a PostgreSQL major upgrade of the CNPG cluster
+	// is orchestrated (the reason is its phase). Only reported for database type CNPG; see
+	// docs/upgrades.md, "PostgreSQL major upgrades".
+	ConditionDatabaseUpgrading = "DatabaseUpgrading"
 )
 
 // ForgejoPhase is a coarse, human-readable summary of the instance state.
@@ -620,6 +627,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.type) || self.type != 'External' || has(self.external)",message="type External requires external (host and credentialsSecret)",fieldPath=".external",reason="FieldValueRequired"
 // +kubebuilder:validation:XValidation:rule="!has(self.external) || (has(self.type) && self.type == 'External')",message="external requires type External",fieldPath=".type",reason="FieldValueInvalid"
 // +kubebuilder:validation:XValidation:rule="!has(self.type) || self.type != 'External' || !has(self.cnpg) || ((!has(self.cnpg.instances) || self.cnpg.instances == 1) && !has(self.cnpg.parameters) && (!has(self.cnpg.storage) || !has(self.cnpg.storage.storageClassName)) && (!has(self.cnpg.enablePodMonitor) || !self.cnpg.enablePodMonitor) && (!has(self.cnpg.resources) || (!has(self.cnpg.resources.requests) && !has(self.cnpg.resources.limits))))",message="cnpg settings apply to type CNPG only; with type External only cnpg.imageName (the image of backup and restore Jobs) is used",fieldPath=".cnpg",reason="FieldValueForbidden"
+// +kubebuilder:validation:XValidation:rule="(has(self.type) && self.type == 'External') || !has(self.cnpg) || !has(self.cnpg.imageName) || self.cnpg.imageName.matches('^([^@]*/)?[^/:@]+:[0-9][^/:@]*(@[^@/]+)?$')",message="cnpg.imageName needs a tag that starts with the PostgreSQL major version, e.g. ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie (a digest may follow it): CloudNativePG reads the major version from the tag, and refuses a digest alone or 'latest'",fieldPath=".cnpg.imageName",reason="FieldValueInvalid"
 type DatabaseSpec struct {
 	// +kubebuilder:default=CNPG
 	// +optional
@@ -643,8 +651,15 @@ type CNPGSpec struct {
 	// +optional
 	Instances int32 `json:"instances,omitempty"`
 
-	// imageName is the PostgreSQL operand image. Also used for backup/restore jobs.
-	// +kubebuilder:default="ghcr.io/cloudnative-pg/postgresql:17"
+	// imageName is the PostgreSQL operand image, with a tag that starts with its major version
+	// (CloudNativePG images: MM-TYPE-OS, MM.mm-TYPE-OS, MM.mm-TS-TYPE-OS). A change within the
+	// major is rolled out by CloudNativePG. A newer major is an orchestrated upgrade: cold
+	// database backup, CloudNativePG's in-place pg_upgrade, verification, rollback on failure
+	// (docs/upgrades.md, "PostgreSQL major upgrades"); it must keep the image's Debian release
+	// (trixie, bookworm, ...). Older majors are refused. Backup and restore Jobs run pg_dump and
+	// pg_restore from the image of the running cluster (status.database.image), and with type
+	// External from this one.
+	// +kubebuilder:default="ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie"
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=512
 	// +optional
@@ -1080,11 +1095,15 @@ type UpgradeSpec struct {
 	BackupBeforeUpgrade *bool `json:"backupBeforeUpgrade,omitempty"`
 
 	// autoRollback restores the pre-upgrade backup and reverts the image when the new version
-	// does not become healthy within timeout. Defaults to true.
+	// does not become healthy within timeout. A PostgreSQL major upgrade that cannot be reverted
+	// in place is rolled back by recreating the CNPG cluster on the old image and restoring its
+	// pre-upgrade backup. Defaults to true.
 	// +optional
 	AutoRollback *bool `json:"autoRollback,omitempty"`
 
-	// timeout for the new version to become Ready.
+	// timeout for the new version to become Ready. For a PostgreSQL major upgrade: the time
+	// Forgejo has to become available on the new major, and a revert to bring the old data back;
+	// CloudNativePG's pg_upgrade itself is never interrupted.
 	// +kubebuilder:default="15m"
 	// +kubebuilder:validation:Type=string
 	// +kubebuilder:validation:MaxLength=32
@@ -1598,6 +1617,109 @@ type DatabaseStatus struct {
 	ReadyInstances int32 `json:"readyInstances,omitempty"`
 	// +optional
 	Phase string `json:"phase,omitempty"`
+	// image is the PostgreSQL image the CNPG cluster's data belongs to
+	// (status.pgDataImageInfo.image of the Cluster): during a major upgrade the old image,
+	// until pg_upgrade has succeeded. Backup and restore Jobs run pg_dump and pg_restore from it.
+	// +optional
+	Image string `json:"image,omitempty"`
+	// majorVersion is the PostgreSQL major version of the cluster's data.
+	// +optional
+	MajorVersion int32 `json:"majorVersion,omitempty"`
+	// systemID is the database system identifier CNPG reports; pg_upgrade creates a new one.
+	// +optional
+	SystemID string `json:"systemID,omitempty"`
+	// upgrade reports the latest PostgreSQL major upgrade (database type CNPG only).
+	// +optional
+	Upgrade *DatabaseUpgradeStatus `json:"upgrade,omitempty"`
+}
+
+// DatabaseUpgradePhase tracks an orchestrated PostgreSQL major upgrade.
+// +kubebuilder:validation:Enum=Pending;BackingUp;Upgrading;Verifying;Reverting;RollingBack;Succeeded;RolledBack;Failed;Cancelled
+type DatabaseUpgradePhase string
+
+const (
+	// DatabaseUpgradePending: the upgrade is recorded; nothing has changed yet.
+	DatabaseUpgradePending DatabaseUpgradePhase = "Pending"
+	// DatabaseUpgradeBackingUp: Forgejo is stopped, then a cold database backup is taken with
+	// the running (old) PostgreSQL image.
+	DatabaseUpgradeBackingUp DatabaseUpgradePhase = "BackingUp"
+	// DatabaseUpgradeUpgrading: the new image is written to the CNPG Cluster, which runs
+	// pg_upgrade in a Job; Forgejo stays stopped.
+	DatabaseUpgradeUpgrading DatabaseUpgradePhase = "Upgrading"
+	// DatabaseUpgradeVerifying: the data is on the new major; Forgejo starts on it.
+	DatabaseUpgradeVerifying DatabaseUpgradePhase = "Verifying"
+	// DatabaseUpgradeReverting: pg_upgrade failed or could not start; the old image is written
+	// back and CNPG restarts the untouched old data.
+	DatabaseUpgradeReverting DatabaseUpgradePhase = "Reverting"
+	// DatabaseUpgradeRollingBack: the cluster is recreated on the old image and the
+	// pre-upgrade backup is restored into it.
+	DatabaseUpgradeRollingBack DatabaseUpgradePhase = "RollingBack"
+	DatabaseUpgradeSucceeded   DatabaseUpgradePhase = "Succeeded"
+	DatabaseUpgradeRolledBack  DatabaseUpgradePhase = "RolledBack"
+	DatabaseUpgradeFailed      DatabaseUpgradePhase = "Failed"
+	// DatabaseUpgradeCancelled: spec.database.cnpg.imageName changed again before the new
+	// image was written.
+	DatabaseUpgradeCancelled DatabaseUpgradePhase = "Cancelled"
+)
+
+// DatabaseUpgradeStatus reports the latest PostgreSQL major upgrade.
+type DatabaseUpgradeStatus struct {
+	// +optional
+	Phase DatabaseUpgradePhase `json:"phase,omitempty"`
+	// fromImage is the image of the data before the upgrade.
+	// +optional
+	FromImage string `json:"fromImage,omitempty"`
+	// +optional
+	ToImage string `json:"toImage,omitempty"`
+	// +optional
+	FromMajor int32 `json:"fromMajor,omitempty"`
+	// +optional
+	ToMajor int32 `json:"toMajor,omitempty"`
+	// fromSystemID is the system identifier before the upgrade: a cluster that comes back with
+	// it after a revert runs the untouched old data.
+	// +optional
+	FromSystemID string `json:"fromSystemID,omitempty"`
+	// backupName is the cold, database-only pre-upgrade ForgejoBackup.
+	// +optional
+	BackupName string `json:"backupName,omitempty"`
+	// restoreName is the ForgejoRestore of a rollback that recreated the cluster.
+	// +optional
+	RestoreName string `json:"restoreName,omitempty"`
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+	// rolloutStartTime is when the new image was written to the CNPG Cluster.
+	// +optional
+	RolloutStartTime *metav1.Time `json:"rolloutStartTime,omitempty"`
+	// pgUpgradeStarted is set once the container of CloudNativePG's upgrade Job that runs
+	// pg_upgrade has started (or its pods are gone, so that nobody can tell): from then on
+	// pg_upgrade --link may have changed the old data directory. A revert whose old data does
+	// not come back is rolled back from the backup only when it is set; otherwise the old data
+	// is untouched and the Cluster is never deleted.
+	// +optional
+	PGUpgradeStarted bool `json:"pgUpgradeStarted,omitempty"`
+	// phaseStartTime is when the current phase began; the timeouts of Verifying
+	// (spec.upgrade.timeout) and Reverting (spec.upgrade.timeout, at least 15 minutes) count
+	// from it.
+	// +optional
+	PhaseStartTime *metav1.Time `json:"phaseStartTime,omitempty"`
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// failedImage is not upgraded to again until spec.database.cnpg.imageName changes, or the
+	// annotation forgejo.lucas.icu/retry-database-upgrade=true is set.
+	// +optional
+	FailedImage string `json:"failedImage,omitempty"`
+	// +optional
+	FailureReason string `json:"failureReason,omitempty"`
+	// storageSize of the volumes of the Cluster a rollback deleted; the recreated Cluster gets
+	// at least that much.
+	// +optional
+	StorageSize string `json:"storageSize,omitempty"`
+	// rollbackRestoreFailed is set when the restore into the recreated cluster failed: Forgejo
+	// stays stopped until a later ForgejoRestore has restored a backup.
+	// +optional
+	RollbackRestoreFailed bool `json:"rollbackRestoreFailed,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // UpgradePhase tracks an orchestrated upgrade.
@@ -1799,6 +1921,7 @@ type AutoPilotStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.status.readyReplicas`
 // +kubebuilder:printcolumn:name="Support",type=string,JSONPath=`.status.conditions[?(@.type=="VersionSupported")].reason`,priority=1
+// +kubebuilder:printcolumn:name="Postgres",type=integer,JSONPath=`.status.database.majorVersion`,priority=1
 // +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.status.url`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must start with a lowercase letter and contain only lowercase letters, digits and '-' (no '.'): it names the instance's Services, which must be DNS-1035 labels"

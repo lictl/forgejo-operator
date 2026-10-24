@@ -35,6 +35,10 @@ spec:
       name: Support
       priority: 1
       type: string
+    - jsonPath: .status.database.majorVersion
+      name: Postgres
+      priority: 1
+      type: integer
     - jsonPath: .status.url
       name: URL
       priority: 1
@@ -549,9 +553,16 @@ spec:
                           for PostgreSQL metrics.
                         type: boolean
                       imageName:
-                        default: ghcr.io/cloudnative-pg/postgresql:17
-                        description: imageName is the PostgreSQL operand image. Also
-                          used for backup/restore jobs.
+                        default: ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie
+                        description: |-
+                          imageName is the PostgreSQL operand image, with a tag that starts with its major version
+                          (CloudNativePG images: MM-TYPE-OS, MM.mm-TYPE-OS, MM.mm-TS-TYPE-OS). A change within the
+                          major is rolled out by CloudNativePG. A newer major is an orchestrated upgrade: cold
+                          database backup, CloudNativePG's in-place pg_upgrade, verification, rollback on failure
+                          (docs/upgrades.md, "PostgreSQL major upgrades"); it must keep the image's Debian release
+                          (trixie, bookworm, ...). Older majors are refused. Backup and restore Jobs run pg_dump and
+                          pg_restore from the image of the running cluster (status.database.image), and with type
+                          External from this one.
                         maxLength: 512
                         minLength: 1
                         type: string
@@ -719,6 +730,14 @@ spec:
                     && (!has(self.cnpg.enablePodMonitor) || !self.cnpg.enablePodMonitor)
                     && (!has(self.cnpg.resources) || (!has(self.cnpg.resources.requests)
                     && !has(self.cnpg.resources.limits))))'
+                - fieldPath: .cnpg.imageName
+                  message: 'cnpg.imageName needs a tag that starts with the PostgreSQL
+                    major version, e.g. ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie
+                    (a digest may follow it): CloudNativePG reads the major version
+                    from the tag, and refuses a digest alone or ''latest'''
+                  reason: FieldValueInvalid
+                  rule: (has(self.type) && self.type == 'External') || !has(self.cnpg)
+                    || !has(self.cnpg.imageName) || self.cnpg.imageName.matches('^([^@]*/)?[^/:@]+:[0-9][^/:@]*(@[^@/]+)?$')
               env:
                 description: env adds extra environment variables to the Forgejo container.
                 items:
@@ -3373,7 +3392,9 @@ spec:
                   autoRollback:
                     description: |-
                       autoRollback restores the pre-upgrade backup and reverts the image when the new version
-                      does not become healthy within timeout. Defaults to true.
+                      does not become healthy within timeout. A PostgreSQL major upgrade that cannot be reverted
+                      in place is rolled back by recreating the CNPG cluster on the old image and restoring its
+                      pre-upgrade backup. Defaults to true.
                     type: boolean
                   backupBeforeUpgrade:
                     description: backupBeforeUpgrade takes a ForgejoBackup before
@@ -3381,7 +3402,10 @@ spec:
                     type: boolean
                   timeout:
                     default: 15m
-                    description: timeout for the new version to become Ready.
+                    description: |-
+                      timeout for the new version to become Ready. For a PostgreSQL major upgrade: the time
+                      Forgejo has to become available on the new major, and a revert to bring the old data back;
+                      CloudNativePG's pg_upgrade itself is never interrupted.
                     maxLength: 32
                     pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+$
                     type: string
@@ -3705,7 +3729,18 @@ spec:
                     type: string
                   host:
                     type: string
+                  image:
+                    description: |-
+                      image is the PostgreSQL image the CNPG cluster's data belongs to
+                      (status.pgDataImageInfo.image of the Cluster): during a major upgrade the old image,
+                      until pg_upgrade has succeeded. Backup and restore Jobs run pg_dump and pg_restore from it.
+                    type: string
                   instances:
+                    format: int32
+                    type: integer
+                  majorVersion:
+                    description: majorVersion is the PostgreSQL major version of the
+                      cluster's data.
                     format: int32
                     type: integer
                   phase:
@@ -3715,12 +3750,106 @@ spec:
                     type: integer
                   secretName:
                     type: string
+                  systemID:
+                    description: systemID is the database system identifier CNPG reports;
+                      pg_upgrade creates a new one.
+                    type: string
                   type:
                     description: DatabaseType selects the PostgreSQL provider.
                     enum:
                     - CNPG
                     - External
                     type: string
+                  upgrade:
+                    description: upgrade reports the latest PostgreSQL major upgrade
+                      (database type CNPG only).
+                    properties:
+                      backupName:
+                        description: backupName is the cold, database-only pre-upgrade
+                          ForgejoBackup.
+                        type: string
+                      completionTime:
+                        format: date-time
+                        type: string
+                      failedImage:
+                        description: |-
+                          failedImage is not upgraded to again until spec.database.cnpg.imageName changes, or the
+                          annotation forgejo.lucas.icu/retry-database-upgrade=true is set.
+                        type: string
+                      failureReason:
+                        type: string
+                      fromImage:
+                        description: fromImage is the image of the data before the
+                          upgrade.
+                        type: string
+                      fromMajor:
+                        format: int32
+                        type: integer
+                      fromSystemID:
+                        description: |-
+                          fromSystemID is the system identifier before the upgrade: a cluster that comes back with
+                          it after a revert runs the untouched old data.
+                        type: string
+                      message:
+                        type: string
+                      pgUpgradeStarted:
+                        description: |-
+                          pgUpgradeStarted is set once the container of CloudNativePG's upgrade Job that runs
+                          pg_upgrade has started (or its pods are gone, so that nobody can tell): from then on
+                          pg_upgrade --link may have changed the old data directory. A revert whose old data does
+                          not come back is rolled back from the backup only when it is set; otherwise the old data
+                          is untouched and the Cluster is never deleted.
+                        type: boolean
+                      phase:
+                        description: DatabaseUpgradePhase tracks an orchestrated PostgreSQL
+                          major upgrade.
+                        enum:
+                        - Pending
+                        - BackingUp
+                        - Upgrading
+                        - Verifying
+                        - Reverting
+                        - RollingBack
+                        - Succeeded
+                        - RolledBack
+                        - Failed
+                        - Cancelled
+                        type: string
+                      phaseStartTime:
+                        description: |-
+                          phaseStartTime is when the current phase began; the timeouts of Verifying
+                          (spec.upgrade.timeout) and Reverting (spec.upgrade.timeout, at least 15 minutes) count
+                          from it.
+                        format: date-time
+                        type: string
+                      restoreName:
+                        description: restoreName is the ForgejoRestore of a rollback
+                          that recreated the cluster.
+                        type: string
+                      rollbackRestoreFailed:
+                        description: |-
+                          rollbackRestoreFailed is set when the restore into the recreated cluster failed: Forgejo
+                          stays stopped until a later ForgejoRestore has restored a backup.
+                        type: boolean
+                      rolloutStartTime:
+                        description: rolloutStartTime is when the new image was written
+                          to the CNPG Cluster.
+                        format: date-time
+                        type: string
+                      startTime:
+                        format: date-time
+                        type: string
+                      storageSize:
+                        description: |-
+                          storageSize of the volumes of the Cluster a rollback deleted; the recreated Cluster gets
+                          at least that much.
+                        type: string
+                      toImage:
+                        type: string
+                      toMajor:
+                        format: int32
+                        type: integer
+                    type: object
                 type: object
               health:
                 description: HealthStatus reports operator-observed application health.

@@ -189,6 +189,9 @@ const errCredentials = "credentialsSecret"
 // errSLOTarget is the field path of the availability target's validation errors.
 const errSLOTarget = "spec.monitoring.slo.availabilityTarget"
 
+// errPostgresTag is the message of a CNPG image whose tag does not start with a major version.
+const errPostgresTag = "starts with the PostgreSQL major version"
+
 // errRunbookBase is the field path of the runbook base URL's validation errors.
 const errRunbookBase = "spec.monitoring.runbookBaseURL"
 
@@ -203,6 +206,17 @@ func TestForgejoValidation(t *testing.T) {
 		{name: "empty image", obj: fj(`  image: ""`), want: "spec.image"},
 		{name: "pull policy", obj: fj(`  imagePullPolicy: Sometimes`), want: "Unsupported value"},
 		{name: "empty postgres image", obj: fj("  database:\n    cnpg: {imageName: \"\"}"), want: "spec.database.cnpg.imageName"},
+		// CloudNativePG reads the major version from the tag (docs/upgrades.md, "PostgreSQL major upgrades").
+		{name: "postgres image with a major tag", obj: fj("  database:\n    cnpg: {imageName: \"ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie\"}")},
+		{name: "postgres image with a minor tag and a digest", obj: fj("  database:\n    cnpg: {imageName: \"localhost:5000/pg:18.6-minimal-trixie@sha256:" +
+			strings.Repeat("a", 64) + "\"}")},
+		{name: "postgres image of the library", obj: fj("  database:\n    cnpg: {imageName: \"postgres:18\"}")},
+		{name: "postgres image without a tag", obj: fj("  database:\n    cnpg: {imageName: \"localhost:5000/postgresql\"}"), want: errPostgresTag},
+		{name: "postgres image latest", obj: fj("  database:\n    cnpg: {imageName: \"ghcr.io/cloudnative-pg/postgresql:latest\"}"), want: errPostgresTag},
+		{name: "postgres image digest only", obj: fj("  database:\n    cnpg: {imageName: \"ghcr.io/cloudnative-pg/postgresql@sha256:" + strings.Repeat("a", 64) + "\"}"),
+			want: errPostgresTag},
+		{name: "External postgres image digest only", obj: fj("  database:\n    type: External\n    external: {host: pg, credentialsSecret: {name: pg}}\n" +
+			"    cnpg: {imageName: \"ghcr.io/cloudnative-pg/postgresql@sha256:" + strings.Repeat("a", 64) + "\"}")},
 
 		// Names.
 		{name: "name with a dot", obj: forgejo("my.git", "  {}"), want: "DNS-1035"},

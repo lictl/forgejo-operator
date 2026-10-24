@@ -874,6 +874,9 @@ func registrationBlocked(f *forgejov1.Forgejo) string {
 		return "is paused"
 	case f.Status.Image == "":
 		return "has not rolled out its image yet"
+	case forgejo.DatabaseUpgradeInFlight(f):
+		// forgejo-cli writes to the database, which the upgrade backs up, then stops.
+		return "is upgrading PostgreSQL"
 	case f.Status.Phase == forgejov1.PhaseUpgrading:
 		return "is upgrading"
 	case f.Status.Phase == forgejov1.PhaseRestoring:

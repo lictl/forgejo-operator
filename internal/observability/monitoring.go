@@ -261,6 +261,16 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) (*ruleSpec, error) {
 			"`kubectl get fj %s %s -o yaml` names the failed image; it is not retried until spec.image "+
 			"changes. Check the logs of the failed pods for migration errors.", f.Name, kc))
 
+	if forgejo.DatabaseType(f) == forgejov1.DatabaseTypeCNPG {
+		add("ForgejoDatabaseUpgradeFailed", "warning", "",
+			recentlyIncreased(fmt.Sprintf(`forgejo_operator_database_upgrades_total{%s, result!="succeeded"}`, op), "1h"),
+			fmt.Sprintf("A PostgreSQL major upgrade of Forgejo %s failed", ref),
+			fmt.Sprintf("A PostgreSQL major upgrade of the CNPG cluster failed or was rolled back in the last hour. "+
+				"status.database.upgrade of `kubectl get fj %s %s -o yaml` names the failed image and the reason; it is not retried "+
+				"until spec.database.cnpg.imageName changes. With rollbackRestoreFailed Forgejo stays stopped until a backup is "+
+				"restored. See docs/upgrades.md, \"PostgreSQL major upgrades\".", f.Name, kc))
+	}
+
 	add("ForgejoVersionUnsupported", "warning", "1h",
 		fmt.Sprintf(`max by (namespace, name, major, support) (forgejo_operator_version_supported{%s}) == 0`, op),
 		fmt.Sprintf("Forgejo %s runs a version outside the operator's support policy ({{ $labels.support }})", ref),

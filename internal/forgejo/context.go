@@ -48,6 +48,18 @@ type ReconcileContext struct {
 
 	// --- outputs of earlier steps ---
 
+	// DatabaseImage is the PostgreSQL image the database step writes to the CNPG Cluster, set
+	// by the database-upgrade step: spec.database.cnpg.imageName when it may be applied as it
+	// is, otherwise the image a PostgreSQL major upgrade (or its refusal) keeps or requires.
+	// Empty means spec.database.cnpg.imageName.
+	DatabaseImage string
+	// DatabaseStorageFloor is the least size the database step gives the volumes of a CNPG
+	// Cluster it creates: the size of the Cluster a PostgreSQL upgrade's rollback deleted.
+	DatabaseStorageFloor string
+	// DatabaseUpgrading is true while a PostgreSQL major upgrade is orchestrated
+	// (status.database.upgrade in flight). Upgrading is set as well, so the workload, backups,
+	// autopilot and the status treat it like a Forgejo upgrade; Forgejo upgrades wait for it.
+	DatabaseUpgrading bool
 	// DB is set by the database step once credentials are known.
 	DB *DBConnection
 	// DatabaseReady is set by the database step.
@@ -89,9 +101,11 @@ type ReconcileContext struct {
 	// TargetImage is the image the workload step must deploy. Set by the upgrade step;
 	// defaults to Status.Image (if set) or the spec image.
 	TargetImage string
-	// Upgrading is true while the upgrade step is orchestrating an image change. When that
-	// step does not complete, the orchestrator sets it from status.upgrade (UpgradeInFlight).
-	// The workload uses the Recreate strategy and a single replica while it is set.
+	// Upgrading is true while the upgrade step is orchestrating an image change of Forgejo, or
+	// the database-upgrade step a PostgreSQL major upgrade. When those steps do not complete,
+	// the orchestrator sets it from status.upgrade (UpgradeInFlight) and status.database.upgrade
+	// (DatabaseUpgradeInFlight). The workload uses the Recreate strategy and a single replica
+	// while it is set.
 	Upgrading bool
 	// Tuning holds app.ini overrides from auto-tuning as section -> key -> value. User
 	// spec.config wins over these.

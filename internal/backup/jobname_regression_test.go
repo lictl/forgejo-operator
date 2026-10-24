@@ -191,10 +191,7 @@ func TestBackupRefusesForeignJob(t *testing.T) {
 	rs := newRestore("y", forgejov1.RestorePhaseCompleted)
 	b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: "y", Namespace: ns, UID: "backup-y"}}
 	b.Spec.ForgejoRef.Name = "fb"
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "fb-db-app", Namespace: ns},
-		Data:       map[string][]byte{"username": []byte("forgejo"), testPasswordField: []byte("x")},
-	}
+	secret := dbAppSecret("x")
 	c := fake.NewClientBuilder().WithScheme(s).
 		WithStatusSubresource(&forgejov1.ForgejoRestore{}, &forgejov1.ForgejoBackup{}).
 		WithObjects(f, rs, b, secret, completedJob(t, s, backup.BackupJobName(b), rs)).Build()

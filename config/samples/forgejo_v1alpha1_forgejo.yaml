@@ -29,6 +29,9 @@ spec:
     # An operator-managed CloudNativePG cluster "<name>-db".
     cnpg:
       instances: 1
+      # The default. A newer major here is an orchestrated upgrade: cold database backup,
+      # CloudNativePG's pg_upgrade, verification, rollback on failure (docs/upgrades.md).
+      imageName: ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie
       storage:
         size: 5Gi
   storage:

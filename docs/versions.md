@@ -264,7 +264,9 @@ The prepared 18 traits were smoke-tested with `codeberg.org/forgejo-experimental
   layout (`/app/gitea/gitea`, uid 1000 `git`, root and rootless), the CLI the bootstrap uses
   (`migrate`, `admin user list/create/change-password`), `/api/healthz`, `/api/v1/version`,
   `/metrics`, every other `app.ini` key the operator renders, and the minimum PostgreSQL
-  version (14).
+  version (14). Forgejo 15 and 17 are verified on PostgreSQL 17 and 18 (the default,
+  `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`); PostgreSQL majors and their upgrades
+  are described in [upgrades.md](upgrades.md#postgresql-major-upgrades).
 - For 15–17 the rendered `app.ini` and pod template are byte-identical to operator versions
   before the version table, so updating the operator restarts no instance.
 - Not done yet: the one-hour startup probe exists for Forgejo 15, which re-syncs every

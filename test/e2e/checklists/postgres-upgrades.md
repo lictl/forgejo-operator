@@ -1,0 +1,177 @@
+<!-- Manual end-to-end checklist executed by an agent against a local cluster (see .claude/workflows/).
+     Ids are stable; the CI slice will port these checks to Ginkgo specs. -->
+
+# forgejo-operator end-to-end checklist: PostgreSQL major upgrades (namespace `e2e-pg`)
+
+What is checked (user documentation in [docs/upgrades.md](../../../docs/upgrades.md), "PostgreSQL
+major upgrades"; design in [docs/design.md](../../../docs/design.md)): a newer major in
+`spec.database.cnpg.imageName` of a CNPG instance is upgraded by the step `database-upgrade`
+(`status.database.upgrade`: `Pending → BackingUp → Upgrading → Verifying → Succeeded`): Forgejo is
+stopped, a cold database-only `PreUpgrade` backup is taken with the old PostgreSQL image,
+CloudNativePG runs `pg_upgrade` in Job `<primary>-major-upgrade`, and Forgejo is verified on the
+new major. A failed `pg_upgrade` is reverted (`Reverting → RolledBack`, same system ID, no
+restore), also with a short `spec.upgrade.timeout` when `pg_upgrade` never started; a Forgejo
+that does not come up on the new major makes the operator recreate the Cluster on the old image
+and restore the backup (`RollingBack → RolledBack`). Downgrades are
+refused, changes within a major pass straight to CloudNativePG, and Forgejo upgrades, backups and
+restores wait for a PostgreSQL upgrade. Forgejo 15 is used throughout, Forgejo 17 after the
+upgrade in P9.
+
+Shared facts:
+- `LOCAL_KUBE_CONTEXT` is the kube context of the local test cluster. Never point it at a real cluster.
+- `export KUBECONFIG=$OPERATOR_KUBECONFIG` in every shell that runs kubectl. Create it once with `kubectl config view --minify --flatten --context "$LOCAL_KUBE_CONTEXT" > "$OPERATOR_KUBECONFIG"` so that it holds only that context; never use another context, in particular never a real cluster such as `k3s`.
+- `docker` commands must reach the docker engine the local cluster runs on, so that pulled and built images are visible to the cluster; set `DOCKER_CONTEXT` if that is not your current docker context.
+- The operator runs in-cluster (namespace `forgejo-operator-system`, deployment `forgejo-operator-controller-manager`, image `forgejo-operator:dev`) with the PostgreSQL-upgrade build already deployed. Do not modify or redeploy it. You may read its logs: `kubectl -n forgejo-operator-system logs deploy/forgejo-operator-controller-manager --since=30m | grep e2e-pg`.
+- CloudNativePG 1.30.1 runs in namespace `cnpg-system` (read only). It supports PostgreSQL 14 to 18; the operator verifies 17 and 18, and new instances default to `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`.
+- API group/kinds: `forgejo.lucas.icu/v1alpha1` — `Forgejo` (short `fj`), `ForgejoBackup` (`fjb`), `ForgejoRestore` (`fjr`); CNPG `cluster.postgresql.cnpg.io` (`<name>-db`).
+- The local cluster is a single node with `local-path` storage. An instance `<name>` serves HTTP at `http://<name>-http.e2e-pg.svc.cluster.local:3000`; the local cluster must let the host resolve these names directly.
+- Images in the image store of the docker engine the local cluster runs on (no registry needed): `codeberg.org/forgejo/forgejo:15`, `codeberg.org/forgejo/forgejo:17`, `ghcr.io/cloudnative-pg/postgresql:17-minimal-trixie`, `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`, `ghcr.io/cloudnative-pg/postgresql:18-standard-trixie`, `ghcr.io/cloudnative-pg/postgresql:18-minimal-bookworm`. Check with `docker images | grep -E 'forgejo/forgejo|cloudnative-pg/postgresql'`; pull a missing one with `docker pull <image>` (if a registry credential helper fails, use `DOCKER_CONFIG=<empty dir>`). `ghcr.io/cloudnative-pg/postgresql:18.99-minimal-trixie` does not exist on purpose (P7).
+- Tools on the host: `git` with `git-lfs`, `curl`, `jq`, `shasum`.
+- Variables, in every shell (`$W` is a fresh directory under your scratch area, kept for the whole run; files written in one check are read in later ones). Run the checks with bash:
+  ```sh
+  export KUBECONFIG=$OPERATOR_KUBECONFIG
+  NS=e2e-pg; W=<your scratch dir>/pgup; mkdir -p $W
+  PR=http://kps-kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+  creds() { N=$1; U=$(kubectl -n $NS get secret $N-admin -o jsonpath='{.data.username}' | base64 -d); P=$(kubectl -n $NS get secret $N-admin -o jsonpath='{.data.password}' | base64 -d); B=http://$N-http.$NS.svc.cluster.local:3000; }
+  ```
+  Admin passwords only contain URL-safe characters, so `http://$U:$P@host/...` works. Never paste a password into the evidence.
+- The upgrade's record: `kubectl -n $NS get fj $N -o jsonpath='{.status.database.upgrade}' | jq` (fields `phase`, `fromImage`, `toImage`, `fromMajor`, `toMajor`, `fromSystemID`, `backupName`, `restoreName`, `startTime`, `rolloutStartTime`, `pgUpgradeStarted`, `phaseStartTime`, `completionTime`, `failedImage`, `failureReason`, `storageSize`, `rollbackRestoreFailed`, `message`); the data's image, major and system ID: `kubectl -n $NS get fj $N -o jsonpath='{.status.database.image} {.status.database.majorVersion} {.status.database.systemID}'`.
+- Conditions: `kubectl -n $NS get fj $N -o jsonpath='{.status.conditions[?(@.type=="<Type>")]}'` (fields `status`, `reason`, `message`); the types used here are `DatabaseUpgrading`, `Upgrading`, `Degraded`, `Ready`, `DatabaseReady`.
+- Events: `kubectl -n $NS get events --field-selector involvedObject.name=$N,reason=<Reason> -o jsonpath='{range .items[*]}{.type} {.reason}: {.message}{"\n"}{end}'`; in order of time: `kubectl -n $NS get events --field-selector involvedObject.name=$N -o json | jq -r '.items | sort_by(.eventTime // .lastTimestamp) | .[] | "\(.eventTime // .lastTimestamp) \(.type) \(.reason)"'`.
+- Prometheus: `$PR` (`/api/v1/query` with `curl -sG --data-urlencode query=...`, `/api/v1/alerts`). Operator metrics are scraped every 30-60 s; counters restart from 0 when the operator restarts.
+- Repository root: read only; do not edit files, do not run git commands that change state in it (cloning test repositories into `$W` is fine).
+- Wait with bounded `until` loops (poll every 2-10 s, explicit timeout) or the Monitor tool. Never wait without a timeout. A fresh install takes 1-8 minutes; on the local cluster an upgrade 17 → 18 of a small database took about 75 s (the `pg_upgrade` Job about 40 s).
+- Work only in namespace `e2e-pg` (and the local image tag of P0). Other namespaces belong to other work: do not touch them.
+- For every check record: id, passed (true/false), evidence (the decisive command(s) and the observed output, trimmed). On failure also collect: `kubectl -n e2e-pg get fj <name> -o yaml` (status part), `kubectl -n e2e-pg get cluster.postgresql.cnpg.io <name>-db -o yaml` (status part), `kubectl -n e2e-pg get fjb,fjr,jobs,pods -o wide`, `kubectl -n e2e-pg get events --sort-by=.lastTimestamp | tail -30`, relevant operator log lines. Continue with the remaining checks when one fails, unless it is impossible.
+
+Reusable procedures (referenced below):
+- **INSTANCE(name, extra)**: apply
+  ```yaml
+  apiVersion: forgejo.lucas.icu/v1alpha1
+  kind: Forgejo
+  metadata: {name: <name>, namespace: e2e-pg}
+  spec:
+    image: codeberg.org/forgejo/forgejo:15
+    database:
+      cnpg:
+        imageName: ghcr.io/cloudnative-pg/postgresql:17-minimal-trixie
+        storage: {size: 1Gi}
+        <extra>
+    storage: {size: 1Gi, retainPolicy: Delete}
+  ```
+  then wait (8 min) until `status.phase=Running` and `Ready=True`.
+- **DATA(name, repo)**: `creds <name>`; create the repository: `curl -s -o $W/create.json -w '%{http_code}' -u "$U:$P" -H 'Content-Type: application/json' -X POST $B/api/v1/user/repos -d '{"name":"<repo>","auto_init":true}'` → `201` (right after an install Forgejo sometimes answers `422` once: wait 10 s and repeat, at most 3 times). `git clone http://$U:$P@$N-http.$NS.svc.cluster.local:3000/$U/<repo>.git $W/<name>-<repo>`; in it: create `http.txt` with some text, `git lfs install --local`, `git lfs track '*.bin'`, `head -c 2097152 /dev/urandom > big.bin`, `git add .gitattributes http.txt big.bin`, `git -c user.email=e2e@example.com -c user.name=e2e commit -qm data`, `git push` (output contains `Uploading LFS objects: 100% (1/1)`); `shasum -a 256 big.bin | cut -d' ' -f1 > $W/<name>-<repo>.sha` (one file per instance and repository, so that a later DATA does not overwrite it). Then the issue: `curl -s -o /dev/null -w '%{http_code}' -u "$U:$P" -H 'Content-Type: application/json' -X POST $B/api/v1/repos/$U/<repo>/issues -d '{"title":"keep me pg"}'` → `201`.
+- **CHECK(name, repo)**: `creds <name>`; `curl -s $B/api/healthz` reports `"status": "pass"` (any whitespace); `curl -s -u "$U:$P" $B/api/v1/repos/$U/<repo>/contents/http.txt | jq -r .name` → `http.txt`; `curl -s -u "$U:$P" "$B/api/v1/repos/$U/<repo>/issues?state=all" | jq -r '.[].title'` contains `keep me pg`; a fresh `git clone` of the repository into `$W/<name>-check-$(date +%s)` downloads `big.bin` through LFS, and its `shasum -a 256` equals `$W/<name>-<repo>.sha`.
+- **SERVER-VERSION(name)**: `kubectl -n $NS exec $(kubectl -n $NS get cluster.postgresql.cnpg.io <name>-db -o jsonpath='{.status.currentPrimary}') -c postgres -- psql -At -c 'show server_version'`.
+- **PG-WATCH(name, image)**: start this loop in the background **before** the patch that requests `<image>`, writing to `$W/<name>-watch-<n>.log`; it prints a line whenever the state changes and ends at the terminal phase of the upgrade to `<image>` (timeout 15 min):
+  ```sh
+  N=<name>; TO=<image>; prev=""; seen=""; start=$(date +%s)
+  while [ $(( $(date +%s) - start )) -lt 900 ]; do
+    ph=$(kubectl -n $NS get fj $N -o jsonpath='{.status.database.upgrade.phase}'); to=$(kubectl -n $NS get fj $N -o jsonpath='{.status.database.upgrade.toImage}')
+    rep=$(kubectl -n $NS get deploy $N -o jsonpath='{.spec.replicas}')
+    srv=$(kubectl -n $NS get pods -l app.kubernetes.io/instance=$N,app.kubernetes.io/component=server --field-selector=status.phase!=Succeeded,status.phase!=Failed --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    bkp=$(kubectl -n $NS get pods -l app.kubernetes.io/instance=$N,app.kubernetes.io/component=backup --field-selector=status.phase!=Succeeded,status.phase!=Failed --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    cnpg=$(kubectl -n $NS get cluster.postgresql.cnpg.io $N-db -o jsonpath='{.status.phase}|{.status.pgDataImageInfo.majorVersion}|{.status.systemID}' 2>/dev/null)
+    fph=$(kubectl -n $NS get fj $N -o jsonpath='{.status.phase}')
+    cur="db=$ph fj=$fph replicas=$rep serverPods=$srv backupPods=$bkp cnpg=$cnpg"
+    if [ "$cur" != "$prev" ]; then echo "$(date -u +%T) $cur"; prev="$cur"; fi
+    if [ "$to" = "$TO" ]; then case "$ph" in Pending|BackingUp|Upgrading|Verifying|Reverting|RollingBack) seen=1;; Succeeded|Failed|RolledBack|Cancelled) [ -n "$seen" ] && break;; esac; fi
+    sleep 2
+  done
+  ```
+  The **phase sequence** is the list of distinct `db=` values from the first in-flight phase on. `Pending` lasts about a second and may not appear; the events (shared facts) show its `DatabaseUpgradeStarted`. `serverPods` and `backupPods` count pods that have not terminated: a deleted pod whose containers stopped stays listed for a moment in phase `Succeeded` or `Failed`. The fields are read one after the other, so a single line around a phase change can mix two states; judge the lines before and after it.
+
+---
+
+## P0 — Prerequisites
+
+1. **P0.1 images**: all six images of the shared facts are present (pull missing ones). Create the mislabelled image of P6, a Debian bookworm build of PostgreSQL 18 under a trixie tag (`pg_upgrade` then runs the old trixie binaries on bookworm libraries and fails, as CloudNativePG documents for images of different Debian releases): `docker tag ghcr.io/cloudnative-pg/postgresql:18-minimal-bookworm localhost/e2e-postgresql:18-minimal-trixie`; `docker image inspect localhost/e2e-postgresql:18-minimal-trixie --format '{{.Id}}'` equals the ID of `ghcr.io/cloudnative-pg/postgresql:18-minimal-bookworm`.
+2. **P0.2 CRD**: `kubectl get crd forgejos.forgejo.lucas.icu -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.database.properties.cnpg.properties.imageName.default}'` → `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`; `kubectl get crd forgejos.forgejo.lucas.icu -o jsonpath='{.spec.versions[0].additionalPrinterColumns[*].name}'` contains `Postgres`.
+3. **P0.3 namespace**: `kubectl create namespace e2e-pg`.
+
+## P1 — Install on PostgreSQL 17 with data
+
+1. **P1.1 install**: INSTANCE(pg, "") (no extra). Record the elapsed time.
+2. **P1.2 database status**: `status.database.image` = `ghcr.io/cloudnative-pg/postgresql:17-minimal-trixie`, `majorVersion` = `17`, `systemID` non-empty (record it as `SYS_PG_17`); `kubectl -n e2e-pg get fj pg -o wide` shows `17` in the `POSTGRES` column; `DatabaseUpgrading` = `False/UpToDate`; `status.database.upgrade` is empty; SERVER-VERSION(pg) starts with `17.`.
+3. **P1.3 data**: DATA(pg, demo); CHECK(pg, demo) passes.
+
+## P2 — Major upgrade 17 → 18
+
+1. **P2.1 upgrade**: PG-WATCH(pg, `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`) in the background, then `kubectl -n e2e-pg patch fj pg --type merge -p '{"spec":{"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie"}}}}'`. Expect `Succeeded` within 10 min; the phase sequence is `BackingUp`, `Upgrading`, `Verifying`, `Succeeded` (optionally led by `Pending`), in this order. Record the log and the elapsed time.
+2. **P2.2 Forgejo stopped**: in the watch log, every `db=Upgrading` line shows `replicas=0 serverPods=0`; no line shows both `serverPods` and `backupPods` above 0 (the backup starts only after the server pod is gone); lines in flight show `fj=Upgrading`; the last `db=Verifying` line shows `replicas=1` (one Forgejo pod starts once PostgreSQL 18 serves). While it was in flight `DatabaseUpgrading` had `status=True` and the phase as reason (sample it once during the run).
+3. **P2.3 pre-upgrade backup**: `status.database.upgrade.backupName` starts with `pg-pre-pg18-`; that ForgejoBackup has `spec.reason: PreUpgrade`, `spec.includeData: false`, `status.phase: Completed` and `status.postgresImage` = `ghcr.io/cloudnative-pg/postgresql:17-minimal-trixie` (the old image wrote the dump). `kubectl -n e2e-pg get fjb -l forgejo.lucas.icu/instance=pg` lists exactly that one backup.
+4. **P2.4 CloudNativePG reports the new major**: `kubectl -n e2e-pg get cluster.postgresql.cnpg.io pg-db -o jsonpath='{.status.pgDataImageInfo}'` has `majorVersion` 18 and image `...:18-minimal-trixie`; `status.database.majorVersion` = `18`, `status.database.image` = `...:18-minimal-trixie`; `status.database.systemID` differs from `SYS_PG_17` and `status.database.upgrade.fromSystemID` equals it; SERVER-VERSION(pg) starts with `18.`; `kubectl -n e2e-pg get fj pg -o wide` shows `18` under `POSTGRES`.
+5. **P2.5 data intact, Forgejo healthy**: CHECK(pg, demo) passes; `status.phase=Running`, `Ready=True`, `DatabaseUpgrading` = `False/PostgresUpgradeSucceeded` (message starts with `Upgraded PostgreSQL from 17`); `Degraded` is not `True`; `status.version` starts with `15.`; a new push works (DATA(pg, after), CHECK(pg, after)).
+6. **P2.6 events**: in time order the events of `pg` include `DatabaseUpgradeStarted`, `DatabaseUpgradeBackup`, `DatabaseUpgradeBackupCompleted`, `DatabaseUpgradeApplying`, `DatabaseUpgradeVerifying`, `DatabaseUpgradeSucceeded` (all `Normal`), and no `DatabaseUpgradeFailed`, `UpgradeStarted` or `ReconcileError`.
+7. **P2.7 metric and alert rule**: within 3 min Prometheus `forgejo_operator_database_upgrades_total{namespace="e2e-pg",name="pg"}` has one series, `result="succeeded"`, value 1; `kubectl -n e2e-pg get prometheusrule pg -o yaml` contains alert `ForgejoDatabaseUpgradeFailed` with `severity: warning` and an expr on `forgejo_operator_database_upgrades_total{namespace="e2e-pg", name="pg", result!="succeeded"}`; `/api/v1/alerts` has no `ForgejoDatabaseUpgradeFailed` with `forgejo="pg"`.
+
+## P3 — Downgrade refused
+
+1. **P3.1 refuse**: `kubectl -n e2e-pg patch fj pg --type merge -p '{"spec":{"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:17-minimal-trixie"}}}}'`. Within 2 min: `DatabaseUpgrading` = `False/PostgresDowngradeRefused` with a message starting `Refusing to downgrade PostgreSQL from 18`; `Degraded` = `True/PostgresDowngradeRefused`; `kubectl -n e2e-pg get cluster.postgresql.cnpg.io pg-db -o jsonpath='{.spec.imageName}'` is still `...:18-minimal-trixie`; `status.database.upgrade.phase` is still `Succeeded` with the same `startTime`; no new ForgejoBackup; exactly one `PostgresDowngradeRefused` Warning event; `Ready=True`, `phase=Running`.
+2. **P3.2 no reconcile errors**: wait 1 min; `Degraded` still has reason `PostgresDowngradeRefused` (not `ReconcileError`), no `ReconcileError` event for `pg`, and the event of P3.1 was not repeated.
+3. **P3.3 recover**: patch `imageName` back to `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`; within 2 min `Degraded` is not `True` (reason `AsExpected` or absent) and `DatabaseUpgrading` has reason `PostgresUpgradeSucceeded` or `UpToDate`.
+
+## P4 — A change within the major passes straight to CloudNativePG
+
+1. **P4.1 rollout**: record `status.database.upgrade.startTime` and the number of ForgejoBackups; `kubectl -n e2e-pg patch fj pg --type merge -p '{"spec":{"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:18-standard-trixie"}}}}'`. Within 1 min: `status.database.image` = `...:18-standard-trixie`; `status.database.upgrade` unchanged (same `startTime`, `phase: Succeeded`, `toImage: ...:18-minimal-trixie`); no new ForgejoBackup; no `DatabaseUpgradeStarted` event after the patch; `DatabaseUpgrading` has `status=False`.
+2. **P4.2 no orchestration**: poll `kubectl -n e2e-pg get fj pg -o jsonpath='{.status.phase}'` every 5 s until the primary runs the new image (`kubectl -n e2e-pg get pods -l cnpg.io/cluster=pg-db -o jsonpath='{.items[*].spec.containers[0].image}'` shows `...:18-standard-trixie` and the Cluster phase is `Cluster in healthy state`; timeout 8 min: CloudNativePG's restart of the primary waits up to 3 min for Forgejo's connections): the phase never becomes `Upgrading`, the Deployment keeps `spec.replicas=1`.
+3. **P4.3 result**: SERVER-VERSION(pg) starts with `18.`; CHECK(pg, demo) passes.
+
+## P5 — Backup and restore after the upgrade
+
+1. **P5.1 backup**: apply ForgejoBackup `b18` (`spec.forgejoRef.name: pg`). Within 8 min `status.phase=Completed`, `databaseSizeBytes > 0`, `dataSizeBytes > 0`, `status.postgresImage` = `ghcr.io/cloudnative-pg/postgresql:18-standard-trixie`.
+2. **P5.2 change data**: `creds pg`; `curl -s -o /dev/null -w '%{http_code}' -u "$U:$P" -X DELETE $B/api/v1/repos/$U/demo` → `204`; create repository `after-backup` (`auto_init`, `201`).
+3. **P5.3 restore**: apply ForgejoRestore `r18` (`forgejoRef.name: pg`, `backupName: b18`). `Completed` within 10 min (record the phases; Forgejo's `status.phase` is `Restoring` at least once).
+4. **P5.4 result**: within 3 min after Completed: CHECK(pg, demo) passes; `GET $B/api/v1/repos/$U/after-backup` → `404`; `Ready=True`; SERVER-VERSION(pg) starts with `18.`.
+
+## P6 — Failure path: pg_upgrade fails, the old data comes back
+
+1. **P6.1 instance**: INSTANCE(pgf, ""); DATA(pgf, demo); record `status.database.systemID` as `SYS_PGF`. Record the Prometheus value of `forgejo_operator_database_upgrades_total{namespace="e2e-pg",name="pgf",result="rolledback"}` as `RB0` (0 when there is no series) and whether `/api/v1/alerts` already lists `ForgejoDatabaseUpgradeFailed` for `forgejo="pgf"` as `ALERT0`.
+2. **P6.2 failed upgrade**: PG-WATCH(pgf, `localhost/e2e-postgresql:18-minimal-trixie`), then `kubectl -n e2e-pg patch fj pgf --type merge -p '{"spec":{"database":{"cnpg":{"imageName":"localhost/e2e-postgresql:18-minimal-trixie"}}}}'`. Expect `RolledBack` within 10 min; the phase sequence is `BackingUp`, `Upgrading`, `Reverting`, `RolledBack`.
+3. **P6.3 outcome**: `status.database.upgrade`: `failedImage` = `localhost/e2e-postgresql:18-minimal-trixie`, `failureReason` starts with `pg_upgrade failed in CloudNativePG's upgrade Job pgf-db-1-major-upgrade`, `restoreName` empty, `message` contains `nothing had to be restored`; `Degraded` = `True/PostgresUpgradeRolledBack`; `DatabaseUpgrading` = `False/PostgresUpgradeRolledBack`; events `DatabaseUpgradeFailed` (Warning) and `DatabaseUpgradeRolledBack` (Normal) exist; no ForgejoRestore exists for `pgf`.
+4. **P6.4 data intact on the old major**: the Cluster's `status.pgDataImageInfo.majorVersion` is 17, `status.database.systemID` equals `SYS_PGF` (the untouched old data), SERVER-VERSION(pgf) starts with `17.`; within 3 min `Ready=True`; CHECK(pgf, demo) passes.
+5. **P6.5 held**: wait 1 min: `status.database.upgrade.phase` is still `RolledBack`, the Cluster's `spec.imageName` is `...:17-minimal-trixie`, and no further PreUpgrade backup was created (exactly one for `pgf`).
+6. **P6.6 metric and alert**: within 3 min `forgejo_operator_database_upgrades_total{namespace="e2e-pg",name="pgf",result="rolledback"}` = `RB0 + 1` (`RB0` recorded in P6.1), and `/api/v1/alerts` lists `ForgejoDatabaseUpgradeFailed` with labels `forgejo="pgf"`, `severity="warning"` in state `firing` (allow 3 min for the rule evaluation). Prometheus keeps samples of earlier runs of this checklist (same namespace and name) for its retention: when `ALERT0` (recorded in P6.1) already showed the alert, record that it was pre-existing and judge this check by the metric increase alone.
+
+## P7 — Failure path: the new image cannot be pulled
+
+1. **P7.1 pull failure**: record the Cluster's `metadata.creationTimestamp` as `CREATED_PGF`. PG-WATCH(pgf, `ghcr.io/cloudnative-pg/postgresql:18.99-minimal-trixie`), then `kubectl -n e2e-pg patch fj pgf --type merge -p '{"spec":{"upgrade":{"timeout":"5s"},"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:18.99-minimal-trixie"}}}}'` (a tag that does not exist; the 5 s timeout must not cut the revert short). Expect `RolledBack` within 10 min, the phase sequence `BackingUp`, `Upgrading`, `Reverting`, `RolledBack` (never `RollingBack`); `Reverting` begins only after the upgrade pod has failed to pull for 2 minutes (`failureReason` contains `could not be pulled for 2m0s`); `pgUpgradeStarted` is absent or `false`; `restoreName` is empty and no ForgejoRestore exists for `pgf`.
+2. **P7.2 data intact, cluster kept**: the Cluster's `metadata.creationTimestamp` still equals `CREATED_PGF` (it was not recreated); `status.database.systemID` still equals `SYS_PGF`; SERVER-VERSION(pgf) starts with `17.`; within 3 min `Ready=True`; CHECK(pgf, demo) passes.
+
+## P8 — Failure path: Forgejo does not come up on the new major, the cluster is recreated from the backup
+
+1. **P8.1 rollback from the backup**: the Cluster's `metadata.creationTimestamp` still equals `CREATED_PGF` (P7.1). PG-WATCH(pgf, `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`), then `kubectl -n e2e-pg patch fj pgf --type merge -p '{"spec":{"upgrade":{"timeout":"5s"},"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie"}}}}'` (a 5 s timeout leaves Forgejo no time to start on PostgreSQL 18). Expect `RolledBack` within 12 min; the phase sequence `BackingUp`, `Upgrading`, `Verifying`, `RollingBack`, `RolledBack`; in the watch log the `cnpg=` field is empty for a while during `RollingBack` (the Cluster was deleted), and no line with an empty `cnpg=` field shows `serverPods` above 0 (Forgejo stops before the Cluster goes).
+2. **P8.2 outcome**: `failureReason` = `Forgejo did not become available on PostgreSQL 18 within 5s`; `restoreName` starts with `pgf-pg-rollback-`, and that ForgejoRestore has `spec.restoreData: false` and is `Completed` (or `ScalingUp`, then `Completed` within 15 min); `storageSize` = `1Gi`; `message` contains `was recreated on ghcr.io/cloudnative-pg/postgresql:17-minimal-trixie`; events `DatabaseUpgradeSlow` (Warning: the `pg_upgrade` Job ran longer than 5 s and was not interrupted; its message names `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`, unlike the one of P7), `DatabaseUpgradeFailed`, `DatabaseUpgradeRollingBack` and `DatabaseUpgradeRolledBack` exist, the last three emitted after the P8.1 patch.
+3. **P8.3 recreated on the old major**: the Cluster's `metadata.creationTimestamp` is later than `CREATED_PGF`; its `status.pgDataImageInfo.majorVersion` is 17; `status.database.systemID` differs from `SYS_PGF` and from the 18 system ID the watch log showed; SERVER-VERSION(pgf) starts with `17.`.
+4. **P8.4 data intact**: within 3 min `Ready=True`; CHECK(pgf, demo) passes.
+5. **P8.5 reset**: `kubectl -n e2e-pg patch fj pgf --type merge -p '{"spec":{"upgrade":{"timeout":"15m"},"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:17-minimal-trixie"}}}}'`; within 2 min `Degraded` is not `True`, `DatabaseUpgrading` = `False/UpToDate` and `status.database.upgrade.failedImage` is empty.
+
+## P9 — A Forgejo upgrade requested during a PostgreSQL upgrade waits for it
+
+1. **P9.1 both requested**: PG-WATCH(pgf, `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`); patch `imageName` to `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`; wait (1 min) until `status.database.upgrade.phase` is `BackingUp`, then `kubectl -n e2e-pg patch fj pgf --type merge -p '{"spec":{"image":"codeberg.org/forgejo/forgejo:17"}}'`.
+2. **P9.2 the Forgejo upgrade waits**: within 30 s `Upgrading` = `False/WaitingForDatabaseUpgrade`; `status.upgrade` is empty; `kubectl -n e2e-pg get deploy pgf -o jsonpath='{.spec.template.spec.containers[0].image}'` is `codeberg.org/forgejo/forgejo:15`. Sample it again while `status.database.upgrade.phase` is `Upgrading`: unchanged.
+3. **P9.3 then it runs**: within 15 min `status.database.upgrade.phase=Succeeded` and `status.upgrade.phase=Succeeded`; `status.upgrade.startTime` is not earlier than `status.database.upgrade.completionTime`; in time order `DatabaseUpgradeSucceeded` comes before `UpgradeStarted`, and `PreUpgradeBackup` (the Forgejo upgrade's backup) after it; the Forgejo upgrade's backup has `status.postgresImage` = `...:18-minimal-trixie`.
+4. **P9.4 result**: `status.version` starts with `17.`, SERVER-VERSION(pgf) starts with `18.`, `Ready=True`, CHECK(pgf, demo) passes.
+
+## P10 — Two PostgreSQL instances; a Debian change across majors refused; a backup waits
+
+1. **P10.1 instance**: INSTANCE(pgha, `instances: 2`); the Cluster reports `readyInstances` 2; DATA(pgha, demo).
+2. **P10.2 another Debian release refused**: `kubectl -n e2e-pg patch fj pgha --type merge -p '{"spec":{"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:18-minimal-bookworm"}}}}'`. Within 2 min `DatabaseUpgrading` = `False/PostgresUpgradePathUnsupported` (message names Debian `trixie` and `bookworm`), `Degraded` = `True/PostgresUpgradePathUnsupported`, one Warning event of that reason, the Cluster's `spec.imageName` is still `...:17-minimal-trixie`, `status.database.upgrade` is empty.
+3. **P10.3 upgrade with a restore and a backup requested meanwhile**: apply ForgejoBackup `before` (`forgejoRef.name: pgha`, `includeData: false`) and wait (5 min) until it is `Completed`. PG-WATCH(pgha, `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`); patch `imageName` to `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`; as soon as `status.database.upgrade.phase` is `BackingUp` (poll every 2 s), apply ForgejoRestore `mid-r` (`forgejoRef.name: pgha`, `backupName: before`, `restoreData: false`); as soon as it is `Upgrading`, apply ForgejoBackup `mid` (`forgejoRef.name: pgha`, `includeData: false`). While the upgrade is in flight `mid-r` stays `Pending` with a message containing `Waiting for the PostgreSQL major upgrade`, and `mid` stays `Pending` with a message naming the upgrade or `mid-r`, which it waits for as well (sample both once while the phase is `Upgrading` or `Verifying`), and the pre-upgrade backup (`status.database.upgrade.backupName`) is not held up by `mid-r`: it reaches `Completed`, and its `status.message` sampled during `BackingUp` never names `mid-r`. Expect `Succeeded` within 12 min with the phase sequence `BackingUp`, `Upgrading`, `Verifying`, `Succeeded`; then `mid-r` becomes `Completed` within 10 min and `mid` `Completed` within 5 min after that, with `status.postgresImage` = `...:18-minimal-trixie`. (If the watch shows that `mid-r` was applied before `BackingUp`, record it and judge only that both finish.)
+4. **P10.4 both instances on 18**: within 5 min after `Succeeded` the Cluster is `Cluster in healthy state` with `readyInstances` 2; for each pod of `kubectl -n e2e-pg get pods -l cnpg.io/cluster=pgha-db -o name`, `kubectl -n e2e-pg exec <pod> -c postgres -- psql -At -c "select pg_is_in_recovery()::text || ' ' || current_setting('server_version')"` prints `false 18.x` for the primary and `true 18.x` for the replica; CHECK(pgha, demo) passes.
+
+## P11 — Refused images
+
+1. **P11.1 no version in the tag**: `kubectl -n e2e-pg patch fj pg --type merge --dry-run=server -p '{"spec":{"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:latest"}}}}'` fails with a message containing `starts with the PostgreSQL major version`; so does `"imageName":"ghcr.io/cloudnative-pg/postgresql@sha256:` + 64 `a` + `"`.
+2. **P11.2 newer than CloudNativePG supports**: patch `pg`'s `imageName` to `ghcr.io/cloudnative-pg/postgresql:19rc1-minimal-trixie`. Within 2 min `DatabaseUpgrading` = `False/PostgresVersionUnsupported` (message contains `newer than 18`), `Degraded` = `True/PostgresVersionUnsupported`, the Cluster's `spec.imageName` is still `...:18-standard-trixie`, no new ForgejoBackup, `Ready=True`. Patch it back to `ghcr.io/cloudnative-pg/postgresql:18-standard-trixie`; within 2 min `Degraded` is not `True`.
+
+## P12 — Unit-tested behaviour
+
+1. **P12.1 unit tests**: in the repository root run
+   `go test ./internal/upgrade/ ./internal/forgejo/ ./internal/core/ ./internal/backup/ ./internal/controller/ ./api/... -count=1 -v -run 'TestDatabase|TestForgejoUpgradeWaitsForDatabaseUpgrade|TestParsePostgresImage|TestPostgresPolicy|TestReadCNPGClusterAndRunningImage|TestReconcileCNPGWritesTheGatedImage|TestMutateCNPGClusterStorageFloor|TestDumpTooNew|TestRestoresAroundADatabaseUpgrade|TestBackupsAroundADatabaseUpgrade|TestRestoreRequestedDuringTheDatabaseUpgradeBackup|TestPipelineDatabaseUpgradeStopsTheDatabaseStep|TestForgejoValidation' 2>&1 | grep -E '^(=== RUN|--- |ok|FAIL|PASS)'`.
+   Expect every listed test `--- PASS` and every package `ok` (the rollback restore failure that keeps Forgejo stopped and lets no retry or other image start an upgrade, the pauses by a restore, an upgrade waiting for restores that have not finished, cancellation, a rollback that keeps the Cluster when the backup cannot restore it, leftover pods ignored by the verification and the mutual exclusion of upgrades are covered there). Record the `--- PASS` lines of the top-level tests.
+
+## P13 — Cleanup
+
+1. **P13.1 delete**: `kubectl delete namespace e2e-pg --wait=false`, then wait (timeout 6 min) until `kubectl get namespace e2e-pg` returns NotFound. Record anything left behind (`kubectl -n e2e-pg get fj,fjb,fjr,cluster.postgresql.cnpg.io,pvc`). Remove the local tag: `docker rmi localhost/e2e-postgresql:18-minimal-trixie` (only the tag; the bookworm image stays).
+2. **P13.2 metrics gone**: within 3 min after the namespace is gone, Prometheus `forgejo_operator_database_upgrades_total{namespace="e2e-pg"}` returns no series (allow for one more scrape interval).

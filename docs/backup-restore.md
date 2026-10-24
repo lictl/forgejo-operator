@@ -43,7 +43,8 @@ before-migration   forgejo   Manual   Completed   12s         40s
 
 `status` records `phase` (`Pending` → `Running` → `Completed`/`Failed`), `startTime`,
 `completionTime`, `jobName`, `pvcName`, `path`, `forgejoImage` (the image running when the
-backup was taken), `databaseSizeBytes`, `dataSizeBytes`, `includesData`, `message`, a
+backup was taken), `postgresImage` (the PostgreSQL image whose `pg_dump` wrote the dump),
+`databaseSizeBytes`, `dataSizeBytes`, `includesData`, `message`, a
 `Ready` condition and, with `spec.backup.remote`, `remote` (see
 [Remote backups](#remote-backups)). Events are recorded on the backup and on the `Forgejo` object. Status is
 the record of a finished backup: the Job is deleted once its outcome is written there (see
@@ -51,8 +52,11 @@ the record of a finished backup: the Job is deleted once its outcome is written 
 
 What happens:
 
-* The backup waits while a `ForgejoRestore` of the same instance is in progress, and while the
-  instance is being created from a remote backup (`spec.restoreFrom`). It fails
+* The backup waits while a `ForgejoRestore` of the same instance is in progress, while the
+  instance is being created from a remote backup (`spec.restoreFrom`), and while a PostgreSQL
+  major upgrade is in flight (except that upgrade's own backup, which waits only for restores
+  that have started: one that has not waits for the upgrade, see
+  [upgrades.md](upgrades.md#postgresql-major-upgrades)). It fails
   straight away if the instance does not exist, and fails after 2 minutes if the database is
   not ready or the backup PVC cannot be provisioned.
 * The operator creates the backup PVC `<forgejo>-backups` on first use, using
@@ -72,8 +76,10 @@ What happens:
   `(retention + 1) ×` the size of one backup, plus manual and pre-upgrade backups, which
   retention does not prune.
 * A Job `<backup>-backup` runs one pod:
-  * Init container `dump-database` uses the instance's PostgreSQL image
-    (`spec.database.cnpg.imageName`, also for external databases). It connects with
+  * Init container `dump-database` uses the PostgreSQL image of the running CNPG cluster's data
+    (`status.database.image`: during a PostgreSQL major upgrade the old one, so that the dump can
+    be restored into the old major), and `spec.database.cnpg.imageName` for external databases
+    (give it the server's major) and before the cluster reports one. It connects with
     `PGHOST`/`PGPORT`/`PGDATABASE`/`PGSSLMODE`, and `PGUSER`/`PGPASSWORD` come from the
     credentials Secret through `secretKeyRef`, so passwords never appear in a pod spec. It
     writes `db.dump`. With an external database in `sslMode: verify-ca` or `verify-full`,
@@ -291,7 +297,7 @@ spec:
 
 | Phase | What happens |
 |-------|--------------|
-| `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance (for a remote backup: reads and checks its manifest, see [Restoring a remote backup](#restoring-a-remote-backup)). Fails otherwise. Waits for another restore of the instance to finish, while the Secret of SSH host keys is missing or unusable (`status.ssh.message` of the instance; Forgejo could not start again, see [ssh.md](ssh.md#when-something-is-wrong)), and while the Secrets of `spec.objectStorage` are missing or unusable (`ObjectStorageReady=False/CredentialsUnavailable` or `InvalidSpec`; message `Waiting for spec.objectStorage: ...`): no pod could start without them, and the instance's pipeline would not scale it down. The instance keeps serving meanwhile, and the restore starts once the Secrets are back. A bucket the operator cannot reach does not hold a restore. A restore already in `ScalingDown` when a Secret disappears times out (`ScaleDownTimeout`). |
+| `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance (for a remote backup: reads and checks its manifest, see [Restoring a remote backup](#restoring-a-remote-backup)). Fails otherwise, and with reason `NewerDump` when the database is to be restored and the dump was written by `pg_dump` of a newer PostgreSQL major than the CNPG cluster runs (`status.postgresImage` of the backup, `postgresImage` of a remote manifest): a newer dump is not guaranteed to load into an older server. Waits for a PostgreSQL major upgrade of the instance to finish (except the upgrade's own rollback restore), for another restore of the instance to finish, while the Secret of SSH host keys is missing or unusable (`status.ssh.message` of the instance; Forgejo could not start again, see [ssh.md](ssh.md#when-something-is-wrong)), and while the Secrets of `spec.objectStorage` are missing or unusable (`ObjectStorageReady=False/CredentialsUnavailable` or `InvalidSpec`; message `Waiting for spec.objectStorage: ...`): no pod could start without them, and the instance's pipeline would not scale it down. The instance keeps serving meanwhile, and the restore starts once the Secrets are back. A bucket the operator cannot reach does not hold a restore. A restore already in `ScalingDown` when a Secret disappears times out (`ScaleDownTimeout`). |
 | `ScalingDown` | The Forgejo pipeline turns on maintenance mode: `status.backup.activeRestore` is set, the Deployment is scaled to 0, the phase becomes `Restoring` and health checks and autopilot actions are suspended. The restore waits until no Forgejo pod exists, no backup of the instance is running and no Job or pod of another restore of the instance is still running. It fails after 15 minutes if that does not happen, for example because `spec.paused` is set or the reconcile is blocked earlier. |
 | `Restoring` | Job `<restore>-restore` runs (see below); `status.jobStartTime` records when it was created. If its newest pod cannot start within 10 minutes, the Job is stopped and the restore fails. It reports "nothing was changed" only when no earlier pod got past `verify`. Otherwise the failure counts as one that may have changed the instance (see below). A Job that is not found a minute after `jobStartTime` fails the restore with `JobMissing` only after the operator has confirmed with the API server that it is gone. |
 | `ScalingUp` | Maintenance ends and Forgejo is scaled back up. With `spec.highAvailability.enabled`, Valkey is emptied first (event `ValkeyReset`): its pods stop together and start again without data, which takes under a minute, and no Forgejo pod starts before one is Ready. Its queues held work created after the backup point, by row ID (webhook deliveries, PR checks, push updates, mirror syncs), which would act on unrelated rows once the restored database hands out those IDs again, and its cache state from after that point. The bootstrap init container runs `forgejo migrate` against the restored database, in a single pod until that pod is available. The restore waits up to 15 minutes for the Deployment to be available. It completes right away when the instance wants no pods (`spec.replicas: 0` without horizontal autoscaling; with an HPA, `minReplicas` applies). |
@@ -333,8 +339,8 @@ The restore Job:
 
 1. `verify` (Forgejo image, uid 1000) checks the files before anything is touched.
    `db.dump` must be a pg_dump custom archive and `data.tar.gz` must list cleanly.
-2. `restore-database` (PostgreSQL image, uid 1000) replaces the database **in one
-   transaction**. The script sends `BEGIN`, then `DROP SCHEMA public CASCADE; CREATE SCHEMA
+2. `restore-database` (the running cluster's PostgreSQL image, `status.database.image`, uid
+   1000) replaces the database **in one transaction**. The script sends `BEGIN`, then `DROP SCHEMA public CASCADE; CREATE SCHEMA
    public AUTHORIZATION <app user>`, then the output of
    `pg_restore --no-owner --no-acl db.dump` into `psql -v ON_ERROR_STOP=1`. `COMMIT` is sent
    only if pg_restore succeeded, so any failure leaves the database exactly as it was.

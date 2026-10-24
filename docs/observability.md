@@ -226,6 +226,7 @@ is deleted.
 | `forgejo_operator_backup_last_upload_success_timestamp_seconds` | gauge | | Unix time of the last backup uploaded and verified; re-exported from `status.backup.remote.lastUploadTime` on every reconcile, never lowered |
 | `forgejo_operator_restores_total` | counter | `result` | Finished restores |
 | `forgejo_operator_upgrades_total` | counter | `result` (succeeded/failed/rolledback) | Finished upgrades |
+| `forgejo_operator_database_upgrades_total` | counter | `result` (succeeded/failed/rolledback) | Finished PostgreSQL major upgrades of the CNPG cluster ([upgrades.md](upgrades.md#postgresql-major-upgrades)) |
 | `forgejo_operator_autopilot_actions_total` | counter | `action` | Autonomous actions, by type |
 | `forgejo_operator_volume_used_ratio` | gauge | `claim` | Used/capacity of each PVC |
 | `forgejo_operator_version_supported` | gauge | `major`, `support` | 1 when the running Forgejo major is within the support policy, else 0; `support` is `Supported`, `Deprecated`, `EndOfLife`, `Future` or `Unknown` ([versions.md](versions.md)) |
@@ -280,6 +281,7 @@ those metrics are missing.
 | `ForgejoBackupUploadMissing` | warning | No upload recorded at all while the instance's operator metrics are present. Only rendered with `spec.backup.remote` and `spec.backup.enabled` | RPO |
 | `ForgejoVolumeAlmostFull` | warning | `forgejo_operator_volume_used_ratio > 0.9` | 10m |
 | `ForgejoUpgradeFailed` | warning | An upgrade with `result!="succeeded"` (failed or rolled back) in the last hour | – |
+| `ForgejoDatabaseUpgradeFailed` | warning | A PostgreSQL major upgrade with `result!="succeeded"` (failed or rolled back) in the last hour. Only rendered with database type CNPG | – |
 | `ForgejoVersionUnsupported` | warning | `forgejo_operator_version_supported == 0`: the running major is `Deprecated`, `EndOfLife`, `Future` or `Unknown`; the `VersionSupported` condition says what to upgrade to and by when | 1h |
 | `ForgejoVersionAdvisory` | warning | `forgejo_operator_version_advisory == 1`: a supported major runs a patch release that an advisory recommends replacing (e.g. 15.0.7 without critical security fixes, or 17.0.0); the `VersionSupported` condition names the minimum patch | 1h |
 | `ForgejoRunnersOffline` | warning | Per `ForgejoRunner` (label `runner`): `runner_jobs_waiting > 0 and runners_online == 0 and runners_desired > 0`: jobs wait and none of its runners is online ([actions-runners.md](actions-runners.md)) | 10m |
@@ -363,8 +365,8 @@ per `spec.autoPilot.selfHealing.healthCheckInterval` (30s by default) and counts
 
 - a restore holds the instance in maintenance (`ScalingDown`, `Restoring`, `spec.restoreFrom`
   in progress) or brings it back up (`ScalingUp`);
-- an orchestrated upgrade is in flight (`rc.Upgrading`: the cold pre-upgrade backup, the
-  rollout, the verification, a rollback);
+- an orchestrated upgrade of Forgejo or PostgreSQL is in flight (`rc.Upgrading`: the cold
+  pre-upgrade backup, the rollout or CloudNativePG's `pg_upgrade`, the verification, a rollback);
 - `spec.paused` (no step runs; the sample is `up` while a pod is Ready, without a probe);
 - zero desired replicas (`spec.replicas: 0` without an HPA);
 - the instance has never been available (`status.health.lastHealthyTime` empty): the first
@@ -585,6 +587,7 @@ once sampling works again. `status.stats` keeps the last good values in the mean
 | `Degraded` | core / orchestrator, feature packages | Something is wrong but the operator keeps trying (e.g. `ReconcileError` names the failing step, `MonitoringFailed` a monitoring object that could not be applied) |
 | `DatabaseReady` | core | The PostgreSQL backend is reachable/healthy |
 | `Upgrading` | upgrade | A version upgrade is being orchestrated |
+| `DatabaseUpgrading` | upgrade | A PostgreSQL major upgrade of the CNPG cluster is being orchestrated (reason = phase); otherwise its outcome, a refusal or what it waits for ([upgrades.md](upgrades.md#postgresql-major-upgrades)). Only with database type CNPG |
 | `BackupHealthy` | backup | State of scheduled backups (`UploadFailed` when the latest one was not uploaded to `spec.backup.remote`; `BackupKeyNotExported`, `BackupKeyMissing`, `BackupKeyUnusable` while the backup key is not acknowledged as copied out of the cluster, missing or unusable, see [backup-restore.md](backup-restore.md#the-key)) |
 | `RestoredFromBackup` | backup | Bootstrap of `spec.restoreFrom`: `False` while the identity, database and data volume are restored (`TargetNotEmpty` when the database or data volume predates the instance), `True`/`Restored` once they are restored and recorded on `<name>-secrets` ([backup-restore.md](backup-restore.md#disaster-recovery)) |
 | `StorageHealthy` | autopilot | PVC capacity/usage |

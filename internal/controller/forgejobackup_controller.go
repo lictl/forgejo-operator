@@ -223,15 +223,29 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// The cold backup of a PostgreSQL major upgrade in flight does not wait for restores that
+	// have not started (phase "" or Pending): they wait for the upgrade (see the restore
+	// controller's begin), which waits for this backup.
+	ownDatabaseUpgradeBackup := forgejo.DatabaseUpgradeInFlight(f) && forgejo.DatabaseUpgrade(f).BackupName == b.Name
 	for i := range restores {
-		if backup.BlocksBackups(&restores[i]) {
-			return r.wait(ctx, b, fmt.Sprintf("Waiting for ForgejoRestore %s to finish", restores[i].Name), 10*time.Second)
+		rs := &restores[i]
+		if ownDatabaseUpgradeBackup && (rs.Status.Phase == "" || rs.Status.Phase == forgejov1.RestorePhasePending) {
+			continue
+		}
+		if backup.BlocksBackups(rs) {
+			return r.wait(ctx, b, fmt.Sprintf("Waiting for ForgejoRestore %s to finish", rs.Name), 10*time.Second)
 		}
 	}
 
 	if backup.Bootstrapping(f) {
 		// Nothing to back up before spec.restoreFrom has restored the instance.
 		return r.wait(ctx, b, fmt.Sprintf("Waiting for Forgejo %q to be restored from spec.restoreFrom", f.Name), 30*time.Second)
+	}
+	if u := forgejo.DatabaseUpgrade(f); forgejo.DatabaseUpgradeInFlight(f) && u.BackupName != b.Name {
+		// Only the upgrade's own cold backup runs meanwhile; the database is stopped or being
+		// moved to another major.
+		return r.wait(ctx, b, fmt.Sprintf("Waiting for the PostgreSQL major upgrade of Forgejo %q to %s to finish (phase %s)",
+			f.Name, u.ToImage, u.Phase), 30*time.Second)
 	}
 	if !backup.DatabaseReady(f) {
 		return r.waitForDependency(ctx, b, "DatabaseNotReady", fmt.Sprintf("Database of Forgejo %q is not ready", f.Name))
@@ -260,13 +274,16 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 		return ctrl.Result{}, err
 	}
 	image := backup.CurrentImage(f)
+	// pg_dump of the running server's major (the old one during a PostgreSQL major upgrade), so
+	// that the dump can be restored into a server of that major.
+	pgImage := forgejo.RunningPostgresImage(f)
 	now := metav1.Now()
 	job, err := backup.BackupJob(backup.JobInput{
 		Scheme:        r.Scheme,
 		Instance:      f,
 		InstanceName:  f.Name,
 		ForgejoImage:  image,
-		PostgresImage: forgejo.PostgresImage(f),
+		PostgresImage: pgImage,
 		DB:            db,
 		BackupPVC:     pvc,
 		Affinity:      affinity,
@@ -293,6 +310,7 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	b.Status.PVCName = pvc
 	b.Status.Path = "/" + b.Name
 	b.Status.ForgejoImage = image
+	b.Status.PostgresImage = pgImage
 	b.Status.IncludesData = includeData
 	b.Status.Message = fmt.Sprintf("Backup job %s is running", job.Name)
 	setCondition(&b.Status.Conditions, b.Generation, metav1.ConditionFalse, "Running", b.Status.Message)
