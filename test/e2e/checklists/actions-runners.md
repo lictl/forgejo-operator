@@ -10,7 +10,7 @@ Shared facts:
 - The operator runs in-cluster (namespace `forgejo-operator-system`, deployment `forgejo-operator-controller-manager`) with the ForgejoRunner build already deployed. Do not modify or redeploy it. You may read its logs: `kubectl -n forgejo-operator-system logs deploy/forgejo-operator-controller-manager --since=30m | grep e2e-runners`.
 - API group/kinds: `forgejo.lucas.icu/v1alpha1` — `Forgejo` (short `fj`) and `ForgejoRunner` (short `fjrn`). Behaviour is documented in `docs/actions-runners.md` (read it first).
 - Objects of a ForgejoRunner `<r>`: StatefulSet `<r>` (pods `<r>-0`, `<r>-1`, ..., containers `docker` (native sidecar, Docker executor only) and `runner`), Secret `<r>-tokens` (keys `token-<i>`, the runner secrets), Secret `<r>-runner` (keys `config-<i>.yaml`), Job `<r>-register` (exists only while registering, or for 1 min after a failure). All carry the label `forgejo.lucas.icu/runner=<r>`. Runner `i` is named `<r>-<i>` in Forgejo.
-- Instances: `f17` (`codeberg.org/forgejo/forgejo:17`, with object storage in the Garage lab) and `f15` (`codeberg.org/forgejo/forgejo:15`), both in `e2e-runners`. Instance `<N>` serves HTTP at `http://<N>-http.e2e-runners.svc.cluster.local:3000`; the Mac resolves these names directly.
+- Instances: `f17` (`codeberg.org/forgejo/forgejo:17`, with object storage in the Garage lab) and `f15` (`codeberg.org/forgejo/forgejo:15`), both in `e2e-runners`. Instance `<N>` serves HTTP at `http://<N>-http.e2e-runners.svc.cluster.local:3000`; the local cluster must let the host resolve these names directly.
 - **ADMIN(N)** (admin credentials; passwords only contain URL-safe characters):
   ```sh
   NS=e2e-runners; N=<name>
@@ -20,7 +20,7 @@ Shared facts:
   ```
 - Images in the image store of the docker engine the local cluster runs on (no registry needed): `codeberg.org/forgejo/forgejo:15`, `codeberg.org/forgejo/forgejo:17`, `data.forgejo.org/forgejo/runner:13.2.0`, `docker.io/library/docker:29.9.2-dind`, `data.forgejo.org/oci/node:22-bookworm` (the Host executor's image). Check with `docker images`; pull a missing one with `docker pull <image>`. Job containers (`data.forgejo.org/oci/node:22-bookworm`, `docker.io/library/docker:29.9.2-cli`, `data.forgejo.org/oci/alpine:3.22`) and the actions (`https://data.forgejo.org/actions/checkout`) are pulled from the internet by each runner pod's own Docker daemon (or the runner) on first use: allow up to 3 min for the first job of a runner pod.
 - Prometheus: `http://kps-kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090` (`/api/v1/query?query=...` with `--data-urlencode`, `/api/v1/rules`, `/api/v1/alerts`). Operator metrics are scraped every 30-60 s.
-- Garage (S3) lab: namespace `s3-lab`, see `docs/object-storage.md` "Local lab". Listing a prefix from the Mac:
+- Garage (S3) lab: namespace `s3-lab`, see `docs/object-storage.md` "Local lab". Listing a prefix from the host:
   ```sh
   KEY=$(kubectl -n s3-lab get secret s3-credentials -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
   SEC=$(kubectl -n s3-lab get secret s3-credentials -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)

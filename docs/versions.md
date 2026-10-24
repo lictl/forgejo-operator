@@ -290,8 +290,10 @@ Run it on a schedule.
 
 The procedure below is automated by the Claude Code workflow
 [`.claude/workflows/forgejo-new-version.js`](../.claude/workflows/forgejo-new-version.js) (run the
-saved workflow `forgejo-new-version`, optionally with `{event, major}`). It runs the tool,
-researches the release, applies the edits below, verifies them on a local cluster with
+saved workflow `forgejo-new-version` with `{kubeContext}`, the kube context of a local test
+cluster, and optionally `{event, major, dockerContext}`, where `dockerContext` is the docker
+context of the engine that cluster runs on). It runs the tool, researches the release, applies
+the edits below, verifies them on that local cluster with
 [`test/e2e/checklists/versions.md`](../test/e2e/checklists/versions.md), reviews the change, and
 leaves it uncommitted for you to check and commit.
 

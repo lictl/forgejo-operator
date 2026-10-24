@@ -58,8 +58,9 @@ Optional:
 - Gateway API CRDs and a Gateway controller (Envoy Gateway is the tested reference), for
   HTTPRoute/TCPRoute; cert-manager, for certificates. See [docs/networking.md](docs/networking.md).
 
-Build and deploy the operator. On a local cluster the image goes straight into the cluster's image
-store, so no registry is needed:
+Build and deploy the operator. On a local cluster the image is built straight into the docker
+engine the cluster runs on (set `DOCKER_CONTEXT` if that is not your current docker context),
+so no registry is needed:
 
 ```bash
 make deploy-local

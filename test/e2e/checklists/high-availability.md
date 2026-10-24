@@ -18,7 +18,7 @@ Shared facts:
 - The operator runs in-cluster (namespace `forgejo-operator-system`, deployment `forgejo-operator-controller-manager`) with the high-availability build already deployed. Do not modify or redeploy it. You may read its logs: `kubectl -n forgejo-operator-system logs deploy/forgejo-operator-controller-manager --since=30m | grep e2e-ha`.
 - API group/kinds: `forgejo.lucas.icu/v1alpha1` — `Forgejo` (short `fj`), `ForgejoBackup` (`fjb`), `ForgejoRestore` (`fjr`).
 - The local cluster is a **single node** with `local-path` (ReadWriteOnce) storage. All replicas share the node's mount of the data volume, so multi-replica works; topology spreading is `ScheduleAnyway` and must not leave pods Pending. The node has no `topology.kubernetes.io/zone` label, so no zone constraint is expected.
-- An instance `<name>` serves HTTP at `http://<name>-http.e2e-ha.svc.cluster.local:3000`; the Mac resolves service names and reaches pod IPs directly.
+- An instance `<name>` serves HTTP at `http://<name>-http.e2e-ha.svc.cluster.local:3000`; the local cluster must let the host resolve service names and reach pod IPs directly.
 - Variables used below (set them per instance; passwords only contain URL-safe characters):
   ```sh
   NS=e2e-ha; N=<name>

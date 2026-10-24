@@ -9,7 +9,7 @@ Shared facts:
 - `docker` commands must reach the docker engine the local cluster runs on, so that pulled and built images are visible to the cluster; set `DOCKER_CONTEXT` if that is not your current docker context.
 - The operator runs in-cluster (namespace `forgejo-operator-system`, deployment `forgejo-operator-controller-manager`) with the version-support build already deployed. Do not modify or redeploy it. You may read its logs: `kubectl -n forgejo-operator-system logs deploy/forgejo-operator-controller-manager --since=30m | grep e2e-versions`.
 - API group/kinds: `forgejo.lucas.icu/v1alpha1` — `Forgejo` (short `fj`), `ForgejoBackup` (`fjb`), `ForgejoRestore` (`fjr`).
-- An instance `<name>` in namespace `e2e-versions` serves HTTP at `http://<name>-http.e2e-versions.svc.cluster.local:3000` and SSH at `<name>-ssh.e2e-versions.svc.cluster.local:22`; the Mac resolves these names directly.
+- An instance `<name>` in namespace `e2e-versions` serves HTTP at `http://<name>-http.e2e-versions.svc.cluster.local:3000` and SSH at `<name>-ssh.e2e-versions.svc.cluster.local:22`; the local cluster must let the host resolve these names directly.
 - Admin credentials (passwords only contain URL-safe characters, so `http://USER:PASS@host` works):
   ```sh
   NS=e2e-versions; N=<name>

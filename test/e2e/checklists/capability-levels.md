@@ -9,7 +9,7 @@ Shared facts for every scenario:
 - `docker` commands must reach the docker engine the local cluster runs on, so that pulled and built images are visible to the cluster; set `DOCKER_CONTEXT` if that is not your current docker context.
 - The operator runs in-cluster (namespace `forgejo-operator-system`, deployment `forgejo-operator-controller-manager`). Do not modify it. You may read its logs: `kubectl -n forgejo-operator-system logs deploy/forgejo-operator-controller-manager --since=30m | grep <your-namespace>`.
 - API group/kinds: `forgejo.lucas.icu/v1alpha1` — `Forgejo` (short `fj`), `ForgejoBackup` (`fjb`), `ForgejoRestore` (`fjr`).
-- An instance `<name>` in namespace `<ns>` serves HTTP at `http://<name>-http.<ns>.svc.cluster.local:3000` and SSH at `<name>-ssh.<ns>.svc.cluster.local:22`; the Mac resolves these names directly.
+- An instance `<name>` in namespace `<ns>` serves HTTP at `http://<name>-http.<ns>.svc.cluster.local:3000` and SSH at `<name>-ssh.<ns>.svc.cluster.local:22`; the local cluster must let the host resolve these names directly.
 - Admin credentials: `kubectl -n <ns> get secret <name>-admin -o jsonpath='{.data.username}' | base64 -d` (same for `password`).
 - Images available locally: `codeberg.org/forgejo/forgejo:15`, `:16`, `:16-rootless`.
 - Wait with bounded `until` loops (poll every 5-10 s, explicit timeout) or the Monitor tool. Never wait without a timeout.

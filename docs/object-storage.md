@@ -163,8 +163,9 @@ artifacts and, on Forgejo 15, avatars. Uploads always go through Forgejo.
 
 The URL is signed for the endpoint as Forgejo knows it (`endpoint`), so **clients must reach that
 host name and trust its certificate**. An in-cluster endpoint such as
-`http://garage.s3-lab.svc.cluster.local:3900` only works for clients inside the cluster (and, on
-a local cluster, the Mac). Use an endpoint that is public, or leave `serveDirect` off.
+`http://garage.s3-lab.svc.cluster.local:3900` only works for clients inside the cluster (and for
+the host, if the local cluster resolves `*.svc.cluster.local` there). Use an endpoint that is
+public, or leave `serveDirect` off.
 
 ## Status
 
@@ -280,8 +281,8 @@ spec:
       credentialsSecret: {name: s3-credentials}
 ```
 
-From the Mac (the local cluster resolves `*.svc.cluster.local` and routes to Services), `curl`
-signs requests itself:
+From the host (the local cluster has to resolve `*.svc.cluster.local` there and route to
+Services), `curl` signs requests itself:
 
 ```console
 $ KEY=$(kubectl -n s3-lab get secret s3-credentials -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
@@ -295,7 +296,7 @@ $ curl -s --cacert lab-ca.crt --aws-sigv4 aws:amz:garage:s3 --user "$KEY:$SEC" \
 
 `rclone` runs in a pod of the lab, with the key from the Secret (`env_auth` reads
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), so that it never shows up in the pod spec. Docker
-containers on the Mac do not resolve `*.svc.cluster.local`.
+containers on the host do not resolve `*.svc.cluster.local`.
 
 ```console
 $ kubectl -n s3-lab run rclone --rm -i --restart=Never --image=rclone/rclone:1.75.2 --overrides='{"spec":{"containers":[{
@@ -306,7 +307,7 @@ $ kubectl -n s3-lab run rclone --rm -i --restart=Never --image=rclone/rclone:1.7
            {"name":"RCLONE_CONFIG_LAB_REGION","value":"garage"}]}]}}'
 ```
 
-The presigned URLs of `serveDirect` can be fetched from the Mac as well; for the HTTPS endpoint,
+The presigned URLs of `serveDirect` can be fetched from the host as well; for the HTTPS endpoint,
 `git lfs` needs the lab CA in the system keychain.
 
 Remove the lab with `kubectl delete ns s3-lab`.

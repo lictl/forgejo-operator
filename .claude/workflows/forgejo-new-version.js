@@ -1,7 +1,7 @@
 export const meta = {
   name: 'forgejo-new-version',
   description: 'Bring forgejo-operator up to date with a new Forgejo release (branch cut, release day or patch): detect, research, update the version table, verify on a local cluster, review',
-  whenToUse: 'When `make forgejo-versions` reports STALE or WARN findings, or a Forgejo major is branched/released or a patch fixes a security issue or advisory. Args: {event?: "branch-cut"|"release"|"patch", major?: number, kubeconfig?: string}. Without args it acts on what the version tool reports. Runs against the local test cluster only and never commits.',
+  whenToUse: 'When `make forgejo-versions` reports STALE or WARN findings, or a Forgejo major is branched/released or a patch fixes a security issue or advisory. Args: {event?: "branch-cut"|"release"|"patch", major?: number, kubeContext: string, dockerContext?: string, kubeconfig?: string}. kubeContext is the kube context of the local test cluster and is required for every stage that touches a cluster; dockerContext is the docker context of the engine that cluster runs on (omit it when that engine is the current docker context); kubeconfig is the path of the kubeconfig file to create for kubeContext. Without event and major it acts on what the version tool reports. Runs against the local test cluster only and never commits.',
   phases: [
     { title: 'Detect', detail: 'Run the version tool and classify findings', model: 'sonnet' },
     { title: 'Research', detail: 'Release notes, breaking changes, image inspection', model: 'opus' },
@@ -16,7 +16,6 @@ export const meta = {
 // internal/forgejo/versions.go; the verification checklist in test/e2e/checklists/versions.md.
 const a = args || {}
 const KC = a.kubeconfig || '${TMPDIR:-/tmp}/forgejo-operator-local.kubeconfig'
-const CLUSTER = `Cluster: the local test cluster only (its kube context is in the LOCAL_KUBE_CONTEXT environment variable). Create a kubeconfig that holds only that context once with \`kubectl config view --minify --flatten --context "$LOCAL_KUBE_CONTEXT" > ${KC}\` and \`export OPERATOR_KUBECONFIG=${KC} KUBECONFIG=${KC}\` in every shell that runs kubectl or helm. Never use any other kube context (in particular never the user's real "k3s" cluster). The operator runs in-cluster in forgejo-operator-system; redeploy a build with \`make deploy-local IMG=forgejo-operator:dev && git checkout -- config/manager/kustomization.yaml\`. Pull images into the cluster with \`docker pull <image>\` on the docker engine the local cluster runs on.`
 const RULES = 'Work in the repository root (the current project). Never run git commands that change state (no commit, stash, reset, checkout of source files); the person running this workflow commits.'
 
 const DETECT = {
@@ -40,6 +39,17 @@ const explicit = a.event || a.major
 if (!explicit && detected.stale.length === 0 && detected.warn.length === 0) {
   return { status: 'up-to-date', matrix: detected.matrix, info: detected.info }
 }
+if (!a.kubeContext) return { status: 'blocked', reason: 'pass args.kubeContext: the kube context of the local test cluster' }
+
+// From here on a stage may touch the local test cluster (args.kubeContext) and the docker engine it
+// runs on (args.dockerContext, optional: without it docker uses the current docker context).
+const KCTX = a.kubeContext
+const DENV = a.dockerContext ? `DOCKER_CONTEXT=${a.dockerContext} ` : ''
+const DOCKER_NOTE = a.dockerContext
+  ? `Run every docker command, and every make target that runs docker, with \`DOCKER_CONTEXT=${a.dockerContext}\` (\`export DOCKER_CONTEXT=${a.dockerContext}\` in every shell), so that it reaches the docker engine the local cluster runs on.`
+  : 'docker commands use the current docker context, which must be the docker engine the local cluster runs on.'
+const CLUSTER = `Cluster: the local test cluster only (kube context "${KCTX}"). Create a kubeconfig that holds only that context once with \`kubectl config view --minify --flatten --context "${KCTX}" > ${KC}\` and \`export LOCAL_KUBE_CONTEXT="${KCTX}" OPERATOR_KUBECONFIG=${KC} KUBECONFIG=${KC}\` in every shell that runs kubectl or helm. Never use any other kube context (in particular never the user's real "k3s" cluster). ${DOCKER_NOTE} The operator runs in-cluster in forgejo-operator-system; redeploy a build with \`${DENV}make deploy-local IMG=forgejo-operator:dev && git checkout -- config/manager/kustomization.yaml\`. Pull images into the cluster with \`${DENV}docker pull <image>\`.`
+
 const target = explicit
   ? `Requested: event=${a.event || 'infer from findings'}, major=${a.major || 'infer from findings'}.`
   : 'Act on the STALE and WARN findings below.'
@@ -52,7 +62,7 @@ Version tool findings: ${JSON.stringify({ stale: detected.stale, warn: detected.
 Matrix:
 ${detected.matrix}
 
-Follow step 2 of the branch-cut procedure in docs/versions.md for every new major (release notes "Breaking features"/"Breaking bug fixes", PRs labelled breaking in the milestone, config cheat sheet / CLI reference / upgrade guide diff against the previous major, Dockerfiles, /api/healthz, /api/v1/version, /metrics, security announcements), and for patches check the advisory and security notes. Inspect the images hands-on with \`docker\` (for a branch cut: codeberg.org/forgejo-experimental/forgejo:N.0-test and -rootless; otherwise codeberg.org/forgejo/forgejo:N and -rootless): binary path, uid 1000 user git, the bootstrap CLI (migrate, admin user list/create/change-password), generate secret, and a run of "forgejo web --config <app.ini>" as uid 1000 with a read-only root filesystem against PostgreSQL. Report each operator-relevant difference with a source URL and the trait or table change it needs. Do not edit repository files.`, { label: 'research', phase: 'Research', model: 'opus' })
+Follow step 2 of the branch-cut procedure in docs/versions.md for every new major (release notes "Breaking features"/"Breaking bug fixes", PRs labelled breaking in the milestone, config cheat sheet / CLI reference / upgrade guide diff against the previous major, Dockerfiles, /api/healthz, /api/v1/version, /metrics, security announcements), and for patches check the advisory and security notes. Inspect the images hands-on with \`${DENV}docker\` (for a branch cut: codeberg.org/forgejo-experimental/forgejo:N.0-test and -rootless; otherwise codeberg.org/forgejo/forgejo:N and -rootless): binary path, uid 1000 user git, the bootstrap CLI (migrate, admin user list/create/change-password), generate secret, and a run of "forgejo web --config <app.ini>" as uid 1000 with a read-only root filesystem against PostgreSQL. Report each operator-relevant difference with a source URL and the trait or table change it needs. Do not edit repository files.`, { label: 'research', phase: 'Research', model: 'opus' })
 
 phase('Implement')
 const impl = await agent(`${RULES} Update forgejo-operator for the new Forgejo release, following docs/versions.md "When a new Forgejo version is released" exactly (branch cut / release day / patch / end of life, whichever applies).

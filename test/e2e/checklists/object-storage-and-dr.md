@@ -23,8 +23,8 @@ Shared facts:
 - **S3 lab** (namespace `s3-lab`, installed by `hack/s3-lab/setup.sh`; read only for this checklist): Garage v2.4.1 at `http://garage.s3-lab.svc.cluster.local:3900`, region `garage`, path-style addressing, buckets `forgejo` (object storage) and `forgejo-backups` (remote backups). Secret `s3-lab/s3-credentials` holds the access key under `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`; it may create, list, read and delete objects in both buckets. If namespace `s3-lab` does not exist, run `hack/s3-lab/setup.sh` once (it is idempotent) and record that.
 - Bucket prefixes used here (nothing else may be touched): `forgejo-backups/e2e/` (remote backups: `e2e/<namespace>/<name>/<backup>/`), `forgejo/e2e-s3-fj/` and `forgejo/e2e-s3-f15/` (object storage).
 - Images in the image store of the docker engine the local cluster runs on (no registry needed): `codeberg.org/forgejo/forgejo:15`, `codeberg.org/forgejo/forgejo:17`, `docker.io/rclone/rclone:1.75.2` (the default `spec.backup.remote.image`), `ghcr.io/cloudnative-pg/postgresql:17`. Check with `docker images | grep -E 'forgejo/forgejo|rclone|cloudnative-pg/postgresql'`; pull a missing one with `docker pull <image>` (if a registry credential helper fails, use `DOCKER_CONFIG=<empty dir>`).
-- The Mac resolves `*.svc.cluster.local` and reaches Services and pods. An instance `<name>` in namespace `<ns>` serves HTTP at `http://<name>-http.<ns>.svc.cluster.local:3000` and SSH at `<name>-ssh.<ns>.svc.cluster.local:22`. Docker containers on the Mac do **not** resolve cluster names: give them only local files.
-- Tools on the Mac: `git` with `git-lfs`, `curl` (with `--aws-sigv4`), `python3`, `ssh`, `ssh-keygen`, `ssh-keyscan`, `shasum`, `docker`. The two-factor helper is `test/e2e/tools/forgejo-2fa.py` in the repository (standard library only; run it with `python3 -I`).
+- The local cluster must let the host resolve `*.svc.cluster.local` and reach Services and pods. An instance `<name>` in namespace `<ns>` serves HTTP at `http://<name>-http.<ns>.svc.cluster.local:3000` and SSH at `<name>-ssh.<ns>.svc.cluster.local:22`. Docker containers on the host do **not** resolve cluster names: give them only local files.
+- Tools on the host: `git` with `git-lfs`, `curl` (with `--aws-sigv4`), `python3`, `ssh`, `ssh-keygen`, `ssh-keyscan`, `shasum`, `docker`. The two-factor helper is `test/e2e/tools/forgejo-2fa.py` in the repository (standard library only; run it with `python3 -I`).
 - Variables, in every shell (`$W` is a fresh directory under your scratch area, kept for the whole run; files written in one check are read in later ones):
   ```sh
   export KUBECONFIG=$OPERATOR_KUBECONFIG
@@ -50,7 +50,7 @@ Reusable procedures (referenced below):
 - **S3PUT(bucket, key, file)**: `curl -s -o /dev/null -w '%{http_code}\n' --aws-sigv4 aws:amz:garage:s3 --user "$KEY:$SEC" -X PUT --data-binary @<file> "$E/<bucket>/<key>"` → `200`.
 - **S3PURGE(bucket, prefix)**: for every key of S3LS(bucket, prefix): `curl -s -o /dev/null -w '%{http_code}\n' --aws-sigv4 aws:amz:garage:s3 --user "$KEY:$SEC" -X DELETE "$E/<bucket>/<key>"` (204 each); then S3LS(bucket, prefix) is empty.
 - **COPY-CREDS(ns)**: `kubectl -n <ns> create secret generic s3-credentials --from-literal=AWS_ACCESS_KEY_ID="$KEY" --from-literal=AWS_SECRET_ACCESS_KEY="$SEC"`.
-- **DECRYPT(dir, keyfile, file)**: prints the decrypted content of `<dir>/<file>.bin` (a file downloaded from the bucket) using a stock rclone with a local crypt remote; nothing leaves the Mac:
+- **DECRYPT(dir, keyfile, file)**: prints the decrypted content of `<dir>/<file>.bin` (a file downloaded from the bucket) using a stock rclone with a local crypt remote; nothing leaves the host:
   ```sh
   docker run --rm -v "<dir>:/w" -v "<keyfile>:/key:ro" \
     -e RCLONE_CONFIG_ENC_TYPE=crypt -e RCLONE_CONFIG_ENC_REMOTE=/w -e RCLONE_CONFIG_ENC_FILENAME_ENCRYPTION=off \
