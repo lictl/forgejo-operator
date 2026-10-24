@@ -14,21 +14,29 @@ import (
 )
 
 // The availability SLI (docs/observability.md, "Service level objectives") counts one
-// sample per health-check interval in forgejo_operator_availability_probes_total. Unlike
-// the health probe itself, it is also taken when there is nothing to probe: no Ready pod
-// while replicas are desired is an outage, not a pause of the measurement.
+// sample per health-check interval of time in forgejo_operator_availability_probes_total.
+// Unlike the health probe itself, it is also taken when there is nothing to probe: no Ready
+// pod while replicas are desired is an outage, not a pause of the measurement.
 const (
 	resultUp   = "up"
 	resultDown = "down"
 )
 
-// availabilitySamples remembers when each instance was last sampled by this process.
+// availabilitySamples remembers, per instance, how far this process has counted samples.
 var availabilitySamples sync.Map // types.NamespacedName -> sampled
 
 type sampled struct {
 	uid types.UID
-	at  time.Time
+	// until is the end of the last health-check interval counted.
+	until time.Time
 }
+
+// maxSampleSpan bounds the time that the samples of one pass stand for. The controller
+// reconciles every instance at least once a minute, also while a step fails (its resync caps
+// the error backoff as well), so a sample comes at most about a minute after it is due, plus
+// a slow pass (probe timeouts) and the wait for the work queue. A longer gap means that the
+// operator did not watch the instance, and is not counted with the result seen at its end.
+const maxSampleSpan = 3 * time.Minute
 
 // exportAvailability exports the instance's four sample series at 0, so that increase()
 // and rate() also see their first increment.
@@ -40,26 +48,41 @@ func exportAvailability(f *forgejov1.Forgejo) {
 	}
 }
 
-// recordAvailability counts one sample (up or down) when one is due, at most once per
-// interval. It returns how long until the next sample is due.
+// recordAvailability counts the samples that are due, all with the result seen now: one for
+// each health-check interval since the last one counted, so that the SLI measures time, not
+// passes. Passes do not come once per interval: a failing step backs the instance off for up
+// to a minute, and probes that time out slow every pass down, both typically during an
+// outage, which would otherwise weigh less than the same time of normal operation. One pass
+// counts at most the intervals of maxSampleSpan, or one when the interval is longer. It
+// returns how long until the next sample is due.
 func recordAvailability(rc *forgejo.ReconcileContext, up bool, now time.Time, interval time.Duration) time.Duration {
 	f := rc.Instance
 	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
+	count, until := 1, now
 	if v, ok := availabilitySamples.Load(key); ok {
-		// One second of tolerance for timer jitter, as for the probes.
 		if s := v.(sampled); s.uid == f.UID {
-			if wait := interval - now.Sub(s.at) - time.Second; wait > 0 {
-				return wait
+			// One second of tolerance for timer jitter, as for the probes.
+			elapsed := now.Sub(s.until) + time.Second
+			if elapsed < interval {
+				return interval - elapsed
+			}
+			limit := max(1, int(maxSampleSpan/interval))
+			if count = int(elapsed / interval); count <= limit {
+				until = s.until.Add(time.Duration(count) * interval)
+			} else {
+				// After a gap, count from now on.
+				count = limit
 			}
 		}
 	}
-	availabilitySamples.Store(key, sampled{uid: f.UID, at: now})
+	availabilitySamples.Store(key, sampled{uid: f.UID, until: until})
 	result := resultDown
 	if up {
 		result = resultUp
 	}
-	forgejo.AvailabilityProbes.WithLabelValues(f.Namespace, f.Name, result, strconv.FormatBool(plannedDowntime(rc))).Inc()
-	return interval
+	forgejo.AvailabilityProbes.WithLabelValues(f.Namespace, f.Name, result, strconv.FormatBool(plannedDowntime(rc))).
+		Add(float64(count))
+	return until.Add(interval).Sub(now)
 }
 
 // plannedDowntime reports whether Forgejo may be unavailable by design right now, so that

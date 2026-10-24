@@ -3,6 +3,8 @@ package observability
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -24,24 +26,39 @@ const (
 	dashboardFolder      = "Forgejo"
 )
 
-// renderDashboard fills in the instance. The SLO objective is a threshold, a JSON number:
-// the template holds it as the string "__SLO_OBJECTIVE__", so that the template is valid
-// JSON as well. An SLO the CRD would have refused falls back to the defaults.
+// renderDashboard fills in the instance. Strings are placed into JSON strings of the
+// template, escaped. Thresholds are JSON numbers: the template holds them as strings
+// ("__SLO_OBJECTIVE__"), so that the template is valid JSON as well. Both backup age stats
+// turn orange at one and a half schedule intervals and red from the RPO (two intervals) on,
+// where the RPO alerts fire. An SLO the CRD would have refused falls back to the defaults.
 func renderDashboard(f *forgejov1.Forgejo) string {
 	s, err := sloOf(f)
 	if err != nil {
 		s, _ = sloOf(&forgejov1.Forgejo{})
 	}
+	rpo := int64(backupRPO(f).Seconds())
 	return strings.NewReplacer(
-		"__UID__", dashboardUID(f),
-		"__TITLE__", "Forgejo / "+f.Namespace+"/"+f.Name,
-		"__NAMESPACE__", f.Namespace,
-		"__NAME__", f.Name,
-		"__JOB__", forgejo.HTTPServiceName(f),
-		"__SLO_WINDOW__", s.windowName,
+		"__UID__", jsonText(dashboardUID(f)),
+		"__TITLE__", jsonText("Forgejo / "+f.Namespace+"/"+f.Name),
+		"__NAMESPACE__", jsonText(f.Namespace),
+		"__NAME__", jsonText(f.Name),
+		"__JOB__", jsonText(forgejo.HTTPServiceName(f)),
+		"__SLO_WINDOW__", jsonText(s.windowName),
+		"__RUNBOOKS__", jsonText(runbookBase(f)),
 		`"__SLO_OBJECTIVE__"`, s.objective,
-		"__RUNBOOKS__", runbookBase(f),
+		`"__RPO_WARNING__"`, strconv.FormatInt(rpo*3/4, 10),
+		`"__RPO__"`, strconv.FormatInt(rpo, 10),
 	).Replace(dashboardJSON)
+}
+
+// jsonText is s escaped for the inside of a JSON string.
+func jsonText(s string) string {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(s) // a string always encodes
+	quoted := strings.TrimSuffix(b.String(), "\n")
+	return quoted[1 : len(quoted)-1]
 }
 
 func reconcileDashboard(ctx context.Context, rc *forgejo.ReconcileContext, want bool) error {

@@ -32,10 +32,10 @@ func samples(t *testing.T, f *forgejov1.Forgejo) map[string]float64 {
 	return out
 }
 
-// expireSample pretends the last sample was taken one interval ago.
+// expireSample pretends the last interval counted ended one interval ago, so one sample is due.
 func expireSample(f *forgejov1.Forgejo) {
 	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
-	availabilitySamples.Store(key, sampled{uid: f.UID, at: time.Now().Add(-healthInterval(f) - 2*time.Second)})
+	availabilitySamples.Store(key, sampled{uid: f.UID, until: time.Now().Add(-healthInterval(f) - 2*time.Second)})
 }
 
 // With no Ready pod the probe is skipped, but the SLI records the outage: one unplanned
@@ -135,7 +135,8 @@ func TestAvailabilitySamplesDoNotHideOutages(t *testing.T) {
 	if got := samples(t, f)["up/true"] - before["up/true"]; got != 1 {
 		t.Fatalf("paused up/true +%v", got)
 	}
-	if rc.RequeueAfter != defaultHealthInterval {
+	// Requeued for the next sample, due one interval after the interval just counted.
+	if rc.RequeueAfter <= 0 || rc.RequeueAfter > defaultHealthInterval {
 		t.Fatalf("paused requeue %s", rc.RequeueAfter)
 	}
 
@@ -145,5 +146,64 @@ func TestAvailabilitySamplesDoNotHideOutages(t *testing.T) {
 	SampleWhilePaused(ctx, rc)
 	if got := samples(t, f)["up/true"] - before["up/true"]; got != 1 {
 		t.Fatalf("re-created up/true +%v", got)
+	}
+}
+
+// Samples measure time, not passes: a pass that comes late counts every health-check interval
+// it missed, with the result it sees, so an outage during which a failing step backs the
+// instance off for a minute weighs as much as the same time of normal operation. One pass
+// counts at most maxSampleSpan.
+func TestAvailabilitySamplesFollowTime(t *testing.T) {
+	f := testInstance("avail-time")
+	t.Cleanup(func() { ForgetInstance("ns", "avail-time"); forgejo.DeleteInstanceMetrics("ns", "avail-time") })
+	was := metav1.NewTime(time.Now().Add(-time.Hour))
+	f.Status.Health = &forgejov1.HealthStatus{LastHealthyTime: &was}
+	rc := &forgejo.ReconcileContext{Instance: f}
+	t0 := time.Now()
+	s := time.Second
+
+	for _, tt := range []struct {
+		name     string
+		at       time.Duration // since t0
+		interval time.Duration
+		up       bool
+		want     float64       // samples counted
+		wait     time.Duration // returned: until the next sample is due
+	}{
+		{"first sample", 0, 30 * s, true, 1, 30 * s},
+		{"not due yet", 10 * s, 30 * s, true, 0, 19 * s},
+		{"due within the tolerance", 29 * s, 30 * s, true, 1, 31 * s},
+		// A failing step: the controller's backoff (at most a minute) drives the passes.
+		{"backoff 1", 89 * s, 30 * s, false, 2, 31 * s},
+		{"backoff 2", 149 * s, 30 * s, false, 2, 31 * s},
+		// Slow passes, every 37s: one sample each, two once the delay adds up to an interval.
+		{"slow 1", 186 * s, 30 * s, false, 1, 24 * s},
+		{"slow 2", 223 * s, 30 * s, false, 1, 17 * s},
+		{"slow 3", 260 * s, 30 * s, false, 1, 10 * s},
+		{"slow 4", 297 * s, 30 * s, false, 1, 3 * s},
+		{"slow 5", 334 * s, 30 * s, true, 2, 26 * s},
+		// After a gap the operator did not watch: at most maxSampleSpan, then from now on.
+		{"gap", 934 * s, 30 * s, true, 6, 30 * s},
+		{"after the gap", 964 * s, 30 * s, true, 1, 30 * s},
+		// An interval longer than maxSampleSpan: one sample per pass at most.
+		{"long interval", 964*s + 25*time.Minute, 10 * time.Minute, true, 1, 10 * time.Minute},
+	} {
+		before := samples(t, f)
+		wait := recordAvailability(rc, tt.up, t0.Add(tt.at), tt.interval)
+		after := samples(t, f)
+		key := keyDownUnplanned
+		if tt.up {
+			key = "up/false"
+		}
+		if got := after[key] - before[key]; got != tt.want || wait != tt.wait {
+			t.Errorf("%s: %s +%v, next in %s; want +%v, next in %s", tt.name, key, got, wait, tt.want, tt.wait)
+		}
+		var total float64
+		for k := range after {
+			total += after[k] - before[k]
+		}
+		if total != tt.want {
+			t.Errorf("%s: %v samples in all, want %v", tt.name, total, tt.want)
+		}
 	}
 }

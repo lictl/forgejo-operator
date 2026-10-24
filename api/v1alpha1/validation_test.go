@@ -189,6 +189,9 @@ const errCredentials = "credentialsSecret"
 // errSLOTarget is the field path of the availability target's validation errors.
 const errSLOTarget = "spec.monitoring.slo.availabilityTarget"
 
+// errRunbookBase is the field path of the runbook base URL's validation errors.
+const errRunbookBase = "spec.monitoring.runbookBaseURL"
+
 func TestForgejoValidation(t *testing.T) {
 	const s3 = `endpoint: https://s3.example.com
       bucket: bucket
@@ -315,8 +318,10 @@ func TestForgejoValidation(t *testing.T) {
 		{name: "slo target 0.5", obj: fj("  monitoring:\n    slo: {availabilityTarget: \"0.5\"}"), want: errSLOTarget},
 		{name: "slo window in minutes", obj: fj("  monitoring:\n    slo: {window: 90m}"), want: "spec.monitoring.slo.window"},
 		{name: "slo window compound", obj: fj("  monitoring:\n    slo: {window: 1d12h}"), want: "spec.monitoring.slo.window"},
-		{name: "runbook base with a query", obj: fj("  monitoring: {runbookBaseURL: \"https://wiki.example.com/r?page=1\"}"), want: "spec.monitoring.runbookBaseURL"},
-		{name: "runbook base relative", obj: fj("  monitoring: {runbookBaseURL: docs/runbooks}"), want: "spec.monitoring.runbookBaseURL"},
+		{name: "runbook base with a query", obj: fj("  monitoring: {runbookBaseURL: \"https://wiki.example.com/r?page=1\"}"), want: errRunbookBase},
+		{name: "runbook base relative", obj: fj("  monitoring: {runbookBaseURL: docs/runbooks}"), want: errRunbookBase},
+		{name: "runbook base with a template", obj: fj("  monitoring: {runbookBaseURL: 'https://wiki.example.com/{{'}"), want: errRunbookBase},
+		{name: "runbook base with a quote", obj: fj("  monitoring: {runbookBaseURL: 'https://wiki.example.com/a\"b'}"), want: errRunbookBase},
 
 		// Object storage.
 		{name: "object storage without credentials", obj: fj("  objectStorage:\n    s3: {endpoint: \"https://s3.example.com\", bucket: bucket}"), want: errCredentials},

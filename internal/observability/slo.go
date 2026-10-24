@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -31,16 +31,26 @@ func envOr(key, def string) string {
 	return def
 }
 
-// ValidateRunbookBaseURL checks a runbook base: an absolute http(s) URL without query or
-// fragment, since "/<AlertName>.md" is appended to it.
+// runbookBasePattern is the form of a runbook base, and the CRD's pattern of
+// spec.monitoring.runbookBaseURL (TestRunbookBaseURLPattern keeps the two equal): an http(s)
+// URL with a host name or IPv4 address and an optional port, without user information, query
+// or fragment, whose path holds only the characters RFC 3986 allows there (others
+// percent-encoded). "/<AlertName>.md" is appended to it in every alert's runbook_url
+// annotation, which Prometheus expands as a template ("{{" would invalidate the whole
+// PrometheusRule), and it is written into the dashboard's JSON (a quote or backslash would
+// end or escape the string).
+const runbookBasePattern = `^https?://[A-Za-z0-9](?:[-A-Za-z0-9.]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/(?:[-A-Za-z0-9/._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)?$`
+
+var runbookBaseForm = regexp.MustCompile(runbookBasePattern)
+
+// ValidateRunbookBaseURL checks a runbook base (spec.monitoring.runbookBaseURL,
+// --runbook-base-url) against runbookBasePattern.
 func ValidateRunbookBaseURL(s string) error {
-	u, err := url.Parse(s)
-	if err != nil {
-		return fmt.Errorf("runbook base URL %q: %w", s, err)
-	}
-	web := strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://")
-	if !web || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || strings.ContainsAny(s, " \t\n") {
-		return fmt.Errorf("runbook base URL %q must be an http(s) URL without query or fragment", s)
+	if !runbookBaseForm.MatchString(s) {
+		return fmt.Errorf("runbook base URL %q must be an http(s) URL with a host name or IPv4 address and an "+
+			"optional port, without user information, query or fragment, and with every character that RFC 3986 "+
+			"does not allow in a path (such as braces, quotes, backslashes, angle brackets and spaces) "+
+			"percent-encoded", s)
 	}
 	return nil
 }

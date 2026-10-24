@@ -357,7 +357,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Age of the most recent successful ForgejoBackup.",
+      "description": "Age of the most recent successful ForgejoBackup (of any reason). Orange from one and a half schedule intervals on (a run was missed), red above the recovery point objective (RPO, two intervals), where ForgejoBackupTooOld fires.",
       "gridPos": {
         "h": 4,
         "w": 4,
@@ -388,11 +388,11 @@
               },
               {
                 "color": "orange",
-                "value": 129600
+                "value": "__RPO_WARNING__"
               },
               {
                 "color": "red",
-                "value": 172800
+                "value": "__RPO__"
               }
             ]
           },
@@ -716,7 +716,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Age of the newest recovery point: the last successful backup (local) and, with spec.backup.remote, the last verified upload (remote). The RPO is two schedule intervals; see the panel next to it.",
+      "description": "Age of the older recovery point: the last successful backup (local) and, with spec.backup.remote, the last verified upload (remote). Orange from one and a half schedule intervals on, red above the RPO (two intervals), where ForgejoBackupTooOld or ForgejoBackupUploadTooOld fires; the panel below shows both copies.",
       "gridPos": {
         "h": 4,
         "w": 6,
@@ -744,6 +744,14 @@
               {
                 "color": "green",
                 "value": null
+              },
+              {
+                "color": "orange",
+                "value": "__RPO_WARNING__"
+              },
+              {
+                "color": "red",
+                "value": "__RPO__"
               }
             ]
           },

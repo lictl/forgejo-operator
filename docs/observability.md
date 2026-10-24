@@ -181,6 +181,11 @@ The dashboard ConfigMap carries the label `grafana_dashboard: "1"` and the annot
 | Operator | Health check failures, autopilot actions by type, volume usage by PVC, backups by reason/result, backup size and duration |
 | Runtime | Forgejo RSS and heap, CPU, goroutines (per pod) |
 
+The stats *Last successful backup* and *Recovery point age* turn orange at one and a half
+intervals of `spec.backup.schedule` (a run was missed) and red above the
+[RPO](#recovery-point-objective) (two intervals), where `ForgejoBackupTooOld` (or
+`ForgejoBackupUploadTooOld`) fires: the operator renders the dashboard with the instance's RPO.
+
 ## Metrics
 
 ### Forgejo (`/metrics`, scraped through the ServiceMonitor)
@@ -211,7 +216,7 @@ is deleted.
 | `forgejo_operator_instance_info` | gauge | `image`, `version`, `phase` | Always 1 |
 | `forgejo_operator_health_check_failures_total` | counter | | Failed `/api/healthz` probes made by the operator. Exported at 0 from the first reconcile |
 | `forgejo_operator_health_check_unreachable_total` | counter | | Probes that never reached Forgejo (DNS, dial or connection errors, a proxy answering). Not health failures. Exported at 0 from the first reconcile |
-| `forgejo_operator_availability_probes_total` | counter | `result` (up/down), `planned` (true/false) | The availability SLI: one sample per health-check interval, also while no pod is Ready (see [Service level objectives](#service-level-objectives)). All four series are exported at 0 from the first reconcile |
+| `forgejo_operator_availability_probes_total` | counter | `result` (up/down), `planned` (true/false) | The availability SLI: one sample per health-check interval of time, also while no pod is Ready (see [Service level objectives](#service-level-objectives)). All four series are exported at 0 from the first reconcile |
 | `forgejo_operator_stats` | gauge | `kind` (users, organizations, repositories, issues) | Same values as `status.stats` |
 | `forgejo_operator_backup_last_success_timestamp_seconds` | gauge | | Unix time of the last successful backup |
 | `forgejo_operator_backups_total` | counter | `reason`, `result` | Finished backups |
@@ -319,6 +324,14 @@ variable `RUNBOOK_BASE_URL` in `config/manager/manager.yaml`), and
 `https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks`. The dashboard links
 `<base>/README.md`.
 
+A base is an `http(s)` URL with a host name or IPv4 address and an optional port, without user
+information, query or fragment. Its path may hold only the characters RFC 3986 allows there;
+percent-encode the others (`%20` for a space). Prometheus expands every annotation as a
+template, so a `{{` in `runbook_url` would invalidate the whole PrometheusRule, with all the
+instance's alerts, and a quote or backslash would break the dashboard's JSON. The API server
+refuses any other `runbookBaseURL`, and the operator does not start with any other
+`--runbook-base-url`.
+
 ### Rule tests
 
 `make test-rules` renders the PrometheusRule of representative specs (default, daily backups
@@ -327,8 +340,10 @@ operator's rules into `test/prometheus/rules/` (as deployed, checked with `promt
 and `test/prometheus/unit-rules/` (without the long `description` annotations), then runs the
 promtool unit tests `test/prometheus/*_test.yaml` with the official `prom/prometheus` image
 (`PROMETHEUS_IMAGE`, through `CONTAINER_TOOL`, `docker` by default). The rendered files are
-checked in; `go test ./internal/observability` fails when they are stale, when an alert has no
-firing and no non-firing promtool case, or no runbook (`TestEveryAlertHasARunbook`).
+checked in; `go test ./internal/observability` fails when they are stale, when an alert lacks a
+firing or a non-firing promtool case in a test file whose `rule_files` define it (promtool
+passes a non-firing case of an alert it has not loaded), or when it has no runbook
+(`TestEveryAlertHasARunbook`).
 
 ## Service level objectives
 
@@ -363,10 +378,17 @@ failed restore that changed the instance (also the rollback of a failed upgrade)
 healthy probe. Pause and zero replicas stay planned during such a hold. Unreachable probes count as `down` because nothing shows that users can reach
 Forgejo either; `ForgejoHealthProbeUnreachable` tells this case apart.
 
-Samples are taken by the reconcile that probes (or would probe) Forgejo, at most once per
-interval, so an outage is sampled at the same rate as normal operation. Restarting the operator
-resets the counters (`rate()` handles that); while the operator does not run, no samples are
-taken (`ForgejoOperatorDown`).
+Samples are taken by the reconcile that probes (or would probe) Forgejo, and measure time, not
+reconciles: such a reconcile counts one sample for every interval that has passed since the last
+interval counted, all with the result it sees; normally that is one. A reconcile that comes late
+counts the intervals it missed. While a step fails (`Degraded=ReconcileError`), the operator
+backs the instance off for up to a minute, and probes that time out slow reconciles down, both
+typically during an outage. An outage therefore weighs as much as the same time of normal
+operation. One reconcile counts at most 3 minutes' worth of
+samples (one sample when the interval is longer): the operator reconciles every instance at
+least once a minute, so a longer gap means that it did not watch the instance, and the rest of
+the gap is not counted. Restarting the operator resets the counters (`rate()` handles that);
+while the operator does not run, no samples are taken (`ForgejoOperatorDown`).
 
 ### Availability objective
 
@@ -445,7 +467,8 @@ with `1h` (3h), 3h/3h, 6h/3h, 1d/3h, 3d/6h.
 
 At the defaults (99.5%, probes every 30s), a full outage pages after about 5 minutes (4.3 min of
 downtime in an hour is 2% of the 3.6h monthly budget, and the 5m window must hold one down
-sample); a single failed probe never does, also not right after a restore or on a new instance.
+sample); a single failed probe never does, also not right after a restore or on a new instance,
+and not when it counts the intervals of a late reconcile (at most 3 minutes, 5% of an hour).
 Each sample stands for one interval of downtime, though: from an interval of about 4.5 minutes on
 (at 99.5%), one failed probe is more than 7.2% of an hour and pages until the short window has
 let go of it. A short window and a high target, for example

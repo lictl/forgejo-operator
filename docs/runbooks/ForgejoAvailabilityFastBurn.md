@@ -23,7 +23,8 @@ ends). The windows scale with `spec.monitoring.slo.window` (`long`/`short` label
 never shorter than 5m nor than three health-check intervals.
 
 Samples (`forgejo_operator_availability_probes_total`, one per
-`spec.autoPilot.selfHealing.healthCheckInterval`, 30s by default):
+`spec.autoPilot.selfHealing.healthCheckInterval` of time, 30s by default; a reconcile that comes
+late, for example while a step fails, counts every interval it missed):
 
 - **up**: `/api/healthz` passed;
 - **down**: it failed, did not reach Forgejo (`Unreachable`), or no Forgejo pod was Ready while

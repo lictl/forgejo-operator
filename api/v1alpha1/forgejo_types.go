@@ -1137,10 +1137,14 @@ type MonitoringSpec struct {
 
 	// runbookBaseURL is where the runbooks linked from the alerts live: every alert's
 	// runbook_url annotation is "<runbookBaseURL>/<AlertName>.md", and the dashboard links
-	// "<runbookBaseURL>/README.md". Defaults to the operator's --runbook-base-url
-	// (RUNBOOK_BASE_URL), else the runbooks in the operator's repository (docs/runbooks).
+	// "<runbookBaseURL>/README.md". An http(s) URL with a host name or IPv4 address and an
+	// optional port, without user information, query or fragment; in the path, percent-encode
+	// every character that RFC 3986 does not allow there (braces would break the alerts'
+	// templates, quotes and backslashes the dashboard). Defaults to the operator's
+	// --runbook-base-url (RUNBOOK_BASE_URL), else the runbooks in the operator's repository
+	// (docs/runbooks).
 	// +kubebuilder:validation:MaxLength=512
-	// +kubebuilder:validation:Pattern=`^https?://[^\s?#]+$`
+	// +kubebuilder:validation:Pattern=`^https?://[A-Za-z0-9](?:[-A-Za-z0-9.]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/(?:[-A-Za-z0-9/._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)?$`
 	// +optional
 	RunbookBaseURL string `json:"runbookBaseURL,omitempty"`
 }
