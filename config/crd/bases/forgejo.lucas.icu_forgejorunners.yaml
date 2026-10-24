@@ -1858,6 +1858,10 @@ spec:
         - message: 'metadata.name must contain only lowercase letters, digits and
             ''-'' (no ''.''): the runner pods'' host names are "<name>-<index>"'
           rule: self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+        - message: 'metadata.name must not end in ''-valkey'' or ''-cron'': the runners''
+            StatefulSet "<name>" would have the name of the Valkey or cron runner
+            StatefulSet of a Forgejo instance with highAvailability'
+          rule: '!self.metadata.name.endsWith(''-valkey'') && !self.metadata.name.endsWith(''-cron'')'
     served: true
     storage: true
     subresources:

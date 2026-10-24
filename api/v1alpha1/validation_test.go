@@ -207,6 +207,12 @@ func TestForgejoValidation(t *testing.T) {
 			"  database:\n    type: External\n    external: {host: pg, credentialsSecret: {name: pg}}")},
 		{name: "name of 57 with External", obj: forgejo(strings.Repeat("a", 57),
 			"  database:\n    type: External\n    external: {host: pg, credentialsSecret: {name: pg}}"), want: "at most 56 characters"},
+		{name: "name of 45 with HA", obj: forgejo(strings.Repeat("a", 45), "  highAvailability: {enabled: true}")},
+		{name: "name of 46 with HA", obj: forgejo(strings.Repeat("a", 46), "  highAvailability: {enabled: true}"), want: "at most 45 characters"},
+		{name: "name of 46 without HA", obj: forgejo(strings.Repeat("a", 46), "  highAvailability: {enabled: false}")},
+		{name: "name ending in -valkey", obj: forgejo("git-valkey", "  highAvailability: {enabled: false}"), want: "must not end in '-valkey'"},
+		{name: "name ending in -cron", obj: forgejo("git-cron", "  highAvailability: {enabled: true}")},
+		{name: "name containing valkey", obj: forgejo("valkey-git", "  highAvailability: {enabled: true}")},
 
 		// Replicas and autoscaling.
 		{name: "replicas without HA", obj: fj("  replicas: 2"), want: "replicas greater than 1 require highAvailability.enabled"},
@@ -349,6 +355,9 @@ func TestForgejoRunnerValidation(t *testing.T) {
 		{name: "name of 52", obj: runner(strings.Repeat("r", 52), ref+"  executor: Host")},
 		{name: "name of 53", obj: runner(strings.Repeat("r", 53), ref+"  executor: Host"), want: "at most 52 characters"},
 		{name: "name with a dot", obj: runner("ci.a", ref+"  executor: Host"), want: "host names"},
+		{name: "name ending in -valkey", obj: runner("git-valkey", ref+"  executor: Host"), want: "must not end in '-valkey' or '-cron'"},
+		{name: "name ending in -cron", obj: runner("git-cron", ref+"  executor: Host"), want: "must not end in '-valkey' or '-cron'"},
+		{name: "name containing cron", obj: runner("cron-ci", ref+"  executor: Host")},
 		{name: "organization and repository", obj: runner("ci", ref+"  executor: Host\n  scope: {organization: acme, repository: acme/app}"),
 			want: "set at most one of organization and repository"},
 		{name: "repository without owner", obj: runner("ci", ref+"  executor: Host\n  scope: {repository: app}"), want: "spec.scope.repository"},

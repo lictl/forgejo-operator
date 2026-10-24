@@ -172,7 +172,8 @@ are re-populated from the database on start).
   while Forgejo is stopped, so they are fully consistent. When a backup must be fully
   consistent, stop Forgejo first. Use `spec.replicas: 0`, but note that this does not stop
   an instance whose HPA owns the replica count (`spec.autoscaling.horizontal.enabled` with
-  `spec.highAvailability.enabled`): disable horizontal autoscaling as well. Alternatively,
+  `spec.highAvailability.enabled`): disable horizontal autoscaling as well (the cron runner
+  `<name>-cron` stops with the server pods). Alternatively,
   take CSI `VolumeSnapshot`s of the data volume, which are crash-consistent.
 * Forgejo's own `forgejo dump` is not used. Its database export has known long-standing
   bugs, and it produces a single archive that cannot be restored selectively.

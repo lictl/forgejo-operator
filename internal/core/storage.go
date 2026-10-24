@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -21,6 +22,7 @@ func ReconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: f.Spec.Storage.ExistingClaim}, pvc); err != nil {
 			return forgejo.StepResult{}, fmt.Errorf("storage.existingClaim %q: %w", f.Spec.Storage.ExistingClaim, err)
 		}
+		rc.DataVolumeShared = slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteMany)
 		return forgejo.StepResult{}, nil
 	}
 
@@ -47,6 +49,7 @@ func ReconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 	if err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("data PVC: %w", err)
 	}
+	rc.DataVolumeShared = slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteMany)
 	return forgejo.StepResult{}, nil
 }
 

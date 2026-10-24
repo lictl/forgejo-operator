@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
@@ -32,7 +33,7 @@ const (
 	crashRestarts = 3
 
 	// annotationUsesValkey marks a last known good app.ini rendered for highAvailability,
-	// whose cache, sessions and queues live in Valkey.
+	// whose cache and queues live in Valkey.
 	annotationUsesValkey = "forgejo.lucas.icu/uses-valkey"
 )
 
@@ -105,15 +106,15 @@ func currentLKG(ctx context.Context, rc *forgejo.ReconcileContext) (*corev1.Secr
 	return lkg, nil
 }
 
-// lkgUsesValkey reports whether a last known good app.ini keeps cache, sessions and queues
-// in the instance's Valkey. LKG Secrets stored before the annotation existed are recognised
-// by their content.
+// lkgUsesValkey reports whether a last known good app.ini keeps the cache and the queues in
+// the instance's Valkey: by the annotation, or by its content (the Sentinels of
+// "<name>-valkey").
 func lkgUsesValkey(f *forgejov1.Forgejo, lkg *corev1.Secret) bool {
 	if lkg.Annotations[annotationUsesValkey] == valueTrue {
 		return true
 	}
 	ini := string(lkg.Data[forgejo.ConfigSecretKey])
-	return strings.Contains(ini, "redis://") && strings.Contains(ini, "@"+forgejo.ValkeyName(f)+".")
+	return strings.Contains(ini, "+sentinel://") && strings.Contains(ini, "@"+forgejo.ValkeyName(f)+"-0.")
 }
 
 // configProfile is the forgejo.Traits.ConfigProfile an app.ini Secret was rendered for.
@@ -136,10 +137,19 @@ func lkgUnusable(ctx context.Context, rc *forgejo.ReconcileContext, lkg *corev1.
 		return fmt.Sprintf("the last known good app.ini was rendered for another Forgejo version (%s, %s needs %s)",
 			have, rc.TargetImage, want), nil
 	}
-	if f.Spec.HighAvailability.Enabled || !lkgUsesValkey(f, lkg) {
+	if f.Spec.HighAvailability.Enabled {
+		// Without Valkey, every pod would open the same LevelDB queues on the data volume (and
+		// all but one fail on their locks), and without app-web.ini every pod would run the cron
+		// tasks.
+		if !lkgUsesValkey(f, lkg) || len(lkg.Data[forgejo.ConfigSecretKeyWeb]) == 0 {
+			return "the last known good app.ini was rendered without highAvailability", nil
+		}
 		return "", nil
 	}
-	valkey := &appsv1.Deployment{}
+	if !lkgUsesValkey(f, lkg) {
+		return "", nil
+	}
+	valkey := &appsv1.StatefulSet{}
 	err := rc.Client.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.ValkeyName(f)}, valkey)
 	if client.IgnoreNotFound(err) != nil {
 		return "", err
@@ -158,7 +168,11 @@ func lkgUnusable(ctx context.Context, rc *forgejo.ReconcileContext, lkg *corev1.
 // operator's: the pods must still have been Ready for lkgSoak. Without that, no LKG would
 // ever be recorded in such clusters, which also disables config rollback and the pod-level
 // hung check.
-func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep *appsv1.Deployment, pods []corev1.Pod, unreachable bool) error {
+//
+// With the cron runner (StatefulSet "<name>-cron", which runs the same Secret's app.ini), it
+// must be rolled out and Ready for lkgSoak as well, whenever it runs.
+func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep *appsv1.Deployment, cron *appsv1.StatefulSet,
+	pods []corev1.Pod, unreachable bool) error {
 	f := rc.Instance
 	if rc.ConfigHash == "" || rc.ConfigHash != rc.DesiredConfigHash || rc.Maintenance || workloadHeld(rc) {
 		return nil
@@ -167,9 +181,16 @@ func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep 
 	if (!healthy && !unreachable) || !fullyRolledOut(dep, rc.ConfigHash) {
 		return nil
 	}
+	want := *dep.Spec.Replicas
+	if cron != nil && ptr.Deref(cron.Spec.Replicas, 1) > 0 {
+		if !statefulSetRolledOut(cron, rc.ConfigHash) {
+			return nil
+		}
+		want += *cron.Spec.Replicas
+	}
 	// Every replica must be listed, so that the soak check below cannot pass vacuously on
 	// a pod cache that lags behind the Deployment status.
-	if len(pods) < int(*dep.Spec.Replicas) {
+	if len(pods) < int(want) {
 		return nil
 	}
 	for i := range pods {

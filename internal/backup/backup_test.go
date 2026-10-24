@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -419,5 +420,55 @@ func TestBackupScriptsRemovePartialFiles(t *testing.T) {
 		if strings.Contains(script, removePartials) {
 			t.Errorf("%s script must not delete files on the read-only backup volume", name)
 		}
+	}
+}
+
+// A restore or a cold backup waits for the cron runner's pod too, and for one its StatefulSet
+// still wants. An object of that name that the instance does not control (another instance's
+// or a user's) is not its cron runner.
+func TestServerPodsRunningCountsCronRunner(t *testing.T) {
+	ctx := context.Background()
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: "ns", UID: "uid-fj-cron-test"}}
+	other := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fj-other", Namespace: "ns", UID: "uid-other"}}
+	pod := func(name string, labels map[string]string, phase corev1.PodPhase) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: f.Namespace, Labels: labels}, Status: corev1.PodStatus{Phase: phase}}
+	}
+	cronOf := func(owner *forgejov1.Forgejo) *appsv1.StatefulSet {
+		s := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: forgejo.CronRunnerName(f), Namespace: f.Namespace},
+			Spec: appsv1.StatefulSetSpec{Replicas: ptr.To[int32](1)}}
+		if err := controllerutil.SetControllerReference(owner, s, testScheme(t)); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	cron, foreign := cronOf(f), cronOf(other)
+	for _, tt := range []struct {
+		name string
+		objs []client.Object
+		want int
+	}{
+		{"server and cron pods", []client.Object{
+			pod("fj-a", forgejo.SelectorLabels(f), corev1.PodRunning),
+			pod("fj-cron-0", forgejo.CronSelectorLabels(f), corev1.PodRunning),
+			pod("fj-done", forgejo.SelectorLabels(f), corev1.PodSucceeded),
+			pod("fj-valkey-0", map[string]string{forgejo.LabelName: forgejo.AppName, forgejo.LabelInstance: f.Name,
+				forgejo.LabelComponent: forgejo.ComponentValkey}, corev1.PodRunning),
+		}, 2},
+		{"cron runner still wanted, its pod gone", []client.Object{cron}, 1},
+		{"cron runner wanted, with its pod", []client.Object{cron, pod("fj-cron-0", forgejo.CronSelectorLabels(f), corev1.PodPending)}, 1},
+		{"cron runner at zero", []client.Object{func() *appsv1.StatefulSet {
+			d := cron.DeepCopy()
+			d.Spec.Replicas = ptr.To[int32](0)
+			return d
+		}()}, 0},
+		{"not the instance's StatefulSet", []client.Object{foreign}, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(tt.objs...).Build()
+			n, err := ServerPodsRunning(ctx, c, f)
+			if err != nil || n != tt.want {
+				t.Fatalf("ServerPodsRunning = %d, %v; want %d", n, err, tt.want)
+			}
+		})
 	}
 }

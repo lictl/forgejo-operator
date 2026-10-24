@@ -214,6 +214,10 @@ is deleted.
 | `forgejo_operator_version_supported` | gauge | `major`, `support` | 1 when the running Forgejo major is within the support policy, else 0; `support` is `Supported`, `Deprecated`, `EndOfLife`, `Future` or `Unknown` ([versions.md](versions.md)) |
 | `forgejo_operator_version_end_of_life_timestamp_seconds` | gauge | `major` | Upstream end of life of the running major, when it is in the version table |
 | `forgejo_operator_version_advisory` | gauge | `major` | 1 when the running patch release is older than the one an advisory of the version table recommends (critical security fixes, or a patch upstream advises against), else 0; absent while the version is unknown ([versions.md](versions.md#metrics-and-alert)) |
+| `forgejo_operator_valkey_master_available` | gauge | | With HA: 1 while `ValkeyReady` is True (or Unknown with Valkey pods Ready), else 0 ([high-availability.md](high-availability.md#valkey-with-sentinel)) |
+| `forgejo_operator_valkey_ready_members` | gauge | | With HA: Ready Valkey pods (3 when healthy) |
+| `forgejo_operator_valkey_failovers_total` | counter | | Changes of the Valkey primary seen by the operator |
+| `forgejo_operator_cron_runner_ready` | gauge | | With HA, while the cron runner should run: 1 when its pod is Ready ([high-availability.md](high-availability.md#the-cron-runner)) |
 | `forgejo_operator_runners_desired` | gauge | `runner` | `spec.replicas` of a `ForgejoRunner` of the instance ([actions-runners.md](actions-runners.md#metrics-and-alert)) |
 | `forgejo_operator_runners_registered` | gauge | `runner` | Its runners recorded as registered |
 | `forgejo_operator_runners_online` | gauge | `runner` | Its runners Forgejo reports online; absent while the operator cannot read Forgejo's API |
@@ -258,6 +262,10 @@ those metrics are missing.
 | `ForgejoVersionUnsupported` | warning | `forgejo_operator_version_supported == 0`: the running major is `Deprecated`, `EndOfLife`, `Future` or `Unknown`; the `VersionSupported` condition says what to upgrade to and by when | 1h |
 | `ForgejoVersionAdvisory` | warning | `forgejo_operator_version_advisory == 1`: a supported major runs a patch release that an advisory recommends replacing (e.g. 15.0.7 without critical security fixes, or 17.0.0); the `VersionSupported` condition names the minimum patch | 1h |
 | `ForgejoRunnersOffline` | warning | Per `ForgejoRunner` (label `runner`): `runner_jobs_waiting > 0 and runners_online == 0 and runners_desired > 0`: jobs wait and none of its runners is online ([actions-runners.md](actions-runners.md)) | 10m |
+| `ForgejoValkeyNoMaster` | critical | With HA: `forgejo_operator_valkey_master_available == 0`, suppressed while Restoring or Paused: Valkey has no Ready primary (no Sentinel majority, or no replica to promote), so every server pod fails its health check | 2m |
+| `ForgejoValkeyFailedOver` | warning | With HA: the Valkey primary moved to another pod in the last 15 minutes (`forgejo_operator_valkey_failovers_total` increased) | – |
+| `ForgejoValkeyDegraded` | warning | With HA: fewer than 3 Valkey pods Ready, suppressed while Restoring or Paused | 15m |
+| `ForgejoCronRunnerDown` | warning | With HA: `forgejo_operator_cron_runner_ready == 0`; the gauge exists only while the cron runner should run (not during upgrades or restores) | 15m |
 | `ForgejoAutoPilotActive` | warning | At least 5 autopilot actions in the last hour | – |
 
 `maxAge` is the longest gap between two runs of `spec.backup.schedule` plus half of that gap,
@@ -377,6 +385,7 @@ once sampling works again. `status.stats` keeps the last good values in the mean
 | `BackupHealthy` | backup | State of scheduled backups (`UploadFailed` when the latest one was not uploaded to `spec.backup.remote`; `BackupKeyNotExported`, `BackupKeyMissing`, `BackupKeyUnusable` while the backup key is not acknowledged as copied out of the cluster, missing or unusable, see [backup-restore.md](backup-restore.md#the-key)) |
 | `RestoredFromBackup` | backup | Bootstrap of `spec.restoreFrom`: `False` while the identity, database and data volume are restored (`TargetNotEmpty` when the database or data volume predates the instance), `True`/`Restored` once they are restored and recorded on `<name>-secrets` ([backup-restore.md](backup-restore.md#disaster-recovery)) |
 | `StorageHealthy` | autopilot | PVC capacity/usage |
+| `ValkeyReady` | autopilot | With HA only: Valkey has a Ready primary its Sentinels agree on. `True/Available`, `True/Degraded` (fewer than two replicas in sync, three Sentinels or three Ready pods), `False/NoMaster`, `False/NotReady`, `False/NotProvisioned`, `Unknown/UnreachableFromOperator` ([high-availability.md](high-availability.md#valkey-with-sentinel)) |
 | `Healthy` | observability | Result of the operator's `/api/healthz` probe. Reasons: `HealthCheckPassed`, `HealthCheckFailed` (message includes the streak), `Unreachable` (the operator cannot connect; status `Unknown`), `NoReadyReplicas`, `Maintenance` |
 
 ## Events
@@ -400,7 +409,9 @@ Other packages emit their own events:
   `status.autoPilot.recentActions`.
 - `ReconcileError` (Warning) names a failing reconcile step.
 - Backup, maintenance, HA and config events include `BackupScheduled`, `BackupPruned`,
-  `MaintenanceStarted`, `MaintenanceEnded`, `LastKnownGoodConfig` and `ConfigRetry`.
+  `MaintenanceStarted`, `MaintenanceEnded`, `LastKnownGoodConfig`, `ConfigRetry`,
+  `ValkeyFailedOver` (Warning), `WaitingForValkey`, `WaitingForCronRunner`,
+  `CronRunnerStuck` (Warning) and `CronRunnerDeleted`.
 - Remote backups and disaster recovery: `BackupKeyGenerated`, `BackupUploaded`,
   `BackupUploadFailed`, `RemoteBackupPruned`, `RemoteRetentionFailed`, `IdentityRestored`,
   `RestoreFromStarted`, `RestoredFromBackup`, `RestoreFromFailed` (see

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"slices"
@@ -146,14 +147,25 @@ func ReconcileConfig(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		cfg.set("server", "SSH_SERVER_HOST_KEYS", hostKeyPaths(rc.Layout, hk))
 	}
 	content := cfg.render()
-	hash := configHash(content)
+	files := map[string][]byte{forgejo.ConfigSecretKey: []byte(content)}
+	hashed := content
+	if forgejo.CronRunnerEnabled(f) {
+		// The server pods run app-web.ini (mounted as app.ini): the same configuration with
+		// every cron task disabled. app.ini itself, which the cron runner, the CLI Jobs and an
+		// instance without highAvailability use, keeps them. One hash covers both, so a change
+		// of either rolls both Deployments and the last known good copy holds both.
+		web := cfg.withoutCron().render()
+		files[forgejo.ConfigSecretKeyWeb] = []byte(web)
+		hashed += "\n; " + forgejo.ConfigSecretKeyWeb + "\n" + web
+	}
+	hash := configHash(hashed)
 
 	// While the Deployment is held for missing SSH host keys (rc.SSHHostKeysUnavailable), the
 	// pods keep the app.ini they run: it is mounted without subPath, so a change would reach
 	// them at their next container restart, without the rollout that the config guard watches.
 	// It is then rendered for the hashes only.
 	if !rc.SSHHostKeysUnavailable {
-		if err := writeConfig(ctx, rc, content, hash); err != nil {
+		if err := writeConfig(ctx, rc, files, hash); err != nil {
 			return forgejo.StepResult{}, err
 		}
 	}
@@ -190,8 +202,9 @@ func configHash(content string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// writeConfig stores the rendered app.ini in "<name>-config".
-func writeConfig(ctx context.Context, rc *forgejo.ReconcileContext, content, hash string) error {
+// writeConfig stores the rendered app.ini (and, with the cron runner, app-web.ini) in
+// "<name>-config".
+func writeConfig(ctx context.Context, rc *forgejo.ReconcileContext, files map[string][]byte, hash string) error {
 	f := rc.Instance
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.ConfigSecretName(f), Namespace: f.Namespace}}
 	if err := apply(ctx, rc, sec, true, func() error {
@@ -201,7 +214,7 @@ func writeConfig(ctx context.Context, rc *forgejo.ReconcileContext, content, has
 			forgejo.AnnotationConfigProfile: rc.Layout.Traits.ConfigProfile(),
 		})
 		sec.Type = corev1.SecretTypeOpaque
-		sec.Data = map[string][]byte{forgejo.ConfigSecretKey: []byte(content)}
+		sec.Data = files
 		return nil
 	}); err != nil {
 		return fmt.Errorf("config secret: %w", err)
@@ -298,19 +311,84 @@ func defaultConfig(rc *forgejo.ReconcileContext, secrets map[string][]byte) iniF
 	set("log", "MODE", "console")
 	set("log", "LEVEL", "Info")
 	set("cron.update_checker", "ENABLED", "false")
+	// After SIGTERM Forgejo lets requests, git operations and SSH sessions finish for this
+	// long before it stops them; the pod's termination grace period (75s) leaves room for
+	// it, the preStop delay of the server pods (10s) and the shutdown itself.
+	set("server", "GRACEFUL_HAMMER_TIME", gracefulHammerTime)
 	return cfg
 }
 
-// haConfig moves cache, sessions and queues to Valkey so that replicas share state, and
-// keeps indexers out of the (per-pod) local disk.
+// gracefulHammerTime is [server] GRACEFUL_HAMMER_TIME.
+const gracefulHammerTime = "50s"
+
+// clone returns a deep copy.
+func (c iniFile) clone() iniFile {
+	out := make(iniFile, len(c))
+	for s, kv := range c {
+		out[s] = maps.Clone(kv)
+	}
+	return out
+}
+
+// cronSection is the parent section of Forgejo's cron tasks ([cron.<task>]).
+const cronSection = "cron"
+
+// withoutCron returns the configuration with every cron task disabled. Forgejo reads
+// [cron.<task>] through go-ini's parent-section fallback, so ENABLED and RUN_AT_START in
+// [cron] apply to every task that does not set them itself; tasks that do (the operator's
+// update_checker, sections of spec.config) are disabled explicitly. Tasks stay registered,
+// so they are listed by the admin cron API and can still be run by hand.
+func (c iniFile) withoutCron() iniFile {
+	out := c.clone()
+	for s, kv := range out {
+		if s != cronSection && !strings.HasPrefix(s, cronSection+".") {
+			continue
+		}
+		for k := range kv {
+			if strings.EqualFold(k, "ENABLED") || strings.EqualFold(k, "RUN_AT_START") {
+				delete(kv, k)
+			}
+		}
+		if s != cronSection {
+			out.set(s, "ENABLED", "false")
+			out.set(s, "RUN_AT_START", "false")
+		}
+	}
+	out.set(cronSection, "ENABLED", "false")
+	out.set(cronSection, "RUN_AT_START", "false")
+	return out
+}
+
+// haConfig moves the cache and the queues to Valkey so that replicas share them, and keeps
+// indexers off the data volume (bleve indexes cannot be shared between pods). valkeyURL is a
+// redis+sentinel URL without a database (see autopilot.ReconcileHA); each use gets its own.
+//
+// Sessions stay in the database ([session] PROVIDER=db, see defaultConfig): PostgreSQL is
+// replicated by CloudNativePG, so a Valkey failover never logs anyone out, and turning
+// highAvailability on or off keeps the sessions.
 func haConfig(valkeyURL string) map[string]map[string]string {
-	db := func(n int) string { return strings.TrimRight(valkeyURL, "/") + "/" + strconv.Itoa(n) }
 	return map[string]map[string]string{
-		"cache":   {"ADAPTER": settingRedis, "HOST": db(0)},
-		"session": {"PROVIDER": settingRedis, "PROVIDER_CONFIG": db(1)},
-		"queue":   {"TYPE": settingRedis, "CONN_STR": db(2)},
+		"cache":   {"ADAPTER": settingRedis, "HOST": valkeyDB(valkeyURL, valkeyDBCache)},
+		"queue":   {"TYPE": settingRedis, "CONN_STR": valkeyDB(valkeyURL, valkeyDBQueue)},
 		"indexer": {"ISSUE_INDEXER_TYPE": "db", "REPO_INDEXER_ENABLED": "false"},
 	}
+}
+
+// Valkey databases: the cache and the queues are kept apart, so that flushing the cache
+// never drops queued work.
+const (
+	valkeyDBCache = 0
+	valkeyDBQueue = 2
+)
+
+// valkeyDB inserts the database number as the URL's path, before its query.
+func valkeyDB(valkeyURL string, db int) string {
+	base, query, hasQuery := strings.Cut(valkeyURL, "?")
+	u := strings.TrimRight(base, "/") + "/" + strconv.Itoa(db)
+	if hasQuery {
+		u += "?" + query
+	}
+	return u
 }
 
 func hostPort(host string, port int32) string {

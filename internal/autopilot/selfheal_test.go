@@ -131,6 +131,10 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T, f *forgejov1.Forgejo, objs ...client.Object) testEnv {
 	t.Helper()
+	stubNodeZones(t, false)
+	if !nodeCapacityStubbed {
+		stubNodeCapacity(t, 1, 0)
+	}
 	s := testScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
 	rec := events.NewFakeRecorder(100)
@@ -196,7 +200,7 @@ func TestEvictedPodDoesNotBlockLastKnownGood(t *testing.T) {
 	if !allRunning(pods) {
 		t.Fatal("allRunning = false with only a live pod besides the evicted one")
 	}
-	if err := recordLastKnownGood(ctx, env.rc, dep, pods, false); err != nil {
+	if err := recordLastKnownGood(ctx, env.rc, dep, nil, pods, false); err != nil {
 		t.Fatal(err)
 	}
 	if ap := f.Status.AutoPilot; ap == nil || ap.LastKnownGoodConfigHash != testHash {
@@ -221,7 +225,7 @@ func TestLastKnownGoodNeedsEveryReplicaListed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := recordLastKnownGood(context.Background(), env.rc, dep, pods, false); err != nil {
+	if err := recordLastKnownGood(context.Background(), env.rc, dep, nil, pods, false); err != nil {
 		t.Fatal(err)
 	}
 	if ap := f.Status.AutoPilot; ap != nil && ap.LastKnownGoodConfigHash != "" {
@@ -446,4 +450,24 @@ func TestHealthReasonUnreachableMatchesObservability(t *testing.T) {
 	if healthReasonUnreachable != observability.ReasonUnreachable {
 		t.Fatalf("healthReasonUnreachable = %q, observability.ReasonUnreachable = %q", healthReasonUnreachable, observability.ReasonUnreachable)
 	}
+}
+
+// nodeCapacityStubbed is set while a test has replaced nodeCapacityFn.
+var nodeCapacityStubbed bool
+
+// stubNodeCapacity keeps tests away from the cluster of the developer's kubeconfig.
+func stubNodeCapacity(t *testing.T, nodes int, maxMem int64) {
+	t.Helper()
+	old, oldStubbed := nodeCapacityFn, nodeCapacityStubbed
+	nodeCapacityFn = func(context.Context) (int, int64, error) { return nodes, maxMem, nil }
+	nodeCapacityStubbed = true
+	t.Cleanup(func() { nodeCapacityFn, nodeCapacityStubbed = old, oldStubbed })
+}
+
+// stubNodeZones keeps tests away from the cluster of the developer's kubeconfig.
+func stubNodeZones(t *testing.T, zoned bool) {
+	t.Helper()
+	old := nodeZonesFn
+	nodeZonesFn = func(context.Context) (bool, error) { return zoned, nil }
+	t.Cleanup(func() { nodeZonesFn = old })
 }

@@ -271,6 +271,34 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 			"forgejorunner {{ $labels.runner }}` shows why (Ready and Registered conditions); check the runner pods' logs "+
 			"(`kubectl %s logs {{ $labels.runner }}-0 -c runner`) for connection or authentication errors.", kc, kc))
 
+	if f.Spec.HighAvailability.Enabled {
+		valkeyHelp := fmt.Sprintf("`kubectl get fj %s %s -o jsonpath='{.status.highAvailability.valkey}'` shows the primary and "+
+			"each pod's role, the ValkeyReady condition of `kubectl describe fj %s %s` why; the Sentinels log every decision "+
+			"(`kubectl %s logs %s-0 -c sentinel`). See docs/high-availability.md.", f.Name, kc, f.Name, kc, kc, forgejo.ValkeyName(f))
+		add("ForgejoValkeyNoMaster", "critical", "2m",
+			fmt.Sprintf(`max(forgejo_operator_valkey_master_available{%s}) == 0 unless on() %s`, op, expectedDown),
+			fmt.Sprintf("Valkey of Forgejo %s has no usable primary", ref),
+			"Forgejo keeps its cache and queues in Valkey: without a primary its health check fails and every server pod "+
+				"turns NotReady. A failover normally takes about 10 seconds; for 2 minutes now the Sentinels have named no "+
+				"Ready primary (no Sentinel majority, or no replica to promote). "+valkeyHelp)
+		add("ForgejoValkeyFailedOver", "warning", "",
+			recentlyIncreased(fmt.Sprintf(`forgejo_operator_valkey_failovers_total{%s}`, op), "15m"),
+			fmt.Sprintf("The Valkey primary of Forgejo %s moved to another pod", ref),
+			"The Sentinels promoted a replica in the last 15 minutes, after the primary's pod failed, was evicted or "+
+				"was deleted (writes of its last second may be lost: replication is asynchronous). Check why the old "+
+				"primary's pod went away. "+valkeyHelp)
+		add("ForgejoValkeyDegraded", "warning", "15m",
+			fmt.Sprintf(`max(forgejo_operator_valkey_ready_members{%s}) < %d unless on() %s`, op, 3, expectedDown),
+			fmt.Sprintf("Valkey of Forgejo %s runs with fewer than three Ready pods", ref),
+			"One more failure would leave Valkey without a replica to promote or without a Sentinel majority. "+valkeyHelp)
+		add("ForgejoCronRunnerDown", "warning", "15m",
+			fmt.Sprintf(`max(forgejo_operator_cron_runner_ready{%s}) == 0`, op),
+			fmt.Sprintf("The cron runner of Forgejo %s is not Ready", ref),
+			fmt.Sprintf("Pod %s-cron-* runs Forgejo's cron tasks (mirror updates, scheduled workflows, cleanups) for every "+
+				"replica, and has not been Ready for 15 minutes. `kubectl %s get pods -l app.kubernetes.io/instance=%s,"+
+				"app.kubernetes.io/component=cron` and its logs show why. See docs/high-availability.md.", f.Name, kc, f.Name))
+	}
+
 	add("ForgejoAutoPilotActive", "warning", "",
 		fmt.Sprintf(`sum by (namespace, name) (increase(forgejo_operator_autopilot_actions_total{%s}[1h])) >= 5`, op),
 		fmt.Sprintf("The operator keeps intervening on Forgejo %s", ref),

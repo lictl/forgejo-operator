@@ -52,8 +52,18 @@ type ReconcileContext struct {
 	DB *DBConnection
 	// DatabaseReady is set by the database step.
 	DatabaseReady bool
-	// ValkeyURL (redis://host:port) is set by the HA step when highAvailability is enabled.
+	// ValkeyURL is set by the HA step when highAvailability is enabled: the
+	// redis+sentinel:// URL of the instance's Valkey Sentinels, with credentials and the
+	// master name but no database.
 	ValkeyURL string
+	// NodeZones is set by the HA step when the cluster's nodes carry
+	// topology.kubernetes.io/zone: the default topology spread of the pods then also spreads
+	// them across zones.
+	NodeZones bool
+	// DataVolumeShared is set by the storage step when the data claim has the access mode
+	// ReadWriteMany, so that pods on different nodes can mount it. Otherwise the HA cron
+	// runner is placed on a node that runs a server pod.
+	DataVolumeShared bool
 	// Maintenance is set by the maintenance step while a ForgejoRestore holds the instance
 	// (ScalingDown, Restoring, or failed after changing it), and by the restore guard while a
 	// restore Job still runs; the workload is scaled to zero.

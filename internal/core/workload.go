@@ -3,7 +3,9 @@ package core
 import (
 	"context"
 	"fmt"
+	"path"
 	"slices"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -25,15 +27,21 @@ const (
 )
 
 const (
-	containerName     = "forgejo"
-	dataVolume        = "data"
-	configVolume      = "config"
-	tmpVolume         = "tmp"
-	healthzPath       = "/api/healthz"
-	shell             = "/bin/sh"
-	revisionHistory   = 5
-	progressDeadline  = 600
-	terminationPeriod = 60
+	containerName    = "forgejo"
+	dataVolume       = "data"
+	configVolume     = "config"
+	tmpVolume        = "tmp"
+	healthzPath      = "/api/healthz"
+	shell            = "/bin/sh"
+	revisionHistory  = 5
+	progressDeadline = 600
+	// terminationPeriod covers the preStop delay (preStopSleep), Forgejo's graceful shutdown
+	// ([server] GRACEFUL_HAMMER_TIME, 50s) and a margin for the shutdown itself.
+	terminationPeriod = 75
+	// preStopSleep keeps a terminating server pod serving (its SSH listener closes at
+	// SIGTERM) until the endpoint removal has reached kube-proxy and the ingress
+	// controllers, so that no new connection reaches a pod that has stopped listening.
+	preStopSleep = 10
 	// startupFailureThreshold x 10s is how long Forgejo may take to start serving: one hour.
 	// The first start of an adopted instance (another AppPath or app.ini location than the
 	// last start) re-syncs every repository's hooks before the listener opens, and a killed
@@ -77,39 +85,39 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 			return forgejo.StepResult{}, err
 		}
 	}
+	if held, err := holdForCronRunner(ctx, rc); err != nil || held {
+		if err != nil {
+			return forgejo.StepResult{}, err
+		}
+		return forgejo.StepResult{Stop: true, RequeueAfter: cronStopRequeue}, nil
+	}
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: forgejo.DeploymentName(f), Namespace: f.Namespace}}
+	var webReplicas int32
+	var hold bool
 	err = apply(ctx, rc, dep, true, func() error {
 		exists := dep.ResourceVersion != ""
 		restartedAt := dep.Spec.Template.Annotations[forgejo.AnnotationRestartedAt]
-		hold := migrationHold(dep, restore)
+		hold = migrationHold(dep, restore) != ""
+		holdName := migrationHold(dep, restore)
 
 		dep.Labels = mergeMaps(dep.Labels, podLabels(rc, nil))
-		if hold != "" {
-			dep.Annotations = mergeMaps(dep.Annotations, map[string]string{annotationMigrationHold: hold})
+		if hold {
+			dep.Annotations = mergeMaps(dep.Annotations, map[string]string{annotationMigrationHold: holdName})
 		} else {
 			delete(dep.Annotations, annotationMigrationHold)
 		}
-		dep.Spec.Replicas = ptr.To(desiredReplicas(rc, exists, dep.Spec.Replicas, hold != ""))
+		webReplicas = desiredReplicas(rc, exists, dep.Spec.Replicas, hold)
+		dep.Spec.Replicas = ptr.To(webReplicas)
 		if !exists {
 			dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: forgejo.SelectorLabels(f)}
 		}
-		dep.Spec.Strategy = deploymentStrategy(rc, hold != "")
+		dep.Spec.Strategy = deploymentStrategy(rc, hold)
 		dep.Spec.RevisionHistoryLimit = ptr.To[int32](revisionHistory)
 		dep.Spec.ProgressDeadlineSeconds = ptr.To[int32](progressDeadline)
 
-		annotations := mergeMaps(f.Spec.PodTemplate.Annotations, map[string]string{forgejo.AnnotationConfigHash: rc.ConfigHash})
-		if restartedAt != "" {
-			annotations[forgejo.AnnotationRestartedAt] = restartedAt
-		}
-		if servingHostKeys(rc) {
-			annotations[forgejo.AnnotationSSHHostKeys] = rc.SSHHostKeys.Digest
-		}
-		if objectStorageDigest != "" {
-			annotations[forgejo.AnnotationObjectStorage] = objectStorageDigest
-		}
 		dep.Spec.Template.ObjectMeta = metav1.ObjectMeta{
 			Labels:      podLabels(rc, f.Spec.PodTemplate.Labels),
-			Annotations: annotations,
+			Annotations: podAnnotations(rc, restartedAt, objectStorageDigest),
 		}
 		dep.Spec.Template.Spec = podSpec(rc)
 		return nil
@@ -117,8 +125,27 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	if err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("deployment: %w", err)
 	}
+	if err := reconcileCronRunner(ctx, rc, cronReplicas(rc, webReplicas, hold),
+		dep.Spec.Template.Annotations[forgejo.AnnotationRestartedAt], objectStorageDigest); err != nil {
+		return forgejo.StepResult{}, fmt.Errorf("cron runner: %w", err)
+	}
 	f.Status.ConfigHash = rc.ConfigHash
 	return forgejo.StepResult{}, nil
+}
+
+// podAnnotations are the pod template annotations of the server and cron runner pods.
+func podAnnotations(rc *forgejo.ReconcileContext, restartedAt, objectStorageDigest string) map[string]string {
+	annotations := mergeMaps(rc.Instance.Spec.PodTemplate.Annotations, map[string]string{forgejo.AnnotationConfigHash: rc.ConfigHash})
+	if restartedAt != "" {
+		annotations[forgejo.AnnotationRestartedAt] = restartedAt
+	}
+	if servingHostKeys(rc) {
+		annotations[forgejo.AnnotationSSHHostKeys] = rc.SSHHostKeys.Digest
+	}
+	if objectStorageDigest != "" {
+		annotations[forgejo.AnnotationObjectStorage] = objectStorageDigest
+	}
+	return annotations
 }
 
 // desiredReplicas: 0 in maintenance, an explicit override, 1 while upgrading (or while a
@@ -171,7 +198,7 @@ func reportReplicasRequireHA(rc *forgejo.ReconcileContext) {
 		clearDegraded(rc, ReasonReplicasRequireHA)
 		return
 	}
-	msg := fmt.Sprintf("spec.replicas=%d requires highAvailability.enabled (shared queues, cache and indexers); running 1 replica", n)
+	msg := fmt.Sprintf("spec.replicas=%d requires highAvailability.enabled (shared queues, cache and indexers, a single cron runner); running 1 replica", n)
 	setDegraded(rc, ReasonReplicasRequireHA, msg)
 	warnEvery(rc, fmt.Sprintf("replicas-require-ha/%d", n), ReasonReplicasRequireHA, "Scale", "%s", msg)
 }
@@ -240,17 +267,30 @@ func singlePodAvailable(dep *appsv1.Deployment) bool {
 }
 
 func podLabels(rc *forgejo.ReconcileContext, extra map[string]string) map[string]string {
-	l := mergeMaps(extra, forgejo.Labels(rc.Instance, forgejo.ComponentServer))
+	return podLabelsFor(rc, forgejo.ComponentServer, extra)
+}
+
+// podLabelsFor are the labels of the pods of component (server or cron).
+func podLabelsFor(rc *forgejo.ReconcileContext, component string, extra map[string]string) map[string]string {
+	l := mergeMaps(extra, forgejo.Labels(rc.Instance, component))
 	if tag := forgejo.ImageTag(rc.TargetImage); tag != "" && len(validation.IsValidLabelValue(tag)) == 0 {
 		l[forgejo.LabelVersion] = tag
 	}
 	return l
 }
 
-// podSpec builds the pod per docs/design.md "Pod layout". Fields the API server would
-// default are set explicitly so that unchanged specs compare equal and cause no update.
+// podSpec builds the server pod per docs/design.md "Pod layout".
 func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
+	return podSpecFor(rc, forgejo.ComponentServer)
+}
+
+// podSpecFor builds the pod of component: the server pods, or the cron runner, which is the
+// same pod with the full app.ini (cron tasks enabled), no preStop delay (no Service routes to
+// it) and its own placement (topologySpread, affinity). Fields the API server would default are set explicitly so
+// that unchanged specs compare equal and cause no update.
+func podSpecFor(rc *forgejo.ReconcileContext, component string) corev1.PodSpec {
 	f, l := rc.Instance, rc.Layout
+	web := component == forgejo.ComponentServer
 	pt := f.Spec.PodTemplate
 	resources := f.Spec.Resources
 	if rc.ResourcesOverride != nil {
@@ -284,9 +324,7 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		{Name: dataVolume, VolumeSource: corev1.VolumeSource{
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName(f)},
 		}},
-		{Name: configVolume, VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{SecretName: rc.ConfigSecretName, DefaultMode: ptr.To[int32](0o440)},
-		}},
+		{Name: configVolume, VolumeSource: corev1.VolumeSource{Secret: configVolumeSource(rc, web)}},
 		{Name: tmpVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	}
 	s3Env := objectStorageEnv(f, l)
@@ -324,6 +362,11 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		SecurityContext:          nonRootSecurityContext(l),
 		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+	}
+	if web && f.Spec.HighAvailability.Enabled {
+		main.Lifecycle = &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{Command: []string{"/bin/sleep", strconv.Itoa(preStopSleep)}},
+		}}
 	}
 
 	initPerms := corev1.Container{
@@ -398,14 +441,79 @@ func podSpec(rc *forgejo.ReconcileContext) corev1.PodSpec {
 		EnableServiceLinks:            ptr.To(false),
 		NodeSelector:                  pt.NodeSelector,
 		Tolerations:                   pt.Tolerations,
-		Affinity:                      pt.Affinity,
-		TopologySpreadConstraints:     pt.TopologySpreadConstraints,
+		Affinity:                      affinity(rc, component),
+		TopologySpreadConstraints:     topologySpread(rc, component),
 		PriorityClassName:             pt.PriorityClassName,
 		RestartPolicy:                 corev1.RestartPolicyAlways,
 		DNSPolicy:                     corev1.DNSClusterFirst,
 		SchedulerName:                 corev1.DefaultSchedulerName,
 		TerminationGracePeriodSeconds: ptr.To[int64](terminationPeriod),
 	}
+}
+
+// configVolumeSource mounts the app.ini Secret (rc.ConfigSecretName: "<name>-config" or the
+// last known good copy). While the cron runner is enabled, the server pods mount its
+// app-web.ini (cron tasks disabled) as app.ini; the cron runner mounts the full app.ini.
+// Both use the same --config path: Forgejo writes it into the git hooks on the shared
+// volume, and a start with another path than the last one rewrites every repository's hooks.
+func configVolumeSource(rc *forgejo.ReconcileContext, web bool) *corev1.SecretVolumeSource {
+	src := &corev1.SecretVolumeSource{SecretName: rc.ConfigSecretName, DefaultMode: ptr.To[int32](0o440)}
+	if web && forgejo.CronRunnerEnabled(rc.Instance) {
+		src.Items = []corev1.KeyToPath{{Key: forgejo.ConfigSecretKeyWeb, Path: path.Base(rc.Layout.ConfigPath)}}
+	}
+	return src
+}
+
+// topologySpread is spec.podTemplate.topologySpreadConstraints when set. Otherwise, with
+// highAvailability, the server pods are spread across nodes (and zones, see
+// forgejo.DefaultTopologySpread), and the cron runner away from them when the data volume is
+// ReadWriteMany; on any other volume the cron runner shares a server pod's node instead (see
+// affinity). A single pod without highAvailability has nothing to spread.
+func topologySpread(rc *forgejo.ReconcileContext, component string) []corev1.TopologySpreadConstraint {
+	f := rc.Instance
+	if c := f.Spec.PodTemplate.TopologySpreadConstraints; len(c) > 0 || !f.Spec.HighAvailability.Enabled {
+		return c
+	}
+	sel := &metav1.LabelSelector{MatchLabels: forgejo.SelectorLabels(f)}
+	if component == forgejo.ComponentCron {
+		if !rc.DataVolumeShared {
+			return nil
+		}
+		sel = &metav1.LabelSelector{
+			MatchLabels: map[string]string{forgejo.LabelName: forgejo.AppName, forgejo.LabelInstance: f.Name},
+			MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key: forgejo.LabelComponent, Operator: metav1.LabelSelectorOpIn,
+				Values: []string{forgejo.ComponentServer, forgejo.ComponentCron},
+			}},
+		}
+	}
+	return forgejo.DefaultTopologySpread(sel, rc.NodeZones)
+}
+
+// affinity is spec.podTemplate.affinity. With highAvailability and a data volume that is not
+// ReadWriteMany, the cron runner also requires a node that runs a server pod of the instance:
+// only pods on the node the volume is attached to can mount it, and a pod scheduled to
+// another node would wait in ContainerCreating (Multi-Attach) or, after a node restart, take
+// the attachment from the server pods.
+func affinity(rc *forgejo.ReconcileContext, component string) *corev1.Affinity {
+	f := rc.Instance
+	a := f.Spec.PodTemplate.Affinity
+	if component != forgejo.ComponentCron || !f.Spec.HighAvailability.Enabled || rc.DataVolumeShared {
+		return a
+	}
+	out := &corev1.Affinity{}
+	if a != nil {
+		out = a.DeepCopy()
+	}
+	if out.PodAffinity == nil {
+		out.PodAffinity = &corev1.PodAffinity{}
+	}
+	out.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(out.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		corev1.PodAffinityTerm{
+			LabelSelector: &metav1.LabelSelector{MatchLabels: forgejo.SelectorLabels(f)},
+			TopologyKey:   corev1.LabelHostname,
+		})
+	return out
 }
 
 // claimName is the data PVC the pods mount.

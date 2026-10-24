@@ -75,6 +75,10 @@ const (
 	// identity, database and data volume are restored from the remote backup, True once Forgejo
 	// started on them. Only reported while spec.restoreFrom is set; see docs/backup-restore.md.
 	ConditionRestoredFromBackup = "RestoredFromBackup"
+	// ConditionValkeyReady is True when Valkey has a primary that Forgejo can use: its
+	// Sentinels name one and that pod is Ready. Only reported while highAvailability is
+	// enabled; see docs/high-availability.md.
+	ConditionValkeyReady = "ValkeyReady"
 )
 
 // ForgejoPhase is a coarse, human-readable summary of the instance state.
@@ -94,8 +98,8 @@ const (
 
 // ForgejoSpec defines the desired state of a Forgejo instance.
 // +kubebuilder:validation:XValidation:rule="!has(self.restoreFrom) || (has(oldSelf.restoreFrom) && self.restoreFrom == oldSelf.restoreFrom)",message="restoreFrom can only be set when the Forgejo is created and cannot be changed afterwards (it may be removed)"
-// +kubebuilder:validation:XValidation:rule="!has(self.replicas) || self.replicas <= 1 || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="replicas greater than 1 require highAvailability.enabled (Valkey for shared cache, sessions and queues)",fieldPath=".replicas",reason="FieldValueForbidden"
-// +kubebuilder:validation:XValidation:rule="!has(self.autoscaling.horizontal) || !has(self.autoscaling.horizontal.enabled) || !self.autoscaling.horizontal.enabled || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="autoscaling.horizontal requires highAvailability.enabled (Valkey for shared cache, sessions and queues)",fieldPath=".autoscaling.horizontal.enabled",reason="FieldValueForbidden"
+// +kubebuilder:validation:XValidation:rule="!has(self.replicas) || self.replicas <= 1 || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="replicas greater than 1 require highAvailability.enabled (Valkey for shared cache and queues, a single cron runner)",fieldPath=".replicas",reason="FieldValueForbidden"
+// +kubebuilder:validation:XValidation:rule="!has(self.autoscaling.horizontal) || !has(self.autoscaling.horizontal.enabled) || !self.autoscaling.horizontal.enabled || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="autoscaling.horizontal requires highAvailability.enabled (Valkey for shared cache and queues, a single cron runner)",fieldPath=".autoscaling.horizontal.enabled",reason="FieldValueForbidden"
 // +kubebuilder:validation:XValidation:rule="!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || (has(self.ingress.host) && size(self.ingress.host) > 0) || (has(self.server.domain) && size(self.server.domain) > 0) || (has(self.server.rootURL) && size(self.server.rootURL) > 0) || (has(self.gateway) && has(self.gateway.hostnames))",message="ingress.enabled requires ingress.host (or server.domain, server.rootURL or gateway.hostnames): without a public host name ROOT_URL would be the in-cluster Service address",fieldPath=".ingress.host",reason="FieldValueRequired"
 // +kubebuilder:validation:XValidation:rule="!has(self.gateway) || !has(self.gateway.ssh) || !has(self.server.ssh.enabled) || self.server.ssh.enabled",message="gateway.ssh requires server.ssh.enabled",fieldPath=".gateway.ssh",reason="FieldValueForbidden"
 type ForgejoSpec struct {
@@ -1139,6 +1143,10 @@ type PrometheusResourceSpec struct {
 
 // HighAvailabilitySpec configures multi-replica operation.
 type HighAvailabilitySpec struct {
+	// enabled runs Forgejo for several replicas: cache and queues in a Valkey replication
+	// group with Sentinel (StatefulSet "<name>-valkey", three pods), Forgejo's cron tasks in a
+	// single runner pod (StatefulSet "<name>-cron") instead of every replica, and rolling
+	// updates. See docs/high-availability.md.
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
@@ -1147,7 +1155,7 @@ type HighAvailabilitySpec struct {
 	Valkey ValkeySpec `json:"valkey,omitempty"`
 }
 
-// ValkeySpec configures the Valkey (Redis-compatible) instance used for cache, sessions and queues.
+// ValkeySpec configures Valkey (Redis-compatible, with Sentinel) used for the cache and the queues.
 type ValkeySpec struct {
 	// +kubebuilder:default="docker.io/valkey/valkey:8-alpine"
 	// +kubebuilder:validation:MinLength=1
@@ -1155,8 +1163,17 @@ type ValkeySpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
+	// resources of the valkey container of each Valkey pod (the Sentinel container has its
+	// own small fixed resources). maxmemory is 80% of the memory limit.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// topologySpreadConstraints replace the default spreading of the Valkey pods (across
+	// nodes, and across zones when the nodes carry topology.kubernetes.io/zone; both
+	// ScheduleAnyway). Select the pods with app.kubernetes.io/instance=<name> and
+	// app.kubernetes.io/component=valkey.
+	// +optional
+	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 }
 
 // AutoscalingSpec configures scaling.
@@ -1367,6 +1384,67 @@ type ForgejoStatus struct {
 	// restoredFrom reports the bootstrap of spec.restoreFrom.
 	// +optional
 	RestoredFrom *RestoredFromStatus `json:"restoredFrom,omitempty"`
+
+	// highAvailability reports the cron runner and Valkey while highAvailability is enabled.
+	// +optional
+	HighAvailability *HighAvailabilityStatus `json:"highAvailability,omitempty"`
+}
+
+// HighAvailabilityStatus reports the parts of a highAvailability instance that run once.
+type HighAvailabilityStatus struct {
+	// cronRunner is the pod of StatefulSet "<name>-cron" that runs Forgejo's cron tasks; empty
+	// while none runs (it is scaled to zero with the server pods during upgrades, restores and
+	// migrations).
+	// +optional
+	CronRunner string `json:"cronRunner,omitempty"`
+	// cronRunnerReady is true when that pod is Ready.
+	// +optional
+	CronRunnerReady bool `json:"cronRunnerReady,omitempty"`
+	// valkey reports the Valkey replication group as its Sentinels see it.
+	// +optional
+	Valkey *ValkeyStatus `json:"valkey,omitempty"`
+}
+
+// ValkeyRole is the role of a Valkey pod.
+// +kubebuilder:validation:Enum=master;replica;unknown
+type ValkeyRole string
+
+const (
+	ValkeyRoleMaster  ValkeyRole = "master"
+	ValkeyRoleReplica ValkeyRole = "replica"
+	ValkeyRoleUnknown ValkeyRole = "unknown"
+)
+
+// ValkeyStatus reports the Valkey replication group.
+type ValkeyStatus struct {
+	// master is the pod the Sentinels name as the primary.
+	// +optional
+	Master string `json:"master,omitempty"`
+	// members are the Valkey pods with their role and readiness.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Members []ValkeyMember `json:"members,omitempty"`
+	// sentinels is the number of Sentinels that answered the operator.
+	// +optional
+	Sentinels int32 `json:"sentinels,omitempty"`
+	// lastFailoverTime is when the operator last saw the primary move to another pod.
+	// +optional
+	LastFailoverTime *metav1.Time `json:"lastFailoverTime,omitempty"`
+	// +optional
+	LastCheckTime *metav1.Time `json:"lastCheckTime,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// ValkeyMember is one Valkey pod.
+type ValkeyMember struct {
+	Name string `json:"name"`
+	// +optional
+	Role ValkeyRole `json:"role,omitempty"`
+	// ready is the pod's Ready condition (a replica is Ready once it replicates from the primary).
+	// +optional
+	Ready bool `json:"ready"`
 }
 
 // RestoredFromPhase is the progress of a bootstrap from a remote backup.
@@ -1682,6 +1760,8 @@ type AutoPilotStatus struct {
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must start with a lowercase letter and contain only lowercase letters, digits and '-' (no '.'): it names the instance's Services, which must be DNS-1035 labels"
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 56",message="metadata.name must be at most 56 characters: Service \"<name>-valkey\" must fit in 63"
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.database.type) || self.spec.database.type != 'CNPG' || size(self.metadata.name) <= 47",message="with database.type CNPG, metadata.name must be at most 47 characters: CloudNativePG limits the name of Cluster \"<name>-db\" to 50"
+// +kubebuilder:validation:XValidation:rule="!self.metadata.name.endsWith('-valkey')",message="metadata.name must not end in '-valkey': PodDisruptionBudget \"<name>\" would have the name of the Valkey PodDisruptionBudget of another instance with highAvailability"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.highAvailability) || !has(self.spec.highAvailability.enabled) || !self.spec.highAvailability.enabled || size(self.metadata.name) <= 45",message="with highAvailability.enabled, metadata.name must be at most 45 characters: the pods of StatefulSet \"<name>-valkey\" carry the label controller-revision-hash=<name>-valkey-<hash>, which must fit in 63"
 
 // Forgejo is a managed Forgejo software forge instance.
 type Forgejo struct {

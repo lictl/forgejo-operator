@@ -103,6 +103,26 @@ var (
 		Help: "Unix time of the upstream end of life of the running Forgejo major (when it is in the operator's version table).",
 	}, []string{labelNamespace, labelName, labelMajor})
 
+	ValkeyMasterAvailable = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "forgejo_operator_valkey_master_available",
+		Help: "1 when Valkey has a primary Forgejo can use (ValkeyReady is True), else 0. Only exported while highAvailability is enabled.",
+	}, []string{labelNamespace, labelName})
+
+	ValkeyReadyMembers = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "forgejo_operator_valkey_ready_members",
+		Help: "Ready pods of the Valkey replication group (3 when healthy). Only exported while highAvailability is enabled.",
+	}, []string{labelNamespace, labelName})
+
+	ValkeyFailovers = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "forgejo_operator_valkey_failovers_total",
+		Help: "Changes of the Valkey primary seen by the operator (Sentinel failovers).",
+	}, []string{labelNamespace, labelName})
+
+	CronRunnerReady = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "forgejo_operator_cron_runner_ready",
+		Help: "1 when the cron runner pod (Deployment <name>-cron) is Ready, else 0. Only exported while it should run.",
+	}, []string{labelNamespace, labelName})
+
 	VersionAdvisory = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "forgejo_operator_version_advisory",
 		Help: "1 when the running Forgejo patch release is older than the one an advisory of the operator's version table " +
@@ -115,6 +135,7 @@ func init() {
 		InstanceReady, InstanceInfo, HealthCheckFailures, HealthCheckUnreachable,
 		BackupLastSuccess, BackupTotal, BackupDuration, BackupSize, BackupUploadTotal, BackupLastUploadSuccess, RestoreTotal,
 		UpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife, VersionAdvisory,
+		ValkeyMasterAvailable, ValkeyReadyMembers, ValkeyFailovers, CronRunnerReady,
 	)
 }
 
@@ -122,10 +143,12 @@ func init() {
 func DeleteInstanceMetrics(namespace, name string) {
 	l := prometheus.Labels{labelNamespace: namespace, labelName: name}
 	for _, v := range []*prometheus.GaugeVec{InstanceReady, InstanceInfo, BackupLastSuccess, BackupLastUploadSuccess, BackupDuration, BackupSize,
-		VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife, VersionAdvisory} {
+		VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife, VersionAdvisory, ValkeyMasterAvailable, ValkeyReadyMembers,
+		CronRunnerReady} {
 		v.DeletePartialMatch(l)
 	}
-	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, BackupTotal, BackupUploadTotal, RestoreTotal, UpgradeTotal, AutoPilotActions} {
+	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, BackupTotal, BackupUploadTotal, RestoreTotal, UpgradeTotal,
+		AutoPilotActions, ValkeyFailovers} {
 		v.DeletePartialMatch(l)
 	}
 }

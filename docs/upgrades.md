@@ -58,6 +58,15 @@ spec.image ───────────► Pending ─► BackingUp ─► 
 | `Failed` | See [Failures without a rollback](#failures-without-a-rollback) and [Automatic rollback](#automatic-rollback). | old image; the new image with 1 replica; or 0 replicas after a failed rollback restore |
 | `Cancelled` | `spec.image` changed again before the new image was deployed (see below). | old image |
 
+With `spec.highAvailability.enabled`, the cron runner (StatefulSet `<name>-cron`) stops with the
+server pods in `BackingUp` (its pod counts among the pods that must be gone before the backup),
+stays at zero replicas through every phase in flight and while a failed image is held, and
+starts again on the new image once the upgrade has `Succeeded`, so `forgejo migrate` runs in
+exactly one pod. When an upgrade deploys the new image without a backup, the workload step first
+scales the cron runner to zero and waits for its pod to stop (`WaitingForCronRunner`; a pod stuck
+on an unreachable node keeps it waiting until the pod is force-deleted, `CronRunnerStuck`). See
+[high-availability.md](high-availability.md#the-cron-runner).
+
 The whole state machine is persisted in `status.upgrade`, so an operator restart resumes it
 where it was. Every step is idempotent: the backup and restore have names derived from
 `status.upgrade.startTime` and are only created after the phase that needs them has been

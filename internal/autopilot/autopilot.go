@@ -2,7 +2,8 @@
 // and vertical scaling, auto-tuning, storage auto-expansion and self-healing.
 //
 // Pipeline steps (see internal/controller/forgejo_controller.go for the order):
-//   - ReconcileHA          Valkey for shared cache/session/queue; rc.ValkeyURL
+//   - ReconcileHA          Valkey with Sentinel for the shared cache and queues; rc.ValkeyURL
+//   - ReportValkey         the Sentinels' view of Valkey: ValkeyReady, roles, failovers
 //   - ReconcileTuning      rc.Tuning, rc.TuningEnv, rc.ResourcesOverride, rc.HPAManaged
 //   - ReconcileConfigGuard switches to the last-known-good app.ini after a rejected config
 //   - ReconcileScaling     HPA and PodDisruptionBudget
@@ -70,18 +71,26 @@ func Reconcile(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepR
 	if err != nil {
 		return forgejo.StepResult{}, err
 	}
-	pods, err := serverPods(ctx, rc)
+	cron, err := cronRunner(ctx, rc)
 	if err != nil {
 		return forgejo.StepResult{}, err
 	}
+	// The server pods and the cron runner's: both run the same app.ini (hash), image and
+	// resources, so a config that crash-loops, a hung pod or an OOM kill counts in either.
+	pods, err := forgejoPods(ctx, rc)
+	if err != nil {
+		return forgejo.StepResult{}, err
+	}
+	webPods := podsOf(pods, forgejo.ComponentServer)
 
 	var errs []error
-	unreachable := trackUnreachable(st, f, pods)
+	// The operator probes Forgejo through the Service, which routes to the server pods only.
+	unreachable := trackUnreachable(st, f, webPods)
 	// The LKG is recorded before Valkey cleanup looks at it: a non-HA config that just
 	// became last known good lets Valkey go in the same pass.
-	errs = append(errs, recordLastKnownGood(ctx, rc, dep, pods, unreachable))
+	errs = append(errs, recordLastKnownGood(ctx, rc, dep, cron, pods, unreachable))
 	errs = append(errs, cleanupValkey(ctx, rc, st, dep, pods))
-	reportProbeUnreachable(rc, st, pods, unreachable)
+	reportProbeUnreachable(rc, st, webPods, unreachable)
 	if forgejo.SelfHealingEnabled(f) {
 		errs = append(errs, rollbackFailingConfig(ctx, rc, st, pods))
 		errs = append(errs, restartUnhealthy(ctx, rc, dep, pods))
@@ -109,6 +118,15 @@ func serverDeployment(ctx context.Context, rc *forgejo.ReconcileContext) (*appsv
 		return nil, err
 	}
 	return dep, nil
+}
+
+// cronRunner returns the cron runner StatefulSet the instance controls while
+// highAvailability is enabled, or nil.
+func cronRunner(ctx context.Context, rc *forgejo.ReconcileContext) (*appsv1.StatefulSet, error) {
+	if !forgejo.CronRunnerEnabled(rc.Instance) {
+		return nil, nil
+	}
+	return forgejo.CronRunner(ctx, rc.Client, rc.Instance)
 }
 
 // workloadHeld reports whether a migration owns the workload: an upgrade in progress, a
@@ -142,14 +160,53 @@ func serverPods(ctx context.Context, rc *forgejo.ReconcileContext) ([]corev1.Pod
 		client.MatchingLabels(forgejo.SelectorLabels(rc.Instance))); err != nil {
 		return nil, err
 	}
-	pods := list.Items[:0]
-	for _, p := range list.Items {
+	return livePods(list.Items), nil
+}
+
+// forgejoPods lists the server pods and the cron runner's pods of the instance that are
+// neither terminating nor terminated (see serverPods).
+func forgejoPods(ctx context.Context, rc *forgejo.ReconcileContext) ([]corev1.Pod, error) {
+	list := &corev1.PodList{}
+	if err := rc.Client.List(ctx, list, client.InNamespace(rc.Instance.Namespace),
+		client.MatchingLabelsSelector{Selector: forgejo.ForgejoPodSelector(rc.Instance)}); err != nil {
+		return nil, err
+	}
+	return livePods(list.Items), nil
+}
+
+// podsOf returns the pods of one component (server or cron).
+func podsOf(pods []corev1.Pod, component string) []corev1.Pod {
+	var out []corev1.Pod
+	for i := range pods {
+		if pods[i].Labels[forgejo.LabelComponent] == component {
+			out = append(out, pods[i])
+		}
+	}
+	return out
+}
+
+func livePods(items []corev1.Pod) []corev1.Pod {
+	pods := items[:0]
+	for _, p := range items {
 		if p.DeletionTimestamp != nil || p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded {
 			continue
 		}
 		pods = append(pods, p)
 	}
-	return pods, nil
+	return pods
+}
+
+// statefulSetRolledOut reports whether every replica of sts runs the current revision with
+// the given config hash and is available.
+func statefulSetRolledOut(sts *appsv1.StatefulSet, configHash string) bool {
+	if sts == nil || sts.Spec.Replicas == nil || *sts.Spec.Replicas == 0 {
+		return false
+	}
+	want := *sts.Spec.Replicas
+	s := sts.Status
+	return s.ObservedGeneration >= sts.Generation && s.UpdateRevision != "" && s.CurrentRevision == s.UpdateRevision &&
+		s.UpdatedReplicas == want && s.Replicas == want && s.AvailableReplicas == want &&
+		sts.Spec.Template.Annotations[forgejo.AnnotationConfigHash] == configHash
 }
 
 // fullyRolledOut reports whether every replica of dep runs the current template with the
@@ -239,6 +296,8 @@ type instanceState struct {
 	memRequestCap int64
 
 	unansweredSince time.Time // start of the current run of unanswered health probes
+
+	valkeyMaster string // the Valkey primary last seen, to notice failovers
 }
 
 func (s *instanceState) allow(key string, every time.Duration) bool {

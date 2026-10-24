@@ -26,17 +26,17 @@ garbage collection under `spec.storage.retainPolicy: Delete`.
 |-----------|-----------|-------|----------|
 | core | `secrets` | get, list, watch, create, update, patch, delete | The instance's generated Secrets (`<name>-secrets`, also patched with the Valkey password, `-admin`, `-ssh-host-keys`, `-backup-key`), `app.ini` (`<name>-config`, `-config-lkg`), identity Secrets of a disaster recovery, a `ForgejoRunner`'s `<name>-tokens` and `<name>-runner`, and the identity bundle `<backup>-identity` of an upload Job, deleted with the Job (the only Secret the operator deletes). Reads of Secrets the spec names (`configFrom`, `admin.existingSecret`, external database, S3 and backup keys) and CNPG's `-app` Secret. list and watch feed the cache, which holds only Secrets labelled `app.kubernetes.io/managed-by=forgejo-operator`, and the metadata-only cache of CNPG Secrets (label `cnpg.io/cluster`); RBAC cannot express that filter |
 | core | `configmaps` | get, list, watch, create, update, delete | Grafana dashboard `<name>-dashboard` |
-| core | `services` | get, list, watch, create, update, delete | `<name>-http`, `<name>-ssh`, `<name>-valkey` |
+| core | `services` | get, list, watch, create, update, delete | `<name>-http`, `<name>-ssh`, `<name>-valkey` (headless); delete: Valkey when HA is turned off |
 | core | `persistentvolumeclaims` | get, list, watch, create, update, patch | Data and backup PVCs; owner references under `retainPolicy` and automatic expansion (patch). Never deleted |
 | core | `pods` | get, list, watch, delete | Server, CNPG, Job and runner pods; delete: a hung pod (self-healing) or a failing pod of an upgrade's new image |
 | core | `namespaces` | get | The Pod Security label of a `ForgejoRunner`'s namespace (Docker executor) |
-| core | `nodes`, `persistentvolumes` | get, list, watch | Placing backup and restore Jobs where node-local volumes can be attached; schedulable nodes and their memory (HA warnings, vertical sizing) |
+| core | `nodes`, `persistentvolumes` | get, list, watch | Placing backup and restore Jobs where node-local volumes can be attached; schedulable nodes and their memory (HA warnings, vertical sizing); whether nodes carry `topology.kubernetes.io/zone` (HA spreading) |
 | `storage.k8s.io` | `storageclasses` | get, list, watch | `allowVolumeExpansion` before growing a volume |
-| `apps` | `deployments` | get, list, watch, create, update, patch, delete | Forgejo and Valkey; patch: autopilot restarts and vertical sizing; delete: Valkey when HA is turned off |
-| `apps` | `statefulsets` | get, list, watch, create, update, delete | `ForgejoRunner` pods |
+| `apps` | `deployments` | get, list, watch, create, update, patch, delete | Forgejo `<name>`; patch: autopilot restarts and vertical sizing |
+| `apps` | `statefulsets` | get, list, watch, create, update, delete | Valkey `<name>-valkey` and the cron runner `<name>-cron` with HA (update: scaling the cron runner down before a new image; delete: both when HA is turned off), and `ForgejoRunner` pods |
 | `batch` | `jobs` | get, list, watch, create, delete | Backup, upload, restore and runner registration Jobs, deleted once their result is recorded |
 | `autoscaling` | `horizontalpodautoscalers` | get, list, watch, create, update, delete | HPA `<name>` |
-| `policy` | `poddisruptionbudgets` | get, list, watch, create, update, delete | PDB `<name>` |
+| `policy` | `poddisruptionbudgets` | get, list, watch, create, update, delete | PDBs `<name>` and `<name>-valkey` |
 | `networking.k8s.io` | `ingresses` | get, list, watch, create, update, delete | Ingress `<name>` |
 | `events.k8s.io` | `events` | create, patch | Events on the operator's objects |
 | `metrics.k8s.io` | `pods` | list | Usage of the Forgejo pods for vertical sizing |

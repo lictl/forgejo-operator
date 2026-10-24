@@ -104,7 +104,8 @@ func TestPipelineValkeyStop(t *testing.T) {
 	rc := newRC()
 	p := runPipeline(context.Background(), rc, st)
 	want := []string{stepMaintenance, stepRestoreGuard, stepRestoreIdentity, stepSecrets, stepBackupOwnership, stepDatabase, stepHighAvailability,
-		stepSSHHostKeys, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepBackupSchedule, stepHealth, stepStorageAutopilot}
+		stepSSHHostKeys, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepBackupSchedule, stepHealth, stepValkeyStatus,
+		stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
 		t.Errorf("ran %v, want %v", *ran, want)
 	}
@@ -208,7 +209,8 @@ func TestPipelineStepsWithoutNeedsRunAfterMaintenanceError(t *testing.T) {
 		return forgejo.StepResult{}, nil
 	})
 	runPipeline(context.Background(), newRC(), st)
-	want := []string{stepMaintenance, stepBackupOwnership, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepStorageAutopilot}
+	want := []string{stepMaintenance, stepBackupOwnership, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepValkeyStatus,
+		stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
 		t.Errorf("ran %v, want %v", *ran, want)
 	}

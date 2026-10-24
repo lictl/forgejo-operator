@@ -3,6 +3,11 @@
 package forgejo
 
 import (
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
+
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 )
 
@@ -61,7 +66,10 @@ const (
 	ManagedBy = "forgejo-operator"
 	AppName   = "forgejo"
 
-	ComponentServer   = "server"
+	ComponentServer = "server"
+	// ComponentCron marks the pod of StatefulSet "<name>-cron", the single pod that runs
+	// Forgejo's cron tasks while highAvailability is enabled. It is not behind the Services.
+	ComponentCron     = "cron"
 	ComponentDatabase = "database"
 	ComponentValkey   = "valkey"
 	ComponentBackup   = "backup"
@@ -89,6 +97,7 @@ func ConfigSecretName(f *forgejov1.Forgejo) string    { return f.Name + "-config
 func LKGConfigSecretName(f *forgejov1.Forgejo) string { return f.Name + "-config-lkg" }
 func DatabaseClusterName(f *forgejov1.Forgejo) string { return f.Name + "-db" }
 func ValkeyName(f *forgejov1.Forgejo) string          { return f.Name + "-valkey" }
+func CronRunnerName(f *forgejov1.Forgejo) string      { return f.Name + "-cron" }
 func HPAName(f *forgejov1.Forgejo) string             { return f.Name }
 func PDBName(f *forgejov1.Forgejo) string             { return f.Name }
 func ServiceMonitorName(f *forgejov1.Forgejo) string  { return f.Name }
@@ -123,6 +132,9 @@ const (
 	SecretKeyLFSJWTSecret  = "lfs-jwt-secret"
 	SecretKeyMetricsToken  = "metrics-token"
 	ConfigSecretKey        = "app.ini"
+	// ConfigSecretKeyWeb is the server pods' app.ini while the cron runner is enabled
+	// (CronRunnerEnabled): ConfigSecretKey without cron tasks. They mount it as app.ini.
+	ConfigSecretKeyWeb = "app-web.ini"
 )
 
 // SelectorLabels are the immutable labels used by the Deployment selector and Services.
@@ -132,6 +144,37 @@ func SelectorLabels(f *forgejov1.Forgejo) map[string]string {
 		LabelInstance:  f.Name,
 		LabelComponent: ComponentServer,
 	}
+}
+
+// CronSelectorLabels select the pod of the cron runner, StatefulSet "<name>-cron".
+func CronSelectorLabels(f *forgejov1.Forgejo) map[string]string {
+	return map[string]string{
+		LabelName:      AppName,
+		LabelInstance:  f.Name,
+		LabelComponent: ComponentCron,
+	}
+}
+
+// ForgejoPodSelector selects every pod that runs Forgejo for the instance: the server pods
+// of Deployment "<name>" and the cron runner of StatefulSet "<name>-cron". Both mount the data volume
+// and run "forgejo migrate" in their bootstrap init container, so a restore, a cold backup
+// or a migration must wait for all of them.
+func ForgejoPodSelector(f *forgejov1.Forgejo) labels.Selector {
+	sel := labels.SelectorFromSet(labels.Set{LabelName: AppName, LabelInstance: f.Name})
+	req, err := labels.NewRequirement(LabelComponent, selection.In, []string{ComponentServer, ComponentCron})
+	if err != nil {
+		panic(err) // constant input
+	}
+	return sel.Add(*req)
+}
+
+// CronRunnerEnabled reports whether Forgejo's cron tasks run in the separate StatefulSet
+// "<name>-cron" instead of the server pods: whenever highAvailability is enabled, the only
+// mode in which several server pods may run (spec.replicas, kubectl scale or an HPA change
+// the count at any time without a new app.ini). Forgejo has no leader election or lock for
+// its cron tasks, so every server pod would otherwise run each of them.
+func CronRunnerEnabled(f *forgejov1.Forgejo) bool {
+	return f.Spec.HighAvailability.Enabled
 }
 
 // Labels returns the standard labels for a child resource of the given component.
@@ -187,4 +230,26 @@ func itoa(i int32) string {
 		b[n] = '-'
 	}
 	return string(b[n:])
+}
+
+// DefaultTopologySpread spreads the pods sel selects across nodes and, when the cluster's
+// nodes carry topology.kubernetes.io/zone (zoned), across zones. Both constraints are
+// ScheduleAnyway: a scoring preference, so a single node (or a single zone) still schedules
+// every pod.
+func DefaultTopologySpread(sel *metav1.LabelSelector, zoned bool) []corev1.TopologySpreadConstraint {
+	out := []corev1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		TopologyKey:       corev1.LabelHostname,
+		WhenUnsatisfiable: corev1.ScheduleAnyway,
+		LabelSelector:     sel.DeepCopy(),
+	}}
+	if zoned {
+		out = append(out, corev1.TopologySpreadConstraint{
+			MaxSkew:           1,
+			TopologyKey:       corev1.LabelTopologyZone,
+			WhenUnsatisfiable: corev1.ScheduleAnyway,
+			LabelSelector:     sel.DeepCopy(),
+		})
+	}
+	return out
 }

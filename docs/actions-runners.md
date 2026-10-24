@@ -68,7 +68,9 @@ jobs:
 
 The API server refuses a `ForgejoRunner` whose name is longer than 52 characters or contains a
 `.`: the pods of StatefulSet `<name>` carry `controller-revision-hash=<name>-<hash>` (a label value
-of at most 63 characters, the hash up to 10) and the host name `<name>-<index>`. It also refuses
+of at most 63 characters, the hash up to 10) and the host name `<name>-<index>`. Names ending in
+`-valkey` or `-cron` are refused too: StatefulSet `<name>` would have the name of the Valkey or
+cron runner StatefulSet of a Forgejo instance with high availability. It also refuses
 `scope` with both `organization` and `repository`, labels of the other executor's form, `docker`
 settings (other than `resources`) with the Host executor, and `host.image` with the Docker executor.
 

@@ -42,7 +42,7 @@ func ReconcileScaling(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 	defer st.mu.Unlock()
 
 	if h := f.Spec.Autoscaling.Horizontal; h != nil && h.Enabled && !f.Spec.HighAvailability.Enabled {
-		msg := "autoscaling.horizontal requires highAvailability.enabled (shared cache, sessions and queues); the HPA is not created"
+		msg := "autoscaling.horizontal requires highAvailability.enabled (shared cache and queues, a single cron runner); the HPA is not created"
 		setDegraded(rc, ReasonHorizontalScalingRequiresHA, msg)
 		warnEvery(rc, st, "hpa-requires-ha", ReasonHorizontalScalingRequiresHA, "%s", msg)
 	} else {

@@ -20,7 +20,8 @@ template and replica count alone: during an upgrade, while a failed upgrade's ne
 still deployed and unverified (its `bootstrap` init container may still be running
 `forgejo migrate`, which takes no lock), and while a restored database waits for its first
 pod to migrate it. Then there is no HPA or PDB, no config rollback or last-known-good
-bookkeeping, no health-based restart and no vertical scaling. Restores (scaled to zero) are
+bookkeeping, no health-based restart and no vertical scaling, and with HA the cron runner is
+scaled to zero. Restores (scaled to zero) are
 treated the same way. While the Secret of SSH host keys is missing or unusable
 (`Degraded=SSHHostKeysUnavailable`), new pods could not start, so there is no health-based
 restart, no config rollback, no vertical scaling and no restart for a file system resize
@@ -31,7 +32,7 @@ either; see [ssh.md](ssh.md#when-something-is-wrong). The same holds while the e
 
 | Feature | Spec | Default |
 |---|---|---|
-| High availability (Valkey) | `spec.highAvailability.enabled` | off |
+| High availability (Valkey with Sentinel, cron runner) | `spec.highAvailability.enabled` | off |
 | Horizontal autoscaling (HPA) | `spec.autoscaling.horizontal` | off; needs HA |
 | PodDisruptionBudget | automatic when more than one replica | — |
 | Auto-tuning | `spec.autoPilot.autoTuning.enabled` | on |
@@ -40,57 +41,82 @@ either; see [ssh.md](ssh.md#when-something-is-wrong). The same holds while the e
 | OOM and usage-based vertical scaling | `spec.autoscaling.vertical` | off |
 | Storage monitoring and auto-expansion | `spec.autoPilot.storageAutoExpand` | on, 80%, +50%, max 200Gi |
 
-## High availability: Valkey
+## High availability: Valkey and the cron runner
 
-With `highAvailability.enabled` the operator runs Valkey as Deployment and Service
-`<name>-valkey` (image `spec.highAvailability.valkey.image`, default
-`docker.io/valkey/valkey:8-alpine`). Forgejo then uses it for cache (db 0), sessions (db 1)
-and queues (db 2). The issue indexer switches to `db` and the repository indexer is turned off,
-because bleve indexes cannot be shared between pods.
+With `highAvailability.enabled` the operator runs Valkey with Sentinel as StatefulSet, headless
+Service and PDB `<name>-valkey` (three pods, image `spec.highAvailability.valkey.image`, default
+`docker.io/valkey/valkey:8-alpine`), and Forgejo's cron tasks in a single pod, StatefulSet
+`<name>-cron` (pod `<name>-cron-0`). Forgejo uses Valkey for its cache (db 0) and queues (db 2) through the Sentinels
+(`redis+sentinel://`); sessions stay in the database. The issue indexer switches to `db` and the
+repository indexer is turned off, because bleve indexes cannot be shared between pods. How both
+work, what HA covers and its failure modes are in [high-availability.md](high-availability.md);
+here only how the autopilot steps handle them.
 
 - **Authentication.** A random password is added to `<name>-secrets` as `valkey-password`;
-  the other keys in that Secret are left alone. Forgejo connects with
-  `redis://:<password>@<name>-valkey.<ns>.svc.cluster.local:6379/<db>`.
+  the other keys in that Secret are left alone. Valkey and its Sentinels share it; it reaches
+  the pods only through `secretKeyRef`s.
 - **Hardening.** Valkey runs as uid 999 with a read-only root filesystem and no
-  capabilities. It has an exec `PING` readiness probe and a TCP liveness probe. Default
-  resources are 50m CPU and 64Mi memory requested, with a 256Mi memory limit.
-  `maxmemory` is 80% of the memory limit. The eviction policy is `volatile-lru`, so only
-  keys with a TTL (cache, sessions) can be evicted; queue entries never are.
-- **Persistence.** Data is an append-only file (`appendfsync everysec`) on an emptyDir.
-  Queues hold pending work such as webhook deliveries, mirror syncs and PR checks. The AOF
-  survives Valkey container restarts, including OOM kills and crashes. It does not survive
-  the pod being rescheduled: cache and sessions are then rebuilt, and Forgejo's cron and
-  retry logic re-creates most queued tasks. A PVC would tie Valkey to one node and add a
-  storage dependency for data that is mostly transient, so emptyDir is the deliberate
-  compromise.
-- **Ordering.** Pods are only rolled onto the redis configuration once Valkey is ready.
-  While Valkey is not ready, the `high-availability` step stops, so the steps that depend
-  on it (app.ini, workload, HPA, post-rollout actions) wait, with a `WaitingForValkey`
-  event and requeues every 5s. The redis URL itself (`rc.ValkeyURL`) is set as soon as the
-  password is known, ready or not, so every step renders the same app.ini. During a restore
-  the step does not stop: Forgejo is scaled to zero anyway, and scaling it down must not
-  wait for Valkey. If the cache has not seen `<name>-secrets` yet, the password is read
+  capabilities. Default resources of the `valkey` container are 50m CPU and 64Mi memory
+  requested, with a 256Mi memory limit (`spec.highAvailability.valkey.resources`); the Sentinel
+  and init containers request 10m and 16Mi with a 64Mi limit. `maxmemory` is 80% of the memory
+  limit. The eviction policy is `volatile-lru`, so only keys with a TTL (cache) can be evicted;
+  queue entries never are.
+- **Ordering.** Pods are only rolled onto the Valkey configuration once a Valkey pod is Ready (a
+  primary, or a replica replicating from it). While none is, the `high-availability` step stops,
+  so the steps that depend on it (app.ini, workload, HPA, post-rollout actions) wait, with a
+  `WaitingForValkey` event and requeues every 5s. The Valkey URL itself (`rc.ValkeyURL`) is set
+  as soon as the password is known, ready or not, so every step renders the same app.ini. During
+  a restore the step does not stop: Forgejo is scaled to zero anyway, and scaling it down must
+  not wait for Valkey. If the cache has not seen `<name>-secrets` yet, the password is read
   live.
-- **Disabling HA.** Valkey is deleted only when nothing can bring a redis app.ini back:
+- **Zones.** The default topology spread of HA pods adds `topology.kubernetes.io/zone` when a
+  node carries that label (Ready or not, schedulable or not). The answer is part of every pod
+  template, so it only changes with the nodes' labels: it is cached for 10 minutes and kept
+  when the nodes cannot be read. Before the first successful read after the operator started,
+  the `high-availability` step fails and retries instead of guessing. Without permission to
+  list nodes (a namespaced installation) pods are spread across nodes only.
+- **Reporting.** The `valkey-status` step (no prerequisites, so it also runs while the database
+  is down) asks the Sentinels for the primary and reports `ValkeyReady`,
+  `status.highAvailability.valkey`, the `forgejo_operator_valkey_*` metrics and
+  `ValkeyFailedOver` events ([high-availability.md](high-availability.md#valkey-with-sentinel)).
+  It asks only the pods that StatefulSet `<name>-valkey` controls, and only while the instance
+  controls that StatefulSet; what it reads from a connection is bounded (256 KiB, arrays of at
+  most 1024 elements, four levels deep), whatever image answers.
+- **The cron runner** has the server pods' template and the full `app.ini`; the server pods mount
+  `app-web.ini`, without cron tasks. It is at zero replicas under every migration hold, in
+  maintenance and before the first rollout, like the server pods' migration it must not run
+  beside ([high-availability.md](high-availability.md#the-cron-runner)). The autopilot treats its
+  pod like a server pod: the last known good app.ini is recorded only once it has been Ready
+  for a minute too, a config it crash-loops on is rolled back, a hung runner is deleted, and its
+  OOM kills raise the memory of both. Auto-tuning counts it as one more database client. Only a
+  StatefulSet `<name>-cron` that the instance controls is its cron runner.
+- **Disabling HA.** The cron runner is deleted at once. Valkey (StatefulSet, Service and PDB) is
+  deleted only when nothing can bring a Valkey app.ini back:
   - the desired (non-redis) app.ini is deployed, not a rolled-back last known good one, and
     no rollback is pending;
   - the Deployment is fully rolled out and every Forgejo pod runs that app.ini;
   - with config rollback on, the last known good app.ini no longer uses Valkey. The LKG
     Secret is annotated `forgejo.lucas.icu/uses-valkey: "true"` when it was rendered
-    for HA (older ones are recognised by their content). Valkey therefore stays until the
-    non-HA app.ini has run healthy for a minute and replaced the LKG.
+    for HA (or recognised by its content). Valkey therefore stays until the non-HA app.ini has
+    run healthy for a minute and replaced the LKG.
 
   Until then a `ValkeyRetained` event (at most hourly) says why. If Valkey is gone anyway
   (for example config rollback was off at the time), a rollback to an LKG that needs it is
-  declined with `ConfigRollbackUnavailable`.
-- **Shared storage warning.** Several replicas sharing a `ReadWriteOnce` data volume work on
-  a single node, but not across nodes. When the replica count (or HPA maximum) is greater
-  than 1, the data PVC is not `ReadWriteMany`, and the cluster has more than one schedulable
-  node, the operator sets `Degraded=True` with reason `HARequiresSharedStorage` and emits a
-  Warning event at most hourly.
+  declined with `ConfigRollbackUnavailable`. With HA enabled, a last known good app.ini rendered
+  without it (LevelDB queues, cron tasks in every pod) is declined the same way.
+- **Shared storage.** Every HA pod mounts the data volume: the server replicas, a surge pod
+  during rolling updates and the cron runner, so even one replica means several pods. They work
+  on a `ReadWriteOnce` volume on a single node, but not across nodes. When the data PVC is not
+  `ReadWriteMany` and the cluster has more than one schedulable node, the operator sets
+  `Degraded=True` with reason `HARequiresSharedStorage` and emits a Warning event at most
+  hourly. On such a volume the cron runner requires a node that runs a server pod
+  (`podAffinity` on `kubernetes.io/hostname`) instead of being spread away from them, so that it
+  shares the volume's attachment rather than waiting on `Multi-Attach`.
 
-Observe: `kubectl get deploy,svc <name>-valkey`, `Degraded` condition, events
-`ValkeyPasswordGenerated`, `WaitingForValkey`, `ValkeyRetained`, `ValkeyDeleted`.
+Observe: `kubectl get sts,svc,pdb <name>-valkey`, `kubectl get sts <name>-cron`, the
+`ValkeyReady` and `Degraded` conditions, `status.highAvailability`, events
+`ValkeyPasswordGenerated`, `WaitingForValkey`, `ValkeyFailedOver`, `WaitingForCronRunner`,
+`CronRunnerStuck`, `CronRunnerDeleted`, `ValkeyRetained`, `ValkeyDeleted`.
 
 ## Horizontal scaling and disruption budget
 
@@ -134,7 +160,7 @@ Auto-tuning is derived from the effective container resources, which are
 | Value | Rule |
 |---|---|
 | `env.GOMEMLIMIT` | 85% of the memory limit (only with a limit). Go 1.25+ already derives GOMAXPROCS from the CPU limit, so that is not set. |
-| `database.MAX_OPEN_CONNS` | `min(50, (max_connections − 10) / pods)`. `max_connections` comes from `spec.database.cnpg.parameters` or PostgreSQL's default of 100. `pods` is the HPA maximum or `spec.replicas`, plus one surge pod when HA rolling updates are used. Forgejo's own default is 30 per pod, regardless of replica count. |
+| `database.MAX_OPEN_CONNS` | `min(50, (max_connections − 10) / pods)`. `max_connections` comes from `spec.database.cnpg.parameters` or PostgreSQL's default of 100. `pods` is the HPA maximum or `spec.replicas`, plus, with HA, one surge pod of the rolling updates and the cron runner. Forgejo's own default is 30 per pod, regardless of replica count. |
 | `database.MAX_IDLE_CONNS` | half of `MAX_OPEN_CONNS`, at least 2 |
 | `database.CONN_MAX_LIFETIME` | `5m`, so pools move to the new primary soon after a CNPG switchover. Forgejo's default of 0 keeps connections forever. |
 | `queue.MAX_WORKERS` | CPU limit (or request) ÷ 2, clamped to 1–10. Forgejo computes the same formula from the node's CPU count, not the container's. |
@@ -408,6 +434,7 @@ On top of the core permissions, the autopilot needs:
 - `persistentvolumeclaims` patch.
 - CNPG `clusters` patch.
 - `horizontalpodautoscalers` and `poddisruptionbudgets` get/list/watch/create/update/delete.
+- `statefulsets` get/list/watch/create/update/delete (Valkey).
 - `deployments` patch (restarts, vertical sizing) and `pods` delete (hung pods).
 
 [permissions.md](permissions.md) lists every permission of the operator.

@@ -2,6 +2,8 @@ package autopilot
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -285,6 +287,12 @@ func haInstance() *forgejov1.Forgejo {
 	return f
 }
 
+// valkeyDBURL is how core renders a database of rc.ValkeyURL (for test fixtures).
+func valkeyDBURL(u string, db int) string {
+	base, query, _ := strings.Cut(u, "?")
+	return base + "/" + strconv.Itoa(db) + "?" + query
+}
+
 func secretsWithValkeyPassword(f *forgejov1.Forgejo, pw string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace},
@@ -321,12 +329,12 @@ func TestReconcileHAValkeyURLSameWhenReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	notReady := env.rc.ValkeyURL
-	dep := &appsv1.Deployment{}
-	if err := env.rc.Client.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.ValkeyName(f)}, dep); err != nil {
+	sts := &appsv1.StatefulSet{}
+	if err := env.rc.Client.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.ValkeyName(f)}, sts); err != nil {
 		t.Fatal(err)
 	}
-	dep.Status = appsv1.DeploymentStatus{ObservedGeneration: dep.Generation, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1, AvailableReplicas: 1}
-	if err := env.rc.Client.Status().Update(ctx, dep); err != nil {
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation, Replicas: 3, ReadyReplicas: 1, AvailableReplicas: 1}
+	if err := env.rc.Client.Status().Update(ctx, sts); err != nil {
 		t.Fatal(err)
 	}
 	env.rc.ValkeyURL = ""

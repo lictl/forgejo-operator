@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -394,17 +395,32 @@ func setBackupPVCOwnership(pvc *corev1.PersistentVolumeClaim, f *forgejov1.Forge
 	return controllerutil.SetControllerReference(f, pvc, scheme)
 }
 
-// ServerPodsRunning counts Forgejo server pods that still exist (including terminating ones).
+// ServerPodsRunning counts the Forgejo pods that still exist (including terminating ones):
+// the server pods and the cron runner's (StatefulSet "<name>-cron"). A cron runner the
+// instance controls that still wants its pod counts as one, so that a pod it is about to
+// (re)create cannot start next to a restore or a cold backup. It counts even while
+// highAvailability is being turned off: until the workload step has deleted it, it would
+// recreate its pod.
 func ServerPodsRunning(ctx context.Context, c client.Client, f *forgejov1.Forgejo) (int, error) {
 	pods := &corev1.PodList{}
-	if err := c.List(ctx, pods, client.InNamespace(f.Namespace), client.MatchingLabels(forgejo.SelectorLabels(f))); err != nil {
+	if err := c.List(ctx, pods, client.InNamespace(f.Namespace), client.MatchingLabelsSelector{Selector: forgejo.ForgejoPodSelector(f)}); err != nil {
 		return 0, err
 	}
-	n := 0
+	n, cronPods := 0, 0
 	for _, p := range pods.Items {
 		if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
 			n++
+			if p.Labels[forgejo.LabelComponent] == forgejo.ComponentCron {
+				cronPods++
+			}
 		}
+	}
+	cron, err := forgejo.CronRunner(ctx, c, f)
+	if err != nil {
+		return 0, err
+	}
+	if cron != nil && cron.DeletionTimestamp == nil && ptr.Deref(cron.Spec.Replicas, 1) > 0 && cronPods == 0 {
+		n++
 	}
 	return n, nil
 }

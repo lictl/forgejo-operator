@@ -315,6 +315,7 @@ type ForgejoRunnerStatus struct {
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 52",message="metadata.name must be at most 52 characters: the runner pods carry it in labels limited to 63 characters"
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must contain only lowercase letters, digits and '-' (no '.'): the runner pods' host names are \"<name>-<index>\""
+// +kubebuilder:validation:XValidation:rule="!self.metadata.name.endsWith('-valkey') && !self.metadata.name.endsWith('-cron')",message="metadata.name must not end in '-valkey' or '-cron': the runners' StatefulSet \"<name>\" would have the name of the Valkey or cron runner StatefulSet of a Forgejo instance with highAvailability"
 
 // ForgejoRunner is a set of Forgejo Actions runners registered with a Forgejo instance.
 type ForgejoRunner struct {

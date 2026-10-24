@@ -115,16 +115,37 @@ var nodeInfo struct {
 	at     time.Time
 	count  int
 	maxMem int64 // largest allocatable memory of a Ready, schedulable node (bytes)
+	// zoned: a node carries topology.kubernetes.io/zone, whether Ready and schedulable or
+	// not; zonesKnown: zoned comes from a successful read.
+	zoned, zonesKnown bool
 }
 
 // schedulableNodes counts Ready, schedulable nodes (cached for 10 minutes).
 func schedulableNodes(ctx context.Context) (int, error) {
-	n, _, err := nodeCapacity(ctx)
+	n, _, err := nodeCapacityFn(ctx)
 	return n, err
 }
 
 // nodeCapacityFn is nodeCapacity; tests replace it.
 var nodeCapacityFn = nodeCapacity
+
+// nodeZonesFn is nodeZones; tests replace it.
+var nodeZonesFn = nodeZones
+
+// nodeZones reports whether the cluster's nodes carry topology.kubernetes.io/zone (cached
+// for 10 minutes, with nodeCapacity). The answer is part of every HA pod template, so it must
+// not change unless the nodes do: it counts every node, so that nodes that are NotReady or
+// cordoned for a moment do not change it, and when the nodes cannot be read it is the answer
+// of the last successful read. Only before the first successful read is the error returned.
+func nodeZones(ctx context.Context) (bool, error) {
+	_, _, err := nodeCapacity(ctx)
+	nodeInfo.Lock()
+	defer nodeInfo.Unlock()
+	if err != nil && !nodeInfo.zonesKnown {
+		return false, err
+	}
+	return nodeInfo.zoned, nil
+}
 
 // nodeCapacity returns the number of Ready, schedulable nodes and the largest allocatable
 // memory among them, cached for 10 minutes.
@@ -142,8 +163,9 @@ func nodeCapacity(ctx context.Context) (int, int64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	n, maxMem := 0, int64(0)
+	n, maxMem, zoned := 0, int64(0), false
 	for _, node := range list.Items {
+		zoned = zoned || node.Labels[corev1.LabelTopologyZone] != ""
 		if node.Spec.Unschedulable {
 			continue
 		}
@@ -155,5 +177,6 @@ func nodeCapacity(ctx context.Context) (int, int64, error) {
 		}
 	}
 	nodeInfo.at, nodeInfo.count, nodeInfo.maxMem = time.Now(), n, maxMem
+	nodeInfo.zoned, nodeInfo.zonesKnown = zoned, true
 	return n, maxMem, nil
 }

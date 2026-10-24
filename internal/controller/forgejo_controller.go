@@ -77,6 +77,7 @@ const (
 	stepMonitoring       = "monitoring"
 	stepHealth           = "health"
 	stepAutopilot        = "autopilot"
+	stepValkeyStatus     = "valkey-status"
 )
 
 // defaultResync bounds how long the operator goes without re-checking an instance, which
@@ -188,6 +189,10 @@ var steps = []namedStep{
 	{name: stepBackupSchedule, fn: backup.ReconcileSchedule, needs: []string{stepRestoreGuard}},
 	// rc.Maintenance suspends probing during a restore.
 	{name: stepHealth, fn: observability.ReconcileHealth, needs: []string{stepRestoreGuard}},
+	// The Valkey replication group as its Sentinels see it (ValkeyReady, roles, failovers).
+	// No needs: the report stays current while the database, which high-availability waits
+	// for, is down.
+	{name: stepValkeyStatus, fn: autopilot.ReportValkey},
 	// Self-healing, LKG bookkeeping and right-sizing must never act on a partial pass.
 	{name: stepAutopilot, fn: autopilot.Reconcile, needs: []string{stepWorkload, stepHealth}},
 	// Volume measurement, StorageHealthy and PVC auto-expansion. No needs: a full CNPG
@@ -616,6 +621,7 @@ func (r *ForgejoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			predicate.LabelChangedPredicate{},
 		))).
 		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
 		Owns(&corev1.ConfigMap{}).

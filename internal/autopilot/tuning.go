@@ -89,10 +89,7 @@ func dbMaxOpenConns(f *forgejov1.Forgejo) int {
 			maxConns = v
 		}
 	}
-	pods := int(maxPods(f))
-	if f.Spec.HighAvailability.Enabled {
-		pods++ // rolling updates surge one extra pod
-	}
+	pods := int(maxForgejoPods(f))
 	return min(maxOpenConnsCap, max(2, (maxConns-reservedConnections)/pods))
 }
 

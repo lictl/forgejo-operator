@@ -395,3 +395,29 @@ func TestRunnersOfflineAlert(t *testing.T) {
 		t.Fatalf("description %q", d)
 	}
 }
+
+// With highAvailability: alerts for a Valkey without a usable primary, a failover, a
+// degraded group and a cron runner that is down; none without it.
+func TestHighAvailabilityAlerts(t *testing.T) {
+	names := []string{"ForgejoValkeyNoMaster", "ForgejoValkeyFailedOver", "ForgejoValkeyDegraded", "ForgejoCronRunnerDown"}
+	f := testInstance("ha")
+	for _, n := range names {
+		if findRule(prometheusRuleSpec(f, false), n) != nil {
+			t.Fatalf("%s without highAvailability", n)
+		}
+	}
+	f.Spec.HighAvailability.Enabled = true
+	spec := prometheusRuleSpec(f, false)
+	for _, n := range names {
+		if findRule(spec, n) == nil {
+			t.Fatalf("no %s", n)
+		}
+	}
+	if r := findRule(spec, "ForgejoValkeyNoMaster"); r.Labels["severity"] != "critical" ||
+		!strings.Contains(r.Expr, `forgejo_operator_valkey_master_available{namespace="ns", name="ha"}`) {
+		t.Fatalf("ForgejoValkeyNoMaster: %+v", r)
+	}
+	if r := findRule(spec, "ForgejoCronRunnerDown"); !strings.Contains(r.Expr, "forgejo_operator_cron_runner_ready") || r.For == "" {
+		t.Fatalf("ForgejoCronRunnerDown: %+v", r)
+	}
+}

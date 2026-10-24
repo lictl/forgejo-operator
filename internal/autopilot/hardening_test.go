@@ -161,15 +161,16 @@ func TestHPAMissingCPURequestIsReported(t *testing.T) {
 
 func valkeyObjects(t *testing.T, f *forgejov1.Forgejo) []client.Object {
 	return []client.Object{
-		owned(t, f, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: forgejo.ValkeyName(f), Namespace: f.Namespace}}),
+		owned(t, f, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: forgejo.ValkeyName(f), Namespace: f.Namespace}}),
 		owned(t, f, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: forgejo.ValkeyName(f), Namespace: f.Namespace}}),
+		owned(t, f, &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: forgejo.ValkeyName(f), Namespace: f.Namespace}}),
 	}
 }
 
 func lkgSecret(f *forgejov1.Forgejo, redis bool) *corev1.Secret {
 	ini := "[cache]\nADAPTER = memory\n"
 	if redis {
-		ini = "[cache]\nADAPTER = redis\nHOST = redis://:pw@" + forgejo.ValkeyName(f) + "." + f.Namespace + ".svc.cluster.local:6379/0\n"
+		ini = "[cache]\nADAPTER = redis\nHOST = " + valkeyDBURL(valkeyURL(f, "pw"), 0) + "\n"
 	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: forgejo.LKGConfigSecretName(f), Namespace: f.Namespace,
@@ -207,9 +208,10 @@ func TestValkeyKeptWhileRedisConfigMayRun(t *testing.T) {
 			if err := cleanupValkey(ctx, env.rc, stateFor(f), dep, pods); err != nil {
 				t.Fatal(err)
 			}
-			kept := found(t, env.rc.Client, f, forgejo.ValkeyName(f), &appsv1.Deployment{})
-			if kept != tc.wantKept {
-				t.Fatalf("Valkey kept = %v, want %v (events %q)", kept, tc.wantKept, env.events())
+			for _, obj := range []client.Object{&appsv1.StatefulSet{}, &corev1.Service{}, &policyv1.PodDisruptionBudget{}} {
+				if kept := found(t, env.rc.Client, f, forgejo.ValkeyName(f), obj); kept != tc.wantKept {
+					t.Fatalf("Valkey %T kept = %v, want %v (events %q)", obj, kept, tc.wantKept, env.events())
+				}
 			}
 		})
 	}
@@ -285,7 +287,7 @@ func TestLastKnownGoodRecordsConfigProfile(t *testing.T) {
 	src.Annotations[forgejo.AnnotationConfigProfile] = socketProfile
 	env := newTestEnv(t, f, dep, src, readyPod(f, "fj-a", testHash, time.Hour))
 	pods, _ := serverPods(context.Background(), env.rc)
-	if err := recordLastKnownGood(context.Background(), env.rc, dep, pods, false); err != nil {
+	if err := recordLastKnownGood(context.Background(), env.rc, dep, nil, pods, false); err != nil {
 		t.Fatal(err)
 	}
 	lkg := &corev1.Secret{}
@@ -301,7 +303,7 @@ func TestLastKnownGoodMarksValkeyConfig(t *testing.T) {
 	env := newTestEnv(t, f, dep, configSecret(f), readyPod(f, "fj-a", testHash, time.Hour))
 	env.rc.ValkeyURL = "redis://:pw@fj-valkey.ns.svc.cluster.local:6379"
 	pods, _ := serverPods(context.Background(), env.rc)
-	if err := recordLastKnownGood(context.Background(), env.rc, dep, pods, false); err != nil {
+	if err := recordLastKnownGood(context.Background(), env.rc, dep, nil, pods, false); err != nil {
 		t.Fatal(err)
 	}
 	lkg := &corev1.Secret{}
@@ -417,9 +419,7 @@ func oomPod(f *forgejov1.Forgejo, res corev1.ResourceRequirements) *corev1.Pod {
 
 func withNodeCapacity(t *testing.T, maxMem int64) {
 	t.Helper()
-	old := nodeCapacityFn
-	nodeCapacityFn = func(context.Context) (int, int64, error) { return 1, maxMem, nil }
-	t.Cleanup(func() { nodeCapacityFn = old })
+	stubNodeCapacity(t, 1, maxMem)
 }
 
 func TestOOMNeverLowersALimitAboveMaxAllowed(t *testing.T) {

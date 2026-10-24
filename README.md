@@ -35,13 +35,13 @@ upgrades, monitoring and autonomous operations. It targets **Operator Capability
 | **II Seamless upgrades** | Changing `spec.image` to a newer version is version-gated and preceded by a cold backup. Forgejo is migrated with a single pod and verified. Downgrades are refused, and upgrades can be cancelled or retried. |
 | **III Full lifecycle** | On-demand and cron-scheduled backups with retention, uploaded encrypted (with the instance's identity) to S3 off the cluster, and restores with maintenance mode, also of remote backups. Disaster recovery recreates a lost instance from a remote backup before it first starts. Data is retained on deletion by default (`retainPolicy`), and CNPG handles database failover. |
 | **IV Deep insights** | Health, version and statistics in status. Conditions and events, operator metrics, Forgejo `/metrics` through a ServiceMonitor, a PrometheusRule with per-instance alerts, and a Grafana dashboard. |
-| **V Auto pilot** | Automatic rollback of failed upgrades and of configs that make Forgejo crash. Restarts hung pods. Vertical right-sizing from OOM kills and usage. HPA with Valkey-backed HA. PVC auto-expansion. Tuning derived from resources (GOMEMLIMIT, DB pool). |
+| **V Auto pilot** | Automatic rollback of failed upgrades and of configs that make Forgejo crash. Restarts hung pods. Vertical right-sizing from OOM kills and usage. HPA with high availability: Valkey with Sentinel failover, a single cron runner, spreading. PVC auto-expansion. Tuning derived from resources (GOMEMLIMIT, DB pool). |
 
 Details are in [docs/design.md](docs/design.md), [docs/versions.md](docs/versions.md), [docs/upgrades.md](docs/upgrades.md),
 [docs/backup-restore.md](docs/backup-restore.md), [docs/observability.md](docs/observability.md),
 [docs/autopilot.md](docs/autopilot.md), [docs/networking.md](docs/networking.md), [docs/ssh.md](docs/ssh.md),
-[docs/object-storage.md](docs/object-storage.md), [docs/actions-runners.md](docs/actions-runners.md) and
-[docs/permissions.md](docs/permissions.md).
+[docs/object-storage.md](docs/object-storage.md), [docs/actions-runners.md](docs/actions-runners.md),
+[docs/high-availability.md](docs/high-availability.md) and [docs/permissions.md](docs/permissions.md).
 
 ## Quick start (local or any other cluster)
 
@@ -201,7 +201,7 @@ metadata:
 spec:
   replicas: 2
   highAvailability:
-    enabled: true          # Valkey for cache, sessions and queues
+    enabled: true          # Valkey with Sentinel, one cron runner
   storage:
     size: 50Gi
     accessModes: [ReadWriteMany]
@@ -223,8 +223,12 @@ spec:
     tlsSecretName: git-example-com-tls
 ```
 
-Upstream Forgejo says it is not fully ready for more than one replica: scheduled cron jobs run
-on every replica. Use the HA mode knowing this, and with storage that every replica can mount.
+Forgejo runs its cron tasks in every process, so with HA the server pods run none and a single
+pod, StatefulSet `git-cron`, runs them. Cache and queues live in a three-pod Valkey with Sentinel
+(`git-valkey`) that fails over in seconds; sessions stay in PostgreSQL. Every replica mounts the
+same data volume, so it must be `ReadWriteMany` on a cluster with more than one node. What HA
+covers, and what it does not (the volume, upgrades and restores still stop Forgejo), is in
+[docs/high-availability.md](docs/high-availability.md).
 
 ## Development
 

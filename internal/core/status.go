@@ -33,6 +33,9 @@ func ReconcileStatus(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 		return forgejo.StepResult{}, err
 	}
 	found := err == nil
+	if err := reportCronRunner(ctx, rc); err != nil {
+		return forgejo.StepResult{}, err
+	}
 	st.Replicas, st.ReadyReplicas = 0, 0
 	if found {
 		st.Replicas = dep.Status.Replicas
