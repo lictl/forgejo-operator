@@ -35,7 +35,14 @@ const (
 	// annotationUsesValkey marks a last known good app.ini rendered for highAvailability,
 	// whose cache and queues live in Valkey.
 	annotationUsesValkey = "forgejo.lucas.icu/uses-valkey"
+	// annotationValkeyURL records a digest of the Valkey URL (with its password) that a last
+	// known good app.ini for highAvailability was rendered with (valkeyURLDigest).
+	annotationValkeyURL = "forgejo.lucas.icu/valkey-url-hash"
 )
+
+// valkeyURLDigest identifies rc.ValkeyURL, which embeds the Valkey password, without
+// revealing it.
+func valkeyURLDigest(u string) string { return passwordDigest(u) }
 
 func configRollbackEnabled(f *forgejov1.Forgejo) bool {
 	return forgejo.SelfHealingEnabled(f) && forgejo.BoolOr(f.Spec.AutoPilot.SelfHealing.ConfigRollback, true)
@@ -128,6 +135,9 @@ func configProfile(sec *corev1.Secret) string {
 // lkgUnusable explains why the last known good config cannot run now, or returns "":
 //   - it was rendered for a Forgejo major that needs other keys than the image now deployed
 //     (e.g. an app.ini without INTERNAL_TOKEN crash-loops Forgejo 17 and older);
+//   - with highAvailability enabled, it must use Valkey with the password Valkey has now:
+//     after a change of valkey-password, Valkey is emptied and starts with the new one only
+//     (planValkeyReset), and an app.ini with the old one cannot reach it;
 //   - with highAvailability disabled, an LKG that uses Valkey only works while Valkey still
 //     exists. (A Valkey that is merely not ready may recover; it is never re-created once
 //     deleted.)
@@ -143,6 +153,10 @@ func lkgUnusable(ctx context.Context, rc *forgejo.ReconcileContext, lkg *corev1.
 		// tasks.
 		if !lkgUsesValkey(f, lkg) || len(lkg.Data[forgejo.ConfigSecretKeyWeb]) == 0 {
 			return "the last known good app.ini was rendered without highAvailability", nil
+		}
+		if lkg.Annotations[annotationValkeyURL] != valkeyURLDigest(rc.ValkeyURL) {
+			return fmt.Sprintf("the last known good app.ini was rendered with another Valkey password (key %s of Secret %s "+
+				"changed since)", valkeyPasswordKey, forgejo.SecretsName(f)), nil
 		}
 		return "", nil
 	}
@@ -170,7 +184,10 @@ func lkgUnusable(ctx context.Context, rc *forgejo.ReconcileContext, lkg *corev1.
 // hung check.
 //
 // With the cron runner (StatefulSet "<name>-cron", which runs the same Secret's app.ini), it
-// must be rolled out and Ready for lkgSoak as well, whenever it runs.
+// must be rolled out and Ready for lkgSoak as well, whenever it runs, unless its pod has not
+// started any container for cronStartTimeout (cronRunnerCannotStart): such a pod has not run
+// the config, so the server pods decide alone, and the LKG (which config rollback and the
+// pod-level hung check need) is not held back for as long as the pod cannot start.
 func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep *appsv1.Deployment, cron *appsv1.StatefulSet,
 	pods []corev1.Pod, unreachable bool) error {
 	f := rc.Instance
@@ -182,11 +199,17 @@ func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep 
 		return nil
 	}
 	want := *dep.Spec.Replicas
+	note := ""
 	if cron != nil && ptr.Deref(cron.Spec.Replicas, 1) > 0 {
-		if !statefulSetRolledOut(cron, rc.ConfigHash) {
+		switch {
+		case statefulSetRolledOut(cron, rc.ConfigHash):
+			want += *cron.Spec.Replicas
+		case cronRunnerCannotStart(cron, podsOf(pods, forgejo.ComponentCron), rc.ConfigHash):
+			pods = podsOf(pods, forgejo.ComponentServer)
+			note = fmt.Sprintf(" by the server pods (the cron runner's pod has not started for %s)", cronStartTimeout)
+		default:
 			return nil
 		}
-		want += *cron.Spec.Replicas
 	}
 	// Every replica must be listed, so that the soak check below cannot pass vacuously on
 	// a pod cache that lags behind the Deployment status.
@@ -203,7 +226,8 @@ func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep 
 	lkg := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.LKGConfigSecretName(f), Namespace: f.Namespace}}
 	if ap.LastKnownGoodConfigHash == rc.ConfigHash {
 		err := rc.Client.Get(ctx, client.ObjectKeyFromObject(lkg), lkg)
-		if err == nil && lkg.Annotations[forgejo.AnnotationConfigHash] == rc.ConfigHash {
+		if err == nil && lkg.Annotations[forgejo.AnnotationConfigHash] == rc.ConfigHash &&
+			(rc.ValkeyURL == "" || lkg.Annotations[annotationValkeyURL] == valkeyURLDigest(rc.ValkeyURL)) {
 			return nil
 		}
 		if client.IgnoreNotFound(err) != nil {
@@ -223,13 +247,7 @@ func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep 
 		if lkg.Annotations == nil {
 			lkg.Annotations = map[string]string{}
 		}
-		lkg.Annotations[forgejo.AnnotationConfigHash] = rc.ConfigHash
-		lkg.Annotations[forgejo.AnnotationConfigProfile] = configProfile(src)
-		if rc.ValkeyURL != "" || lkgUsesValkey(f, src) {
-			lkg.Annotations[annotationUsesValkey] = valueTrue
-		} else {
-			delete(lkg.Annotations, annotationUsesValkey)
-		}
+		annotateLKG(rc, lkg, src)
 		lkg.Type = corev1.SecretTypeOpaque
 		lkg.Data = src.Data
 		return nil
@@ -237,8 +255,62 @@ func recordLastKnownGood(ctx context.Context, rc *forgejo.ReconcileContext, dep 
 		return err
 	}
 	ap.LastKnownGoodConfigHash = rc.ConfigHash
-	rc.Event(corev1.EventTypeNormal, "LastKnownGoodConfig", "AutoPilot", "app.ini %s ran healthy; stored as last known good", short(rc.ConfigHash))
+	rc.Event(corev1.EventTypeNormal, "LastKnownGoodConfig", "AutoPilot", "app.ini %s ran healthy%s; stored as last known good", short(rc.ConfigHash), note)
 	return nil
+}
+
+// annotateLKG records on the last known good Secret what its app.ini was rendered for: the
+// config hash and profile, whether it uses Valkey and, with highAvailability, a digest of the
+// Valkey URL (the deployed app.ini is the desired one, rendered in this pass with
+// rc.ValkeyURL).
+func annotateLKG(rc *forgejo.ReconcileContext, lkg, src *corev1.Secret) {
+	lkg.Annotations[forgejo.AnnotationConfigHash] = rc.ConfigHash
+	lkg.Annotations[forgejo.AnnotationConfigProfile] = configProfile(src)
+	if rc.ValkeyURL != "" || lkgUsesValkey(rc.Instance, src) {
+		lkg.Annotations[annotationUsesValkey] = valueTrue
+	} else {
+		delete(lkg.Annotations, annotationUsesValkey)
+	}
+	if rc.ValkeyURL != "" {
+		lkg.Annotations[annotationValkeyURL] = valkeyURLDigest(rc.ValkeyURL)
+	} else {
+		delete(lkg.Annotations, annotationValkeyURL)
+	}
+}
+
+// cronStartTimeout is how long the cron runner's pod may go without starting a container
+// before it no longer holds back the last known good config.
+const cronStartTimeout = notReadyTimeout
+
+// cronRunnerCannotStart reports whether the cron runner's pods (live ones, at least one) all
+// belong to its current template with the given config hash and none has started a container
+// in the cronStartTimeout since it was created: not scheduled (e.g. a required podAntiAffinity
+// of spec.podTemplate, which the cron runner inherits, on as many nodes as replicas), waiting
+// for the data volume (Multi-Attach) or for its image on a new node. A pod that started and
+// then failed did run the config, so it still decides.
+func cronRunnerCannotStart(cron *appsv1.StatefulSet, pods []corev1.Pod, configHash string) bool {
+	if cron.Spec.Template.Annotations[forgejo.AnnotationConfigHash] != configHash || len(pods) == 0 {
+		return false
+	}
+	for i := range pods {
+		p := &pods[i]
+		if p.Annotations[forgejo.AnnotationConfigHash] != configHash || anyContainerStarted(p) ||
+			time.Since(p.CreationTimestamp.Time) < cronStartTimeout {
+			return false
+		}
+	}
+	return true
+}
+
+// anyContainerStarted reports whether a container of the pod, init containers included, has
+// run (or is running).
+func anyContainerStarted(p *corev1.Pod) bool {
+	for _, cs := range append(append([]corev1.ContainerStatus{}, p.Status.InitContainerStatuses...), p.Status.ContainerStatuses...) {
+		if cs.State.Running != nil || cs.State.Terminated != nil || cs.LastTerminationState.Terminated != nil || cs.RestartCount > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // rollbackFailingConfig rejects the desired app.ini when pods running it crash-loop or never

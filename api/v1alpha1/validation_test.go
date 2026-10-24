@@ -186,6 +186,9 @@ func fj(spec string) string { return forgejo("git", spec) }
 
 const errCredentials = "credentialsSecret"
 
+// errSLOTarget is the field path of the availability target's validation errors.
+const errSLOTarget = "spec.monitoring.slo.availabilityTarget"
+
 func TestForgejoValidation(t *testing.T) {
 	const s3 = `endpoint: https://s3.example.com
       bucket: bucket
@@ -304,6 +307,16 @@ func TestForgejoValidation(t *testing.T) {
 		{name: "schedule with zone", obj: fj("  backup: {enabled: true, schedule: \"CRON_TZ=Asia/Tokyo 30 2 * * 1-5\"}")},
 		{name: "remote without credentials", obj: fj("  backup:\n    remote:\n      s3: {endpoint: \"https://s3.example.com\", bucket: bucket}"), want: errCredentials},
 		{name: "remote with a generated key", obj: fj("  backup:\n    remote:\n      s3:\n        " + strings.ReplaceAll(s3, "\n      ", "\n        "))},
+
+		// Monitoring: SLOs and the runbook base.
+		{name: "slo", obj: fj("  monitoring:\n    slo: {availabilityTarget: \"99.95\", window: 28d}\n    runbookBaseURL: https://wiki.example.com/forgejo/runbooks")},
+		{name: "slo target as a number", obj: fj("  monitoring:\n    slo: {availabilityTarget: 99.9}"), want: errSLOTarget},
+		{name: "slo target 100", obj: fj("  monitoring:\n    slo: {availabilityTarget: \"100\"}"), want: errSLOTarget},
+		{name: "slo target 0.5", obj: fj("  monitoring:\n    slo: {availabilityTarget: \"0.5\"}"), want: errSLOTarget},
+		{name: "slo window in minutes", obj: fj("  monitoring:\n    slo: {window: 90m}"), want: "spec.monitoring.slo.window"},
+		{name: "slo window compound", obj: fj("  monitoring:\n    slo: {window: 1d12h}"), want: "spec.monitoring.slo.window"},
+		{name: "runbook base with a query", obj: fj("  monitoring: {runbookBaseURL: \"https://wiki.example.com/r?page=1\"}"), want: "spec.monitoring.runbookBaseURL"},
+		{name: "runbook base relative", obj: fj("  monitoring: {runbookBaseURL: docs/runbooks}"), want: "spec.monitoring.runbookBaseURL"},
 
 		// Object storage.
 		{name: "object storage without credentials", obj: fj("  objectStorage:\n    s3: {endpoint: \"https://s3.example.com\", bucket: bucket}"), want: errCredentials},

@@ -1459,6 +1459,15 @@ spec:
                           type: string
                         type: object
                     type: object
+                  runbookBaseURL:
+                    description: |-
+                      runbookBaseURL is where the runbooks linked from the alerts live: every alert's
+                      runbook_url annotation is "<runbookBaseURL>/<AlertName>.md", and the dashboard links
+                      "<runbookBaseURL>/README.md". Defaults to the operator's --runbook-base-url
+                      (RUNBOOK_BASE_URL), else the runbooks in the operator's repository (docs/runbooks).
+                    maxLength: 512
+                    pattern: ^https?://[^\s?#]+$
+                    type: string
                   serviceMonitor:
                     description: |-
                       serviceMonitor creates a prometheus-operator ServiceMonitor. Defaults to true when the
@@ -1475,6 +1484,33 @@ spec:
                         additionalProperties:
                           type: string
                         type: object
+                    type: object
+                  slo:
+                    default: {}
+                    description: |-
+                      slo sets the instance's service level objectives: the availability target and window
+                      that the PrometheusRule's recording rules and burn-rate alerts are built from, and the
+                      dashboard's SLO panels show. See docs/observability.md, "Service level objectives".
+                    properties:
+                      availabilityTarget:
+                        default: "99.5"
+                        description: |-
+                          availabilityTarget is the share of the window, in percent, in which Forgejo must be
+                          available: the operator's health probes pass, outside of planned downtime (restores,
+                          orchestrated upgrades, spec.paused, zero replicas). A string such as "99.5" or "99.9"
+                          (quote it in YAML); the error budget is 100 minus it.
+                        maxLength: 8
+                        pattern: ^[1-9][0-9]?(\.[0-9]{1,4})?$
+                        type: string
+                      window:
+                        default: 30d
+                        description: |-
+                          window is the period the availability target and the error budget apply to, a number
+                          of hours, days or weeks (e.g. 30d, 28d, 4w). The burn-rate alerts' windows scale with
+                          it (1h and 5m for the fastest page at 30d), but never below 5m.
+                        maxLength: 6
+                        pattern: ^[1-9][0-9]{0,3}(h|d|w)$
+                        type: string
                     type: object
                   statsInterval:
                     default: 5m
@@ -3723,6 +3759,9 @@ spec:
                       Sentinels see it.
                     properties:
                       lastCheckTime:
+                        description: |-
+                          lastCheckTime is when the operator last asked the Sentinels: at most every 10s while
+                          the Valkey pods stay the same, every minute while none answers.
                         format: date-time
                         type: string
                       lastFailoverTime:

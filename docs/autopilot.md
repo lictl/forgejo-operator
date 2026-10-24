@@ -81,14 +81,24 @@ here only how the autopilot steps handle them.
   `ValkeyFailedOver` events ([high-availability.md](high-availability.md#valkey-with-sentinel)).
   It asks only the pods that StatefulSet `<name>-valkey` controls, and only while the instance
   controls that StatefulSet; what it reads from a connection is bounded (256 KiB, arrays of at
-  most 1024 elements, four levels deep), whatever image answers.
+  most 1024 elements, four levels deep), whatever image answers. It asks at most every 10 s
+  while the pods stay the same and every minute while no Sentinel answers although pods are
+  Ready, with a 1 s dial timeout, so that a NetworkPolicy that drops the operator's packets does
+  not keep the controller busy; other reconciles reuse the answers.
+- **Emptying Valkey.** After a restore (in `ScalingUp`, before Forgejo starts) and when
+  `valkey-password` changes, the `high-availability` step scales Valkey to zero and back and
+  stops meanwhile ([high-availability.md](high-availability.md#valkey-with-sentinel)).
 - **The cron runner** has the server pods' template and the full `app.ini`; the server pods mount
   `app-web.ini`, without cron tasks. It is at zero replicas under every migration hold, in
   maintenance and before the first rollout, like the server pods' migration it must not run
   beside ([high-availability.md](high-availability.md#the-cron-runner)). The autopilot treats its
   pod like a server pod: the last known good app.ini is recorded only once it has been Ready
   for a minute too, a config it crash-loops on is rolled back, a hung runner is deleted, and its
-  OOM kills raise the memory of both. Auto-tuning counts it as one more database client. Only a
+  OOM kills raise the memory of both. Two exceptions: the health-based restart of the
+  Deployment depends on the server pods only (the probes reach only them), and a runner pod that
+  has not started any container for 5 minutes (unschedulable, waiting for its volume or image)
+  has not run the config, so the last known good app.ini is then recorded from the server pods
+  alone (event `LastKnownGoodConfig` says so). Auto-tuning counts it as one more database client. Only a
   StatefulSet `<name>-cron` that the instance controls is its cron runner.
 - **Disabling HA.** The cron runner is deleted at once. Valkey (StatefulSet, Service and PDB) is
   deleted only when nothing can bring a Valkey app.ini back:
@@ -103,7 +113,10 @@ here only how the autopilot steps handle them.
   Until then a `ValkeyRetained` event (at most hourly) says why. If Valkey is gone anyway
   (for example config rollback was off at the time), a rollback to an LKG that needs it is
   declined with `ConfigRollbackUnavailable`. With HA enabled, a last known good app.ini rendered
-  without it (LevelDB queues, cron tasks in every pod) is declined the same way.
+  without it (LevelDB queues, cron tasks in every pod) is declined the same way, as is one
+  rendered with another Valkey password (the LKG Secret's annotation
+  `forgejo.lucas.icu/valkey-url-hash`, a digest of the Valkey URL, differs): after a change
+  of `valkey-password`, Valkey runs with the new password only.
 - **Shared storage.** Every HA pod mounts the data volume: the server replicas, a surge pod
   during rolling updates and the cron runner, so even one replica means several pods. They work
   on a `ReadWriteOnce` volume on a single node, but not across nodes. When the data PVC is not
@@ -115,7 +128,7 @@ here only how the autopilot steps handle them.
 
 Observe: `kubectl get sts,svc,pdb <name>-valkey`, `kubectl get sts <name>-cron`, the
 `ValkeyReady` and `Degraded` conditions, `status.highAvailability`, events
-`ValkeyPasswordGenerated`, `WaitingForValkey`, `ValkeyFailedOver`, `WaitingForCronRunner`,
+`ValkeyPasswordGenerated`, `WaitingForValkey`, `ValkeyReset`, `ValkeyFailedOver`, `WaitingForCronRunner`,
 `CronRunnerStuck`, `CronRunnerDeleted`, `ValkeyRetained`, `ValkeyDeleted`.
 
 ## Horizontal scaling and disruption budget
@@ -216,7 +229,8 @@ Safeguards:
 - Nothing happens during upgrades, restores and other migration holds: image failures
   belong to the upgrade's auto-rollback. An active rollback stays in place through them.
 - With `highAvailability` off, an LKG that uses Valkey is only rolled back to while Valkey
-  still exists; otherwise the rejection is dropped (`ConfigRollbackUnavailable`).
+  still exists; otherwise the rejection is dropped (`ConfigRollbackUnavailable`). With it on, the
+  LKG must have been rendered with the current Valkey password (see **Disabling HA** above).
 - An LKG is only rolled back to when it was rendered for the same config profile as the image
   now deployed (annotation `forgejo.lucas.icu/config-profile`; e.g. Forgejo 18 needs
   no `INTERNAL_TOKEN` but 17 does), otherwise `ConfigRollbackUnavailable`. See

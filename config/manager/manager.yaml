@@ -78,6 +78,11 @@ spec:
         # cluster.local.
         - name: CLUSTER_DOMAIN
           value: ""
+        # Base URL of the runbooks the generated alerts link (same as --runbook-base-url):
+        # runbook_url is <base>/<AlertName>.md. Empty links docs/runbooks of the operator's
+        # repository; spec.monitoring.runbookBaseURL overrides it per instance.
+        - name: RUNBOOK_BASE_URL
+          value: ""
         # Soft limit for the Go runtime, ~90% of resources.limits.memory below: the GC works
         # harder near the limit instead of the container being OOM-killed. Keep both in sync.
         - name: GOMEMLIMIT

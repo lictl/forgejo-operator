@@ -41,7 +41,9 @@ What it does **not** cover:
   or more for failover. `CONN_MAX_LIFETIME` (auto-tuning) moves the pools to a new primary.
 - **Upgrades and restores.** `forgejo migrate` takes no lock, so an upgrade still stops every
   pod for the cold pre-upgrade backup and migrates in a single pod, and a restore scales the
-  instance to zero ([upgrades.md](upgrades.md), [backup-restore.md](backup-restore.md)).
+  instance to zero ([upgrades.md](upgrades.md), [backup-restore.md](backup-restore.md)). A
+  restore (also an upgrade's rollback) empties Valkey before Forgejo starts again
+  ([below](#valkey-with-sentinel)).
 - **Valkey durability.** Replication is asynchronous: a failover can lose the last second of
   writes to the cache and the queues (for example a webhook delivery queued at that moment).
   Valkey keeps its data on an emptyDir: a pod that is recreated resynchronises from the
@@ -177,7 +179,26 @@ evicted, never queued work.
 **Password.** Generated once into `<name>-secrets` (`valkey-password`). The pods read it from
 `secretKeyRef` environment variables and the init container writes it into the configuration
 files on a memory-backed emptyDir; probes and hooks authenticate through `REDISCLI_AUTH`. It
-never appears in arguments, logs, events or status.
+never appears in arguments, logs, events or status. Changing the key (or deleting it, which
+generates a new one) empties Valkey (see **Emptying Valkey**): pods with the new password could
+neither find the primary through the old pods' Sentinels nor replicate from it, so a rolling
+update would stall at its first pod. Forgejo is interrupted meanwhile: its pods lose the cache
+and the queues while Valkey restarts, and turn NotReady until the server pods and the cron
+runner have rolled onto an `app.ini` with the new password, which the operator renders once
+Valkey is back. Config rollback never returns to a last known good `app.ini` with the old
+password (it could not reach Valkey): the LKG Secret records a digest of the Valkey URL
+(annotation `forgejo.lucas.icu/valkey-url-hash`), and until the new `app.ini` has run
+healthy and replaced it, a rollback is declined with `ConfigRollbackUnavailable`.
+
+**Emptying Valkey.** The `high-availability` step scales StatefulSet `<name>-valkey` to zero
+(annotation `forgejo.lucas.icu/valkey-reset` on it says why) and, once no pod is left,
+terminating ones included, back to three; the new pods form a new group with pod 0 as the primary
+and no data (event `ValkeyReset`, about 30-60 s). Replacing the pods one at a time would keep the
+data: each new pod resynchronises from the others. The step stops meanwhile, as when no Valkey
+pod is Ready, so nothing is rolled onto Valkey, and once begun the reset is finished even when its
+reason went away. It happens once per `ForgejoRestore` that reaches `ScalingUp` (recorded in the
+annotation `forgejo.lucas.icu/valkey-reset-done`), before any Forgejo pod starts, and when
+the password changes. A new group is not reported as a failover.
 
 **Readiness.** A `valkey` container is Ready when it is the primary or a replica whose link to
 the primary is up, a `sentinel` container when it answers. The StatefulSet rolls one pod at a
@@ -186,7 +207,9 @@ before the next pod goes; the primary hands over in its preStop hook. The `high-
 step rolls Forgejo onto Valkey only while at least one Valkey pod is Ready.
 
 **Status.** The `valkey-status` step asks each pod's Sentinel (port 26379, from the operator) for
-the primary and its replicas and reports:
+the primary and its replicas (at most every 10 s while the pods, their IPs and readiness stay the
+same, every minute while none answers although pods are Ready; `lastCheckTime` is the last
+query) and reports:
 
 - `status.highAvailability.valkey`: `master`, `members` (each pod's role `master`, `replica` or
   `unknown`, and readiness), `sentinels` (how many answered), `lastFailoverTime`, `message`;
@@ -194,7 +217,9 @@ the primary and its replicas and reports:
   Sentinels), `True/Degraded` (usable, but one more failure would leave no replica or no
   majority), `False/NoMaster`, `False/NotReady`, `False/NotProvisioned`,
   `Unknown/UnreachableFromOperator` (pods Ready, Sentinels not reachable from the operator);
-- event `ValkeyFailedOver` (Warning) when the primary moved to another pod;
+- event `ValkeyFailedOver` (Warning) when the primary moved to another pod of the group (a new
+  group, whose pods all replaced the old ones, is none: HA turned off and on, the StatefulSet
+  recreated, Valkey emptied);
 - metrics `forgejo_operator_valkey_master_available`, `forgejo_operator_valkey_ready_members` and
   `forgejo_operator_valkey_failovers_total`, and alerts `ForgejoValkeyNoMaster` (critical, 2m),
   `ForgejoValkeyFailedOver`, `ForgejoValkeyDegraded` (15m) and `ForgejoCronRunnerDown` (15m)
@@ -249,6 +274,8 @@ own constraints to make spreading a requirement.
 | The Valkey primary fails | Failover in seconds, see above |
 | Two Valkey pods fail | No failover; Forgejo serves while the primary lives, otherwise every server pod turns NotReady |
 | Every Valkey pod is recreated | Cache and queued work are lost; Forgejo recreates most tasks (cron, retries) |
+| `valkey-password` changes | Valkey is emptied and restarted with the new password; Forgejo is unavailable until its pods have rolled onto the new `app.ini` (a few minutes) |
+| The cron runner's pod cannot start (unschedulable, `Multi-Attach`, image pull) | Cron tasks pause (`ForgejoCronRunnerDown` after 15 min); health-based restarts of the server pods go on, and after 5 minutes the last known good config is recorded from the server pods alone |
 | A node is lost | Its pods are rescheduled after the node's taint tolerations (300 s by default); other replicas serve meanwhile, if the data volume can be attached elsewhere (RWX) |
 | PostgreSQL primary fails | CloudNativePG fails over; pods reconnect (`CONN_MAX_LIFETIME`) |
 | The data volume fails | Forgejo is down; restore from a backup |

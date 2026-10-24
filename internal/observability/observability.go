@@ -69,7 +69,7 @@ func ReconcileMonitoring(ctx context.Context, rc *forgejo.ReconcileContext) (for
 	scraped := smOn && (err == nil || smExists)
 	if _, err := applyUnstructured(ctx, rc, forgejo.PrometheusRuleGVK, forgejo.PrometheusRuleName(f),
 		on && toggle(m.PrometheusRule, true), specLabels(m.PrometheusRule),
-		func() (any, error) { return prometheusRuleSpec(f, scraped), nil }); err != nil {
+		func() (any, error) { return prometheusRuleSpec(f, scraped) }); err != nil {
 		errs = append(errs, fmt.Errorf("PrometheusRule %s: %w", forgejo.PrometheusRuleName(f), err))
 	}
 	if err := reconcileDashboard(ctx, rc, on && toggle(m.GrafanaDashboard, false)); err != nil {

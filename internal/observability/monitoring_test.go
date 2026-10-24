@@ -257,10 +257,22 @@ func TestMonitoringKeepsOtherDegradedReasons(t *testing.T) {
 	}
 }
 
+func ruleSpecOf(t *testing.T, f *forgejov1.Forgejo, scraped bool) *ruleSpec {
+	t.Helper()
+	spec, err := prometheusRuleSpec(f, scraped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return spec
+}
+
+// findRule returns the first rule of the alert in any group.
 func findRule(spec *ruleSpec, alert string) *rule {
-	for i := range spec.Groups[0].Rules {
-		if r := &spec.Groups[0].Rules[i]; r.Alert == alert {
-			return r
+	for g := range spec.Groups {
+		for i := range spec.Groups[g].Rules {
+			if r := &spec.Groups[g].Rules[i]; r.Alert == alert {
+				return r
+			}
 		}
 	}
 	return nil
@@ -288,7 +300,7 @@ func TestNotReadyAlertFollowsDesiredReplicas(t *testing.T) {
 			if tt.hpa {
 				hpa(f)
 			}
-			spec := prometheusRuleSpec(f, true)
+			spec := ruleSpecOf(t, f, true)
 			if got := findRule(spec, "ForgejoNotReady") != nil; got != tt.want {
 				t.Fatalf("ForgejoNotReady rendered=%v, want %v", got, tt.want)
 			}
@@ -306,8 +318,8 @@ func TestNotReadyAlertFollowsDesiredReplicas(t *testing.T) {
 func TestOperatorMetricsGuard(t *testing.T) {
 	f := testInstance("guard")
 	f.Spec.Backup.Enabled = true
-	f.Spec.Backup.Schedule = "0 3 * * *"
-	spec := prometheusRuleSpec(f, false)
+	f.Spec.Backup.Schedule = testDailySchedule
+	spec := ruleSpecOf(t, f, false)
 
 	guard := findRule(spec, "ForgejoOperatorMetricsMissing")
 	if guard == nil || guard.Expr != `absent(forgejo_operator_instance_ready{namespace="ns", name="guard"})` || guard.For != "15m" {
@@ -320,7 +332,7 @@ func TestOperatorMetricsGuard(t *testing.T) {
 	missing := findRule(spec, "ForgejoBackupMissing")
 	want := `absent(forgejo_operator_backup_last_success_timestamp_seconds{namespace="ns", name="guard"}) and on() ` +
 		`count(forgejo_operator_instance_ready{namespace="ns", name="guard"}) > 0`
-	if missing == nil || missing.Expr != want || missing.For != "1d12h" {
+	if missing == nil || missing.Expr != want || missing.For != "2d" {
 		t.Fatalf("ForgejoBackupMissing %+v", missing)
 	}
 
@@ -334,13 +346,13 @@ func TestOperatorMetricsGuard(t *testing.T) {
 	}
 	// A slow probe interval widens the window so that it always contains a probe.
 	f.Spec.AutoPilot.SelfHealing.HealthCheckInterval = &metav1.Duration{Duration: 10 * time.Minute}
-	if r := findRule(prometheusRuleSpec(f, false), "ForgejoHealthProbeUnreachable"); !strings.Contains(r.Expr, "[20m]") {
+	if r := findRule(ruleSpecOf(t, f, false), "ForgejoHealthProbeUnreachable"); !strings.Contains(r.Expr, "[20m]") {
 		t.Fatalf("expr %q", r.Expr)
 	}
 }
 
 func TestVersionUnsupportedAlert(t *testing.T) {
-	r := findRule(prometheusRuleSpec(testInstance("ver"), false), "ForgejoVersionUnsupported")
+	r := findRule(ruleSpecOf(t, testInstance("ver"), false), "ForgejoVersionUnsupported")
 	want := `max by (namespace, name, major, support) (forgejo_operator_version_supported{namespace="ns", name="ver"}) == 0`
 	if r == nil || r.Expr != want || r.For != "1h" || r.Labels["severity"] != testSeverityWarning {
 		t.Fatalf("ForgejoVersionUnsupported %+v", r)
@@ -348,7 +360,7 @@ func TestVersionUnsupportedAlert(t *testing.T) {
 	if d := r.Annotations["description"]; !strings.Contains(d, "VersionSupported") || !strings.Contains(d, "docs/versions.md") {
 		t.Fatalf("description %q", d)
 	}
-	r = findRule(prometheusRuleSpec(testInstance("ver"), false), "ForgejoVersionAdvisory")
+	r = findRule(ruleSpecOf(t, testInstance("ver"), false), "ForgejoVersionAdvisory")
 	want = `max by (namespace, name, major) (forgejo_operator_version_advisory{namespace="ns", name="ver"}) == 1`
 	if r == nil || r.Expr != want || r.For != "1h" || r.Labels["severity"] != testSeverityWarning {
 		t.Fatalf("ForgejoVersionAdvisory %+v", r)
@@ -359,31 +371,31 @@ func TestVersionUnsupportedAlert(t *testing.T) {
 func TestBackupUploadAlerts(t *testing.T) {
 	f := testInstance("up")
 	for _, name := range []string{"ForgejoBackupUploadFailed", "ForgejoBackupUploadTooOld", "ForgejoBackupUploadMissing"} {
-		if findRule(prometheusRuleSpec(f, false), name) != nil {
+		if findRule(ruleSpecOf(t, f, false), name) != nil {
 			t.Errorf("%s without spec.backup.remote", name)
 		}
 	}
 	f.Spec.Backup.Remote = &forgejov1.RemoteBackupSpec{}
-	r := findRule(prometheusRuleSpec(f, false), "ForgejoBackupUploadFailed")
+	r := findRule(ruleSpecOf(t, f, false), "ForgejoBackupUploadFailed")
 	if r == nil || !strings.Contains(r.Expr, `forgejo_operator_backup_uploads_total{namespace="ns", name="up", result="failed"}`) {
 		t.Fatalf("upload failed rule %+v", r)
 	}
-	if findRule(prometheusRuleSpec(f, false), "ForgejoBackupUploadTooOld") != nil {
+	if findRule(ruleSpecOf(t, f, false), "ForgejoBackupUploadTooOld") != nil {
 		t.Error("staleness alert without scheduled backups")
 	}
 	f.Spec.Backup.Enabled = true
-	f.Spec.Backup.Schedule = "0 3 * * *"
-	if r := findRule(prometheusRuleSpec(f, false), "ForgejoBackupUploadTooOld"); r == nil ||
+	f.Spec.Backup.Schedule = testDailySchedule
+	if r := findRule(ruleSpecOf(t, f, false), "ForgejoBackupUploadTooOld"); r == nil ||
 		!strings.Contains(r.Expr, "forgejo_operator_backup_last_upload_success_timestamp_seconds") {
 		t.Errorf("too old rule %+v", r)
 	}
-	if r := findRule(prometheusRuleSpec(f, false), "ForgejoBackupUploadMissing"); r == nil || !strings.Contains(r.Expr, "absent(") {
+	if r := findRule(ruleSpecOf(t, f, false), "ForgejoBackupUploadMissing"); r == nil || !strings.Contains(r.Expr, "absent(") {
 		t.Errorf("missing rule %+v", r)
 	}
 }
 
 func TestRunnersOfflineAlert(t *testing.T) {
-	r := findRule(prometheusRuleSpec(testInstance("run"), false), "ForgejoRunnersOffline")
+	r := findRule(ruleSpecOf(t, testInstance("run"), false), "ForgejoRunnersOffline")
 	want := `max by (namespace, name, runner) (forgejo_operator_runner_jobs_waiting{namespace="ns", name="run"}) > 0 ` +
 		`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_online{namespace="ns", name="run"}) == 0 ` +
 		`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_desired{namespace="ns", name="run"}) > 0`
@@ -402,12 +414,12 @@ func TestHighAvailabilityAlerts(t *testing.T) {
 	names := []string{"ForgejoValkeyNoMaster", "ForgejoValkeyFailedOver", "ForgejoValkeyDegraded", "ForgejoCronRunnerDown"}
 	f := testInstance("ha")
 	for _, n := range names {
-		if findRule(prometheusRuleSpec(f, false), n) != nil {
+		if findRule(ruleSpecOf(t, f, false), n) != nil {
 			t.Fatalf("%s without highAvailability", n)
 		}
 	}
 	f.Spec.HighAvailability.Enabled = true
-	spec := prometheusRuleSpec(f, false)
+	spec := ruleSpecOf(t, f, false)
 	for _, n := range names {
 		if findRule(spec, n) == nil {
 			t.Fatalf("no %s", n)

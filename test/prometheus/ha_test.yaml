@@ -1,0 +1,87 @@
+# promtool unit tests of the PrometheusRule of ns/fj with highAvailability (three replicas,
+# Valkey with Sentinel, a cron runner). Run with `make test-rules`.
+rule_files:
+  - unit-rules/ha.yaml
+evaluation_interval: 1m
+
+tests:
+  - name: a healthy Valkey and cron runner raise nothing
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="i", version="15.0.10", phase="Running"}'
+        values: '1x40'
+      - series: 'forgejo_operator_valkey_master_available{namespace="ns", name="fj"}'
+        values: '1x40'
+      - series: 'forgejo_operator_valkey_ready_members{namespace="ns", name="fj"}'
+        values: '3x40'
+      - series: 'forgejo_operator_valkey_failovers_total{namespace="ns", name="fj"}'
+        values: '2x40'
+      - series: 'forgejo_operator_cron_runner_ready{namespace="ns", name="fj"}'
+        values: '1x40'
+    alert_rule_test:
+      - {eval_time: 30m, alertname: ForgejoValkeyNoMaster, exp_alerts: []}
+      - {eval_time: 30m, alertname: ForgejoValkeyFailedOver, exp_alerts: []}
+      - {eval_time: 30m, alertname: ForgejoValkeyDegraded, exp_alerts: []}
+      - {eval_time: 30m, alertname: ForgejoCronRunnerDown, exp_alerts: []}
+
+  - name: Valkey has no primary, a failover, too few members and the cron runner is down
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="i", version="15.0.10", phase="Running"}'
+        values: '1x40'
+      - series: 'forgejo_operator_valkey_master_available{namespace="ns", name="fj"}'
+        values: '0x40'
+      - series: 'forgejo_operator_valkey_ready_members{namespace="ns", name="fj"}'
+        values: '2x40'
+      # The primary moved at 5m.
+      - series: 'forgejo_operator_valkey_failovers_total{namespace="ns", name="fj"}'
+        values: '0x4 1x35'
+      - series: 'forgejo_operator_cron_runner_ready{namespace="ns", name="fj"}'
+        values: '0x40'
+    alert_rule_test:
+      - {eval_time: 1m, alertname: ForgejoValkeyNoMaster, exp_alerts: []}
+      - eval_time: 3m
+        alertname: ForgejoValkeyNoMaster
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: Valkey of Forgejo ns/fj has no usable primary
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoValkeyNoMaster.md
+      - eval_time: 10m
+        alertname: ForgejoValkeyFailedOver
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: The Valkey primary of Forgejo ns/fj moved to another pod
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoValkeyFailedOver.md
+      # Only for 15 minutes after the failover.
+      - {eval_time: 25m, alertname: ForgejoValkeyFailedOver, exp_alerts: []}
+      - {eval_time: 14m, alertname: ForgejoValkeyDegraded, exp_alerts: []}
+      - eval_time: 16m
+        alertname: ForgejoValkeyDegraded
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: Valkey of Forgejo ns/fj runs with fewer than three Ready pods
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoValkeyDegraded.md
+      - {eval_time: 14m, alertname: ForgejoCronRunnerDown, exp_alerts: []}
+      - eval_time: 16m
+        alertname: ForgejoCronRunnerDown
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: The cron runner of Forgejo ns/fj is not Ready
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoCronRunnerDown.md
+
+  - name: Valkey is down on purpose during a restore
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="i", version="15.0.10", phase="Restoring"}'
+        values: '1x40'
+      - series: 'forgejo_operator_valkey_master_available{namespace="ns", name="fj"}'
+        values: '0x40'
+      - series: 'forgejo_operator_valkey_ready_members{namespace="ns", name="fj"}'
+        values: '0x40'
+    alert_rule_test:
+      - {eval_time: 30m, alertname: ForgejoValkeyNoMaster, exp_alerts: []}
+      - {eval_time: 30m, alertname: ForgejoValkeyDegraded, exp_alerts: []}

@@ -121,6 +121,7 @@ spec:
 3. **H3.3 agreement**: `sentinel get-master-addr-by-name forgejo` returns the same first line on all three Sentinels, and its pod equals `status.highAvailability.valkey.master`.
 4. **H3.4 replication**: VALKEY(ha17, <master>, `info replication | grep -E "^(role|connected_slaves)"`) → `role:master`, `connected_slaves:2`; on the other two: `role:slave` and `master_link_status:up`. VALKEY(ha17, <master>, `info keyspace`) lists `db0` (the cache).
 5. **H3.5 no password in arguments**: with `PW=$(kubectl -n e2e-ha get secret ha17-secrets -o jsonpath='{.data.valkey-password}' | base64 -d)`: `kubectl -n e2e-ha get sts ha17-valkey -o yaml | grep -c "$PW"` → 0 and `kubectl -n e2e-ha get pods -l $SEL,app.kubernetes.io/component=valkey -o yaml | grep -c "$PW"` → 0 (the password reaches the containers only through `secretKeyRef`); `kubectl -n e2e-ha get events | grep -c "$PW"` → 0; `kubectl -n e2e-ha get fj ha17 -o yaml | grep -c "$PW"` → 0. Do not print `$PW`.
+6. **H3.6 Sentinels asked at most every 10 s**: sample `kubectl -n e2e-ha get fj ha17 -o jsonpath='{.status.highAvailability.valkey.lastCheckTime}'` every 2 s for 40 s while nothing changes: consecutive distinct values are at least 10 s apart (at most 4 distinct values; `lastCheckTime` is the time of the last query, not of the last reconcile).
 
 ## H4 — Valkey primary failover
 
@@ -152,11 +153,12 @@ Start a sampler that every 2 s records the number of cron runner pods that are `
 
 ## H7 — Backup and restore with HA
 
-1. **H7.1 backup**: HTTP-PUSH(ha17, restore-me, r.txt). Apply `ForgejoBackup ha17-before` (`spec: {forgejoRef: {name: ha17}, includeData: true, reason: Manual}`); within 5 min `status.phase=Completed`. Then create repo `after-backup` (POST `/api/v1/user/repos`, 201).
-2. **H7.2 restore stops every Forgejo pod**: apply `ForgejoRestore ha17-restore` (`spec: {forgejoRef: {name: ha17}, backupName: ha17-before}`) and WATCH-WORKLOAD(ha17) plus `kubectl -n e2e-ha get fjr ha17-restore -o jsonpath='{.status.phase}'`. While the restore is `ScalingDown`/`Restoring`, both `deploy ha17` and `sts ha17-cron` have `spec.replicas` 0, and once the `ha17-restore-restore-*` Job pod exists no non-terminating server or cron pod is listed. Valkey keeps running (the `ha17-valkey-*` pods are not restarted: same names and ages).
-3. **H7.3 migration hold**: during `ScalingUp`, `kubectl -n e2e-ha get deploy ha17 -o jsonpath='{.metadata.annotations.forgejo\.lucas\.icu/migration-hold} {.spec.replicas} {.spec.strategy.type}'` → `ha17-restore 1 Recreate`, and `sts ha17-cron` has 0 replicas.
-4. **H7.4 back to HA**: within 10 min the restore is `Completed`, `ha17` `3/3`, `ha17-cron` `1/1`, `fj ha17` `Running`/`Ready=True`.
-5. **H7.5 data**: `GET $B/api/v1/repos/$U/after-backup` → 404; `restore-me` has `r.txt`; `demo` has `http.txt`. CRON-COUNTS(ha17) after 70 s: server pods `total 0`, the cron pod's `archive_cleanup` ≥ 1.
+1. **H7.1 backup**: HTTP-PUSH(ha17, restore-me, r.txt). Apply `ForgejoBackup ha17-before` (`spec: {forgejoRef: {name: ha17}, includeData: true, reason: Manual}`); within 5 min `status.phase=Completed`. Then create repo `after-backup` (POST `/api/v1/user/repos`, 201), and put a marker into Valkey's queue database: VALKEY(ha17, <master>, `-n 2 set e2e:after-backup 1`) → `OK`. Record the `metadata.uid` of the three `ha17-valkey-*` pods and the count of `ValkeyFailedOver` events of `ha17`.
+2. **H7.2 restore stops every Forgejo pod**: apply `ForgejoRestore ha17-restore` (`spec: {forgejoRef: {name: ha17}, backupName: ha17-before}`) and WATCH-WORKLOAD(ha17) plus `kubectl -n e2e-ha get fjr ha17-restore -o jsonpath='{.status.phase}'`. While the restore is `ScalingDown`/`Restoring`, both `deploy ha17` and `sts ha17-cron` have `spec.replicas` 0, and once the `ha17-restore-restore-*` Job pod exists no non-terminating server or cron pod is listed. Valkey keeps running meanwhile (the `ha17-valkey-*` pods keep their uids).
+3. **H7.2b Valkey emptied before Forgejo starts**: once the restore is `ScalingUp`, a Normal event `ValkeyReset` of `ha17` names `ForgejoRestore ha17-restore`; `sts ha17-valkey` goes to `spec.replicas` 0 with annotation `forgejo.lucas.icu/valkey-reset=restore/<uid of fjr ha17-restore>`, then, once no `ha17-valkey-*` pod is left, back to 3 with `forgejo.lucas.icu/valkey-reset-done=restore/<that uid>` and no `valkey-reset`. All three Valkey pods get new uids, and the new `ha17-valkey-0`'s `config` log says `starting as the primary`. `deploy ha17` keeps `spec.replicas` 0 until a Valkey pod is Ready again (WATCH-WORKLOAD shows no server pod before that).
+4. **H7.3 migration hold**: during `ScalingUp`, `kubectl -n e2e-ha get deploy ha17 -o jsonpath='{.metadata.annotations.forgejo\.lucas\.icu/migration-hold} {.spec.replicas} {.spec.strategy.type}'` → `ha17-restore 1 Recreate`, and `sts ha17-cron` has 0 replicas.
+5. **H7.4 back to HA**: within 10 min the restore is `Completed`, `ha17` `3/3`, `ha17-cron` `1/1`, `fj ha17` `Running`/`Ready=True`.
+6. **H7.5 data**: `GET $B/api/v1/repos/$U/after-backup` → 404; `restore-me` has `r.txt`; `demo` has `http.txt`. VALKEY(ha17, <master>, `-n 2 exists e2e:after-backup`) → `0`. CRON-COUNTS(ha17) after 70 s: server pods `total 0`, the cron pod's `archive_cleanup` ≥ 1. The number of `ValkeyFailedOver` events of `ha17` is the one recorded in H7.1, and `ValkeyReady` is `True/Available`.
 
 ## H8 — One replica without HA (`solo`)
 
@@ -185,11 +187,12 @@ Apply `ha15`: the manifest of H1 with `name: ha15` and `image: codeberg.org/forg
 
 ## H10 — Turning HA off
 
-On `ha15`: LOGIN(ha15, `$W/jar15`), SESSION-OK → 200. Then `kubectl -n e2e-ha patch fj ha15 --type merge -p '{"spec":{"replicas":1,"highAvailability":{"enabled":false}}}'`.
+On `ha15`: LOGIN(ha15, `$W/jar15`), SESSION-OK → 200. If MASTER(ha15) is `ha15-valkey-0`, move the primary first: `kubectl -n e2e-ha delete pod ha15-valkey-0 --wait=false`, and wait until `status.highAvailability.valkey.master` names another pod and `ValkeyReady` is `True/Available` (≤ 2 min); record that primary and the count of `ValkeyFailedOver` events of `ha15`. Then `kubectl -n e2e-ha patch fj ha15 --type merge -p '{"spec":{"replicas":1,"highAvailability":{"enabled":false}}}'`.
 
 1. **H10.1 cron runner removed**: within 1 min `sts ha15-cron` is NotFound and an event `CronRunnerDeleted` exists; `ha15-config` has only `app.ini`.
 2. **H10.2 Valkey removed after the soak**: `ValkeyRetained` events appear first (the non-HA app.ini must run healthy for a minute and become the last known good one); within 5 min `kubectl -n e2e-ha get sts,svc,pdb ha15-valkey` are all NotFound and an event `ValkeyDeleted` exists; `status.highAvailability` and the `ValkeyReady` condition are gone; `ha15` is `1/1`, `Recreate`, `Ready=True`.
 3. **H10.3 session and cron**: SESSION-OK(`$W/jar15`) → `200` (sessions are in the database); CRON-COUNTS(ha15) after 70 s: the single pod `scheduled` ≥ 10.
+4. **H10.4 on again is no failover**: `kubectl -n e2e-ha patch fj ha15 --type merge -p '{"spec":{"highAvailability":{"enabled":true}}}'` (same operator process). Within 8 min `ha15` is `Running`/`Ready=True` with `ha15-valkey` `3/3`, `status.highAvailability.valkey.master` is `ha15-valkey-0` (a new group), `lastFailoverTime` is absent, and 2 min later the count of `ValkeyFailedOver` events of `ha15` is still the one recorded before H10.1.
 
 ## H12 — At most one cron runner (`ha17`, after H7)
 
@@ -197,6 +200,43 @@ On `ha15`: LOGIN(ha15, `$W/jar15`), SESSION-OK → 200. Then `kubectl -n e2e-ha 
 2. **H12.2 a pod that does not go away blocks the replacement**: `kubectl -n e2e-ha patch pod ha17-cron-0 --type merge -p '{"metadata":{"finalizers":["e2e.example.com/hold"]}}'`, then `kubectl -n e2e-ha delete pod ha17-cron-0 --wait=false` at T2 (simulates a pod whose deletion never completes, as on a lost node). For 3 min: the old pod object stays (deletionTimestamp set), no other cron pod is created, `status.highAvailability.cronRunner` is empty and `cronRunnerReady` false. Within 4 min of T2 a Warning event `CronRunnerStuck` names `ha17-cron-0` and contains `delete pod ha17-cron-0 --force --grace-period=0`.
 3. **H12.3 recovery**: `kubectl -n e2e-ha patch pod ha17-cron-0 --type json -p '[{"op":"remove","path":"/metadata/finalizers"}]'`. Within 3 min a new `ha17-cron-0` (another uid) is Running and Ready, `cronRunnerReady: true`; the sampler of H12.1 (still running) never saw two cron pods. CRON-COUNTS(ha17) after 70 s: the cron pod `archive_cleanup` ≥ 1, server pods `total 0`.
 
+## H13 — Changing the Valkey password (`ha17`, after H12)
+
+1. **H13.1 a new password empties Valkey**: record the uids of the three `ha17-valkey-*` pods and the count of `ValkeyFailedOver` events of `ha17`. `kubectl -n e2e-ha patch secret ha17-secrets --type json -p '[{"op":"remove","path":"/data/valkey-password"}]'` at T3. Within 30 s: a new `valkey-password` exists (do not print it), an event `ValkeyPasswordGenerated`, and a Normal event `ValkeyReset` that names the Valkey password; `sts ha17-valkey` has `spec.replicas` 0 and annotation `forgejo.lucas.icu/valkey-reset=password`, and its template annotation `forgejo.lucas.icu/valkey-password-hash` changed.
+2. **H13.2 recovery**: within 6 min of T3: `sts ha17-valkey` `3/3` (all three pods have new uids and no pod is stuck NotReady), `ValkeyReady=True/Available`, `ha17` `3/3`, `ha17-cron` `1/1`, `fj ha17` `Ready=True`, `curl -s $B/api/healthz` `pass` with `cache:ping` `pass`; the decoded `app.ini` of `ha17-config` carries the new password in its `[cache] HOST` (compare `sha256sum` of the password and of the value between `redis+sentinel://:` and `@`, without printing either). The count of `ValkeyFailedOver` events is unchanged. H3.5 still holds with the new password.
+
+## H14 — A cron runner pod that cannot start (`ha17`, after H13)
+
+The fault is injected with a MutatingAdmissionPolicy that puts a scheduling gate on new cron runner pods of `ha17`, so that such a pod stays `Pending` (`SchedulingGated`) without any container:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata: {name: e2e-ha-gate-cron}
+spec:
+  matchConstraints:
+    namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: e2e-ha}}
+    resourceRules: [{apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}]
+  matchConditions:
+    - name: cron-of-ha17
+      expression: "has(object.metadata.labels) && 'app.kubernetes.io/instance' in object.metadata.labels && object.metadata.labels['app.kubernetes.io/instance'] == 'ha17' && 'app.kubernetes.io/component' in object.metadata.labels && object.metadata.labels['app.kubernetes.io/component'] == 'cron'"
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: "Object{spec: Object.spec{schedulingGates: [Object.spec.schedulingGates{name: 'e2e.example.com/hold'}]}}"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata: {name: e2e-ha-gate-cron}
+spec: {policyName: e2e-ha-gate-cron}
+```
+
+1. **H14.1 the runner cannot start**: apply both objects and wait 15 s (the API server picks policies up asynchronously; the same holds for their deletion in H14.3), then change the config so that every pod is replaced: `kubectl -n e2e-ha patch fj ha17 --type merge -p '{"spec":{"config":{"ui":{"EXPLORE_PAGING_NUM":"21"}}}}'` at T4. Within 5 min `ha17` is `3/3` on the new `forgejo.lucas.icu/config-hash` (H), while `ha17-cron-0` is `Pending` with condition `PodScheduled=False/SchedulingGated` and no container status; `cronRunnerReady` is false.
+2. **H14.2 the last known good config is recorded without it**: within 8 min of T4 (5 min after the cron pod was created, plus the minute of soak) `status.autoPilot.lastKnownGoodConfigHash` is H and an event `LastKnownGoodConfig` says `ran healthy by the server pods (the cron runner's pod has not started for 5m0s)`; `ha17-config-lkg` has annotation `forgejo.lucas.icu/config-hash` H.
+3. **H14.3 recovery**: delete both admission objects, wait 15 s, and `kubectl -n e2e-ha delete pod ha17-cron-0`. Within 3 min `ha17-cron-0` is Running and Ready on H, `cronRunnerReady: true`. Then remove the config change (`kubectl -n e2e-ha patch fj ha17 --type json -p '[{"op":"remove","path":"/spec/config/ui"}]'`) and wait for `3/3` and `1/1`.
+
 ## H11 — Cleanup
 
-1. **H11.1**: `kubectl delete namespace e2e-ha` and wait until it is gone (timeout 10 min). Remove `$W`.
+1. **H11.1**: `kubectl delete mutatingadmissionpolicybinding,mutatingadmissionpolicy e2e-ha-gate-cron --ignore-not-found`; `kubectl delete namespace e2e-ha` and wait until it is gone (timeout 10 min). Remove `$W`.

@@ -51,12 +51,14 @@ type ruleSpec struct {
 }
 
 type ruleGroup struct {
-	Name  string `json:"name"`
-	Rules []rule `json:"rules"`
+	Name     string `json:"name"`
+	Interval string `json:"interval,omitempty"`
+	Rules    []rule `json:"rules"`
 }
 
 type rule struct {
-	Alert       string            `json:"alert"`
+	Record      string            `json:"record,omitempty"`
+	Alert       string            `json:"alert,omitempty"`
 	Expr        string            `json:"expr"`
 	For         string            `json:"for,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
@@ -103,7 +105,19 @@ func serviceMonitorSpec(f *forgejov1.Forgejo) (*smSpec, error) {
 // install does not scrape. ForgejoOperatorMetricsMissing reports that, and absent()-based
 // alerts only fire while the instance's operator metrics are present, so a scrape gap is
 // not mistaken for a missing backup.
-func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
+//
+// Every alert links its runbook (runbook_url, docs/runbooks/<AlertName>.md). The SLO
+// recording rules and burn-rate alerts are in groups of their own (see sloGroups).
+func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) (*ruleSpec, error) {
+	s, err := sloOf(f)
+	if err != nil {
+		return nil, err
+	}
+	if b := f.Spec.Monitoring.RunbookBaseURL; b != "" {
+		if err := ValidateRunbookBaseURL(b); err != nil {
+			return nil, fmt.Errorf("spec.monitoring.runbookBaseURL: %w", err)
+		}
+	}
 	op := fmt.Sprintf(`namespace=%q, name=%q`, f.Namespace, f.Name)
 	job := fmt.Sprintf(`namespace=%q, job=%q`, f.Namespace, forgejo.HTTPServiceName(f))
 	// Phases in which Forgejo is expected to be unavailable.
@@ -119,11 +133,11 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 			Expr:  expr,
 			For:   forDur,
 			Labels: map[string]string{
-				"severity":  severity,
-				"namespace": f.Namespace,
-				"forgejo":   f.Name,
+				"severity":     severity,
+				labelNamespace: f.Namespace,
+				"forgejo":      f.Name,
 			},
-			Annotations: map[string]string{"summary": summary, "description": description},
+			Annotations: map[string]string{"summary": summary, "description": description, "runbook_url": runbookURL(f, alert)},
 		})
 	}
 
@@ -188,19 +202,22 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 			"-l forgejo.lucas.icu/instance=%s` and inspect the failed backup's status and Job logs "+
 			"(database reachability, space on the %s PVC).", kc, f.Name, forgejo.BackupPVCName(f)))
 
+	// The recovery point objective (RPO) is two intervals of the backup schedule: a missed
+	// run is tolerated, a second one is not.
 	if f.Spec.Backup.Enabled {
-		maxAge := backupMaxAge(f)
+		rpo := model.Duration(backupRPO(f))
 		last := fmt.Sprintf(`forgejo_operator_backup_last_success_timestamp_seconds{%s}`, op)
-		desc := fmt.Sprintf("Scheduled backups (%q) should have produced a successful backup within %s. "+
-			"Check status.backup and the BackupHealthy condition of `kubectl describe fj %s %s`, and the "+
-			"most recent ForgejoBackups.", f.Spec.Backup.Schedule, model.Duration(maxAge), f.Name, kc)
-		add("ForgejoBackupTooOld", "warning", "10m",
-			fmt.Sprintf(`time() - max(%s) > %d`, last, int64(maxAge.Seconds())),
-			fmt.Sprintf("The last successful backup of Forgejo %s is too old", ref), desc)
-		// No success recorded at all: only alert once a full period has passed without data,
+		desc := fmt.Sprintf("Scheduled backups (%q) must keep the last successful backup younger than the recovery point "+
+			"objective of %s (two schedule intervals). Check status.backup and the BackupHealthy condition of "+
+			"`kubectl describe fj %s %s`, and the most recent ForgejoBackups (`kubectl get fjb %s -l "+
+			"forgejo.lucas.icu/instance=%s`).", f.Spec.Backup.Schedule, rpo, f.Name, kc, kc, f.Name)
+		add("ForgejoBackupTooOld", "warning", "5m",
+			fmt.Sprintf(`time() - max(%s) > %d`, last, int64(time.Duration(rpo).Seconds())),
+			fmt.Sprintf("The last successful backup of Forgejo %s is older than its RPO of %s", ref, rpo), desc)
+		// No success recorded at all: only alert once a full RPO has passed without data,
 		// and only while the instance's operator metrics are scraped at all (otherwise
 		// ForgejoOperatorMetricsMissing fires).
-		add("ForgejoBackupMissing", "warning", model.Duration(maxAge).String(),
+		add("ForgejoBackupMissing", "warning", rpo.String(),
 			fmt.Sprintf(`absent(%s) and on() count(%s) > 0`, last, ready),
 			fmt.Sprintf("Forgejo %s has no successful backup", ref), desc)
 	}
@@ -214,14 +231,16 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 				"forgejo.lucas.icu/instance=%s -o wide`) and the BackupUploadFailed events name the cause (credentials, "+
 				"key Secret, bucket reachability).", forgejo.BackupPVCName(f), kc, f.Name))
 		if f.Spec.Backup.Enabled {
-			maxAge := backupMaxAge(f)
+			rpo := model.Duration(backupRPO(f))
 			last := fmt.Sprintf(`forgejo_operator_backup_last_upload_success_timestamp_seconds{%s}`, op)
-			desc := fmt.Sprintf("Scheduled backups should have been uploaded to spec.backup.remote within %s. Check "+
-				"status.backup.remote and the BackupHealthy condition of `kubectl describe fj %s %s`.", model.Duration(maxAge), f.Name, kc)
-			add("ForgejoBackupUploadTooOld", "warning", "10m",
-				fmt.Sprintf(`time() - max(%s) > %d`, last, int64(maxAge.Seconds())),
-				fmt.Sprintf("The last off-cluster backup of Forgejo %s is too old", ref), desc)
-			add("ForgejoBackupUploadMissing", "warning", model.Duration(maxAge).String(),
+			desc := fmt.Sprintf("The off-cluster copy is the recovery point of a disaster recovery: the last backup uploaded "+
+				"to spec.backup.remote must be younger than the recovery point objective of %s (two intervals of %q). Check "+
+				"status.backup.remote and the BackupHealthy condition of `kubectl describe fj %s %s`.", rpo,
+				f.Spec.Backup.Schedule, f.Name, kc)
+			add("ForgejoBackupUploadTooOld", "warning", "5m",
+				fmt.Sprintf(`time() - max(%s) > %d`, last, int64(time.Duration(rpo).Seconds())),
+				fmt.Sprintf("The last off-cluster backup of Forgejo %s is older than its RPO of %s", ref, rpo), desc)
+			add("ForgejoBackupUploadMissing", "warning", rpo.String(),
 				fmt.Sprintf(`absent(%s) and on() count(%s) > 0`, last, ready),
 				fmt.Sprintf("Forgejo %s has no off-cluster backup", ref), desc)
 		}
@@ -306,7 +325,9 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) *ruleSpec {
 			"expansion) were taken in the last hour, which usually hides a persistent problem. See "+
 			"status.autoPilot.recentActions of `kubectl get fj %s %s -o yaml` and the events.", f.Name, kc))
 
-	return &ruleSpec{Groups: []ruleGroup{{Name: "forgejo." + f.Namespace + "." + f.Name, Rules: rules}}}
+	groups := append([]ruleGroup{{Name: "forgejo." + f.Namespace + "." + f.Name, Rules: rules}},
+		sloGroups(f, s, op, ref, kc)...)
+	return &ruleSpec{Groups: groups}, nil
 }
 
 // recentlyIncreased is true when the counter grew within window. A counter series is
@@ -316,11 +337,11 @@ func recentlyIncreased(sel, window string) string {
 	return fmt.Sprintf(`sum by (namespace, name) (increase(%[1]s[%[2]s]) > 0 or (%[1]s unless %[1]s offset %[2]s)) > 0`, sel, window)
 }
 
-// backupMaxAge is the tolerated age of the last successful backup: the longest gap
-// between two scheduled runs plus half of it (at least one hour) of slack. The gap is
-// taken over a fixed reference window so the rendered rule is stable, and falls back to
-// a day for unparsable schedules.
-func backupMaxAge(f *forgejov1.Forgejo) time.Duration {
+// backupRPO is the recovery point objective of the instance: twice the longest gap
+// between two scheduled runs, so one missed or failed run is tolerated. The gap is taken
+// over a fixed reference window so the rendered rule is stable, and falls back to a day
+// for unparsable schedules.
+func backupRPO(f *forgejov1.Forgejo) time.Duration {
 	period := 24 * time.Hour
 	if sched, err := cron.ParseStandard(f.Spec.Backup.Schedule); err == nil {
 		ref := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
@@ -338,7 +359,7 @@ func backupMaxAge(f *forgejov1.Forgejo) time.Duration {
 			period = gap
 		}
 	}
-	return (period + max(period/2, time.Hour)).Round(time.Minute)
+	return (2 * period).Round(time.Minute)
 }
 
 // dashboardUID is a stable Grafana uid (max 40 chars) for the instance.

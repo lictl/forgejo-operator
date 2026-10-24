@@ -63,6 +63,18 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
+# Official Prometheus image whose promtool checks and unit-tests the alerting rules. Pass e.g.
+# CONTAINER_TOOL="docker --context <name>" when the default Docker context has no daemon.
+PROMETHEUS_IMAGE ?= prom/prometheus:v3.15.0
+PROMTOOL = $(CONTAINER_TOOL) run --rm -v "$(CURDIR)/test/prometheus:/work:ro" -w /work --entrypoint promtool $(PROMETHEUS_IMAGE)
+
+.PHONY: test-rules
+test-rules: ## Render the PrometheusRules to test/prometheus, then run promtool check rules and test rules on them (docker).
+	go test ./internal/observability/ -run 'TestPrometheusRuleFiles' -count=1 -args -update-rules
+	go test ./internal/observability/ -run 'TestPrometheusRuleFiles|TestEveryAlertHasARunbook|TestEveryAlertIsUnitTested' -count=1
+	$(PROMTOOL) check rules $(patsubst test/prometheus/%,%,$(wildcard test/prometheus/rules/*.yaml test/prometheus/unit-rules/*.yaml))
+	$(PROMTOOL) test rules $(patsubst test/prometheus/%,%,$(wildcard test/prometheus/*_test.yaml))
+
 .PHONY: forgejo-versions
 forgejo-versions: ## Compare the Forgejo version table with upstream releases; fails when it is stale (docs/versions.md).
 	go run ./hack/forgejo-versions

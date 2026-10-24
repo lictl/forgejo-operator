@@ -102,6 +102,32 @@ func TestReconcileStatusVerifiesImageOnlyWithAvailablePods(t *testing.T) {
 	}
 }
 
+// A restore in progress is phase Restoring; a hold that only a person ends (a failed restore
+// that changed the instance) is Degraded, so that ForgejoDown and ForgejoNotReady fire.
+func TestReconcileStatusHeldMaintenanceIsDegraded(t *testing.T) {
+	ctx := context.Background()
+	f := testInstance()
+	dep := statusDeployment(f, img16, 0, appsv1.DeploymentStatus{})
+	rc := testContext(t, f, dep)
+	rc.TargetImage = img16
+	rc.Maintenance, rc.MaintenanceReason = true, "ForgejoRestore r1 is restoring backup b1"
+	if _, err := ReconcileStatus(ctx, rc); err != nil {
+		t.Fatal(err)
+	}
+	if f.Status.Phase != forgejov1.PhaseRestoring {
+		t.Fatalf("restore in progress: phase %s, want Restoring", f.Status.Phase)
+	}
+	rc.MaintenanceHeld, rc.MaintenanceReason = true, "ForgejoRestore r1 failed after it changed the instance"
+	if _, err := ReconcileStatus(ctx, rc); err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionReady)
+	if f.Status.Phase != forgejov1.PhaseDegraded || ready == nil || ready.Reason != "Maintenance" ||
+		!strings.Contains(ready.Message, "failed after it changed") {
+		t.Fatalf("held: phase %s, Ready %+v; want Degraded and Ready=False/Maintenance", f.Status.Phase, ready)
+	}
+}
+
 // F18: a ReplicaSet that cannot create pods (Pod Security admission) is reported.
 func TestReconcileStatusReportsReplicaFailure(t *testing.T) {
 	ctx := context.Background()

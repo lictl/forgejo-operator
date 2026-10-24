@@ -1,0 +1,93 @@
+# promtool unit tests of the PrometheusRule of ns/fj with the default objective (99.5% over
+# 30 days) and spec.autoPilot.selfHealing.healthCheckInterval 10m: one availability sample
+# every 10 minutes, scraped every minute. Every burn-rate window spans at least three samples
+# (30m), so the windows are 1h/30m, 6h/30m, 1d/2h and 3d/6h. Run with `make test-rules`.
+rule_files:
+  - unit-rules/probes.yaml
+evaluation_interval: 1m
+
+tests:
+  # With a 5m short window, which falls between two samples half the time, the page would
+  # resolve and fire again every few minutes.
+  - name: a continuous outage pages without flapping
+    interval: 1m
+    input_series:
+      # Available for 3h, down from 180m to 240m (six samples), available again.
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '1x9 2x9 3x9 4x9 5x9 6x9 7x9 8x9 9x9 10x9 11x9 12x9 13x9 14x9 15x9 16x9 17x9 18x9 18x59 19x9 20x9 21x9 22x9 23x9 24x9 25x9 26x9 27x9 28x9'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x179 1x9 2x9 3x9 4x9 5x9 6x9 6x99'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="true"}'
+        values: '0x339'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="true"}'
+        values: '0x339'
+    alert_rule_test:
+      - {eval_time: 175m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 175m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+      # Right after the first failed sample, and just before the second one.
+      - eval_time: 181m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1h, short: 30m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 1h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      - eval_time: 189m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1h, short: 30m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 1h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      - eval_time: 237m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1h, short: 30m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 1h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 6h, short: 30m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 6x over 6h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      - eval_time: 237m
+        alertname: ForgejoAvailabilitySlowBurn
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1d, short: 2h}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 3x over 1d (slow burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilitySlowBurn.md
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 3d, short: 6h}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 1x over 3d (slow burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilitySlowBurn.md
+      # The 30m short window lets go of the last failed sample (230m) 30 minutes later.
+      - {eval_time: 262m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+    promql_expr_test:
+      # The short window always holds samples: its burn rate is defined and above 14.4 for
+      # every minute of the outage.
+      - expr: count_over_time((forgejo_slo:availability_burn_rate{window="30m"} > 14.4)[59m:1m])
+        eval_time: 239m
+        exp_samples:
+          - labels: '{namespace="ns", name="fj", window="30m"}'
+            value: 59
+
+  # Each sample stands for a whole interval: one failed sample is 10 minutes of downtime, more
+  # than 7.2% of an hour, so it pages until the 30m window has let go of it.
+  - name: one failed sample of a 10-minute interval pages
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '1x9 2x9 3x9 4x9 5x9 6x9 7x9 8x9 9x9 10x9 11x9 12x9 13x9 14x9 15x9 16x9 17x9 18x9 18x9 19x9 20x9 21x9 22x9 23x9 24x9'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x179 1x69'
+    alert_rule_test:
+      - eval_time: 185m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1h, short: 30m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 1h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      - {eval_time: 185m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+      - {eval_time: 212m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}

@@ -297,7 +297,9 @@ type instanceState struct {
 
 	unansweredSince time.Time // start of the current run of unanswered health probes
 
-	valkeyMaster string // the Valkey primary last seen, to notice failovers
+	valkeyMaster string               // the Valkey primary last seen, to notice failovers
+	valkeyGroup  map[string]types.UID // the Valkey pods (name -> UID) when valkeyMaster was seen
+	sentinels    sentinelAnswers      // the last answers of the Sentinels
 }
 
 func (s *instanceState) allow(key string, every time.Duration) bool {

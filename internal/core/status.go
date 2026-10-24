@@ -109,6 +109,10 @@ func setPhase(rc *forgejo.ReconcileContext, ro rollout, ready, replicaFailure bo
 	f := rc.Instance
 	st := &f.Status
 	switch {
+	case rc.MaintenanceHeld:
+		// A failed restore or bootstrap holds the instance at zero until a person acts: an
+		// outage, not a restore in progress (ForgejoDown and ForgejoNotReady are not suppressed).
+		st.Phase = forgejov1.PhaseDegraded
 	case rc.Maintenance:
 		st.Phase = forgejov1.PhaseRestoring
 	case rc.Upgrading:

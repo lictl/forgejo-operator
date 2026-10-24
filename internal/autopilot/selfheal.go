@@ -96,8 +96,11 @@ func reportProbeUnreachable(rc *forgejo.ReconcileContext, st *instanceState, pod
 // business).
 //
 //   - instance level: status.health.consecutiveFailures >= failureThreshold, the latest
-//     probe was not Unreachable and every server container is running → rolling restart
-//     through the restarted-at annotation. The health step counts only probes Forgejo
+//     probe was not Unreachable and every server container of the server pods is running →
+//     rolling restart through the restarted-at annotation (the cron runner follows it). The
+//     probes reach the server pods only (through the Service), so the cron runner's pod has
+//     no say: one that cannot start (unschedulable, waiting for its volume) would otherwise
+//     block the restart. The health step counts only probes Forgejo
 //     answered (failing checks, error pages) or accepted and then left hanging; probes that
 //     never reached Forgejo are reported as Unreachable and reset the streak, and while they
 //     persist with pods Ready the operator cannot reach Forgejo (see trackUnreachable);
@@ -112,7 +115,8 @@ func restartUnhealthy(ctx context.Context, rc *forgejo.ReconcileContext, dep *ap
 	}
 	threshold := failureThreshold(f)
 
-	if h := f.Status.Health; h != nil && h.ConsecutiveFailures >= threshold && !probeUnanswered(f) && allRunning(pods) {
+	web := podsOf(pods, forgejo.ComponentServer)
+	if h := f.Status.Health; h != nil && h.ConsecutiveFailures >= threshold && !probeUnanswered(f) && len(web) > 0 && allRunning(web) {
 		patch := client.MergeFrom(dep.DeepCopy())
 		if dep.Spec.Template.Annotations == nil {
 			dep.Spec.Template.Annotations = map[string]string{}

@@ -47,6 +47,7 @@ import (
 	"github.com/lictl/forgejo-operator/internal/autopilot"
 	"github.com/lictl/forgejo-operator/internal/controller"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
+	"github.com/lictl/forgejo-operator/internal/observability"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -79,6 +80,10 @@ func main() {
 	flag.StringVar(&forgejo.ClusterDomain, "cluster-domain", forgejo.ClusterDomain,
 		"DNS domain of the cluster used for in-cluster Service names "+
 			"(default: CLUSTER_DOMAIN, the pod's resolv.conf, or cluster.local).")
+	flag.StringVar(&observability.RunbookBaseURL, "runbook-base-url", observability.RunbookBaseURL,
+		"Base URL of the runbooks the generated alerts link (runbook_url is <base>/<AlertName>.md); "+
+			"spec.monitoring.runbookBaseURL overrides it per instance (default: RUNBOOK_BASE_URL, or the docs/runbooks "+
+			"directory of the operator's repository).")
 	flag.StringVar(&watchNamespaces, "watch-namespace", os.Getenv("WATCH_NAMESPACE"),
 		"Comma-separated namespaces to watch. Empty watches all namespaces.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -104,6 +109,11 @@ func main() {
 	// Events rejected because their namespace is being deleted are logged at V(1), not as
 	// errors (see forgejo.QuietTerminatingNamespaces).
 	ctrl.SetLogger(forgejo.QuietTerminatingNamespaces(zap.New(zap.UseFlagOptions(&opts))))
+
+	if err := observability.ValidateRunbookBaseURL(observability.RunbookBaseURL); err != nil {
+		setupLog.Error(err, "Invalid --runbook-base-url (RUNBOOK_BASE_URL)")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will

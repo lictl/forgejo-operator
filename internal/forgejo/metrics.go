@@ -37,6 +37,15 @@ var (
 		Help: "Health probes that never reached Forgejo (DNS, dial, reset, proxy replies); not counted as failures.",
 	}, []string{labelNamespace, labelName})
 
+	// AvailabilityProbes is the availability SLI: one sample per health-check interval,
+	// also while no pod is Ready (see observability.sampleAvailability).
+	AvailabilityProbes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "forgejo_operator_availability_probes_total",
+		Help: "Availability samples, one per health-check interval: result is up (/api/healthz passed) or down " +
+			"(failed, unreachable, or no Ready pod while replicas are desired); planned is true during restores, " +
+			"orchestrated upgrades, spec.paused, zero desired replicas and before the instance was first available.",
+	}, []string{labelNamespace, labelName, labelResult, "planned"})
+
 	BackupLastSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "forgejo_operator_backup_last_success_timestamp_seconds",
 		Help: "Unix time of the last successful backup.",
@@ -132,7 +141,7 @@ var (
 
 func init() {
 	metrics.Registry.MustRegister(
-		InstanceReady, InstanceInfo, HealthCheckFailures, HealthCheckUnreachable,
+		InstanceReady, InstanceInfo, HealthCheckFailures, HealthCheckUnreachable, AvailabilityProbes,
 		BackupLastSuccess, BackupTotal, BackupDuration, BackupSize, BackupUploadTotal, BackupLastUploadSuccess, RestoreTotal,
 		UpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife, VersionAdvisory,
 		ValkeyMasterAvailable, ValkeyReadyMembers, ValkeyFailovers, CronRunnerReady,
@@ -147,7 +156,7 @@ func DeleteInstanceMetrics(namespace, name string) {
 		CronRunnerReady} {
 		v.DeletePartialMatch(l)
 	}
-	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, BackupTotal, BackupUploadTotal, RestoreTotal, UpgradeTotal,
+	for _, v := range []*prometheus.CounterVec{HealthCheckFailures, HealthCheckUnreachable, AvailabilityProbes, BackupTotal, BackupUploadTotal, RestoreTotal, UpgradeTotal,
 		AutoPilotActions, ValkeyFailovers} {
 		v.DeletePartialMatch(l)
 	}

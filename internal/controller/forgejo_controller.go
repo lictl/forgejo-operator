@@ -378,7 +378,9 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		forgejo.SetInstanceInfo(instance, rc.TargetImage)
 		exportInstanceReady(instance)
 		upgrade.ExportVersionSupport(instance, time.Now())
-		return r.finish(ctx, original, instance, ctrl.Result{}, nil)
+		// Planned availability samples, so the SLI shows the pause instead of a gap.
+		observability.SampleWhilePaused(ctx, rc)
+		return r.finish(ctx, original, instance, ctrl.Result{RequeueAfter: rc.RequeueAfter}, nil)
 	}
 
 	p := runPipeline(ctx, rc, steps)

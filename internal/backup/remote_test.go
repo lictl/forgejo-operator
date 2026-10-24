@@ -582,6 +582,8 @@ func TestMaintenanceHoldsUntilBootstrapRestored(t *testing.T) {
 		done    bool
 		marked  bool
 		hold    bool
+		held    bool // only a person ends the hold
+		failed  string
 		message string
 	}{
 		{name: "no restore yet", hold: true, message: "before Forgejo starts"},
@@ -589,13 +591,17 @@ func TestMaintenanceHoldsUntilBootstrapRestored(t *testing.T) {
 		// Forgejo starts only once the restore is recorded on <name>-secrets (by restore-from).
 		{name: "restored, not yet recorded", phase: forgejov1.RestorePhaseScalingUp, hold: true, message: "recorded on Secret fj-secrets"},
 		{name: "restored and recorded", phase: forgejov1.RestorePhaseScalingUp, marked: true},
-		{name: "restore failed", phase: forgejov1.RestorePhaseFailed, hold: true, message: "Delete it to try again"},
+		{name: "restore failed", phase: forgejov1.RestorePhaseFailed, hold: true, held: true, message: "Delete it to try again"},
+		{name: "target not empty", failed: "spec.restoreFrom was not restored: TargetNotEmpty", hold: true, held: true, message: "TargetNotEmpty"},
 		{name: "completed long ago", done: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := restoreFromInstance(store)
 			if tc.done {
 				f.Status.RestoredFrom = &forgejov1.RestoredFromStatus{Phase: forgejov1.RestoredFromCompleted}
+			}
+			if tc.failed != "" {
+				f.Status.RestoredFrom = &forgejov1.RestoredFromStatus{Phase: forgejov1.RestoredFromFailed, Message: tc.failed}
 			}
 			var objs []client.Object
 			if tc.marked {
@@ -613,8 +619,8 @@ func TestMaintenanceHoldsUntilBootstrapRestored(t *testing.T) {
 			if _, err := ReconcileMaintenance(ctx, rc); err != nil {
 				t.Fatal(err)
 			}
-			if rc.Maintenance != tc.hold || !strings.Contains(rc.MaintenanceReason, tc.message) {
-				t.Errorf("maintenance %t (%q), want %t", rc.Maintenance, rc.MaintenanceReason, tc.hold)
+			if rc.Maintenance != tc.hold || rc.MaintenanceHeld != tc.held || !strings.Contains(rc.MaintenanceReason, tc.message) {
+				t.Errorf("maintenance %t held %t (%q), want %t held %t", rc.Maintenance, rc.MaintenanceHeld, rc.MaintenanceReason, tc.hold, tc.held)
 			}
 		})
 	}

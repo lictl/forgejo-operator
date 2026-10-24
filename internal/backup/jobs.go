@@ -219,10 +219,16 @@ func restoreJob(in JobInput, r *forgejov1.ForgejoRestore, src restoreSteps, rest
 		// Forgejo would trust that the restored database already holds the Secret's admin
 		// password. Removing the marker makes the next pod apply the Secret again. A data
 		// restore brings back the marker that belongs to the restored database instead.
+		// Likewise the LevelDB queues (without highAvailability): their work refers to rows of
+		// the replaced database by ID. A data restore empties the volume, and backups leave the
+		// queues out (DataExcludes); with highAvailability the HA step empties Valkey.
 		volumes = append(volumes, dataVolume(in.Instance, false))
 		steps = append(steps, container(ContainerResetAdminSync, in.ForgejoImage, resetAdminSyncScript,
 			[]corev1.VolumeMount{{Name: volData, MountPath: layout.DataMountPath}},
-			[]corev1.EnvVar{{Name: "ADMIN_SYNC_MARKER", Value: layout.WorkPath + "/" + AdminSyncMarker}}))
+			[]corev1.EnvVar{
+				{Name: "ADMIN_SYNC_MARKER", Value: layout.WorkPath + "/" + AdminSyncMarker},
+				{Name: "QUEUES_DIR", Value: layout.WorkPath + "/queues"},
+			}))
 	}
 
 	last := len(steps) - 1
@@ -527,6 +533,13 @@ if rm -f "$ADMIN_SYNC_MARKER"; then
   echo "removed $ADMIN_SYNC_MARKER; Forgejo sets the admin password from the admin Secret when it starts"
 else
   echo "warning: could not remove $ADMIN_SYNC_MARKER; the admin password is set from the Secret only after the Secret changes" >&2
+fi
+if [ -d "$QUEUES_DIR" ]; then
+  if rm -rf "$QUEUES_DIR"; then
+    echo "removed the queues in $QUEUES_DIR: their work belongs to the replaced database"
+  else
+    echo "warning: could not remove $QUEUES_DIR; queued work of the replaced database may run against the restored one" >&2
+  fi
 fi
 `
 

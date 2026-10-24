@@ -3,6 +3,7 @@ package autopilot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -307,8 +308,25 @@ func TestLastKnownGoodMarksValkeyConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	lkg := &corev1.Secret{}
-	if !found(t, env.rc.Client, f, forgejo.LKGConfigSecretName(f), lkg) || lkg.Annotations[annotationUsesValkey] != valueTrue {
-		t.Fatalf("LKG not marked as using Valkey: %+v", lkg.Annotations)
+	if !found(t, env.rc.Client, f, forgejo.LKGConfigSecretName(f), lkg) || lkg.Annotations[annotationUsesValkey] != valueTrue ||
+		lkg.Annotations[annotationValkeyURL] != valkeyURLDigest(env.rc.ValkeyURL) {
+		t.Fatalf("LKG not marked as using Valkey with this password: %+v", lkg.Annotations)
+	}
+	if strings.Contains(fmt.Sprint(lkg.Annotations), "pw@") {
+		t.Fatalf("LKG annotations reveal the Valkey URL: %+v", lkg.Annotations)
+	}
+
+	// An LKG recorded without the digest gets it on the next pass, although the config is
+	// the same.
+	delete(lkg.Annotations, annotationValkeyURL)
+	if err := env.rc.Client.Update(context.Background(), lkg); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordLastKnownGood(context.Background(), env.rc, dep, nil, pods, false); err != nil {
+		t.Fatal(err)
+	}
+	if !found(t, env.rc.Client, f, forgejo.LKGConfigSecretName(f), lkg) || lkg.Annotations[annotationValkeyURL] != valkeyURLDigest(env.rc.ValkeyURL) {
+		t.Fatalf("LKG digest not added: %+v", lkg.Annotations)
 	}
 }
 

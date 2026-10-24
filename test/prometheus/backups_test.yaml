@@ -1,0 +1,113 @@
+# promtool unit tests of the PrometheusRule of ns/fj with daily backups ("0 3 * * *", so a
+# recovery point objective of 2d) and an availability objective of 99.9% over 28 days, whose
+# burn-rate windows are the SRE workbook's scaled by 28/30. Run with `make test-rules`.
+rule_files:
+  - unit-rules/backups.yaml
+evaluation_interval: 1m
+
+tests:
+  # Backup timestamps are Unix times; promtool's clock starts at 0, so a negative value is a
+  # backup taken before the test started.
+  - name: a backup younger than the RPO
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '1x30'
+      - series: 'forgejo_operator_backup_last_success_timestamp_seconds{namespace="ns", name="fj"}'
+        values: '-86400x30'
+    alert_rule_test:
+      - {eval_time: 20m, alertname: ForgejoBackupTooOld, exp_alerts: []}
+      - {eval_time: 20m, alertname: ForgejoBackupMissing, exp_alerts: []}
+    promql_expr_test:
+      - expr: forgejo_slo:backup_recovery_point_age_seconds
+        eval_time: 20m
+        exp_samples:
+          - labels: 'forgejo_slo:backup_recovery_point_age_seconds{namespace="ns", name="fj", copy="local"}'
+            value: 87600
+      - expr: forgejo_slo:backup_recovery_point_objective_seconds
+        eval_time: 20m
+        exp_samples:
+          - labels: 'forgejo_slo:backup_recovery_point_objective_seconds{namespace="ns", name="fj"}'
+            value: 172800
+
+  - name: the last backup is older than two schedule intervals
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '1x30'
+      - series: 'forgejo_operator_backup_last_success_timestamp_seconds{namespace="ns", name="fj"}'
+        values: '-172800x30'
+    alert_rule_test:
+      # Older than 2d from the first minute on, pending for 5 minutes.
+      - {eval_time: 5m, alertname: ForgejoBackupTooOld, exp_alerts: []}
+      - eval_time: 7m
+        alertname: ForgejoBackupTooOld
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: The last successful backup of Forgejo ns/fj is older than its RPO of 2d
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupTooOld.md
+
+  - name: no successful backup for a whole RPO
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '1x2900'
+    alert_rule_test:
+      - {eval_time: 1d, alertname: ForgejoBackupMissing, exp_alerts: []}
+      - eval_time: 2885m
+        alertname: ForgejoBackupMissing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: Forgejo ns/fj has no successful backup
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupMissing.md
+
+  - name: a scrape gap is not a missing backup
+    interval: 1m
+    input_series:
+      - series: 'up{namespace="ns", job="fj-http", instance="10.0.0.1:3000"}'
+        values: '1x2900'
+    alert_rule_test:
+      - {eval_time: 2885m, alertname: ForgejoBackupMissing, exp_alerts: []}
+      - {eval_time: 2885m, alertname: ForgejoBackupTooOld, exp_alerts: []}
+
+  # Budget 0.1%: windows 56m/5m (14.4x), 5h36m/28m (6x), 22h24m/1h52m (3x), 2d19h12m/5h36m (1x).
+  - name: the burn-rate windows scale with the SLO window
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0+2x180 360x30'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x180 2+2x29'
+    alert_rule_test:
+      - {eval_time: 180m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 180m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+      - eval_time: 190m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 56m, short: 5m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 56m (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 5h36m, short: 28m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 6x over 5h36m (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      - eval_time: 190m
+        alertname: ForgejoAvailabilitySlowBurn
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 22h24m, short: 1h52m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 3x over 22h24m (slow burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilitySlowBurn.md
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 2d19h12m, short: 5h36m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 1x over 2d19h12m (slow burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilitySlowBurn.md
+    promql_expr_test:
+      - expr: forgejo_slo:availability_objective
+        eval_time: 190m
+        exp_samples:
+          - labels: 'forgejo_slo:availability_objective{namespace="ns", name="fj", window="28d"}'
+            value: 0.999

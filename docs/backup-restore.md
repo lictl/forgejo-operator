@@ -294,7 +294,7 @@ spec:
 | `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance (for a remote backup: reads and checks its manifest, see [Restoring a remote backup](#restoring-a-remote-backup)). Fails otherwise. Waits for another restore of the instance to finish, while the Secret of SSH host keys is missing or unusable (`status.ssh.message` of the instance; Forgejo could not start again, see [ssh.md](ssh.md#when-something-is-wrong)), and while the Secrets of `spec.objectStorage` are missing or unusable (`ObjectStorageReady=False/CredentialsUnavailable` or `InvalidSpec`; message `Waiting for spec.objectStorage: ...`): no pod could start without them, and the instance's pipeline would not scale it down. The instance keeps serving meanwhile, and the restore starts once the Secrets are back. A bucket the operator cannot reach does not hold a restore. A restore already in `ScalingDown` when a Secret disappears times out (`ScaleDownTimeout`). |
 | `ScalingDown` | The Forgejo pipeline turns on maintenance mode: `status.backup.activeRestore` is set, the Deployment is scaled to 0, the phase becomes `Restoring` and health checks and autopilot actions are suspended. The restore waits until no Forgejo pod exists, no backup of the instance is running and no Job or pod of another restore of the instance is still running. It fails after 15 minutes if that does not happen, for example because `spec.paused` is set or the reconcile is blocked earlier. |
 | `Restoring` | Job `<restore>-restore` runs (see below); `status.jobStartTime` records when it was created. If its newest pod cannot start within 10 minutes, the Job is stopped and the restore fails. It reports "nothing was changed" only when no earlier pod got past `verify`. Otherwise the failure counts as one that may have changed the instance (see below). A Job that is not found a minute after `jobStartTime` fails the restore with `JobMissing` only after the operator has confirmed with the API server that it is gone. |
-| `ScalingUp` | Maintenance ends and Forgejo is scaled back up. The bootstrap init container runs `forgejo migrate` against the restored database, in a single pod until that pod is available. The restore waits up to 15 minutes for the Deployment to be available. It completes right away when the instance wants no pods (`spec.replicas: 0` without horizontal autoscaling; with an HPA, `minReplicas` applies). |
+| `ScalingUp` | Maintenance ends and Forgejo is scaled back up. With `spec.highAvailability.enabled`, Valkey is emptied first (event `ValkeyReset`): its pods stop together and start again without data, which takes under a minute, and no Forgejo pod starts before one is Ready. Its queues held work created after the backup point, by row ID (webhook deliveries, PR checks, push updates, mirror syncs), which would act on unrelated rows once the restored database hands out those IDs again, and its cache state from after that point. The bootstrap init container runs `forgejo migrate` against the restored database, in a single pod until that pod is available. The restore waits up to 15 minutes for the Deployment to be available. It completes right away when the instance wants no pods (`spec.replicas: 0` without horizontal autoscaling; with an HPA, `minReplicas` applies). |
 | `Completed` / `Failed` | Terminal. The restore Job is deleted (see [Jobs are deleted when they finish](#jobs-are-deleted-when-they-finish)). See below for when a failed restore ends maintenance. |
 
 Each kind has its own Job suffix (`-backup`, `-cleanup`, `-restore`), so a restore may have
@@ -315,7 +315,9 @@ looks at every pod of the Job, not only the newest:
 A failed restore whose `DataModified` is `False` ends maintenance, and Forgejo runs on the
 untouched instance. A failed restore whose `DataModified` is `True` or `Unknown` **keeps
 Forgejo scaled to zero**. Its message, the `Forgejo`'s `Ready=False/Maintenance` condition
-and a `MaintenanceHeld` event say so. The data volume may be empty or half-extracted, and
+and a `MaintenanceHeld` event say so. The phase is `Degraded`, not `Restoring`: this is an
+outage that only a person ends, so `ForgejoDown` and `ForgejoNotReady` fire and the availability
+SLI counts it as unplanned. The data volume may be empty or half-extracted, and
 the database may already hold the backup. The hold ends when one of these happens:
 
 * A new `ForgejoRestore` of the instance gets to `ScalingUp`. This is the usual fix: correct
@@ -374,7 +376,13 @@ Notes:
   migrations only go forward, and an older binary refuses a newer database. The operator
   emits a `NewerBackup` warning event when `status.forgejoImage` of the backup is newer
   than the deployed image.
-* Excluded content (search indexes, queues, caches) is rebuilt after the restore.
+* Excluded content (search indexes, queues, caches) is rebuilt after the restore. No queued
+  work from after the backup point survives a restore: a data restore empties the volume,
+  including `gitea/queues` (the LevelDB queues without HA), a database-only restore removes
+  `gitea/queues` in its `reset-admin-sync` step, and with HA Valkey is emptied before Forgejo
+  starts (see `ScalingUp`). Undelivered webhooks are queued again from the restored database
+  when Forgejo starts. The rollback of a failed upgrade is a restore too, so the older version
+  never consumes queue items that the newer one wrote.
 * `ForgejoRestore` objects carry the finalizer `forgejo.lucas.icu/finalizer`.
   Deleting one stops its Job. The object, and maintenance mode while it is `ScalingDown`
   or `Restoring`, stays until none of the Job's pods can still write. The `restore-data`
@@ -602,8 +610,10 @@ $ kubectl get fjb forgejo-scheduled-202610 -o jsonpath='{.status.remote}'
 * Metrics: `forgejo_operator_backup_uploads_total{reason,result}` and
   `forgejo_operator_backup_last_upload_success_timestamp_seconds`.
 * Alerts: `ForgejoBackupUploadFailed` (an upload failed in the last hour) and, with scheduled
-  backups, `ForgejoBackupUploadTooOld` and `ForgejoBackupUploadMissing`, with the same
-  `maxAge` as the local backup alerts (see [observability.md](observability.md#alerts)).
+  backups, `ForgejoBackupUploadTooOld` and `ForgejoBackupUploadMissing`: the off-cluster copy
+  is the recovery point of a disaster recovery, and it has the same recovery point objective
+  (two schedule intervals) as the local backups (see
+  [observability.md](observability.md#recovery-point-objective)).
 
 ### Remote retention
 
@@ -751,7 +761,7 @@ What the operator does (`status.restoredFrom`, condition `RestoredFromBackup`):
    Retain` from an earlier instance of the same name, so it may hold data the restore would
    replace), or when `<name>-secrets` records the restore of another backup:
    `restoredFrom.phase` is `Failed`, `RestoredFromBackup=False/TargetNotEmpty`, and Forgejo stays
-   scaled down. Remove `spec.restoreFrom` to start the instance on its data, or annotate the
+   scaled down (phase `Degraded`, as for any failed bootstrap). Remove `spec.restoreFrom` to start the instance on its data, or annotate the
    Forgejo with `forgejo.lucas.icu/restore-from-overwrite=true` to restore the backup over
    it.
 4. **Start** (`Completed`): once the restore has restored everything (`ScalingUp`), the operator
@@ -768,7 +778,9 @@ another cluster, while the original instance still uploads, cannot be protected:
 that is not the oldest one kept (a newer upload would then prune it mid-recovery), or rely on
 the bucket's versioning (see [Before a disaster](#before-a-disaster)).
 
-If the `ForgejoRestore` fails, `restoredFrom.phase` is `Failed` and Forgejo stays scaled down.
+If the `ForgejoRestore` fails, `restoredFrom.phase` is `Failed` and Forgejo stays scaled down;
+the phase is then `Degraded` instead of `Restoring`, so `ForgejoDown` and `ForgejoNotReady` alert
+and the availability SLI counts the hold as unplanned.
 Delete `<name>-restore-from` to try again (the operator creates it anew), or remove
 `spec.restoreFrom` to start the instance without the backup. `spec.restoreFrom` can only be set
 when the `Forgejo` is created. **Remove it once `restoredFrom.phase` is `Completed`**, also from

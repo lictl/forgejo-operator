@@ -1,0 +1,134 @@
+# promtool unit tests of the PrometheusRule of ns/fj with hourly backups uploaded off-cluster
+# ("0 * * * *", so a recovery point objective of 2h for both copies) and an availability
+# objective of 99% over one day, whose burn-rate windows reach the 5m floor
+# (5m/5m, 12m/5m, 48m/5m, 2h24m/12m). Run with `make test-rules`.
+rule_files:
+  - unit-rules/remote.yaml
+evaluation_interval: 1m
+
+tests:
+  - name: a failed upload alerts for an hour, also as its first increment
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_backup_uploads_total{namespace="ns", name="fj", reason="Scheduled", result="failed"}'
+        values: '_x10 1x120'
+      - series: 'forgejo_operator_backup_uploads_total{namespace="ns", name="fj", reason="Scheduled", result="succeeded"}'
+        values: '3x130'
+    alert_rule_test:
+      - {eval_time: 5m, alertname: ForgejoBackupUploadFailed, exp_alerts: []}
+      - eval_time: 15m
+        alertname: ForgejoBackupUploadFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: A backup of Forgejo ns/fj was not uploaded off-cluster
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupUploadFailed.md
+      - {eval_time: 80m, alertname: ForgejoBackupUploadFailed, exp_alerts: []}
+
+  - name: the off-cluster copy misses its RPO while the local one is fresh
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '1x30'
+      - series: 'forgejo_operator_backup_last_success_timestamp_seconds{namespace="ns", name="fj"}'
+        values: '-1800x30'
+      - series: 'forgejo_operator_backup_last_upload_success_timestamp_seconds{namespace="ns", name="fj"}'
+        values: '-7200x30'
+    alert_rule_test:
+      - {eval_time: 7m, alertname: ForgejoBackupTooOld, exp_alerts: []}
+      - eval_time: 7m
+        alertname: ForgejoBackupUploadTooOld
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: The last off-cluster backup of Forgejo ns/fj is older than its RPO of 2h
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupUploadTooOld.md
+    promql_expr_test:
+      - expr: forgejo_slo:backup_recovery_point_age_seconds
+        eval_time: 7m
+        exp_samples:
+          - labels: 'forgejo_slo:backup_recovery_point_age_seconds{namespace="ns", name="fj", copy="local"}'
+            value: 2220
+          - labels: 'forgejo_slo:backup_recovery_point_age_seconds{namespace="ns", name="fj", copy="remote"}'
+            value: 7620
+      - expr: forgejo_slo:backup_recovery_point_objective_seconds
+        eval_time: 7m
+        exp_samples:
+          - labels: 'forgejo_slo:backup_recovery_point_objective_seconds{namespace="ns", name="fj"}'
+            value: 7200
+
+  - name: both copies within the RPO
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '1x30'
+      - series: 'forgejo_operator_backup_last_success_timestamp_seconds{namespace="ns", name="fj"}'
+        values: '-1800x30'
+      - series: 'forgejo_operator_backup_last_upload_success_timestamp_seconds{namespace="ns", name="fj"}'
+        values: '-3600x30'
+    alert_rule_test:
+      - {eval_time: 20m, alertname: ForgejoBackupTooOld, exp_alerts: []}
+      - {eval_time: 20m, alertname: ForgejoBackupUploadTooOld, exp_alerts: []}
+      - {eval_time: 20m, alertname: ForgejoBackupUploadMissing, exp_alerts: []}
+
+  - name: local backups but never an upload
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '1x150'
+      # A backup succeeds every minute (the value follows the clock).
+      - series: 'forgejo_operator_backup_last_success_timestamp_seconds{namespace="ns", name="fj"}'
+        values: '0+60x150'
+    alert_rule_test:
+      - {eval_time: 60m, alertname: ForgejoBackupUploadMissing, exp_alerts: []}
+      - {eval_time: 125m, alertname: ForgejoBackupMissing, exp_alerts: []}
+      - eval_time: 125m
+        alertname: ForgejoBackupUploadMissing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: Forgejo ns/fj has no off-cluster backup
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupUploadMissing.md
+
+  # Budget 1%.
+  - name: one failed probe does not alert
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0+2x180 361+2x9'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x180 1x10'
+    alert_rule_test:
+      - {eval_time: 183m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 183m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+
+  - name: an outage with the windows at their floor
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0+2x180 360x30'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x180 2+2x29'
+    alert_rule_test:
+      - eval_time: 190m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 5m, short: 5m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 5m (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 12m, short: 5m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 6x over 12m (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      - eval_time: 190m
+        alertname: ForgejoAvailabilitySlowBurn
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 48m, short: 5m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 3x over 48m (slow burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilitySlowBurn.md
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 2h24m, short: 12m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 1x over 2h24m (slow burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilitySlowBurn.md

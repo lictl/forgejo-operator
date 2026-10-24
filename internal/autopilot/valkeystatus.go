@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
@@ -30,6 +31,17 @@ const (
 	ReasonValkeyNotProvisioned  = "NotProvisioned"
 	valkeyStatusRequeueHealthy  = 30 * time.Second
 	valkeyStatusRequeueDegraded = 10 * time.Second
+)
+
+// The Sentinels are asked at most every sentinelQueryInterval while the Valkey pods stay the
+// same (names, UIDs, IPs, readiness) and the password does too; reconciles in between (an
+// owned Deployment's status during a rollout, another step's requeue) reuse the answers.
+// When none answered although pods are Ready (UnreachableFromOperator, e.g. a NetworkPolicy
+// that drops the operator's packets, which is only reported), they are asked again only after
+// sentinelRetryInterval, so that dial timeouts do not keep the controller's worker busy.
+const (
+	sentinelQueryInterval = 10 * time.Second
+	sentinelRetryInterval = time.Minute
 )
 
 // sentinelAddr is how the operator reaches a pod's Sentinel; tests replace it.
@@ -51,7 +63,9 @@ type sentinelView struct {
 // event when the primary moved. It is a step of its own without prerequisites, so that the
 // report stays current while the database (which the high-availability step waits for) is
 // down. The operator connects to each pod's Sentinel (port 26379); where it cannot, roles
-// are unknown and ValkeyReady follows pod readiness (Unknown/UnreachableFromOperator).
+// are unknown and ValkeyReady follows pod readiness (Unknown/UnreachableFromOperator). The
+// Sentinels' answers are reused between reconciles (sentinelQueryInterval,
+// sentinelRetryInterval) while the pods stay the same; pod readiness is always current.
 func ReportValkey(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	if !f.Spec.HighAvailability.Enabled {
@@ -59,6 +73,11 @@ func ReportValkey(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.St
 		f.Status.HighAvailability = nil
 		forgejo.ValkeyMasterAvailable.DeleteLabelValues(f.Namespace, f.Name)
 		forgejo.ValkeyReadyMembers.DeleteLabelValues(f.Namespace, f.Name)
+		// Valkey created when HA is turned on again is a new replication group.
+		st := stateFor(f)
+		st.mu.Lock()
+		st.valkeyMaster, st.valkeyGroup, st.sentinels = "", nil, sentinelAnswers{}
+		st.mu.Unlock()
 		return forgejo.StepResult{}, nil
 	}
 	if f.Status.HighAvailability == nil {
@@ -70,7 +89,6 @@ func ReportValkey(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.St
 	}
 	vs := ha.Valkey
 	now := metav1.Now()
-	vs.LastCheckTime = &now
 
 	sts := &appsv1.StatefulSet{}
 	err := rc.Client.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.ValkeyName(f)}, sts)
@@ -78,6 +96,7 @@ func ReportValkey(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.St
 		return forgejo.StepResult{}, err
 	}
 	if err != nil || !metav1.IsControlledBy(sts, f) {
+		vs.LastCheckTime = &now
 		vs.Master, vs.Members, vs.Sentinels = "", nil, 0
 		vs.Message = "StatefulSet " + forgejo.ValkeyName(f) + " does not exist yet"
 		if err == nil {
@@ -108,32 +127,114 @@ func ReportValkey(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.St
 	} else if client.IgnoreNotFound(err) != nil {
 		return forgejo.StepResult{}, err
 	}
-	views := querySentinels(ctx, pods, password)
-	r := summarizeValkey(pods, views)
-
 	st := stateFor(f)
+	key := sentinelQueryKey(pods, password)
 	st.mu.Lock()
+	answers := st.sentinels
+	st.mu.Unlock()
+	if !answers.fresh(key, now.Time) {
+		answers = sentinelAnswers{key: key, at: now.Time, views: querySentinels(ctx, pods, password)}
+	}
+	r := summarizeValkey(pods, answers.views)
+	answers.unreachable = r.reason == ReasonValkeyUnreachable
+	at := metav1.NewTime(answers.at)
+	vs.LastCheckTime = &at
+
+	st.mu.Lock()
+	st.sentinels = answers
 	if st.valkeyMaster == "" {
 		// After an operator restart: the primary recorded in status.
 		st.valkeyMaster = vs.Master
 	}
 	vs.Master, vs.Members, vs.Sentinels, vs.Message = r.master, r.members, r.sentinels, r.message
-	if r.master != "" && st.valkeyMaster != "" && r.master != st.valkeyMaster {
-		vs.LastFailoverTime = &now
-		forgejo.ValkeyFailovers.WithLabelValues(f.Namespace, f.Name).Inc()
-		rc.Event(corev1.EventTypeWarning, "ValkeyFailedOver", "HighAvailability",
-			"the Valkey primary moved from %s to %s", st.valkeyMaster, r.master)
-	}
 	if r.master != "" {
-		st.valkeyMaster = r.master
+		if failedOver(st.valkeyMaster, st.valkeyGroup, r.master, pods) {
+			vs.LastFailoverTime = &now
+			forgejo.ValkeyFailovers.WithLabelValues(f.Namespace, f.Name).Inc()
+			rc.Event(corev1.EventTypeWarning, "ValkeyFailedOver", "HighAvailability",
+				"the Valkey primary moved from %s to %s", st.valkeyMaster, r.master)
+		}
+		st.valkeyMaster, st.valkeyGroup = r.master, podUIDs(pods)
 	}
 	st.mu.Unlock()
 
 	setValkeyReady(rc, r.status, r.reason, r.message, r.ready)
-	if r.status == metav1.ConditionTrue && r.reason == ReasonValkeyAvailable {
+	switch {
+	case r.status == metav1.ConditionTrue && r.reason == ReasonValkeyAvailable:
 		return forgejo.StepResult{RequeueAfter: valkeyStatusRequeueHealthy}, nil
+	case answers.unreachable:
+		return forgejo.StepResult{RequeueAfter: max(answers.next().Sub(now.Time), time.Second)}, nil
 	}
 	return forgejo.StepResult{RequeueAfter: valkeyStatusRequeueDegraded}, nil
+}
+
+// sentinelAnswers are the Sentinels' answers of the last query, and what they were asked for.
+type sentinelAnswers struct {
+	key   string // sentinelQueryKey of the query
+	at    time.Time
+	views []sentinelView
+	// unreachable: no Sentinel answered although pods were Ready.
+	unreachable bool
+}
+
+// next is when the Sentinels are asked again while nothing changes.
+func (a sentinelAnswers) next() time.Time {
+	if a.unreachable {
+		return a.at.Add(sentinelRetryInterval)
+	}
+	return a.at.Add(sentinelQueryInterval)
+}
+
+// fresh reports whether the answers can stand in for a query with key at now.
+func (a sentinelAnswers) fresh(key string, now time.Time) bool {
+	return a.key != "" && a.key == key && now.Before(a.next()) && !now.Before(a.at)
+}
+
+// sentinelQueryKey identifies what the Sentinels would be asked: the pods (name, UID, IP,
+// readiness) and a digest of the password.
+func sentinelQueryKey(pods []corev1.Pod, password string) string {
+	var b strings.Builder
+	b.WriteString(passwordDigest(password))
+	for i := range pods {
+		p := &pods[i]
+		fmt.Fprintf(&b, "|%s/%s/%s/%t", p.Name, p.UID, p.Status.PodIP, podIsReady(p))
+	}
+	return b.String()
+}
+
+// podUIDs maps the pods' names to their UIDs.
+func podUIDs(pods []corev1.Pod) map[string]types.UID {
+	m := make(map[string]types.UID, len(pods))
+	for i := range pods {
+		m[pods[i].Name] = pods[i].UID
+	}
+	return m
+}
+
+// failedOver reports whether the primary moved from prev to master within the replication
+// group in which prev was seen; group maps the names of that group's pods to their UIDs (nil
+// after an operator restart, when only status names the previous primary). The Sentinels only
+// promote a replica, a pod of the group. A primary whose pod is not one of them heads a new
+// group whose pods all replaced the old ones (highAvailability turned off and on, the
+// StatefulSet recreated, Valkey emptied after a restore or a password change): its pod 0
+// starts as the primary, which is no failover.
+func failedOver(prev string, group map[string]types.UID, master string, pods []corev1.Pod) bool {
+	if prev == "" || master == prev {
+		return false
+	}
+	if group == nil {
+		return true
+	}
+	uid, member := group[master]
+	if !member {
+		return false
+	}
+	for i := range pods {
+		if pods[i].Name == master {
+			return pods[i].UID == uid
+		}
+	}
+	return true
 }
 
 func setValkeyReady(rc *forgejo.ReconcileContext, status metav1.ConditionStatus, reason, msg string, ready int) {

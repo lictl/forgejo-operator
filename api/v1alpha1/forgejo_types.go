@@ -1127,6 +1127,44 @@ type MonitoringSpec struct {
 	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="must be a positive Go duration such as 30s, 5m or 1h"
 	// +optional
 	StatsInterval *metav1.Duration `json:"statsInterval,omitempty"`
+
+	// slo sets the instance's service level objectives: the availability target and window
+	// that the PrometheusRule's recording rules and burn-rate alerts are built from, and the
+	// dashboard's SLO panels show. See docs/observability.md, "Service level objectives".
+	// +kubebuilder:default={}
+	// +optional
+	SLO SLOSpec `json:"slo,omitempty"`
+
+	// runbookBaseURL is where the runbooks linked from the alerts live: every alert's
+	// runbook_url annotation is "<runbookBaseURL>/<AlertName>.md", and the dashboard links
+	// "<runbookBaseURL>/README.md". Defaults to the operator's --runbook-base-url
+	// (RUNBOOK_BASE_URL), else the runbooks in the operator's repository (docs/runbooks).
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^https?://[^\s?#]+$`
+	// +optional
+	RunbookBaseURL string `json:"runbookBaseURL,omitempty"`
+}
+
+// SLOSpec configures the service level objectives of an instance.
+type SLOSpec struct {
+	// availabilityTarget is the share of the window, in percent, in which Forgejo must be
+	// available: the operator's health probes pass, outside of planned downtime (restores,
+	// orchestrated upgrades, spec.paused, zero replicas). A string such as "99.5" or "99.9"
+	// (quote it in YAML); the error budget is 100 minus it.
+	// +kubebuilder:default="99.5"
+	// +kubebuilder:validation:MaxLength=8
+	// +kubebuilder:validation:Pattern=`^[1-9][0-9]?(\.[0-9]{1,4})?$`
+	// +optional
+	AvailabilityTarget string `json:"availabilityTarget,omitempty"`
+
+	// window is the period the availability target and the error budget apply to, a number
+	// of hours, days or weeks (e.g. 30d, 28d, 4w). The burn-rate alerts' windows scale with
+	// it (1h and 5m for the fastest page at 30d), but never below 5m.
+	// +kubebuilder:default="30d"
+	// +kubebuilder:validation:MaxLength=6
+	// +kubebuilder:validation:Pattern=`^[1-9][0-9]{0,3}(h|d|w)$`
+	// +optional
+	Window string `json:"window,omitempty"`
 }
 
 // PrometheusResourceSpec toggles a monitoring resource and its labels.
@@ -1431,6 +1469,8 @@ type ValkeyStatus struct {
 	// lastFailoverTime is when the operator last saw the primary move to another pod.
 	// +optional
 	LastFailoverTime *metav1.Time `json:"lastFailoverTime,omitempty"`
+	// lastCheckTime is when the operator last asked the Sentinels: at most every 10s while
+	// the Valkey pods stay the same, every minute while none answers.
 	// +optional
 	LastCheckTime *metav1.Time `json:"lastCheckTime,omitempty"`
 	// +optional

@@ -65,6 +65,18 @@ const (
 	valkeyTerminationPeriod = 30
 
 	annotationValkeyPassword = "forgejo.lucas.icu/valkey-password-hash"
+
+	// annotationValkeyReset is set on StatefulSet "<name>-valkey" while the operator empties
+	// Valkey (see planValkeyReset): what it is emptied for (valkeyResetPassword or
+	// valkeyResetRestore + the restore's UID).
+	annotationValkeyReset = "forgejo.lucas.icu/valkey-reset"
+	// annotationValkeyResetDone records the restore Valkey was last emptied for, so that a
+	// restore that is still ScalingUp does not empty it again.
+	annotationValkeyResetDone = "forgejo.lucas.icu/valkey-reset-done"
+	valkeyResetPassword       = "password"
+	valkeyResetRestore        = "restore/"
+	// valkeyResetPoll is how often the HA step looks again while Valkey is emptied.
+	valkeyResetPoll = 2 * time.Second
 )
 
 // ReconcileHA ensures Valkey when highAvailability is enabled and sets rc.ValkeyURL.
@@ -81,7 +93,8 @@ const (
 // only depends on the instance and the password, so every step renders the same app.ini.
 // While no Valkey pod is ready the step stops, so that no pod is rolled onto a dead backend,
 // except in maintenance: a restore keeps Forgejo scaled to zero, and the workload step that
-// scales it down must not wait for Valkey.
+// scales it down must not wait for Valkey. The step stops in the same way while it empties
+// Valkey after a restore or a password change (planValkeyReset).
 func ReconcileHA(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	if !f.Spec.HighAvailability.Enabled {
@@ -125,9 +138,17 @@ func ReconcileHA(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.Ste
 	if err := ensureValkeyService(ctx, rc); err != nil {
 		return forgejo.StepResult{}, err
 	}
-	sts, err := ensureValkeyStatefulSet(ctx, rc, password)
+	reset, err := planValkeyReset(ctx, rc, passwordDigest(password))
 	if err != nil {
 		return forgejo.StepResult{}, err
+	}
+	sts, err := ensureValkeyStatefulSet(ctx, rc, password, reset)
+	if err != nil {
+		return forgejo.StepResult{}, err
+	}
+	if reset.start {
+		rc.Event(corev1.EventTypeNormal, "ValkeyReset", "HighAvailability",
+			"emptying Valkey %s: %s. Its pods stop together and start again without data; Forgejo waits for it", sts.Name, reset.why)
 	}
 	if err := ensureValkeyPDB(ctx, rc); err != nil {
 		return forgejo.StepResult{}, err
@@ -138,6 +159,14 @@ func ReconcileHA(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.Ste
 	defer st.mu.Unlock()
 	if err := checkSharedStorage(ctx, rc, st); err != nil {
 		return forgejo.StepResult{}, err
+	}
+
+	if reset.key != "" && !reset.empty {
+		// Like a Valkey outage: nothing is rolled onto Valkey meanwhile.
+		return forgejo.StepResult{Stop: !rc.Maintenance, RequeueAfter: valkeyResetPoll}, nil
+	}
+	if reset.empty {
+		logger(ctx).Info("Started Valkey again without data", "statefulSet", sts.Name, "reset", reset.key)
 	}
 
 	// Pods are only rolled onto the redis config once Valkey answers, so an outage pauses
@@ -203,6 +232,91 @@ func ensureValkeyPassword(ctx context.Context, rc *forgejo.ReconcileContext, r c
 	}
 	rc.Event(corev1.EventTypeNormal, "ValkeyPasswordGenerated", "HighAvailability", "generated the Valkey password in %s", sec.Name)
 	return pw, nil
+}
+
+// passwordDigest is what the Valkey pod template records of the password it was rendered
+// with (annotationValkeyPassword).
+func passwordDigest(password string) string {
+	sum := sha256.Sum256([]byte(password))
+	return hex.EncodeToString(sum[:8])
+}
+
+// valkeyResetPlan says whether, and why, Valkey is emptied in this pass.
+type valkeyResetPlan struct {
+	// key is what Valkey is emptied for (annotationValkeyReset); "" when it is not.
+	key string
+	// why explains it in the ValkeyReset event.
+	why string
+	// start: this pass begins the reset.
+	start bool
+	// empty: every pod is gone, so this pass starts Valkey again.
+	empty bool
+}
+
+// planValkeyReset decides whether Valkey is emptied: its StatefulSet is scaled to zero, and
+// once every pod is gone, terminating ones included, back to three pods that start as a new,
+// empty replication group (pod 0 the primary). Replacing pods one at a time, as a rolling
+// update does, would keep the data, since each new pod resynchronises from the others. The
+// HA step stops meanwhile, so no Forgejo pod is rolled onto Valkey. Valkey is emptied
+//
+//   - for a restore that has restored its backup (ForgejoRestore in ScalingUp, also the
+//     rollback of a failed upgrade), before any Forgejo pod starts: the queues hold work
+//     created after the backup point (webhook deliveries, PR checks, push updates, mirror
+//     syncs by row ID), which would act on unrelated rows once the restored sequences reissue
+//     those IDs, or, after a rollback, items the newer major wrote; and the cache would serve
+//     state from after that point. Once per restore (annotationValkeyResetDone);
+//   - when the Valkey password in "<name>-secrets" changed: a pod that starts with the new
+//     one can neither ask the old pods' Sentinels for the primary nor replicate from it, so a
+//     rolling update would stall at its first pod, with two pods left on the old password
+//     that the new app.ini cannot use.
+//
+// A reset that has begun is completed even when its reason went away (the restore finished),
+// so that new pods never resynchronise from an old one.
+func planValkeyReset(ctx context.Context, rc *forgejo.ReconcileContext, digest string) (valkeyResetPlan, error) {
+	f := rc.Instance
+	sts := &appsv1.StatefulSet{}
+	if err := rc.Client.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.ValkeyName(f)}, sts); err != nil {
+		// A Valkey that is still to be created starts empty.
+		return valkeyResetPlan{}, client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(sts, f) {
+		return valkeyResetPlan{}, nil
+	}
+	var p valkeyResetPlan
+	rs := rc.ScalingUpRestore
+	switch {
+	case sts.Annotations[annotationValkeyReset] != "":
+		p.key = sts.Annotations[annotationValkeyReset]
+	case sts.Spec.Template.Annotations[annotationValkeyPassword] != digest:
+		p.key, p.start = valkeyResetPassword, true
+		p.why = fmt.Sprintf("the Valkey password (key %s of Secret %s) changed", valkeyPasswordKey, forgejo.SecretsName(f))
+	case rs != nil && sts.Annotations[annotationValkeyResetDone] != valkeyResetRestore+string(rs.UID):
+		p.key, p.start = valkeyResetRestore+string(rs.UID), true
+		p.why = fmt.Sprintf("ForgejoRestore %s restored a backup, and the queues and the cache in Valkey are from after it", rs.Name)
+	}
+	if p.key == "" || p.start {
+		return p, nil
+	}
+	if sts.Status.ObservedGeneration < sts.Generation || sts.Status.Replicas > 0 {
+		return p, nil
+	}
+	// Read live: a pod the cache no longer lists may still be terminating.
+	var r client.Reader = rc.Client
+	if rc.APIReader != nil {
+		r = rc.APIReader
+	}
+	list := &corev1.PodList{}
+	if err := r.List(ctx, list, client.InNamespace(f.Namespace), client.MatchingLabels(valkeySelector(f))); err != nil {
+		return p, err
+	}
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if metav1.IsControlledBy(pod, sts) && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+			return p, nil
+		}
+	}
+	p.empty = true
+	return p, nil
 }
 
 func valkeySelector(f *forgejov1.Forgejo) map[string]string {
@@ -392,7 +506,7 @@ done
 
 // ensureValkeyStatefulSet ensures StatefulSet "<name>-valkey". Fields the API server would
 // default are set explicitly, so an unchanged spec compares equal and causes no update.
-func ensureValkeyStatefulSet(ctx context.Context, rc *forgejo.ReconcileContext, password string) (*appsv1.StatefulSet, error) {
+func ensureValkeyStatefulSet(ctx context.Context, rc *forgejo.ReconcileContext, password string, reset valkeyResetPlan) (*appsv1.StatefulSet, error) {
 	f := rc.Instance
 	image := f.Spec.HighAvailability.Valkey.Image
 	if image == "" {
@@ -404,7 +518,10 @@ func ensureValkeyStatefulSet(ctx context.Context, rc *forgejo.ReconcileContext, 
 		maxmemory = lim.Value() * 8 / 10
 	}
 	scripts := newValkeyScripts(f, maxmemory)
-	sum := sha256.Sum256([]byte(password))
+	replicas := int32(valkeyMembers)
+	if reset.key != "" && !reset.empty {
+		replicas = 0
+	}
 	secretRef := &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 		LocalObjectReference: corev1.LocalObjectReference{Name: forgejo.SecretsName(f)},
 		Key:                  valkeyPasswordKey,
@@ -481,7 +598,16 @@ func ensureValkeyStatefulSet(ctx context.Context, rc *forgejo.ReconcileContext, 
 	_, err := rc.CreateOrUpdate(ctx, sts, true, func() error {
 		exists := sts.ResourceVersion != ""
 		sts.Labels = forgejo.Labels(f, forgejo.ComponentValkey)
-		sts.Spec.Replicas = ptr.To[int32](valkeyMembers)
+		switch {
+		case reset.empty:
+			delete(sts.Annotations, annotationValkeyReset)
+			if strings.HasPrefix(reset.key, valkeyResetRestore) {
+				metav1.SetMetaDataAnnotation(&sts.ObjectMeta, annotationValkeyResetDone, reset.key)
+			}
+		case reset.key != "":
+			metav1.SetMetaDataAnnotation(&sts.ObjectMeta, annotationValkeyReset, reset.key)
+		}
+		sts.Spec.Replicas = ptr.To(replicas)
 		if !exists {
 			sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: valkeySelector(f)}
 			sts.Spec.ServiceName = forgejo.ValkeyName(f)
@@ -501,7 +627,7 @@ func ensureValkeyStatefulSet(ctx context.Context, rc *forgejo.ReconcileContext, 
 
 		t := &sts.Spec.Template
 		t.Labels = forgejo.Labels(f, forgejo.ComponentValkey)
-		t.Annotations = map[string]string{annotationValkeyPassword: hex.EncodeToString(sum[:8])}
+		t.Annotations = map[string]string{annotationValkeyPassword: passwordDigest(password)}
 		ps := &t.Spec
 		ps.RestartPolicy = corev1.RestartPolicyAlways
 		ps.DNSPolicy = corev1.DNSClusterFirst

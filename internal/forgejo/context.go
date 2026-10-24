@@ -69,10 +69,23 @@ type ReconcileContext struct {
 	// restore Job still runs; the workload is scaled to zero.
 	Maintenance       bool
 	MaintenanceReason string
+	// MaintenanceHeld is set with Maintenance when nothing but a person ends it: a failed
+	// restore that changed the instance, or a failed bootstrap of spec.restoreFrom. The phase
+	// is then Degraded rather than Restoring (so ForgejoDown and ForgejoNotReady are not
+	// suppressed), and the availability SLI counts the downtime as unplanned.
+	MaintenanceHeld bool
 	// RestoreMigrating is set by the maintenance step while a restored database waits for
 	// its first pod to migrate it (restore in ScalingUp). The workload runs a single pod with
 	// the Recreate strategy and the HPA is held back until that pod is available.
 	RestoreMigrating bool
+	// RestoreScalingUp is set by the maintenance step while a restore waits for Forgejo to
+	// come back after its Job succeeded (ScalingUp, also when it restored only the data
+	// volume). The availability SLI counts that start-up as planned downtime.
+	RestoreScalingUp bool
+	// ScalingUpRestore is that restore (the newest one, should there be several), or nil. With
+	// highAvailability the HA step empties Valkey for it before any Forgejo pod starts: the
+	// queues and the cache there are from after the restored backup.
+	ScalingUpRestore *forgejov1.ForgejoRestore
 	// TargetImage is the image the workload step must deploy. Set by the upgrade step;
 	// defaults to Status.Image (if set) or the spec image.
 	TargetImage string

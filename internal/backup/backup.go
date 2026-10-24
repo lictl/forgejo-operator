@@ -28,7 +28,8 @@ import (
 // records it in status.backup.activeRestore. The restore controller waits for that
 // acknowledgement and for the server pods to be gone before it touches any data. A failed
 // restore that already changed the database or the data volume keeps the instance in
-// maintenance until it is released (see HoldsMaintenance).
+// maintenance until it is released (see HoldsMaintenance), as does a failed bootstrap of
+// spec.restoreFrom; both set rc.MaintenanceHeld as well.
 func ReconcileMaintenance(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	if Bootstrapping(f) {
@@ -42,6 +43,15 @@ func ReconcileMaintenance(ctx context.Context, rc *forgejo.ReconcileContext) (fo
 	}
 	active, held := MaintenanceRestore(restores)
 	rc.RestoreMigrating = migratingRestore(restores) != nil
+	rc.RestoreScalingUp = slices.ContainsFunc(restores, func(r forgejov1.ForgejoRestore) bool {
+		return r.Status.Phase == forgejov1.RestorePhaseScalingUp
+	})
+	rc.ScalingUpRestore = nil
+	for i := range restores { // oldest first
+		if restores[i].Status.Phase == forgejov1.RestorePhaseScalingUp {
+			rc.ScalingUpRestore = &restores[i]
+		}
+	}
 
 	previous := ""
 	if f.Status.Backup != nil {
@@ -54,14 +64,14 @@ func ReconcileMaintenance(ctx context.Context, rc *forgejo.ReconcileContext) (fo
 		}
 		// spec.restoreFrom: no pod starts before the backup is restored, also before its
 		// ForgejoRestore exists and after it failed.
-		if reason := bootstrapHold(f, restores); reason != "" {
-			rc.Maintenance = true
+		if reason, failed := bootstrapHold(f, restores); reason != "" {
+			rc.Maintenance, rc.MaintenanceHeld = true, failed
 			rc.MaintenanceReason = reason
 		}
 		return forgejo.StepResult{}, nil
 	}
 
-	rc.Maintenance = true
+	rc.Maintenance, rc.MaintenanceHeld = true, held
 	summary(f).ActiveRestore = active.Name
 	if held {
 		rc.MaintenanceReason = fmt.Sprintf("ForgejoRestore %s failed after it changed the instance; fix the cause and run a new restore, "+

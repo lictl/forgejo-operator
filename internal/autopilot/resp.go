@@ -16,8 +16,13 @@ import (
 // (AUTH, SENTINEL GET-MASTER-ADDR-BY-NAME, SENTINEL REPLICAS). The operator writes no data
 // to Valkey and needs no connection pool, so it does not depend on a Redis client library.
 
-// respTimeout bounds one Sentinel conversation (dial, AUTH and the queries).
-const respTimeout = 3 * time.Second
+// respTimeout bounds one Sentinel conversation (dial, AUTH and the queries), dialTimeout the
+// connection: a Sentinel in the cluster accepts within milliseconds, while a NetworkPolicy
+// that drops the packets would otherwise hold the controller's worker for all of respTimeout.
+const (
+	respTimeout = 3 * time.Second
+	dialTimeout = time.Second
+)
 
 // respError is an error reply ("-ERR ...", "-NOAUTH ...").
 type respError string
@@ -34,7 +39,7 @@ type sentinelConn struct {
 func dialSentinel(ctx context.Context, addr, password string) (*sentinelConn, error) {
 	ctx, cancel := context.WithTimeout(ctx, respTimeout)
 	defer cancel()
-	var d net.Dialer
+	d := net.Dialer{Timeout: dialTimeout}
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err

@@ -1,0 +1,490 @@
+# promtool unit tests of the PrometheusRule of a default instance (ns/fj: one replica, no
+# backups, availability objective 99.5% over 30 days). Run with `make test-rules`.
+# Every alert of the operator has at least one firing and one non-firing case in
+# test/prometheus/*_test.yaml (TestEveryAlertIsUnitTested checks that).
+rule_files:
+  - unit-rules/basic.yaml
+evaluation_interval: 1m
+
+tests:
+  - name: a healthy instance raises nothing
+    interval: 1m
+    input_series:
+      - series: 'up{namespace="ns", job="fj-http", instance="10.0.0.1:3000"}'
+        values: '1x240'
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '1x240'
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="codeberg.org/forgejo/forgejo:15", version="15.0.10", phase="Running"}'
+        values: '1x240'
+      - series: 'forgejo_operator_health_check_failures_total{namespace="ns", name="fj"}'
+        values: '0x240'
+      - series: 'forgejo_operator_health_check_unreachable_total{namespace="ns", name="fj"}'
+        values: '0x240'
+      - series: 'forgejo_operator_volume_used_ratio{namespace="ns", name="fj", claim="fj-data"}'
+        values: '0.5x240'
+      - series: 'forgejo_operator_backups_total{namespace="ns", name="fj", reason="Scheduled", result="succeeded"}'
+        values: '0+1x240'
+      - series: 'forgejo_operator_upgrades_total{namespace="ns", name="fj", result="succeeded"}'
+        values: '1x240'
+      - series: 'forgejo_operator_version_supported{namespace="ns", name="fj", major="15", support="Supported"}'
+        values: '1x240'
+      - series: 'forgejo_operator_version_advisory{namespace="ns", name="fj", major="15"}'
+        values: '0x240'
+      - series: 'forgejo_operator_runners_desired{namespace="ns", name="fj", runner="r"}'
+        values: '2x240'
+      - series: 'forgejo_operator_runners_online{namespace="ns", name="fj", runner="r"}'
+        values: '2x240'
+      - series: 'forgejo_operator_runner_jobs_waiting{namespace="ns", name="fj", runner="r"}'
+        values: '4x240'
+      - series: 'forgejo_operator_autopilot_actions_total{namespace="ns", name="fj", action="PodRestarted"}'
+        values: '1x240'
+      # One probe every 30s, all of them passing.
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0+2x240'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x240'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="true"}'
+        values: '0x240'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="true"}'
+        values: '0x240'
+    alert_rule_test:
+      - {eval_time: 4h, alertname: ForgejoDown, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoOperatorMetricsMissing, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoNotReady, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoHealthCheckFailing, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoHealthProbeUnreachable, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoBackupFailed, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoVolumeAlmostFull, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoUpgradeFailed, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoVersionUnsupported, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoVersionAdvisory, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoRunnersOffline, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoAutoPilotActive, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+    promql_expr_test:
+      - expr: forgejo_slo:availability_burn_rate{window="1h"}
+        eval_time: 4h
+        exp_samples:
+          - labels: 'forgejo_slo:availability_burn_rate{namespace="ns", name="fj", window="1h"}'
+            value: 0
+      - expr: forgejo_slo:availability_objective
+        eval_time: 4h
+        exp_samples:
+          - labels: 'forgejo_slo:availability_objective{namespace="ns", name="fj", window="30d"}'
+            value: 0.995
+      - expr: forgejo_slo:availability_error_budget_remaining
+        eval_time: 4h
+        exp_samples:
+          - labels: 'forgejo_slo:availability_error_budget_remaining{namespace="ns", name="fj", window="30d"}'
+            value: 1
+
+  - name: Forgejo is down
+    interval: 1m
+    input_series:
+      - series: 'up{namespace="ns", job="fj-http", instance="10.0.0.1:3000"}'
+        values: '0x20'
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '0x20'
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="i", version="15.0.10", phase="Running"}'
+        values: '1x20'
+    alert_rule_test:
+      # Pending for 5 and 10 minutes.
+      - {eval_time: 4m, alertname: ForgejoDown, exp_alerts: []}
+      - {eval_time: 9m, alertname: ForgejoNotReady, exp_alerts: []}
+      - eval_time: 6m
+        alertname: ForgejoDown
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: Forgejo ns/fj is down
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoDown.md
+      - eval_time: 11m
+        alertname: ForgejoNotReady
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: Forgejo ns/fj has not been Ready for 10 minutes
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoNotReady.md
+
+  - name: no scrape target is down as well
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="i", version="15.0.10", phase="Running"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ForgejoDown
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, job: fj-http}
+            exp_annotations:
+              summary: Forgejo ns/fj is down
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoDown.md
+
+  - name: a restore or a pause is expected downtime
+    interval: 1m
+    input_series:
+      - series: 'up{namespace="ns", job="fj-http", instance="10.0.0.1:3000"}'
+        values: '0x30'
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '0x30'
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="i", version="15.0.10", phase="Restoring"}'
+        values: '1x14 _x16'
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="i", version="15.0.10", phase="Paused"}'
+        values: '_x15 1x15'
+    alert_rule_test:
+      - {eval_time: 12m, alertname: ForgejoDown, exp_alerts: []}
+      - {eval_time: 12m, alertname: ForgejoNotReady, exp_alerts: []}
+      - {eval_time: 28m, alertname: ForgejoDown, exp_alerts: []}
+      - {eval_time: 28m, alertname: ForgejoNotReady, exp_alerts: []}
+
+  - name: operator metrics are missing
+    interval: 1m
+    input_series:
+      - series: 'up{namespace="ns", job="fj-http", instance="10.0.0.1:3000"}'
+        values: '1x20'
+    alert_rule_test:
+      - {eval_time: 14m, alertname: ForgejoOperatorMetricsMissing, exp_alerts: []}
+      - eval_time: 16m
+        alertname: ForgejoOperatorMetricsMissing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: Operator metrics of Forgejo ns/fj are missing
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoOperatorMetricsMissing.md
+
+  - name: health checks fail, or do not reach Forgejo
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_health_check_failures_total{namespace="ns", name="fj"}'
+        values: '0+1x30'
+      - series: 'forgejo_operator_health_check_unreachable_total{namespace="ns", name="fj"}'
+        values: '0+1x30'
+    alert_rule_test:
+      # Unreachable must last 15 minutes.
+      - {eval_time: 10m, alertname: ForgejoHealthProbeUnreachable, exp_alerts: []}
+      - eval_time: 10m
+        alertname: ForgejoHealthCheckFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: Forgejo ns/fj fails its health checks
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoHealthCheckFailing.md
+      - eval_time: 20m
+        alertname: ForgejoHealthProbeUnreachable
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: The operator cannot reach Forgejo ns/fj
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoHealthProbeUnreachable.md
+
+  - name: a failed backup and a failed upgrade alert for an hour, also as their first increment
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_backups_total{namespace="ns", name="fj", reason="Scheduled", result="failed"}'
+        values: '_x10 1x120'
+      - series: 'forgejo_operator_upgrades_total{namespace="ns", name="fj", result="rolledback"}'
+        values: '_x10 1x120'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ForgejoBackupFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: A backup of Forgejo ns/fj failed
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupFailed.md
+      - eval_time: 15m
+        alertname: ForgejoUpgradeFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: An upgrade of Forgejo ns/fj failed
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoUpgradeFailed.md
+      - {eval_time: 80m, alertname: ForgejoBackupFailed, exp_alerts: []}
+      - {eval_time: 80m, alertname: ForgejoUpgradeFailed, exp_alerts: []}
+
+  - name: a volume fills up
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_volume_used_ratio{namespace="ns", name="fj", claim="fj-data"}'
+        values: '0.95x20'
+      - series: 'forgejo_operator_volume_used_ratio{namespace="ns", name="fj", claim="fj-backups"}'
+        values: '0.6x20'
+    alert_rule_test:
+      - {eval_time: 9m, alertname: ForgejoVolumeAlmostFull, exp_alerts: []}
+      - eval_time: 11m
+        alertname: ForgejoVolumeAlmostFull
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, claim: fj-data}
+            exp_annotations:
+              summary: Volume fj-data of Forgejo ns/fj is almost full
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoVolumeAlmostFull.md
+
+  - name: an unsupported version and a patch release with an advisory
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_version_supported{namespace="ns", name="fj", major="16", support="Deprecated"}'
+        values: '0x90'
+      - series: 'forgejo_operator_version_advisory{namespace="ns", name="fj", major="16"}'
+        values: '1x90'
+    alert_rule_test:
+      - {eval_time: 59m, alertname: ForgejoVersionUnsupported, exp_alerts: []}
+      - {eval_time: 59m, alertname: ForgejoVersionAdvisory, exp_alerts: []}
+      - eval_time: 61m
+        alertname: ForgejoVersionUnsupported
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, major: "16", support: Deprecated}
+            exp_annotations:
+              summary: Forgejo ns/fj runs a version outside the operator's support policy (Deprecated)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoVersionUnsupported.md
+      - eval_time: 61m
+        alertname: ForgejoVersionAdvisory
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, major: "16"}
+            exp_annotations:
+              summary: Forgejo ns/fj runs a patch release that an advisory recommends replacing
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoVersionAdvisory.md
+
+  - name: jobs wait while no runner is online
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_runners_desired{namespace="ns", name="fj", runner="docker"}'
+        values: '2x20'
+      - series: 'forgejo_operator_runners_online{namespace="ns", name="fj", runner="docker"}'
+        values: '0x20'
+      - series: 'forgejo_operator_runner_jobs_waiting{namespace="ns", name="fj", runner="docker"}'
+        values: '3x20'
+      # A runner set scaled to zero on purpose does not alert.
+      - series: 'forgejo_operator_runners_desired{namespace="ns", name="fj", runner="idle"}'
+        values: '0x20'
+      - series: 'forgejo_operator_runners_online{namespace="ns", name="fj", runner="idle"}'
+        values: '0x20'
+      - series: 'forgejo_operator_runner_jobs_waiting{namespace="ns", name="fj", runner="idle"}'
+        values: '3x20'
+    alert_rule_test:
+      - {eval_time: 9m, alertname: ForgejoRunnersOffline, exp_alerts: []}
+      - eval_time: 11m
+        alertname: ForgejoRunnersOffline
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, runner: docker}
+            exp_annotations:
+              summary: Jobs wait for ForgejoRunner docker of Forgejo ns/fj, but none of its runners is online
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoRunnersOffline.md
+
+  - name: autopilot keeps intervening
+    interval: 1m
+    input_series:
+      # Three actions an hour, then one every two minutes.
+      - series: 'forgejo_operator_autopilot_actions_total{namespace="ns", name="fj", action="PodRestarted"}'
+        values: '0+0.05x60 3.5+0.5x59'
+    alert_rule_test:
+      - {eval_time: 60m, alertname: ForgejoAutoPilotActive, exp_alerts: []}
+      - eval_time: 90m
+        alertname: ForgejoAutoPilotActive
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj}
+            exp_annotations:
+              summary: The operator keeps intervening on Forgejo ns/fj
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAutoPilotActive.md
+
+  # The SLO: 99.5% over 30 days, error budget 0.5%. Probes every 30s. A burn-rate window
+  # counts at least one sample per 30s, also where it reaches back before the instance's first
+  # sample, so each pair fires once its long window's share of the budget is spent: 1h/5m
+  # after 4.5 minutes of outage, 6h/30m after 11, both slow-burn pairs after 22.
+  - name: an outage burns the error budget fast and slowly
+    interval: 1m
+    input_series:
+      # Available for 3h, then down for the rest.
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0+2x180 360x60'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x180 2+2x59'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="true"}'
+        values: '0x240'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="true"}'
+        values: '0x240'
+    alert_rule_test:
+      - {eval_time: 180m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - eval_time: 188m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1h, short: 5m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 1h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      - {eval_time: 188m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+      - eval_time: 200m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1h, short: 5m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 1h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 6h, short: 30m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 6x over 6h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      - {eval_time: 200m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+      - eval_time: 225m
+        alertname: ForgejoAvailabilitySlowBurn
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1d, short: 2h}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 3x over 1d (slow burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilitySlowBurn.md
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 3d, short: 6h}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 1x over 3d (slow burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilitySlowBurn.md
+    promql_expr_test:
+      # Nothing but failures in the last 5 minutes: 1/0.005.
+      - expr: forgejo_slo:availability_burn_rate{window="5m"}
+        eval_time: 190m
+        exp_samples:
+          - labels: 'forgejo_slo:availability_burn_rate{namespace="ns", name="fj", window="5m"}'
+            value: 200
+
+  - name: a short blip does not page, and recovery ends the page
+    interval: 1m
+    input_series:
+      # 6h40m available, one minute down at 401m, available again; down again 420m-440m.
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0+2x400 800 802+2x18 838x20 840+2x40'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x400 2x19 4+2x19 42x40'
+    alert_rule_test:
+      - {eval_time: 403m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 403m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+      - eval_time: 435m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1h, short: 5m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 1h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 6h, short: 30m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 6x over 6h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      # Available again from 440m: the 5m window clears first, the 30m one 30 minutes later.
+      - eval_time: 450m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 6h, short: 30m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 6x over 6h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+      - {eval_time: 475m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+
+  - name: planned downtime does not burn the error budget
+    interval: 1m
+    input_series:
+      # Available for 3h, then an hour of restore: planned down samples only.
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0+2x180 360x60'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x240'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="true"}'
+        values: '0x240'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="true"}'
+        values: '0x180 2+2x59'
+    alert_rule_test:
+      - {eval_time: 230m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 230m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+    promql_expr_test:
+      - expr: forgejo_slo:availability_burn_rate{window="1h"}
+        eval_time: 230m
+        exp_samples:
+          - labels: 'forgejo_slo:availability_burn_rate{namespace="ns", name="fj", window="1h"}'
+            value: 0
+
+  # Planned samples count as available: after an hour of restore the 1h window still holds
+  # 120 samples, so one failed probe right after it is 1/120 of the window, not 1/10.
+  - name: one failed probe right after planned downtime does not page
+    interval: 1m
+    input_series:
+      # Available for 3h, an hour of restore (planned down samples), one failed probe at 242m,
+      # available again.
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0+2x180 360x60 361+2x60'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x241 1x60'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="true"}'
+        values: '0x302'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="true"}'
+        values: '0x180 2+2x59 120x62'
+    alert_rule_test:
+      - {eval_time: 245m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 245m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+      - {eval_time: 260m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 260m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+
+  - name: an outage right after planned downtime still pages
+    interval: 1m
+    input_series:
+      # Forgejo does not come back after the restore: unplanned down samples from 242m.
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0+2x180 360x80'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x241 1+2x40'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="true"}'
+        values: '0x262'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="true"}'
+        values: '0x180 2+2x59 120x22'
+    alert_rule_test:
+      - {eval_time: 244m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - eval_time: 250m
+        alertname: ForgejoAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj, name: fj, slo: availability, long: 1h, short: 5m}
+            exp_annotations:
+              summary: Forgejo ns/fj burns its availability error budget at 14.4x over 1h (fast burn)
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoAvailabilityFastBurn.md
+
+  # A window that reaches back before the instance's first sample counts one sample per 30s
+  # for the time it did not exist, so the first failed probe of a new instance is not 1/10
+  # of its 1h window.
+  - name: the first failed probe of a new instance does not page
+    interval: 1m
+    input_series:
+      # Installing during the first minute (planned), healthy from 2m, one failed probe at 4m.
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="false"}'
+        values: '0 0 2 4 5 7+2x60'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="false"}'
+        values: '0x3 1x60'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="up", planned="true"}'
+        values: '0x64'
+      - series: 'forgejo_operator_availability_probes_total{namespace="ns", name="fj", result="down", planned="true"}'
+        values: '0 2x63'
+    alert_rule_test:
+      - {eval_time: 6m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 6m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+      - {eval_time: 20m, alertname: ForgejoAvailabilityFastBurn, exp_alerts: []}
+      - {eval_time: 20m, alertname: ForgejoAvailabilitySlowBurn, exp_alerts: []}
+
+  # A failed restore that changed the instance holds it at zero replicas until a person acts:
+  # the operator reports phase Degraded, not Restoring, so the outage alerts fire.
+  - name: a failed restore holding the instance is an outage
+    interval: 1m
+    input_series:
+      - series: 'up{namespace="ns", job="fj-http", instance="10.0.0.1:3000"}'
+        values: '0x20'
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '0x20'
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="i", version="15.0.10", phase="Degraded"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ForgejoDown
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: Forgejo ns/fj is down
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoDown.md
+      - eval_time: 11m
+        alertname: ForgejoNotReady
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: Forgejo ns/fj has not been Ready for 10 minutes
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoNotReady.md

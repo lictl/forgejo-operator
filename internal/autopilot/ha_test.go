@@ -34,6 +34,7 @@ const (
 	testValkeyPassword = "s3cr3tvalkeypassword"
 	testValkeyPod0     = "fj-valkey-0"
 	testValkeyPod1     = "fj-valkey-1"
+	testValkeyPod2     = "fj-valkey-2"
 )
 
 // The Forgejo URL names every Sentinel, the group and both passwords; no database.
@@ -356,16 +357,18 @@ func TestReportValkeyRolesAndFailover(t *testing.T) {
 	for _, s := range sentinels {
 		s.set(host(f, 2), replicaEntry(host(f, 0), "ok", "slave"), replicaEntry(host(f, 1), "ok", "slave"))
 	}
+	expireSentinelAnswers(f)
 	if _, err := ReportValkey(ctx, env.rc); err != nil {
 		t.Fatal(err)
 	}
-	if vs.Master != "fj-valkey-2" || vs.LastFailoverTime == nil || vs.Members[2].Role != forgejov1.ValkeyRoleMaster {
+	if vs.Master != testValkeyPod2 || vs.LastFailoverTime == nil || vs.Members[2].Role != forgejov1.ValkeyRoleMaster {
 		t.Fatalf("after failover %+v", vs)
 	}
 	if evs := env.events(); !hasEvent(evs, "Warning ValkeyFailedOver") {
 		t.Fatalf("no ValkeyFailedOver event: %v", evs)
 	}
 	// Seen once, not again.
+	expireSentinelAnswers(f)
 	if _, err := ReportValkey(ctx, env.rc); err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +391,7 @@ func TestSummarizeValkey(t *testing.T) {
 		}
 		return sentinelView{pod: pod, master: master, replicas: m}
 	}
-	down := sentinelView{pod: "fj-valkey-2", err: fmt.Errorf("refused")}
+	down := sentinelView{pod: testValkeyPod2, err: fmt.Errorf("refused")}
 	for _, tt := range []struct {
 		name   string
 		pods   []corev1.Pod
@@ -603,19 +606,31 @@ func TestCronRunnerOfAnotherOwnerIgnoredByAutopilot(t *testing.T) {
 }
 
 // With highAvailability, an LKG rendered without it (LevelDB queues, cron tasks in every pod)
-// is not rolled back to.
+// is not rolled back to, nor one rendered with a Valkey password that Valkey no longer has.
 func TestLKGWithoutHAUnusableWithHA(t *testing.T) {
 	f := haInstance()
 	env := newTestEnv(t, f)
+	env.rc.ValkeyURL = valkeyURL(f, "new-password")
 	plain := lkgSecret(f, false)
 	if why, err := lkgUnusable(context.Background(), env.rc, plain); err != nil || !strings.Contains(why, "without highAvailability") {
 		t.Fatalf("why = %q, err = %v", why, err)
 	}
 	ha := lkgSecret(f, true)
 	ha.Annotations[annotationUsesValkey] = valueTrue
+	ha.Annotations[annotationValkeyURL] = valkeyURLDigest(env.rc.ValkeyURL)
 	ha.Data[forgejo.ConfigSecretKeyWeb] = []byte("[cron]\nENABLED = false\n")
 	if why, err := lkgUnusable(context.Background(), env.rc, ha); err != nil || why != "" {
 		t.Fatalf("HA LKG: why = %q, err = %v", why, err)
+	}
+	// valkey-password changed after the LKG was recorded: Valkey is emptied and restarted
+	// with the new password only, so the LKG's app.ini could not reach it.
+	ha.Annotations[annotationValkeyURL] = valkeyURLDigest(valkeyURL(f, "old-password"))
+	if why, err := lkgUnusable(context.Background(), env.rc, ha); err != nil || !strings.Contains(why, "another Valkey password") {
+		t.Fatalf("LKG with the old password: why = %q, err = %v", why, err)
+	}
+	delete(ha.Annotations, annotationValkeyURL)
+	if why, err := lkgUnusable(context.Background(), env.rc, ha); err != nil || !strings.Contains(why, "another Valkey password") {
+		t.Fatalf("LKG without a password digest: why = %q, err = %v", why, err)
 	}
 }
 

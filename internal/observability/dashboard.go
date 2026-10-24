@@ -24,13 +24,23 @@ const (
 	dashboardFolder      = "Forgejo"
 )
 
+// renderDashboard fills in the instance. The SLO objective is a threshold, a JSON number:
+// the template holds it as the string "__SLO_OBJECTIVE__", so that the template is valid
+// JSON as well. An SLO the CRD would have refused falls back to the defaults.
 func renderDashboard(f *forgejov1.Forgejo) string {
+	s, err := sloOf(f)
+	if err != nil {
+		s, _ = sloOf(&forgejov1.Forgejo{})
+	}
 	return strings.NewReplacer(
 		"__UID__", dashboardUID(f),
 		"__TITLE__", "Forgejo / "+f.Namespace+"/"+f.Name,
 		"__NAMESPACE__", f.Namespace,
 		"__NAME__", f.Name,
 		"__JOB__", forgejo.HTTPServiceName(f),
+		"__SLO_WINDOW__", s.windowName,
+		`"__SLO_OBJECTIVE__"`, s.objective,
+		"__RUNBOOKS__", runbookBase(f),
 	).Replace(dashboardJSON)
 }
 

@@ -120,6 +120,9 @@ var statsMetrics = map[string]string{
 // reason a probe that never got an answer from Forgejo (DNS, dial or connection-reset
 // errors: a NetworkPolicy or service-mesh mTLS shutting the operator out) is reported as
 // Unreachable and resets the streak instead of extending it.
+//
+// The availability SLI is sampled here as well, once per interval, also while probing is
+// suspended (see recordAvailability): no Ready pod, or maintenance, is a down sample.
 func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	if f.Status.Health == nil {
@@ -129,16 +132,19 @@ func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	// Export the counters from the start so increase() also sees the first increment.
 	forgejo.HealthCheckFailures.WithLabelValues(f.Namespace, f.Name).Add(0)
 	forgejo.HealthCheckUnreachable.WithLabelValues(f.Namespace, f.Name).Add(0)
+	exportAvailability(f)
 	if forgejo.MonitoringEnabled(f) {
 		collectStats(rc)
 	}
 	publishStats(f)
 
+	now := time.Now()
+	interval := healthInterval(f)
 	if rc.Maintenance {
 		skipHealth(rc, ReasonMaintenance, "Health checks are suspended during maintenance: "+rc.MaintenanceReason)
+		rc.Requeue(recordAvailability(rc, false, now, interval))
 		return forgejo.StepResult{}, nil
 	}
-	now := time.Now()
 	ready, settling, err := servingPods(ctx, rc, now)
 	if err != nil {
 		return forgejo.StepResult{}, err
@@ -152,10 +158,11 @@ func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	}
 	if ready == 0 {
 		skipHealth(rc, ReasonNoReadyReplicas, "No Forgejo pod is Ready; health checks resume once one is")
+		// Nothing serves: a down sample, unplanned unless replicas are not desired.
+		rc.Requeue(recordAvailability(rc, false, now, interval))
 		return forgejo.StepResult{}, nil
 	}
 
-	interval := forgejo.DurationOr(f.Spec.AutoPilot.SelfHealing.HealthCheckInterval, defaultHealthInterval)
 	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
 	var last time.Time
 	if h.LastCheckTime != nil {
@@ -176,9 +183,12 @@ func ReconcileHealth(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo
 	res := probeHealthz(ctx, base)
 	if res.unreachable {
 		recordUnreachable(rc, res, metav1.NewTime(now))
+		// Unreachable is down for the SLI: nothing shows that users can reach Forgejo either.
+		recordAvailability(rc, false, now, interval)
 		return forgejo.StepResult{}, nil
 	}
 	recordHealth(rc, res, metav1.NewTime(now))
+	recordAvailability(rc, res.healthy, now, interval)
 	if !res.healthy {
 		return forgejo.StepResult{}, nil
 	}
@@ -242,6 +252,7 @@ func ForgetInstance(namespace, name string) {
 	statsSamplers.Delete(key)
 	monitoringWarned.Delete(key)
 	detectedVersions.Delete(key)
+	availabilitySamples.Delete(key)
 }
 
 // servingPods counts the instance's Ready pods that are not terminating, i.e. the pods

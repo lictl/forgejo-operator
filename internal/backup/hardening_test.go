@@ -3,6 +3,9 @@ package backup
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -367,6 +370,43 @@ func TestReconcileMaintenanceFlagsRestoreMigration(t *testing.T) {
 		if rc.RestoreMigrating != tc.want {
 			t.Errorf("%s: RestoreMigrating=%v, want %v", tc.restore.Name, rc.RestoreMigrating, tc.want)
 		}
+		// Every restore in ScalingUp, also a data-only one, is handed to the HA step, which
+		// empties Valkey for it.
+		scalingUp := tc.restore.Status.Phase == forgejov1.RestorePhaseScalingUp
+		if got := rc.ScalingUpRestore; (got != nil) != scalingUp || (got != nil && got.Name != tc.restore.Name) || rc.RestoreScalingUp != scalingUp {
+			t.Errorf("%s: ScalingUpRestore=%v RestoreScalingUp=%v, want ScalingUp %v", tc.restore.Name, got, rc.RestoreScalingUp, scalingUp)
+		}
+	}
+}
+
+// A running restore is planned maintenance; a failed one that changed the instance holds it
+// until a person acts (rc.MaintenanceHeld: phase Degraded, unplanned downtime).
+func TestReconcileMaintenanceFlagsHeldRestore(t *testing.T) {
+	s := testScheme(t)
+	ctx := context.Background()
+	f := ownedInstance(forgejov1.RetainPolicyRetain)
+	for _, tc := range []struct {
+		phase             forgejov1.RestorePhase
+		mod               Modification
+		maintenance, held bool
+	}{
+		{forgejov1.RestorePhaseRestoring, Unmodified, true, false},
+		{forgejov1.RestorePhaseFailed, Modified, true, true},
+		{forgejov1.RestorePhaseFailed, MaybeModified, true, true},
+		{forgejov1.RestorePhaseFailed, Unmodified, false, false},
+	} {
+		r := restore("r1", time.Now(), tc.phase, tc.mod)
+		r.Namespace = "ns"
+		r.Spec.ForgejoRef.Name = "fb"
+		c := fake.NewClientBuilder().WithScheme(s).WithObjects(&r).Build()
+		rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f.DeepCopy()}
+		if _, err := ReconcileMaintenance(ctx, rc); err != nil {
+			t.Fatal(err)
+		}
+		if rc.Maintenance != tc.maintenance || rc.MaintenanceHeld != tc.held {
+			t.Errorf("%s/%v: Maintenance=%v MaintenanceHeld=%v, want %v %v", tc.phase, tc.mod, rc.Maintenance, rc.MaintenanceHeld,
+				tc.maintenance, tc.held)
+		}
 	}
 }
 
@@ -389,6 +429,10 @@ func TestRestoreJobResetsAdminSyncAfterDatabaseOnlyRestore(t *testing.T) {
 	}
 	if env := main.Env[0]; env.Name != "ADMIN_SYNC_MARKER" || env.Value != "/data/gitea/"+AdminSyncMarker {
 		t.Errorf("marker env %v", env)
+	}
+	// The LevelDB queues (without highAvailability) hold work for the replaced database.
+	if env := main.Env[1]; env.Name != "QUEUES_DIR" || env.Value != "/data/gitea/queues" {
+		t.Errorf("queues env %v", env)
 	}
 	if init := job.Spec.Template.Spec.InitContainers; len(init) != 2 || init[1].Name != ContainerRestoreDB {
 		t.Errorf("init containers %v, want verify and %s", init, ContainerRestoreDB)
@@ -462,5 +506,41 @@ func TestResizeWarningIsRateLimited(t *testing.T) {
 	}
 	if warnings != 2 {
 		t.Errorf("a new size was not reported (%d warnings)", warnings)
+	}
+}
+
+// The step that ends a database-only restore removes the admin sync marker and the LevelDB
+// queues, and nothing else of the data volume.
+func TestResetAdminSyncScriptRemovesQueues(t *testing.T) {
+	dir := t.TempDir()
+	marker, queues, repo := filepath.Join(dir, AdminSyncMarker), filepath.Join(dir, "queues"), filepath.Join(dir, "repo")
+	for _, d := range []string{filepath.Join(queues, "common"), repo} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{marker, filepath.Join(queues, "common", "000001.log"), filepath.Join(repo, "HEAD")} {
+		if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("sh", "-c", resetAdminSyncScript)
+	cmd.Env = append(os.Environ(), "ADMIN_SYNC_MARKER="+marker, "QUEUES_DIR="+queues)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+	for _, gone := range []string{marker, queues} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Errorf("%s still exists (%v)", gone, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(repo, "HEAD")); err != nil {
+		t.Errorf("other data removed: %v", err)
+	}
+	// Without queues (an HA instance, or a fresh volume) the script still succeeds.
+	again := exec.Command("sh", "-c", resetAdminSyncScript)
+	again.Env = cmd.Env
+	if out, err := again.CombinedOutput(); err != nil {
+		t.Fatalf("second run failed: %v\n%s", err, out)
 	}
 }

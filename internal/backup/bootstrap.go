@@ -110,10 +110,11 @@ func restoreFromLocation(f *forgejov1.Forgejo) string {
 // bootstrapHold explains why spec.restoreFrom keeps the instance in maintenance, or returns ""
 // once the bootstrap is complete. Forgejo does not start before the restore is recorded on
 // "<name>-secrets" (status.restoredFrom Completed), which the restore-from step does in the
-// pass that sees the restore reach ScalingUp.
-func bootstrapHold(f *forgejov1.Forgejo, restores []forgejov1.ForgejoRestore) string {
+// pass that sees the restore reach ScalingUp. failed is true when the bootstrap failed and
+// only a person can end the hold (the restore failed, or the target is not empty).
+func bootstrapHold(f *forgejov1.Forgejo, restores []forgejov1.ForgejoRestore) (reason string, failed bool) {
 	if !Bootstrapping(f) {
-		return ""
+		return "", false
 	}
 	where := restoreFromLocation(f)
 	for i := range restores {
@@ -124,16 +125,16 @@ func bootstrapHold(f *forgejov1.Forgejo, restores []forgejov1.ForgejoRestore) st
 		switch r.Status.Phase {
 		case forgejov1.RestorePhaseScalingUp, forgejov1.RestorePhaseCompleted:
 			return fmt.Sprintf("ForgejoRestore %s restored %s; Forgejo starts once that is recorded on Secret %s",
-				r.Name, where, forgejo.SecretsName(f))
+				r.Name, where, forgejo.SecretsName(f)), false
 		case forgejov1.RestorePhaseFailed:
 			return fmt.Sprintf("ForgejoRestore %s of spec.restoreFrom failed: %s. Delete it to try again, or remove "+
-				"spec.restoreFrom to start Forgejo without the backup", r.Name, r.Status.Message)
+				"spec.restoreFrom to start Forgejo without the backup", r.Name, r.Status.Message), true
 		}
 	}
 	if st := f.Status.RestoredFrom; st != nil && st.Phase == forgejov1.RestoredFromFailed && st.Message != "" {
-		return st.Message
+		return st.Message, true
 	}
-	return fmt.Sprintf("Restoring the instance from %s (spec.restoreFrom) before Forgejo starts", where)
+	return fmt.Sprintf("Restoring the instance from %s (spec.restoreFrom) before Forgejo starts", where), false
 }
 
 // restoredMarker reads the restored-from annotation of "<name>-secrets" ("" without one).

@@ -4,11 +4,16 @@ This page covers the operator's Level IV ("deep insights") features:
 
 - Prometheus metrics from Forgejo and from the operator.
 - One ServiceMonitor, one PrometheusRule and an optional Grafana dashboard for each `Forgejo`.
+- Service level objectives: an availability SLI that does not hide downtime, burn-rate alerts
+  and a recovery point objective derived from the backup schedule.
+- A runbook for every alert ([runbooks/](runbooks/README.md)).
 - Health, version and statistics in `status`.
 - Conditions and events.
 
-Code: `internal/observability` (steps `monitoring` and `health`), `internal/forgejo/metrics.go`
-(operator metrics) and `config/prometheus` (the operator's own ServiceMonitor and alerts).
+Code: `internal/observability` (steps `monitoring` and `health`; `slo.go` and
+`availability.go` for the SLOs), `internal/forgejo/metrics.go` (operator metrics) and
+`config/prometheus` (the operator's own ServiceMonitor and alerts). Rule tests:
+`test/prometheus` (`make test-rules`).
 
 ## Prerequisites
 
@@ -138,6 +143,10 @@ spec:
     grafanaDashboard:
       enabled: true
       labels: {}
+    slo:
+      availabilityTarget: "99.5"   # default; a string, quote it
+      window: 30d                  # default
+    runbookBaseURL: https://wiki.example.com/forgejo/runbooks   # default: the operator's --runbook-base-url
 ```
 
 ### ServiceMonitor
@@ -160,12 +169,14 @@ The dashboard ConfigMap carries the label `grafana_dashboard: "1"` and the annot
 |---|---|
 | Title | `Forgejo / <namespace>/<name>` |
 | UID | `forgejo-<namespace>-<name>`, or a hash when that is longer than 40 characters |
-| Hidden constants | `$namespace`, `$forgejo` and `$job`; edit these to reuse the JSON for another instance |
+| Hidden constants | `$namespace`, `$forgejo`, `$job` and `$slo_window`; edit these to reuse the JSON for another instance |
+| Links | **Runbooks** (the [runbook index](runbooks/README.md) under the instance's runbook base); the SLO panels link the runbooks of their alerts |
 | Template | `internal/observability/dashboard.json` |
 
 | Row | Panels |
 |-----|--------|
 | Overview | Forgejo targets up, Ready, version, health check failures (1h), age of the last successful backup, data volume usage |
+| Service level objectives | Availability over the SLO window (red below the objective), objective, error budget remaining, recovery point age; burn rate per alert window (thresholds 1, 3, 14.4), availability samples by result and planned, recovery point age against the RPO |
 | Forgejo statistics | Users, repositories, organizations, issues, plus their trends (open/closed issues, comments, mirrors) |
 | Operator | Health check failures, autopilot actions by type, volume usage by PVC, backups by reason/result, backup size and duration |
 | Runtime | Forgejo RSS and heap, CPU, goroutines (per pod) |
@@ -200,6 +211,7 @@ is deleted.
 | `forgejo_operator_instance_info` | gauge | `image`, `version`, `phase` | Always 1 |
 | `forgejo_operator_health_check_failures_total` | counter | | Failed `/api/healthz` probes made by the operator. Exported at 0 from the first reconcile |
 | `forgejo_operator_health_check_unreachable_total` | counter | | Probes that never reached Forgejo (DNS, dial or connection errors, a proxy answering). Not health failures. Exported at 0 from the first reconcile |
+| `forgejo_operator_availability_probes_total` | counter | `result` (up/down), `planned` (true/false) | The availability SLI: one sample per health-check interval, also while no pod is Ready (see [Service level objectives](#service-level-objectives)). All four series are exported at 0 from the first reconcile |
 | `forgejo_operator_stats` | gauge | `kind` (users, organizations, repositories, issues) | Same values as `status.stats` |
 | `forgejo_operator_backup_last_success_timestamp_seconds` | gauge | | Unix time of the last successful backup |
 | `forgejo_operator_backups_total` | counter | `reason`, `result` | Finished backups |
@@ -236,8 +248,12 @@ The endpoint also serves the standard controller-runtime metrics:
 
 ### Per instance (`PrometheusRule <name>`)
 
-All alerts carry the labels `severity`, `namespace` and `forgejo: <name>`. Their descriptions
-include the `kubectl` commands to start investigating with.
+All alerts carry the labels `severity`, `namespace` and `forgejo: <name>`, and the annotations
+`summary`, `description` (with the `kubectl` commands to start investigating with) and
+`runbook_url` (see [Runbooks](#runbooks)). The PrometheusRule has three groups:
+`forgejo.<ns>.<name>` (the alerts below), `forgejo-slo.<ns>.<name>` (SLO recording rules and the
+burn-rate alerts) and `forgejo-slo-window.<ns>.<name>` (recording rules over the whole SLO window,
+evaluated every 3m).
 
 Only `ForgejoDown` uses Forgejo's own metrics. All the other alerts read operator metrics, so
 they work only when the operator is scraped with `honorLabels: true` (see
@@ -246,17 +262,17 @@ those metrics are missing.
 
 | Alert | Severity | Expression (simplified) | For |
 |-------|----------|-------------------------|-----|
-| `ForgejoDown` | critical | `max(up{job="<name>-http"}) == 0` or the target is absent; suppressed while the phase is Restoring or Paused. Only rendered when the ServiceMonitor is enabled and replicas > 0 or HPA is enabled | 5m |
+| `ForgejoDown` | critical | `max(up{job="<name>-http"}) == 0` or the target is absent; suppressed while the phase is Restoring or Paused (a failed restore that holds the instance at zero is Degraded, so it alerts). Only rendered when the ServiceMonitor is enabled and replicas > 0 or HPA is enabled | 5m |
 | `ForgejoOperatorMetricsMissing` | warning | `absent(forgejo_operator_instance_ready)` for the instance: the operator is not running, or not scraped (or scraped without `honorLabels`). All other alerts except `ForgejoDown` are inactive meanwhile | 15m |
-| `ForgejoNotReady` | warning | `forgejo_operator_instance_ready == 0`; suppressed while Restoring or Paused. Only rendered when replicas > 0 or HPA is enabled, so an instance intentionally scaled to `spec.replicas: 0` does not alert | 10m |
+| `ForgejoNotReady` | warning | `forgejo_operator_instance_ready == 0`; suppressed while Restoring or Paused (not while a failed restore holds the instance: phase Degraded). Only rendered when replicas > 0 or HPA is enabled, so an instance intentionally scaled to `spec.replicas: 0` does not alert | 10m |
 | `ForgejoHealthCheckFailing` | warning | `increase(forgejo_operator_health_check_failures_total[10m]) > 3` | – |
 | `ForgejoHealthProbeUnreachable` | warning | `increase(forgejo_operator_health_check_unreachable_total[W]) > 0`, where W is 5m or twice `healthCheckInterval`, whichever is longer: the operator's probes do not reach Forgejo. A NetworkPolicy or service mesh must let the operator connect to `<name>-http` on the HTTP port (3000 by default) | 15m |
 | `ForgejoBackupFailed` | warning | A `result="failed"` backup in the last hour | – |
-| `ForgejoBackupTooOld` | warning | `time() - backup_last_success_timestamp > maxAge`. Only rendered when `spec.backup.enabled` | 10m |
-| `ForgejoBackupMissing` | warning | No successful backup recorded at all, while the instance's operator metrics are present (`absent(last_success) and on() count(instance_ready) > 0`), so a scrape gap is not reported as a missing backup. Only rendered when `spec.backup.enabled` | maxAge |
+| `ForgejoBackupTooOld` | warning | RPO: `time() - backup_last_success_timestamp > RPO`. Only rendered when `spec.backup.enabled` | 5m |
+| `ForgejoBackupMissing` | warning | No successful backup recorded at all, while the instance's operator metrics are present (`absent(last_success) and on() count(instance_ready) > 0`), so a scrape gap is not reported as a missing backup. Only rendered when `spec.backup.enabled` | RPO |
 | `ForgejoBackupUploadFailed` | warning | A `result="failed"` upload to `spec.backup.remote` in the last hour. Only rendered with `spec.backup.remote` | – |
-| `ForgejoBackupUploadTooOld` | warning | `time() - backup_last_upload_success_timestamp > maxAge`. Only rendered with `spec.backup.remote` and `spec.backup.enabled` | 10m |
-| `ForgejoBackupUploadMissing` | warning | No upload recorded at all while the instance's operator metrics are present. Only rendered with `spec.backup.remote` and `spec.backup.enabled` | maxAge |
+| `ForgejoBackupUploadTooOld` | warning | RPO of the off-cluster copy: `time() - backup_last_upload_success_timestamp > RPO`. Only rendered with `spec.backup.remote` and `spec.backup.enabled` | 5m |
+| `ForgejoBackupUploadMissing` | warning | No upload recorded at all while the instance's operator metrics are present. Only rendered with `spec.backup.remote` and `spec.backup.enabled` | RPO |
 | `ForgejoVolumeAlmostFull` | warning | `forgejo_operator_volume_used_ratio > 0.9` | 10m |
 | `ForgejoUpgradeFailed` | warning | An upgrade with `result!="succeeded"` (failed or rolled back) in the last hour | – |
 | `ForgejoVersionUnsupported` | warning | `forgejo_operator_version_supported == 0`: the running major is `Deprecated`, `EndOfLife`, `Future` or `Unknown`; the `VersionSupported` condition says what to upgrade to and by when | 1h |
@@ -267,33 +283,194 @@ those metrics are missing.
 | `ForgejoValkeyDegraded` | warning | With HA: fewer than 3 Valkey pods Ready, suppressed while Restoring or Paused | 15m |
 | `ForgejoCronRunnerDown` | warning | With HA: `forgejo_operator_cron_runner_ready == 0`; the gauge exists only while the cron runner should run (not during upgrades or restores) | 15m |
 | `ForgejoAutoPilotActive` | warning | At least 5 autopilot actions in the last hour | – |
+| `ForgejoAvailabilityFastBurn` | critical | Availability SLO, page: burn rate above 14.4 over 1h and 5m, or above 6 over 6h and 30m (at a 30d window; labels `long`, `short`, `slo: availability`). See [Burn-rate alerts](#burn-rate-alerts) | – |
+| `ForgejoAvailabilitySlowBurn` | warning | Availability SLO, ticket: burn rate above 3 over 1d and 2h, or above 1 over 3d and 6h (at a 30d window) | – |
 
-`maxAge` is the longest gap between two runs of `spec.backup.schedule` plus half of that gap,
-and the slack is at least 1h. For example:
-
-| Schedule | maxAge |
-|----------|--------|
-| `0 3 * * *` (the default) | 36h |
-| `0 3 * * 1-5` (weekdays only) | 108h, because of the weekend gap |
-| `0 * * * *` | 2h |
+`RPO` is the [recovery point objective](#recovery-point-objective): twice the longest gap between
+two runs of `spec.backup.schedule`.
 
 A counter series appears with value 1 on its first increment, and `increase()` cannot see that
 first step. The backup and upgrade alerts therefore also fire when a failure series appeared
 within the window. The two health-check counters do not need this, because they are exported at
 0 from the first reconcile.
 
-`forgejo_operator_backup_last_success_timestamp_seconds` is set when a backup completes in the
-running operator process, so it is absent after an operator restart until the next backup
-succeeds. During that time `ForgejoBackupTooOld` cannot fire. `ForgejoBackupMissing` fires only
-if no backup succeeds within maxAge.
+`forgejo_operator_backup_last_success_timestamp_seconds` and
+`forgejo_operator_backup_last_upload_success_timestamp_seconds` are re-exported from
+`status.backup` on every reconcile, so the RPO alerts keep working across operator restarts.
 
 ### Operator (`config/prometheus/rules.yaml`)
 
 | Alert | Severity | Condition |
 |-------|----------|-----------|
 | `ForgejoOperatorDown` | critical | No `controller_runtime_reconcile_total{controller="forgejo"}` for 10m |
-| `ForgejoOperatorReconcileErrors` | warning | More than 5 reconcile errors in 15m, sustained for 15m |
-| `ForgejoOperatorWorkQueueBacklog` | warning | Work queue depth above 20 for 15m |
+| `ForgejoOperatorReconcileErrors` | warning | More than 5 reconcile errors in 15m of the `forgejo`, `forgejobackup`, `forgejorestore` or `forgejorunner` controller, sustained for 15m |
+| `ForgejoOperatorWorkQueueBacklog` | warning | Depth of one of these work queues above 20 for 15m |
+
+Their `runbook_url` annotations link the default runbook base; patch them with kustomize if you
+host the runbooks elsewhere.
+
+### Runbooks
+
+Every alert links `<base>/<AlertName>.md` in its `runbook_url` annotation. The runbooks are in
+[docs/runbooks](runbooks/README.md): what the alert means, the impact, how to confirm it
+(`kubectl` and PromQL), likely causes, remediation and when to escalate. The base is, in this
+order, `spec.monitoring.runbookBaseURL`, the operator's `--runbook-base-url` (environment
+variable `RUNBOOK_BASE_URL` in `config/manager/manager.yaml`), and
+`https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks`. The dashboard links
+`<base>/README.md`.
+
+### Rule tests
+
+`make test-rules` renders the PrometheusRule of representative specs (default, daily backups
+with a 99.9%/28d objective, hourly backups uploaded off-cluster with 99%/1d, HA) and the
+operator's rules into `test/prometheus/rules/` (as deployed, checked with `promtool check rules`)
+and `test/prometheus/unit-rules/` (without the long `description` annotations), then runs the
+promtool unit tests `test/prometheus/*_test.yaml` with the official `prom/prometheus` image
+(`PROMETHEUS_IMAGE`, through `CONTAINER_TOOL`, `docker` by default). The rendered files are
+checked in; `go test ./internal/observability` fails when they are stale, when an alert has no
+firing and no non-firing promtool case, or no runbook (`TestEveryAlertHasARunbook`).
+
+## Service level objectives
+
+### Availability SLI
+
+The health probe (see [`status.health`](#statushealth)) is suspended while no pod is Ready, so it
+cannot measure outages by itself. The operator therefore takes an **availability sample** once
+per `spec.autoPilot.selfHealing.healthCheckInterval` (30s by default) and counts it in
+`forgejo_operator_availability_probes_total{namespace, name, result, planned}`:
+
+| `result` | When |
+|----------|------|
+| `up` | The probe passed (`/api/healthz` 200 with `pass` or `warn`) |
+| `down` | The probe failed, did not reach Forgejo (`Unreachable`), or no Forgejo pod is Ready while replicas are desired |
+
+`planned="true"` marks samples taken while unavailability is expected; they count as available:
+
+- a restore holds the instance in maintenance (`ScalingDown`, `Restoring`, `spec.restoreFrom`
+  in progress) or brings it back up (`ScalingUp`);
+- an orchestrated upgrade is in flight (`rc.Upgrading`: the cold pre-upgrade backup, the
+  rollout, the verification, a rollback);
+- `spec.paused` (no step runs; the sample is `up` while a pod is Ready, without a probe);
+- zero desired replicas (`spec.replicas: 0` without an HPA);
+- the instance has never been available (`status.health.lastHealthyTime` empty): the first
+  installation.
+
+Everything else is unplanned: a crash loop after a configuration change, a database outage,
+a Recreate rollout of a single replica, a failed upgrade holding its image, pods scaled to zero
+out of band, and a hold that only a person ends (`rc.MaintenanceHeld`, phase `Degraded`): a
+failed restore that changed the instance (also the rollback of a failed upgrade) or a failed
+`spec.restoreFrom` (`restoredFrom.phase: Failed`, e.g. `TargetNotEmpty`), even before the first
+healthy probe. Pause and zero replicas stay planned during such a hold. Unreachable probes count as `down` because nothing shows that users can reach
+Forgejo either; `ForgejoHealthProbeUnreachable` tells this case apart.
+
+Samples are taken by the reconcile that probes (or would probe) Forgejo, at most once per
+interval, so an outage is sampled at the same rate as normal operation. Restarting the operator
+resets the counters (`rate()` handles that); while the operator does not run, no samples are
+taken (`ForgejoOperatorDown`).
+
+### Availability objective
+
+```yaml
+spec:
+  monitoring:
+    slo:
+      availabilityTarget: "99.5"   # percent of the window, < 100; the error budget is 100 - target
+      window: 30d                  # hours, days or weeks: 12h, 7d, 28d, 4w
+```
+
+The SLI over a window `w` is the ratio of unplanned down samples to all samples, planned ones
+included (they count as available):
+
+```promql
+forgejo_slo:availability_error_ratio{namespace="<ns>", name="<name>", window="<w>"}
+  = sum(rate(forgejo_operator_availability_probes_total{..., planned="false", result="down"}[<w>]))
+  / sum(rate(forgejo_operator_availability_probes_total{...}[<w>]))
+```
+
+Over the windows of the burn-rate alerts the denominator is at least one sample per
+health-check interval, `clamp_min(..., 1 / <interval in seconds>)`: time in the window without
+samples (before the instance existed, while the operator did not run) counts as available, so a
+window that holds few samples is not dominated by one failed probe. The ratio over the SLO
+window is not clamped: it covers the samples Prometheus holds.
+
+Recording rules (labels `namespace`, `name`, and `window`):
+
+| Rule | Meaning |
+|------|---------|
+| `forgejo_slo:availability_error_ratio` | The error ratio above, for every window of the burn-rate alerts (with the denominator clamped) and for the SLO window |
+| `forgejo_slo:availability_burn_rate` | Error ratio / error budget, for every window of the burn-rate alerts. 1 spends the budget exactly over the SLO window |
+| `forgejo_slo:availability_objective` | The target as a ratio (0.995), `window` = the SLO window |
+| `forgejo_slo:availability_error_budget_remaining` | 1 - error ratio over the SLO window / budget: 1 = untouched, 0 = spent, negative = objective missed |
+| `forgejo_slo:backup_recovery_point_age_seconds` | Age of the newest backup, `copy="local"`, and of the newest upload, `copy="remote"` (with `spec.backup.remote`). Only with `spec.backup.enabled` |
+| `forgejo_slo:backup_recovery_point_objective_seconds` | The RPO. Only with `spec.backup.enabled` |
+
+An SLO window longer than Prometheus's retention (kube-prometheus-stack keeps 10 days by
+default) only covers the retained samples: availability and budget are then computed over the
+retention.
+
+The SLI is keyed by namespace and name, not by the object's UID: an instance deleted and created
+again under the same name keeps the samples Prometheus still holds of its predecessor, so
+recreating an instance does not reset its error budget.
+
+### Burn-rate alerts
+
+The multiwindow, multi-burn-rate alerts of the
+[SRE workbook](https://sre.google/workbook/alerting-on-slos/). Each fires when the burn rate is
+above its threshold over both a long window (the outage is significant) and a short one (it is
+still going on, so the alert resolves soon after recovery):
+
+| Alert | Severity | Long window | Short window | Burn rate | Budget spent when it fires |
+|-------|----------|-------------|--------------|-----------|----------------------------|
+| `ForgejoAvailabilityFastBurn` | critical (page) | 1h | 5m | 14.4 | 2% in 1h |
+| `ForgejoAvailabilityFastBurn` | critical (page) | 6h | 30m | 6 | 5% in 6h |
+| `ForgejoAvailabilitySlowBurn` | warning (ticket) | 1d | 2h | 3 | 10% in 1d |
+| `ForgejoAvailabilitySlowBurn` | warning (ticket) | 3d | 6h | 1 | 10% in 3d |
+
+The windows are those of a 30-day SLO window. For another window they scale by `window / 30d`,
+rounded to minutes and never below **5m** (shorter windows hold too few probes and scrapes) nor
+below **three health-check intervals**, rounded up to minutes (so that a window always holds
+samples: with slow probes a shorter one would fall between two of them, and the alert, which has
+no `for`, would resolve and fire again within one outage); the burn rates stay. The alert's labels
+`long` and `short` name the effective pair that fired. Examples at the default interval (30s):
+
+| `window` | Fast burn | Slow burn |
+|----------|-----------|-----------|
+| `30d` | 1h/5m, 6h/30m | 1d/2h, 3d/6h |
+| `28d` | 56m/5m, 5h36m/28m | 22h24m/1h52m, 2d19h12m/5h36m |
+| `7d` | 14m/5m, 1h24m/7m | 5h36m/28m, 16h48m/1h24m |
+| `1d` | 5m/5m, 12m/5m | 48m/5m, 2h24m/12m |
+
+With `healthCheckInterval: 10m` (shortest window 30m), `30d` gives 1h/30m, 6h/30m, 1d/2h, 3d/6h;
+with `1h` (3h), 3h/3h, 6h/3h, 1d/3h, 3d/6h.
+
+At the defaults (99.5%, probes every 30s), a full outage pages after about 5 minutes (4.3 min of
+downtime in an hour is 2% of the 3.6h monthly budget, and the 5m window must hold one down
+sample); a single failed probe never does, also not right after a restore or on a new instance.
+Each sample stands for one interval of downtime, though: from an interval of about 4.5 minutes on
+(at 99.5%), one failed probe is more than 7.2% of an hour and pages until the short window has
+let go of it. A short window and a high target, for example
+99.9% over `1d`, page within one or two minutes of an outage, which the end-to-end checks use.
+
+### Recovery point objective
+
+The RPO of an instance with scheduled backups is **two intervals of `spec.backup.schedule`**
+(the longest gap between two runs): one missed or failed run is tolerated, the second one is
+not.
+
+| Schedule | RPO |
+|----------|-----|
+| `0 3 * * *` (the default) | 48h |
+| `0 3 * * 1-5` (weekdays only) | 144h, because of the weekend gap |
+| `0 * * * *` | 2h |
+| `*/5 * * * *` | 10m |
+
+`ForgejoBackupTooOld` fires when the last successful backup (of any reason, from
+`forgejo_operator_backup_last_success_timestamp_seconds`) is older than the RPO for 5 minutes,
+and `ForgejoBackupMissing` when there has been none for a whole RPO. With `spec.backup.remote`,
+the off-cluster copy is the recovery point of a disaster recovery and has the same RPO:
+`ForgejoBackupUploadTooOld` and `ForgejoBackupUploadMissing` watch
+`forgejo_operator_backup_last_upload_success_timestamp_seconds`. Pausing an instance stops
+scheduled backups but not these alerts: a paused instance can still change.
 
 ## Status
 
@@ -331,7 +508,10 @@ How probing behaves:
   operator requeues the instance accordingly.
 - **Suspended:** while no pod of the instance is Ready and not terminating, or while a restore
   holds the instance in maintenance. The Healthy condition is then Unknown (`NoReadyReplicas` /
-  `Maintenance`), nothing is counted, and the message names the failing checks of the last probe.
+  `Maintenance`), the health counters do not move, and the message names the failing checks of
+  the last probe. The availability SLI still takes its sample (down; planned during
+  maintenance, unless a failed restore holds it), and the instance is requeued every interval
+  meanwhile.
 - **Why only Ready pods count:** `consecutiveFailures` feeds self-healing, which restarts pods
   that stay Ready but unhealthy, so a pod that is not serving traffic must not add to it.
 - **Effect of the readiness probe:** the pod's readiness probe also uses `/api/healthz`. In an
@@ -410,7 +590,7 @@ Other packages emit their own events:
 - `ReconcileError` (Warning) names a failing reconcile step.
 - Backup, maintenance, HA and config events include `BackupScheduled`, `BackupPruned`,
   `MaintenanceStarted`, `MaintenanceEnded`, `LastKnownGoodConfig`, `ConfigRetry`,
-  `ValkeyFailedOver` (Warning), `WaitingForValkey`, `WaitingForCronRunner`,
+  `ValkeyFailedOver` (Warning), `WaitingForValkey`, `ValkeyReset`, `WaitingForCronRunner`,
   `CronRunnerStuck` (Warning) and `CronRunnerDeleted`.
 - Remote backups and disaster recovery: `BackupKeyGenerated`, `BackupUploaded`,
   `BackupUploadFailed`, `RemoteBackupPruned`, `RemoteRetentionFailed`, `IdentityRestored`,
@@ -443,6 +623,9 @@ forgejo_operator_instance_ready{namespace="<ns>", name="<name>"}
 increase(forgejo_operator_health_check_failures_total{namespace="<ns>", name="<name>"}[1h])
 time() - forgejo_operator_backup_last_success_timestamp_seconds{namespace="<ns>", name="<name>"}
 ALERTS{forgejo="<name>"}
+forgejo_slo:availability_burn_rate{namespace="<ns>", name="<name>"}
+forgejo_slo:availability_error_budget_remaining{namespace="<ns>", name="<name>"}
+sum by (result, planned) (increase(forgejo_operator_availability_probes_total{namespace="<ns>", name="<name>"}[1h]))
 ```
 
 Grafana: open **Dashboards → Forgejo → Forgejo / &lt;ns&gt;/&lt;name&gt;**.
