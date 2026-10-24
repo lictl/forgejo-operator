@@ -258,3 +258,46 @@ func TestRetryKeepsMigratingPodAndDeletesFailingOne(t *testing.T) {
 		t.Fatalf("pods left: %v", pods.Items)
 	}
 }
+
+// A later restore lifts the hold after a failed rollback restore only when it restored the
+// database, and the data volume when its backup has a data archive.
+func TestFailedRollbackRestoreNeedsDatabaseAndData(t *testing.T) {
+	cases := []struct {
+		name          string
+		db, data      *bool
+		backupHasData bool
+		backupGone    bool
+		lifts         bool
+	}{
+		{name: "database and data", backupHasData: true, lifts: true},
+		{name: "data only", db: ptr.To(false), backupHasData: true},
+		{name: "database only from a backup with data", data: ptr.To(false), backupHasData: true},
+		{name: "database only from a backup without data", data: ptr.To(false), lifts: true},
+		{name: "database only from a deleted backup", data: ptr.To(false), backupGone: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := fixture(&forgejov1.UpgradeStatus{
+				Phase: forgejov1.UpgradePhaseFailed, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup,
+				RestoreName: testRollbackRestore, StartTime: ago(time.Hour), RolloutStartTime: ago(50 * time.Minute),
+				CompletionTime: ago(10 * time.Minute), FailedImage: imgB, RollbackRestoreFailed: true,
+			})
+			r := restore("manual", forgejov1.RestorePhaseCompleted, ago(time.Minute))
+			r.Spec.BackupName = "later"
+			r.Spec.RestoreDatabase, r.Spec.RestoreData = tc.db, tc.data
+			objs := []client.Object{r}
+			if !tc.backupGone {
+				objs = append(objs, &forgejov1.ForgejoBackup{
+					ObjectMeta: metav1.ObjectMeta{Name: "later", Namespace: "ns"},
+					Spec:       forgejov1.ForgejoBackupSpec{ForgejoRef: forgejov1.ForgejoRef{Name: "fj"}},
+					Status:     forgejov1.ForgejoBackupStatus{Phase: forgejov1.BackupPhaseCompleted, IncludesData: tc.backupHasData},
+				})
+			}
+			rc, _ := reconcile(t, f, objs...)
+			stopped := rc.ReplicasOverride != nil && *rc.ReplicasOverride == 0
+			if stopped == tc.lifts || f.Status.Upgrade.RollbackRestoreFailed == tc.lifts {
+				t.Fatalf("want lifted %v: stopped %v, rollbackRestoreFailed %v", tc.lifts, stopped, f.Status.Upgrade.RollbackRestoreFailed)
+			}
+		})
+	}
+}

@@ -23,7 +23,7 @@ annotation is set.
   deployed with one replica, possibly not serving, and the workload is held (no HPA, no
   self-healing restarts).
 - **Rollback failed** (`rollbackRestoreFailed: true`): Forgejo stays scaled to zero until a
-  restore succeeds. Forgejo is down: the phase is `Degraded`, and `ForgejoDown`,
+  later restore has restored the database, and the data volume when its backup has one. Forgejo is down: the phase is `Degraded`, and `ForgejoDown`,
   `ForgejoNotReady` and the burn-rate alerts keep firing after this alert has ended.
 
 ## Diagnosis

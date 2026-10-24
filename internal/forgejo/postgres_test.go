@@ -54,6 +54,11 @@ func TestPostgresPolicy(t *testing.T) {
 	if Postgres.IsVerified(16) || Postgres.VerifiedList() != "17 and 18" {
 		t.Errorf("verified %v (%s)", Postgres.Verified, Postgres.VerifiedList())
 	}
+	// CloudNativePG 1.30 upgrades in place only to 16 or newer, so 14 → 15 is the one upgrade
+	// within the range it refuses; every verified major is a target it accepts.
+	if Postgres.MinUpgradeTarget != 16 || !Postgres.InRange(Postgres.MinUpgradeTarget) || Postgres.Verified[0] < Postgres.MinUpgradeTarget {
+		t.Errorf("MinUpgradeTarget %d", Postgres.MinUpgradeTarget)
+	}
 }
 
 func TestReadCNPGClusterAndRunningImage(t *testing.T) {

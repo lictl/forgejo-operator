@@ -75,14 +75,19 @@ const (
 	reasonWaitingForRestore        = "WaitingForRestore"
 	reasonWaitingForForgejoUpgrade = "WaitingForForgejoUpgrade"
 	reasonWaitingForSSHHostKeys    = "WaitingForSSHHostKeys"
+
+	// reasonClusterDeleting is the DatabaseReady reason while a CNPG cluster that is being
+	// deleted, or what a deleted one left behind, keeps the new one from being created.
+	reasonClusterDeleting = "ClusterDeleting"
 )
 
 // ReconcileDatabase is the database-upgrade step. It decides rc.DatabaseImage, sets
 // rc.Upgrading and rc.DatabaseUpgrading while a PostgreSQL major upgrade is in flight (and
 // rc.ReplicasOverride while it keeps Forgejo stopped), and drives status.database.upgrade and the
 // DatabaseUpgrading condition. It stops (so that the database step does not touch the Cluster)
-// while a rollback deletes the Cluster, and while a new instance asks for a major the operator
-// does not run.
+// while a rollback deletes the Cluster, while a deleted Cluster is not yet gone with its pods,
+// volumes, Secrets and Services, and while a new instance asks for a major the operator does not
+// run.
 func ReconcileDatabase(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	desired := forgejo.PostgresImage(f)
@@ -165,24 +170,39 @@ func idleDatabase(ctx context.Context, rc *forgejo.ReconcileContext, c *forgejo.
 		u.FailedImage = ""
 	}
 	ref := forgejo.ParsePostgresImage(desired)
-	if c == nil {
-		return newDatabaseCluster(rc, desired, ref), nil
+	if c == nil || c.Deleting {
+		return newDatabaseCluster(ctx, rc, c, desired, ref)
 	}
 
-	current := c.RunningImage()
 	// Unless the gate lets the requested image through, what the Cluster asks for stays.
 	if c.SpecImage != "" {
 		rc.DatabaseImage = c.SpecImage
 	}
-	if desired == c.SpecImage || desired == current {
+	// A failed upgrade's image stays failed also when the cluster runs it (a failure that kept
+	// the new major), until another image or the retry annotation releases it.
+	runs := runsImage(c, desired)
+	if keepFailedImage(rc, u, c, desired, retry, held, runs) {
+		return forgejo.StepResult{}, nil
+	}
+	if runs {
 		rc.DatabaseImage = desired
-		settleDatabase(rc, current)
+		settleDatabase(rc, c.RunningImage())
 		return forgejo.StepResult{}, nil
 	}
-	if keepFailedImage(rc, u, c, desired, retry, held) {
-		return forgejo.StepResult{}, nil
-	}
+	return versionGate(ctx, rc, c, desired, ref)
+}
 
+// runsImage reports whether the cluster asks for image or holds data of it.
+func runsImage(c *forgejo.CNPGCluster, image string) bool {
+	return c != nil && (c.SpecImage == image || c.RunningImage() == image)
+}
+
+// versionGate decides about an image the cluster does not run: CloudNativePG rolls out a change
+// within the major by itself, the operator upgrades to a newer major, and what CloudNativePG or
+// pg_upgrade would refuse is refused before anything changes.
+func versionGate(ctx context.Context, rc *forgejo.ReconcileContext, c *forgejo.CNPGCluster, desired string,
+	ref forgejo.PostgresImageRef) (forgejo.StepResult, error) {
+	current := c.RunningImage()
 	cur := forgejo.ParsePostgresImage(current)
 	switch {
 	case !ref.OK || c.DataMajor == 0:
@@ -205,6 +225,14 @@ func idleDatabase(ctx context.Context, rc *forgejo.ReconcileContext, c *forgejo.
 	case ref.Major == c.DataMajor:
 		rollOutDatabase(rc, desired, fmt.Sprintf("Rolling out %s (PostgreSQL %d like %s): CloudNativePG replaces the instances one by one",
 			desired, ref.Major, current))
+	case ref.Major < forgejo.Postgres.MinUpgradeTarget:
+		// CloudNativePG's webhook would refuse the image once Forgejo is stopped and backed up.
+		refuseDatabase(rc, ReasonPostgresUpgradePathUnsupported, fmt.Sprintf(
+			"Refusing to upgrade PostgreSQL from %d (%s) to %d (%s): the supported CloudNativePG release (1.30) upgrades a major in place "+
+				"only to PostgreSQL %d or newer, because pg_upgrade of an older major needs the new cluster created with the old one's "+
+				"locale and encoding. Choose PostgreSQL %d or newer (verified: %s); pg_upgrade can skip majors.",
+			c.DataMajor, current, ref.Major, desired, forgejo.Postgres.MinUpgradeTarget, forgejo.Postgres.MinUpgradeTarget,
+			forgejo.Postgres.VerifiedList()))
 	case cur.OS != "" && ref.OS != "" && cur.OS != ref.OS:
 		refuseDatabase(rc, ReasonPostgresUpgradePathUnsupported, fmt.Sprintf(
 			"Refusing to upgrade PostgreSQL from %s (%d on Debian %s) to %s (%d on Debian %s): CloudNativePG upgrades a major in place "+
@@ -231,26 +259,52 @@ func idleDatabase(ctx context.Context, rc *forgejo.ReconcileContext, c *forgejo.
 	return forgejo.StepResult{}, nil
 }
 
-// newDatabaseCluster lets a new cluster (also the one a rollback recreates, see
-// dbMachine.rollingBack) start on the requested image, if Forgejo can run on its major.
-func newDatabaseCluster(rc *forgejo.ReconcileContext, desired string, ref forgejo.PostgresImageRef) forgejo.StepResult {
+// newDatabaseCluster lets the database step create the cluster on the requested image, if
+// Forgejo can run on its major, with no upgrade in flight (a rollback recreates it in
+// dbMachine.rollingBack): a new instance's, or one the user deleted (docs/upgrades.md, "Rolling
+// back a PostgreSQL upgrade"). A Cluster that is being deleted (c), and the pods, volumes,
+// Secrets and Services a deleted one left, are waited for, with the step stopped so that the
+// database step neither updates the old Cluster nor creates the new one: it would take them over
+// (its first instance could start on the old volume, or hang on one that is being deleted).
+func newDatabaseCluster(ctx context.Context, rc *forgejo.ReconcileContext, c *forgejo.CNPGCluster, desired string,
+	ref forgejo.PostgresImageRef) (forgejo.StepResult, error) {
 	if ref.OK && !forgejo.Postgres.InRange(ref.Major) {
 		msg := refuseVersion(rc, "", desired, ref)
 		rc.SetCondition(forgejov1.ConditionDatabaseReady, metav1.ConditionFalse, ReasonPostgresVersionUnsupported, msg)
-		return forgejo.StepResult{Stop: true}
+		return forgejo.StepResult{Stop: true}, nil
+	}
+	name := forgejo.DatabaseClusterName(rc.Instance)
+	wait := ""
+	if c != nil {
+		wait = fmt.Sprintf("Waiting for CNPG cluster %s, which is being deleted, to go with its pods, volumes, Secrets and Services "+
+			"before it is created again with %s", name, desired)
+	} else if left, err := clusterLeftovers(ctx, rc); err != nil {
+		return forgejo.StepResult{}, err
+	} else if len(left) > 0 {
+		wait = fmt.Sprintf("Waiting for %s of the deleted CNPG cluster %s to go before it is created again with %s: a new cluster of "+
+			"that name would take them over (delete any that is not being deleted)", describe(left), name, desired)
+	}
+	// What was refused for the old cluster's data no longer applies.
+	clearDatabaseDegraded(rc)
+	if wait != "" {
+		rc.SetCondition(forgejov1.ConditionDatabaseReady, metav1.ConditionFalse, reasonClusterDeleting, wait)
+		rc.SetCondition(forgejov1.ConditionDatabaseUpgrading, metav1.ConditionFalse, reasonDatabaseUpToDate, wait)
+		rc.Requeue(5 * time.Second)
+		return forgejo.StepResult{Stop: true}, nil
 	}
 	warnUnverified(rc, desired, ref)
-	clearDatabaseDegraded(rc)
 	rc.SetCondition(forgejov1.ConditionDatabaseUpgrading, metav1.ConditionFalse, reasonDatabaseUpToDate,
-		"Creating CNPG cluster "+forgejo.DatabaseClusterName(rc.Instance)+" with "+desired)
-	return forgejo.StepResult{}
+		"Creating CNPG cluster "+name+" with "+desired)
+	return forgejo.StepResult{}, nil
 }
 
 // keepFailedImage holds the image of a failed upgrade (the cluster keeps the one it runs) and
-// reports whether it did. The retry annotation releases it, except while a failed rollback
-// restore keeps Forgejo stopped (held): the retry then waits, and the annotation stays until a
-// restore has lifted the hold.
-func keepFailedImage(rc *forgejo.ReconcileContext, u *forgejov1.DatabaseUpgradeStatus, c *forgejo.CNPGCluster, desired string, retry, held bool) bool {
+// reports whether it did. The retry annotation releases it: the upgrade starts again, or, when
+// the cluster runs that image already (runs: a failure that kept the new major), the failure is
+// cleared, as there is nothing to upgrade. While a failed rollback restore keeps Forgejo stopped
+// (held), the retry waits, and the annotation stays until a restore has lifted the hold.
+func keepFailedImage(rc *forgejo.ReconcileContext, u *forgejov1.DatabaseUpgradeStatus, c *forgejo.CNPGCluster, desired string,
+	retry, held, runs bool) bool {
 	if u == nil || u.FailedImage != desired {
 		return false
 	}
@@ -260,6 +314,13 @@ func keepFailedImage(rc *forgejo.ReconcileContext, u *forgejov1.DatabaseUpgradeS
 		rc.SetCondition(forgejov1.ConditionDatabaseUpgrading, metav1.ConditionFalse, reasonWaitingForRestore, fmt.Sprintf(
 			"The retry of the upgrade to %s (annotation %s) waits: %s", desired, AnnotationRetryDatabase, heldMessage(u)))
 		return true
+	case retry && runs:
+		u.FailedImage = ""
+		u.Message += fmt.Sprintf(" The annotation %s cleared the failure: CNPG cluster %s runs %s.", AnnotationRetryDatabase, c.Name, desired)
+		rc.Event(corev1.EventTypeNormal, "DatabaseUpgradeRetry", dbEventAction,
+			"CNPG cluster %s already runs %s, whose upgrade failed: the annotation %s clears the failure, nothing is upgraded again",
+			c.Name, desired, AnnotationRetryDatabase)
+		return false
 	case retry:
 		rc.Event(corev1.EventTypeNormal, "DatabaseUpgradeRetry", dbEventAction, "Retrying the upgrade to %s (annotation %s)", desired, AnnotationRetryDatabase)
 		u.FailedImage = ""
@@ -292,16 +353,20 @@ func settleDatabase(rc *forgejo.ReconcileContext, current string) {
 }
 
 // holdDatabase keeps a failed upgrade's outcome until spec.database.cnpg.imageName changes or a
-// retry is asked for: the cluster keeps the image it runs.
+// retry is asked for: the cluster keeps the image it runs, also when that is the failed one.
 func holdDatabase(rc *forgejo.ReconcileContext, u *forgejov1.DatabaseUpgradeStatus, c *forgejo.CNPGCluster) {
 	rc.DatabaseImage = keptDatabaseImage(u, c)
 	reason := ReasonPostgresUpgradeFailed
 	if u.Phase == forgejov1.DatabaseUpgradeRolledBack {
 		reason = ReasonPostgresUpgradeRolledBack
 	}
+	next := fmt.Sprintf("Choose another image, or set the annotation %s=\"true\" to retry %s.", AnnotationRetryDatabase, u.ToImage)
+	if u.Phase == forgejov1.DatabaseUpgradeFailed && runsImage(c, u.ToImage) {
+		next = fmt.Sprintf("CNPG cluster %s already runs %s: set the annotation %s=\"true\" to keep it, which clears the failure, or "+
+			"choose another image.", c.Name, u.ToImage, AnnotationRetryDatabase)
+	}
 	rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionTrue, reason, u.Message)
-	rc.SetCondition(forgejov1.ConditionDatabaseUpgrading, metav1.ConditionFalse, reason,
-		fmt.Sprintf("%s Choose another image, or set the annotation %s=\"true\" to retry %s.", u.Message, AnnotationRetryDatabase, u.ToImage))
+	rc.SetCondition(forgejov1.ConditionDatabaseUpgrading, metav1.ConditionFalse, reason, u.Message+" "+next)
 }
 
 // keptDatabaseImage is the image the cluster keeps after a terminal phase: the one it runs.
@@ -395,7 +460,8 @@ func databaseUpgradeBlocked(ctx context.Context, rc *forgejo.ReconcileContext, c
 // heldMessage says why an upgrade (or its retry) waits after a rollback whose restore failed.
 func heldMessage(u *forgejov1.DatabaseUpgradeStatus) string {
 	return fmt.Sprintf("the rollback of the upgrade to %s failed and the recreated database may be empty, so Forgejo is kept stopped "+
-		"and no upgrade starts until a ForgejoRestore has restored a backup (for example %s, database only)", u.ToImage, u.BackupName)
+		"and no upgrade starts until a ForgejoRestore has restored the database from a backup (for example %s, database only)",
+		u.ToImage, u.BackupName)
 }
 
 // forgejoRollbackRestoreFailed reports a Forgejo upgrade whose rollback restore failed, which
@@ -436,7 +502,10 @@ func startDatabaseUpgrade(rc *forgejo.ReconcileContext, c *forgejo.CNPGCluster, 
 // holdAfterFailedDatabaseRestore keeps Forgejo at zero replicas after a rollback whose restore
 // into the recreated cluster failed: the database may be empty or half-restored, and Forgejo
 // must not start on it (it would migrate an empty database and serve an empty instance). A
-// ForgejoRestore created after the failure lifts the hold once it has restored a backup.
+// ForgejoRestore created after the failure lifts the hold once it has restored the database: it
+// restores it (restoreDatabase, true by default) and has reached ScalingUp, so its Job loaded a
+// dump (every backup has one, and the Job fails without it). A restore of the data volume alone
+// does not.
 func holdAfterFailedDatabaseRestore(ctx context.Context, rc *forgejo.ReconcileContext) error {
 	f := rc.Instance
 	u := forgejo.DatabaseUpgrade(f)
@@ -448,20 +517,20 @@ func holdAfterFailedDatabaseRestore(ctx context.Context, rc *forgejo.ReconcileCo
 		return fmt.Errorf("listing restores: %w", err)
 	}
 	for _, r := range restores {
-		if r.Name == u.RestoreName || r.CreationTimestamp.Before(u.CompletionTime) ||
+		if r.Name == u.RestoreName || r.CreationTimestamp.Before(u.CompletionTime) || !forgejo.BoolOr(r.Spec.RestoreDatabase, true) ||
 			(r.Status.Phase != forgejov1.RestorePhaseScalingUp && r.Status.Phase != forgejov1.RestorePhaseCompleted) {
 			continue
 		}
 		u.RollbackRestoreFailed = false
-		u.Message = fmt.Sprintf("Upgrade of PostgreSQL to %s failed and its rollback restore failed; ForgejoRestore %s then restored %s, "+
-			"so Forgejo runs again.", u.ToImage, r.Name, backup.RestoreSource(&r))
+		u.Message = fmt.Sprintf("Upgrade of PostgreSQL to %s failed and its rollback restore failed; ForgejoRestore %s then restored the "+
+			"database from %s, so Forgejo runs again.", u.ToImage, r.Name, backup.RestoreSource(&r))
 		rc.Event(corev1.EventTypeNormal, "DatabaseUpgradeRollbackRestored", dbEventAction, "%s", u.Message)
 		return nil
 	}
 	zero := int32(0)
 	rc.ReplicasOverride = &zero
-	msg := fmt.Sprintf("%s Forgejo is kept stopped until a ForgejoRestore has restored a backup (for example %s, database only).",
-		u.Message, u.BackupName)
+	msg := fmt.Sprintf("%s Forgejo is kept stopped until a ForgejoRestore has restored the database from a backup (for example %s, "+
+		"database only); a restore of the data volume alone does not end this.", u.Message, u.BackupName)
 	rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionTrue, ReasonPostgresUpgradeFailed, msg)
 	if cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionDatabaseUpgrading); cond != nil {
 		switch cond.Reason {

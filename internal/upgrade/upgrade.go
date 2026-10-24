@@ -16,9 +16,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/backup"
@@ -379,6 +381,13 @@ func stopAfterFailedRestore(ctx context.Context, rc *forgejo.ReconcileContext, d
 			(r.Status.Phase != forgejov1.RestorePhaseScalingUp && r.Status.Phase != forgejov1.RestorePhaseCompleted) {
 			continue
 		}
+		complete, err := restoredDatabaseAndData(ctx, rc, &r)
+		if err != nil {
+			return err
+		}
+		if !complete {
+			continue
+		}
 		u.RollbackRestoreFailed = false
 		u.Message = fmt.Sprintf("Upgrade to %s failed and its automatic rollback failed; ForgejoRestore %s then restored backup %s, so %s runs again.",
 			u.ToImage, r.Name, r.Spec.BackupName, u.FromImage)
@@ -387,11 +396,38 @@ func stopAfterFailedRestore(ctx context.Context, rc *forgejo.ReconcileContext, d
 		return nil
 	}
 	rc.ReplicasOverride = ptr.To[int32](0)
-	msg := fmt.Sprintf("%s Forgejo is kept stopped until a ForgejoRestore has restored a backup taken with %s, "+
-		"or spec.image is changed (setting it back to %s starts it without a restore).", u.Message, u.FromImage, u.FromImage)
+	msg := fmt.Sprintf("%s Forgejo is kept stopped until a ForgejoRestore has restored a backup taken with %s "+
+		"(its database, and its data volume when the backup has one), or spec.image is changed (setting it back to %s "+
+		"starts it without a restore).", u.Message, u.FromImage, u.FromImage)
 	rc.SetCondition(forgejov1.ConditionDegraded, metav1.ConditionTrue, ReasonFailed, msg)
 	rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, ReasonFailed, msg)
 	return nil
+}
+
+// restoredDatabaseAndData reports whether r restored the database and, when its backup has an
+// archive of the data volume, the data volume too. Only such a restore undoes a failed rollback
+// restore, which may have left the database in the newer version's state and the data volume
+// partly extracted. A restore with restoreData false counts only when its backup has no data
+// archive; when that cannot be told (the ForgejoBackup is gone), it does not count.
+func restoredDatabaseAndData(ctx context.Context, rc *forgejo.ReconcileContext, r *forgejov1.ForgejoRestore) (bool, error) {
+	if !forgejo.BoolOr(r.Spec.RestoreDatabase, true) {
+		return false, nil
+	}
+	if forgejo.BoolOr(r.Spec.RestoreData, true) {
+		return true, nil
+	}
+	if r.Spec.BackupName == "" {
+		return r.Status.Remote != nil && !r.Status.Remote.IncludesData, nil
+	}
+	b := &forgejov1.ForgejoBackup{}
+	err := rc.Client.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: r.Spec.BackupName}, b)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reading ForgejoBackup %s: %w", r.Spec.BackupName, err)
+	}
+	return !b.Status.IncludesData, nil
 }
 
 // objectName derives the pre-upgrade backup and rollback restore names from the upgrade's

@@ -802,7 +802,7 @@ func (m *dbMachine) rollingBack() error {
 			"Deleted CNPG cluster %s to recreate it on %s and restore pre-upgrade backup %s into it", name, u.FromImage, u.BackupName)
 		return nil
 	case c == nil:
-		left, err := m.clusterLeftovers()
+		left, err := clusterLeftovers(m.ctx, rc)
 		if err != nil {
 			return err
 		}
@@ -895,20 +895,20 @@ func (m *dbMachine) keepCluster(c *forgejo.CNPGCluster, why string) {
 // volumes carry CNPG's cluster label; Secrets and Services (some without it) are found by their
 // owner reference, read as metadata only. Their labels are not the operator's, so they are read
 // live.
-func (m *dbMachine) clusterLeftovers() ([]string, error) {
-	rc, f := m.rc, m.rc.Instance
+func clusterLeftovers(ctx context.Context, rc *forgejo.ReconcileContext) ([]string, error) {
+	f := rc.Instance
 	name := forgejo.DatabaseClusterName(f)
 	sel := client.MatchingLabels{forgejo.CNPGClusterLabel: name}
 	var left []string
 	pvcs := &corev1.PersistentVolumeClaimList{}
-	if err := rc.Client.List(m.ctx, pvcs, client.InNamespace(f.Namespace), sel); err != nil {
+	if err := rc.Client.List(ctx, pvcs, client.InNamespace(f.Namespace), sel); err != nil {
 		return nil, err
 	}
 	for _, p := range pvcs.Items {
 		left = append(left, "PVC "+p.Name)
 	}
 	pods := &corev1.PodList{}
-	if err := rc.Client.List(m.ctx, pods, client.InNamespace(f.Namespace), sel); err != nil {
+	if err := rc.Client.List(ctx, pods, client.InNamespace(f.Namespace), sel); err != nil {
 		return nil, err
 	}
 	for _, p := range pods.Items {
@@ -917,7 +917,7 @@ func (m *dbMachine) clusterLeftovers() ([]string, error) {
 	for _, kind := range []string{"Secret", "Service"} {
 		list := &metav1.PartialObjectMetadataList{}
 		list.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind(kind + "List"))
-		if err := rc.Client.List(m.ctx, list, client.InNamespace(f.Namespace)); err != nil {
+		if err := rc.Client.List(ctx, list, client.InNamespace(f.Namespace)); err != nil {
 			return nil, err
 		}
 		for _, o := range list.Items {

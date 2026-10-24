@@ -43,6 +43,11 @@ type PostgresPolicy struct {
 	// Max is the newest major that the CloudNativePG release the operator supports (1.30)
 	// supports. Newer ones, release candidates included, are refused.
 	Max int
+	// MinUpgradeTarget is the oldest major that this CloudNativePG release upgrades a cluster
+	// to in place. Its webhook refuses a newer major below it ("major upgrades are only
+	// supported to version 16 or higher"): pg_upgrade of an older major needs the new cluster
+	// created with the old one's locale and encoding, which CloudNativePG does not do.
+	MinUpgradeTarget int
 	// Verified majors run Forgejo 15 and 17 in the operator's tests (fresh installs, upgrades
 	// of Forgejo and of PostgreSQL, backups and restores). Others in [Min, Max] are allowed with
 	// an UnsupportedVersion warning.
@@ -50,7 +55,7 @@ type PostgresPolicy struct {
 }
 
 // Postgres is the operator's PostgreSQL version policy.
-var Postgres = PostgresPolicy{Min: 14, Max: 18, Verified: []int{17, 18}}
+var Postgres = PostgresPolicy{Min: 14, Max: 18, MinUpgradeTarget: 16, Verified: []int{17, 18}}
 
 // InRange reports whether major may run Forgejo with the supported CloudNativePG release.
 func (p PostgresPolicy) InRange(major int) bool { return major >= p.Min && major <= p.Max }

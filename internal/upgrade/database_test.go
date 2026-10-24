@@ -26,6 +26,9 @@ import (
 )
 
 const (
+	pg14          = "ghcr.io/cloudnative-pg/postgresql:14-minimal-trixie"
+	pg15          = "ghcr.io/cloudnative-pg/postgresql:15-minimal-trixie"
+	pg16          = "ghcr.io/cloudnative-pg/postgresql:16-minimal-trixie"
 	pg17          = "ghcr.io/cloudnative-pg/postgresql:17-minimal-trixie"
 	pg18          = "ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie"
 	pg18Patch     = "ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie"
@@ -193,10 +196,11 @@ func TestDatabaseVersionGate(t *testing.T) {
 	for _, tt := range []struct {
 		name, running, desired string
 		major                  int
-		// write is the image the database step must write; reason the DatabaseUpgrading reason;
-		// degraded the Degraded reason ("" for none); upgrade whether an upgrade starts.
-		write, reason, degraded string
-		upgrade                 bool
+		// write is the image the database step must write; reason the DatabaseUpgrading reason
+		// and msg a part of its message; degraded the Degraded reason ("" for none); upgrade
+		// whether an upgrade starts.
+		write, reason, msg, degraded string
+		upgrade                      bool
 	}{
 		{name: "same image", running: pg17, desired: pg17, major: 17, write: pg17, reason: reasonDatabaseUpToDate},
 		{name: "minor pin within the major", running: pg18, desired: pg18Patch, major: 18, write: pg18Patch, reason: reasonDatabaseRollout},
@@ -212,9 +216,13 @@ func TestDatabaseVersionGate(t *testing.T) {
 			desired: "ghcr.io/cloudnative-pg/postgresql:13.20-minimal-trixie", major: 13,
 			write: "ghcr.io/cloudnative-pg/postgresql:13-minimal-trixie", reason: ReasonPostgresVersionUnsupported, degraded: ReasonPostgresVersionUnsupported},
 		{name: "upgrade", running: pg17, desired: pg18, major: 17, write: pg17, reason: string(forgejov1.DatabaseUpgradePending), upgrade: true},
-		{name: "upgrade to an unverified major", running: "ghcr.io/cloudnative-pg/postgresql:15-minimal-trixie",
-			desired: "ghcr.io/cloudnative-pg/postgresql:16-minimal-trixie", major: 15,
-			write: "ghcr.io/cloudnative-pg/postgresql:15-minimal-trixie", reason: string(forgejov1.DatabaseUpgradePending), upgrade: true},
+		{name: "upgrade to an unverified major", running: pg15, desired: pg16, major: 15, write: pg15,
+			reason: string(forgejov1.DatabaseUpgradePending), upgrade: true},
+		// CloudNativePG's webhook refuses a newer major below 16: refused before Forgejo stops.
+		{name: "upgrade to a major below 16", running: pg14, desired: pg15, major: 14, write: pg14,
+			reason: ReasonPostgresUpgradePathUnsupported, msg: "only to PostgreSQL 16 or newer", degraded: ReasonPostgresUpgradePathUnsupported},
+		{name: "upgrade from 14 to 16", running: pg14, desired: pg16, major: 14, write: pg14,
+			reason: string(forgejov1.DatabaseUpgradePending), upgrade: true},
 		{name: "unknown Debian release", running: pg17, desired: "registry.example.com/pg:18-custom", major: 17, write: pg17,
 			reason: string(forgejov1.DatabaseUpgradePending), upgrade: true},
 		{name: "no version in the tag", running: pg17, desired: "registry.example.com/pg@sha256:0123", major: 17,
@@ -224,11 +232,11 @@ func TestDatabaseVersionGate(t *testing.T) {
 			f := dbInstance(tt.desired)
 			c := dbClient(t, cnpgCluster(tt.running, tt.running, tt.major, sysOld, true, time.Now().Add(-time.Hour)))
 			rc, res := dbPass(t, c, f)
-			if res.Stop || rc.DatabaseImage != tt.write {
-				t.Fatalf("stop %v, writes %s, want %s", res.Stop, rc.DatabaseImage, tt.write)
+			if res.Stop || rc.DatabaseImage != tt.write || rc.ReplicasOverride != nil {
+				t.Fatalf("stop %v, writes %s (want %s), override %v", res.Stop, rc.DatabaseImage, tt.write, rc.ReplicasOverride)
 			}
-			if cond := condition(f, forgejov1.ConditionDatabaseUpgrading); cond == nil || cond.Reason != tt.reason {
-				t.Fatalf("DatabaseUpgrading %+v, want reason %s", cond, tt.reason)
+			if cond := condition(f, forgejov1.ConditionDatabaseUpgrading); cond == nil || cond.Reason != tt.reason || !strings.Contains(cond.Message, tt.msg) {
+				t.Fatalf("DatabaseUpgrading %+v, want reason %s and %q", cond, tt.reason, tt.msg)
 			}
 			d := condition(f, forgejov1.ConditionDegraded)
 			if (tt.degraded == "") != (d == nil || d.Status != metav1.ConditionTrue) || (d != nil && tt.degraded != "" && d.Reason != tt.degraded) {
@@ -270,7 +278,7 @@ func TestDatabaseNewCluster(t *testing.T) {
 	if !hasEvent(recorded(rc), ReasonPostgresVersionUnsupported) {
 		t.Error("no PostgresVersionUnsupported event")
 	}
-	f = dbInstance("ghcr.io/cloudnative-pg/postgresql:16-minimal-trixie")
+	f = dbInstance(pg16)
 	f.UID = "new-cluster-uid" // the warning is emitted once per instance and image
 	if rc, _ = dbPass(t, dbClient(t), f); !hasEvent(recorded(rc), reasonUnsupportedVersion) {
 		t.Error("an unverified major is not warned about")
@@ -877,6 +885,11 @@ func TestDatabaseRollbackKeepsTheClusterWithoutAUsableBackup(t *testing.T) {
 			if restores(t, c) != 0 {
 				t.Fatal("a restore was created")
 			}
+			// Still reported as failed afterwards, although the kept Cluster runs the new image.
+			if rc, _ = dbPass(t, c, f); rc.DatabaseImage != pg18 || u.FailedImage != pg18 ||
+				condition(f, forgejov1.ConditionDegraded).Reason != ReasonPostgresUpgradeFailed {
+				t.Fatalf("next pass: image %s, failed image %q, Degraded %+v", rc.DatabaseImage, u.FailedImage, condition(f, forgejov1.ConditionDegraded))
+			}
 		})
 	}
 }
@@ -911,7 +924,7 @@ func TestDatabaseRollbackRestoreFailureHoldsForgejo(t *testing.T) {
 		t.Fatal("hold lifted by a spec change")
 	}
 	// A refused image is reported once, as without the hold.
-	f.Spec.Database.CNPG.ImageName = "ghcr.io/cloudnative-pg/postgresql:16-minimal-trixie"
+	f.Spec.Database.CNPG.ImageName = pg16
 	for pass := range 2 {
 		rc, _ := dbPass(t, c, f)
 		if refused := hasEvent(recorded(rc), ReasonPostgresDowngradeRefused); refused != (pass == 0) || !zeroReplicas(rc) ||
@@ -927,6 +940,38 @@ func TestDatabaseRollbackRestoreFailureHoldsForgejo(t *testing.T) {
 	}
 	if rc, _ := dbPass(t, c, f); rc.ReplicasOverride != nil || u.RollbackRestoreFailed || !hasEvent(recorded(rc), "DatabaseUpgradeRollbackRestored") {
 		t.Fatalf("hold kept after a later restore: %v", rc.ReplicasOverride)
+	}
+}
+
+// Only a restore of the database lifts that hold: one of the data volume alone (for example
+// from a scheduled backup) leaves the database empty or half-restored.
+func TestDatabaseRollbackRestoreHoldNeedsADatabaseRestore(t *testing.T) {
+	ctx := context.Background()
+	f, c := failedRollbackRestore(t)
+	u := forgejo.DatabaseUpgrade(f)
+	dataOnly := restore("data-only", forgejov1.RestorePhaseCompleted, ptr.To(metav1.NewTime(time.Now().Add(time.Minute))))
+	dataOnly.Spec.RestoreDatabase = ptr.To(false)
+	if err := c.Create(ctx, dataOnly); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []forgejov1.RestorePhase{forgejov1.RestorePhaseScalingUp, forgejov1.RestorePhaseCompleted} {
+		dataOnly.Status.Phase = phase
+		if err := c.Update(ctx, dataOnly); err != nil {
+			t.Fatal(err)
+		}
+		rc, _ := dbPass(t, c, f)
+		if !zeroReplicas(rc) || !u.RollbackRestoreFailed || hasEvent(recorded(rc), "DatabaseUpgradeRollbackRestored") ||
+			condition(f, forgejov1.ConditionDegraded).Reason != ReasonPostgresUpgradeFailed {
+			t.Fatalf("%s: hold lifted by a data-only restore: override %v, %s", phase, rc.ReplicasOverride, u.Message)
+		}
+	}
+	// A restore of the database (restoreDatabase defaults to true) lifts it.
+	later := restore("database", forgejov1.RestorePhaseScalingUp, ptr.To(metav1.NewTime(time.Now().Add(2*time.Minute))))
+	if err := c.Create(ctx, later); err != nil {
+		t.Fatal(err)
+	}
+	if rc, _ := dbPass(t, c, f); rc.ReplicasOverride != nil || u.RollbackRestoreFailed || !strings.Contains(u.Message, "ForgejoRestore database") {
+		t.Fatalf("hold kept after a database restore: %v: %s", rc.ReplicasOverride, u.Message)
 	}
 }
 
@@ -1068,19 +1113,66 @@ func TestDatabaseVerifyIgnoresLeftoverPods(t *testing.T) {
 }
 
 // Without autoRollback a failed verification keeps the new major; a crash loop fails it early.
+// The failure stays reported (Degraded) although the cluster runs the failed image, until the
+// retry annotation clears it: there is nothing to upgrade again. The annotation is removed in
+// the pass after.
 func TestDatabaseVerifyFailures(t *testing.T) {
+	ctx := context.Background()
 	f := verifying(time.Minute)
 	f.Spec.Upgrade.AutoRollback = ptr.To(false)
 	crashing := serverPod(f, "fj-1", imgA, ago(time.Minute), corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: waitingCrashLoopBackOff}}, 3)
-	rc, _ := dbPass(t, dbClient(t, cnpgCluster(pg18, pg18, 18, sysNew, true, time.Now().Add(-48*time.Hour)), crashing), f)
+	c := dbClient(t, cnpgCluster(pg18, pg18, 18, sysNew, true, time.Now().Add(-48*time.Hour)), crashing, f.DeepCopy())
+	rc, _ := dbPass(t, c, f)
 	u := forgejo.DatabaseUpgrade(f)
 	if u.Phase != forgejov1.DatabaseUpgradeFailed || rc.DatabaseImage != pg18 || u.FailedImage != pg18 ||
 		!strings.Contains(u.FailureReason, "Forgejo fails on PostgreSQL 18") {
 		t.Fatalf("phase %s, image %s: %s", u.Phase, rc.DatabaseImage, u.FailureReason)
 	}
-	// Held on the new major: it is the image the cluster runs.
-	if rc, _ = dbPass(t, dbClient(t, cnpgCluster(pg18, pg18, 18, sysNew, true, time.Now().Add(-48*time.Hour))), f); rc.DatabaseImage != pg18 {
-		t.Fatalf("held image %s", rc.DatabaseImage)
+	failed := func(pass string) {
+		t.Helper()
+		d, cond := condition(f, forgejov1.ConditionDegraded), condition(f, forgejov1.ConditionDatabaseUpgrading)
+		if rc.DatabaseImage != pg18 || u.Phase != forgejov1.DatabaseUpgradeFailed || u.FailedImage != pg18 || d.Status != metav1.ConditionTrue ||
+			d.Reason != ReasonPostgresUpgradeFailed || cond.Reason != ReasonPostgresUpgradeFailed || !strings.Contains(cond.Message, "already runs") {
+			t.Fatalf("%s: image %s, upgrade %+v, Degraded %+v, DatabaseUpgrading %+v", pass, rc.DatabaseImage, u, d, cond)
+		}
+	}
+	failed("failing pass")
+	// Held on the new major (the image the cluster runs), still reported as failed.
+	if err := c.Delete(ctx, crashing); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		rc, _ = dbPass(t, c, f)
+		failed("held pass")
+	}
+	// The retry annotation clears the failure; no upgrade starts.
+	f.Annotations = map[string]string{AnnotationRetryDatabase: valueTrue}
+	rc, _ = dbPass(t, c, f)
+	d, cond := condition(f, forgejov1.ConditionDegraded), condition(f, forgejov1.ConditionDatabaseUpgrading)
+	if u = forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeFailed || u.FailedImage != "" || rc.DatabaseImage != pg18 || rc.Upgrading ||
+		d.Status != metav1.ConditionFalse || cond.Reason != reasonDatabaseUpToDate || backups(t, c) != 0 || !hasEvent(recorded(rc), "DatabaseUpgradeRetry") {
+		t.Fatalf("retry: upgrade %+v, image %s, Degraded %+v, DatabaseUpgrading %+v", u, rc.DatabaseImage, d, cond)
+	}
+	live := func() *forgejov1.Forgejo {
+		t.Helper()
+		obj := &forgejov1.Forgejo{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "fj"}, obj); err != nil {
+			t.Fatal(err)
+		}
+		return obj
+	}
+	annotated := func() bool {
+		_, ok := live().Annotations[AnnotationRetryDatabase]
+		return ok
+	}
+	obj := live()
+	obj.Annotations = map[string]string{AnnotationRetryDatabase: valueTrue}
+	if err := c.Update(ctx, obj); err != nil {
+		t.Fatal(err)
+	}
+	// Removed in the next pass, which finds nothing to retry.
+	if rc, _ = dbPass(t, c, f); annotated() || u.FailedImage != "" || condition(f, forgejov1.ConditionDatabaseUpgrading).Reason != reasonDatabaseUpToDate {
+		t.Fatalf("annotation kept %v, upgrade %+v", annotated(), u)
 	}
 }
 
@@ -1099,6 +1191,62 @@ func TestForgejoUpgradeWaitsForDatabaseUpgrade(t *testing.T) {
 	}
 	if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade == nil || !inFlight(f.Status.Upgrade.Phase) {
 		t.Fatalf("after the database upgrade the Forgejo upgrade starts: %+v", f.Status.Upgrade)
+	}
+}
+
+// A Cluster deleted while no upgrade is in flight (the manual rollback of docs/upgrades.md) is
+// created again only once it and its pods, volumes, Secrets and Services are gone: a new
+// cluster of that name would take them over. The step stops meanwhile, so that the database
+// step neither updates the Cluster being deleted nor creates the new one too early.
+func TestDatabaseRecreatesADeletedClusterOnceItsObjectsAreGone(t *testing.T) {
+	ctx := context.Background()
+	// Rolled back by hand after the upgrade 17 → 18: the image set back to 17 was refused while
+	// the Cluster existed; then the Cluster was deleted.
+	f := dbInstance(pg17)
+	f.Status.Database = &forgejov1.DatabaseStatus{Image: pg18, MajorVersion: 18, SystemID: sysNew, Upgrade: &forgejov1.DatabaseUpgradeStatus{
+		Phase: forgejov1.DatabaseUpgradeSucceeded, FromImage: pg17, ToImage: pg18, FromMajor: 17, ToMajor: 18, BackupName: testPreBackup,
+		StartTime: ago(time.Hour), CompletionTime: ago(50 * time.Minute)}}
+	meta.SetStatusCondition(&f.Status.Conditions, metav1.Condition{Type: forgejov1.ConditionDegraded, Status: metav1.ConditionTrue,
+		Reason: ReasonPostgresDowngradeRefused, Message: "refused"})
+	deleting := cnpgCluster(pg18, pg18, 18, sysNew, true, time.Now().Add(-48*time.Hour))
+	deleting.SetFinalizers([]string{"example.com/hold"})
+	deleting.SetDeletionTimestamp(ago(0))
+	labels := map[string]string{forgejo.CNPGClusterLabel: testCluster}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: testPrimary, Namespace: "ns", Labels: labels}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: testPrimary + "-pod", Namespace: "ns", Labels: labels}}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "fj-db-rw", Namespace: "ns", OwnerReferences: []metav1.OwnerReference{{
+		APIVersion: "postgresql.cnpg.io/v1", Kind: "Cluster", Name: testCluster, UID: "cluster-uid"}}}}
+	c := dbClient(t, deleting, pvc, pod, svc)
+
+	waits := func(want string) {
+		t.Helper()
+		rc, res := dbPass(t, c, f)
+		db, d := condition(f, forgejov1.ConditionDatabaseReady), condition(f, forgejov1.ConditionDegraded)
+		if !res.Stop || db == nil || db.Status != metav1.ConditionFalse || db.Reason != reasonClusterDeleting || !strings.Contains(db.Message, want) ||
+			d.Status == metav1.ConditionTrue || rc.Upgrading || rc.ReplicasOverride != nil {
+			t.Fatalf("stop %v, DatabaseReady %+v, Degraded %+v", res.Stop, db, d)
+		}
+	}
+	waits("is being deleted")
+	cl := getCluster(t, c)
+	cl.SetFinalizers(nil)
+	if err := c.Update(ctx, cl); err != nil {
+		t.Fatal(err)
+	}
+	if getCluster(t, c) != nil {
+		t.Fatal("the Cluster was not deleted")
+	}
+	for _, obj := range []client.Object{pvc, svc, pod} {
+		waits(obj.GetName())
+		if err := c.Delete(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Then the database step creates it again, on the requested image.
+	rc, res := dbPass(t, c, f)
+	if cond := condition(f, forgejov1.ConditionDatabaseUpgrading); res.Stop || rc.DatabaseImage != pg17 || cond.Reason != reasonDatabaseUpToDate ||
+		!strings.Contains(cond.Message, "Creating CNPG cluster fj-db") {
+		t.Fatalf("stop %v, image %s, DatabaseUpgrading %+v", res.Stop, rc.DatabaseImage, cond)
 	}
 }
 
