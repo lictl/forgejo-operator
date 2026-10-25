@@ -2,6 +2,10 @@ module github.com/lictl/forgejo-operator
 
 go 1.26.0
 
+// Go 1.26.0's net/url rejects the multi-host Sentinel URLs of highAvailability (fixed in later
+// 1.26 releases); CI's setup-go installs this toolchain.
+toolchain go1.26.9
+
 require (
 	github.com/go-logr/logr v1.4.3
 	github.com/google/uuid v1.6.0
