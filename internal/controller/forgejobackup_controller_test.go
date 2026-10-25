@@ -54,7 +54,10 @@ var _ = Describe("ForgejoBackup Controller", func() {
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					// A backup of an instance that does not exist: the reconcile waits for it.
+					Spec: forgejov1alpha1.ForgejoBackupSpec{
+						ForgejoRef: forgejov1alpha1.ForgejoRef{Name: "test-forgejo"},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

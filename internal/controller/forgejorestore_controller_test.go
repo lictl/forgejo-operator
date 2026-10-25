@@ -54,7 +54,11 @@ var _ = Describe("ForgejoRestore Controller", func() {
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					// A restore of a backup and an instance that do not exist: the reconcile waits.
+					Spec: forgejov1alpha1.ForgejoRestoreSpec{
+						ForgejoRef: forgejov1alpha1.ForgejoRef{Name: "test-forgejo"},
+						BackupName: "test-backup",
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
