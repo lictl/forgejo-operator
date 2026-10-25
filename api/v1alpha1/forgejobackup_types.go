@@ -175,7 +175,7 @@ type RemoteBackupFile struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=fjb,categories=forgejo
+// +kubebuilder:resource:shortName=fjb,categories=forgejo-all
 // +kubebuilder:printcolumn:name="Forgejo",type=string,JSONPath=`.spec.forgejoRef.name`
 // +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.spec.reason`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`

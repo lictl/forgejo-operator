@@ -9,7 +9,7 @@ spec:
   group: forgejo.lucas.icu
   names:
     categories:
-    - forgejo
+    - forgejo-all
     kind: ForgejoRunner
     listKind: ForgejoRunnerList
     plural: forgejorunners

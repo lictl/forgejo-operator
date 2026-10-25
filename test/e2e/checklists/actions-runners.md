@@ -89,7 +89,7 @@ Reusable procedures (referenced below; run ADMIN(N) first):
 ## R0 — Prerequisites
 
 1. **R0.1 images**: all five images listed in the shared facts are present (pull missing ones). Record `docker image inspect data.forgejo.org/forgejo/runner:13.2.0 --format '{{index .Config.Labels "org.opencontainers.image.version"}}'` → `13.2.0`.
-2. **R0.2 CRD**: `kubectl get crd forgejorunners.forgejo.lucas.icu -o jsonpath='{.spec.names.shortNames} {.spec.names.categories} {.spec.versions[0].subresources.scale.specReplicasPath}'` → `["fjrn"] ["forgejo"] .spec.replicas`; `kubectl api-resources | grep forgejorunners` shows `fjrn`.
+2. **R0.2 CRD**: `kubectl get crd forgejorunners.forgejo.lucas.icu -o jsonpath='{.spec.names.shortNames} {.spec.names.categories} {.spec.versions[0].subresources.scale.specReplicasPath}'` → `["fjrn"] ["forgejo-all"] .spec.replicas`; `kubectl api-resources | grep forgejorunners` shows `fjrn`.
 3. **R0.3 namespace**: `kubectl create namespace e2e-runners`; `kubectl label namespace e2e-runners pod-security.kubernetes.io/enforce=privileged` (the Docker executor runs a privileged daemon).
 4. **R0.4 S3 credentials**: `kubectl -n s3-lab get secret s3-credentials -o json | jq '{apiVersion, kind, type, data, metadata: {name: .metadata.name}}' | kubectl -n e2e-runners apply -f -`. If `s3-lab` does not exist, run `hack/s3-lab/setup.sh` first (it only touches `s3-lab`).
 5. **R0.5 instances**: apply

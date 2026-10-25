@@ -302,7 +302,7 @@ type ForgejoRunnerStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
-// +kubebuilder:resource:path=forgejorunners,shortName=fjrn,categories=forgejo
+// +kubebuilder:resource:path=forgejorunners,shortName=fjrn,categories=forgejo-all
 // +kubebuilder:printcolumn:name="Forgejo",type=string,JSONPath=`.spec.forgejoRef.name`
 // +kubebuilder:printcolumn:name="Executor",type=string,JSONPath=`.spec.executor`
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`

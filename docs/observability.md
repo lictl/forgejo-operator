@@ -637,8 +637,8 @@ kubectl events -n <ns> --for fj/<name>
 kubectl get servicemonitor,prometheusrule,configmap -n <ns> -l app.kubernetes.io/instance=<name>
 ```
 
-`forgejo` is both a short name of `Forgejo` and the category of all three kinds, so
-`kubectl get forgejo <name>` is ambiguous. Use `fj` (or `forgejos`) when you name an object.
+`kubectl get forgejo-all -n <ns>` lists the instances, backups, restores and runners together
+(the category of all four kinds).
 
 Useful PromQL:
 

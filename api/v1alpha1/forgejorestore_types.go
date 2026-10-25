@@ -114,7 +114,7 @@ type RestoreRemoteStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=fjr,categories=forgejo
+// +kubebuilder:resource:shortName=fjr,categories=forgejo-all
 // +kubebuilder:printcolumn:name="Forgejo",type=string,JSONPath=`.spec.forgejoRef.name`
 // +kubebuilder:printcolumn:name="Backup",type=string,JSONPath=`.spec.backupName`
 // +kubebuilder:printcolumn:name="Remote",type=string,JSONPath=`.spec.remote.path`

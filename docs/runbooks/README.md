@@ -78,9 +78,9 @@ q() { curl -s "$PROM/api/v1/query" --data-urlencode "query=$1" | jq -c '.data.re
 q "forgejo_operator_instance_ready{namespace=\"$NS\", name=\"$N\"}"
 ```
 
-`kubectl get fj` (not `kubectl get forgejo`, which is ambiguous: `forgejo` is also the category of
-all the operator's kinds). The operator runs as Deployment `forgejo-operator-controller-manager`
-in namespace `forgejo-operator-system` with the default kustomization:
+`fj` is the short name of `forgejo`, and `kubectl get forgejo-all` lists all the operator's kinds.
+The operator runs as Deployment `forgejo-operator-controller-manager` in namespace
+`forgejo-operator-system` with the default kustomization:
 
 ```sh
 OPNS=forgejo-operator-system
