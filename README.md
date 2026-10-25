@@ -256,7 +256,9 @@ and the Prometheus rule tests. Pushes to `main` and `v*` tags then build the ima
 and push it to the instance's container registry as `<host>/<owner>/forgejo-operator:<commit>`
 (the first 12 characters), plus `:main` or the tag. The push needs the repository secret
 `REGISTRY_TOKEN`: an access token with the `write:package` scope of a user who may publish packages
-for the repository's owner (the workflow's own token cannot push packages).
+for the repository's owner (the workflow's own token cannot push packages). `<host>` is the
+repository variable `REGISTRY`, the instance's public host name; set it when the runners reach
+Forgejo through another address, such as the in-cluster Service that a `ForgejoRunner` uses.
 
 The reconcile pipeline is a table of steps in `internal/controller/forgejo_controller.go`. Each
 step is owned by one package: `core`, `backup`, `upgrade`, `observability` or `autopilot`, and

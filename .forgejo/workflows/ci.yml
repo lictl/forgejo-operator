@@ -31,7 +31,8 @@ jobs:
     container:
       image: docker.io/library/docker:29.9.2-cli
     steps:
-      - run: apk add --no-cache git go make nodejs
+      # The Makefile runs its recipes with bash.
+      - run: apk add --no-cache bash git go make nodejs
       - uses: actions/checkout@v4
       - name: Prometheus rule tests
         env:
@@ -53,9 +54,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build and push the image
         env:
+          REGISTRY: ${{ vars.REGISTRY }}
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        # Runners may reach Forgejo through another address than its public one (a ForgejoRunner
+        # uses the in-cluster Service): the repository variable REGISTRY names the public host.
         run: |
-          registry="${GITHUB_SERVER_URL#*://}"
+          registry="${REGISTRY:-${GITHUB_SERVER_URL#*://}}"
           image="$registry/$GITHUB_REPOSITORY"
           tags="-t $image:$(echo "$GITHUB_SHA" | cut -c1-12)"
           case "$GITHUB_REF" in

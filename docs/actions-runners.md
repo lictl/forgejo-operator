@@ -244,10 +244,12 @@ operator manages, which it then registers again. Neither is needed with a `Forge
 - **Actions** such as `actions/checkout` are fetched from `[actions] DEFAULT_ACTIONS_URL`
   (`https://data.forgejo.org` by default): the runner pods need egress to it, or set it to `self`
   and mirror the actions into the instance for an air-gapped cluster.
-- **Checkout** clones from the instance's `ROOT_URL` (`status.url`), from inside the job
-  container. The default `ROOT_URL` is the in-cluster Service URL, which job containers resolve
-  (the Docker daemon passes the pod's DNS configuration on). With a public `spec.server.domain`,
-  the pods must be able to resolve and reach that name.
+- **The instance's address in jobs** is the one the runners connect to, the in-cluster Service URL,
+  whatever `ROOT_URL` is: Forgejo Runner passes it on as `github.server_url`
+  (`GITHUB_SERVER_URL`), so checkout and API calls from job containers use it (the Docker daemon
+  passes the pod's DNS configuration on). A workflow that needs the public host name, e.g. to name
+  images for the instance's container registry, has to be given it, for example as a repository
+  variable.
 - **The ID token key** that signs OIDC tokens for jobs (Forgejo 15 and later) is kept on the data
   volume (`actions_id_token/`), so it is in backups like the other identity files.
 
@@ -323,7 +325,7 @@ $ kubectl get events --field-selector involvedObject.name=ci   # StatefulSet Fai
 | `Degraded=True/ForgejoAPIUnavailable` | The admin credentials do not work for the API (password changed in the UI, 2FA, basic auth off) or the operator cannot reach `<forgejo>-http` |
 | Jobs stay `waiting` | No runner has a label named like `runs-on`, or the repository is outside the runners' `scope`; `forgejo_operator_runner_jobs_waiting` counts them |
 | `actions/checkout` fails with `node: not found` | A Docker label image or `host.image` without node; use a node image |
-| `actions/checkout` cannot connect | `ROOT_URL` is not reachable from the job container, or no egress to `DEFAULT_ACTIONS_URL` |
+| `actions/checkout` cannot connect | The instance's in-cluster Service is not reachable from the job container (DNS, a NetworkPolicy), or no egress to `DEFAULT_ACTIONS_URL` |
 | `Cannot connect to the Docker daemon` in a step | `docker.mountSocket` is off (it is off by default) |
 | Image pulls hit rate limits | Use the mirrors under `data.forgejo.org/oci/` in labels, or `docker.args: [--registry-mirror=...]` |
 | Job containers stall on large transfers | A path with a smaller MTU than the pod's interface, or a pod interface other than `eth0`: set both `--mtu=<mtu>` and `--default-network-opt=bridge=com.docker.network.driver.mtu=<mtu>` in `docker.args` |
