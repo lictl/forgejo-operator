@@ -139,10 +139,10 @@ spec (an entry of the whole Gateway does not count for one of its listeners):
 
 | Status | Reason | Meaning |
 |--------|--------|---------|
-| True | `Accepted` | Every route is `Accepted` by every parent and its `ResolvedRefs` is True |
+| True | `Accepted` | Every route is `Accepted` by every parent and its `ResolvedRefs` is True, or only lacks ready endpoints (Envoy Gateway: `EndpointsNotFound`) while no Forgejo pod has been Ready for a minute: during installs, restarts, upgrades and restores, which `Ready` reports. The message then says "no ready Forgejo pod behind it yet" |
 | Unknown | `Pending` | A parent has not reported on the route's current generation yet (is a Gateway controller running for its GatewayClass?) |
 | False | `NotAccepted` | A parent rejects the route; the message has the controller's reason, e.g. `NoMatchingParent` (no listener of that name), `NotAllowedByListeners` (`allowedRoutes`) |
-| False | `RefsNotResolved` | A backend does not resolve, e.g. `EndpointsNotFound` while no Forgejo pod is ready (Envoy Gateway) |
+| False | `RefsNotResolved` | A backend does not resolve, e.g. `BackendNotFound`, or `EndpointsNotFound` although a Forgejo pod has been Ready for a minute |
 | False | `NoHostnames` | No host name for the HTTPRoute (see `hostnames`); there is no HTTPRoute. The TCPRoute is still created |
 | False | `GatewayAPIUnavailable` | The cluster does not serve HTTPRoute `gateway.networking.k8s.io/v1`; nothing was created |
 | False | `TCPRouteUnavailable` | `spec.gateway.ssh` is set, but no TCPRoute version is served |

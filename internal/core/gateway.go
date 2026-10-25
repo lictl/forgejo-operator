@@ -48,6 +48,15 @@ const (
 // the operator does not watch these kinds.
 const notReadyRequeue = 15 * time.Second
 
+// gwReasonEndpointsNotFound is the ResolvedRefs reason Envoy Gateway reports while a route's
+// backend Service has no ready endpoints.
+const gwReasonEndpointsNotFound = "EndpointsNotFound"
+
+// endpointsGrace is how long after a Forgejo pod became Ready a Gateway may still report that the
+// routes' Services have no ready endpoints: Gateway controllers update route status
+// asynchronously.
+const endpointsGrace = time.Minute
+
 // Gateway API kinds and values the routes use.
 const (
 	kindGateway    = "Gateway"
@@ -214,7 +223,14 @@ func ReconcileGateway(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		return forgejo.StepResult{}, err
 	}
 
-	status, reason, msg := routesCondition(routes)
+	podsPending, recheck := false, time.Duration(0)
+	if len(routes) > 0 {
+		var err error
+		if podsPending, recheck, err = serverPodsPending(ctx, rc); err != nil {
+			return forgejo.StepResult{}, err
+		}
+	}
+	status, reason, msg, waiting := routesCondition(routes, podsPending)
 	if tcpMissing && status == metav1.ConditionTrue {
 		status, reason = metav1.ConditionFalse, reasonTCPRouteUnavailable
 		msg = "spec.gateway.ssh is set, but the cluster serves no TCPRoute version (" + gvkVersions(forgejo.TCPRouteGVKs) +
@@ -246,7 +262,47 @@ func ReconcileGateway(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 	if status != metav1.ConditionTrue {
 		return forgejo.StepResult{RequeueAfter: notReadyRequeue}, nil
 	}
+	if waiting {
+		// Look again once the youngest Ready pod is past the grace period; while none is
+		// Ready, a pod becoming Ready starts a pass.
+		if recheck <= 0 {
+			recheck = notReadyRequeue
+		}
+		return forgejo.StepResult{RequeueAfter: recheck}, nil
+	}
 	return forgejo.StepResult{}, nil
+}
+
+// serverPodsPending reports whether no Forgejo pod has been Ready for endpointsGrace, so that a
+// Gateway finding no ready endpoints behind the routes is expected: Ready reports the pods, during
+// installs, restarts, upgrades and restores alike. recheck is when the youngest Ready pod leaves
+// the grace period (0 when no pod is Ready).
+func serverPodsPending(ctx context.Context, rc *forgejo.ReconcileContext) (pending bool, recheck time.Duration, err error) {
+	pods := &corev1.PodList{}
+	if err := rc.Client.List(ctx, pods, client.InNamespace(rc.Instance.Namespace),
+		client.MatchingLabels(forgejo.SelectorLabels(rc.Instance))); err != nil {
+		return false, 0, fmt.Errorf("listing Forgejo pods: %w", err)
+	}
+	now := time.Now()
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.DeletionTimestamp != nil {
+			continue
+		}
+		for _, c := range p.Status.Conditions {
+			if c.Type != corev1.PodReady || c.Status != corev1.ConditionTrue {
+				continue
+			}
+			wait := c.LastTransitionTime.Add(endpointsGrace).Sub(now)
+			if wait <= 0 {
+				return false, 0, nil
+			}
+			if recheck == 0 || wait < recheck {
+				recheck = wait
+			}
+		}
+	}
+	return true, recheck, nil
 }
 
 // setRoutesReady sets RoutesReady and records an event when it changes to or from True, or
@@ -577,8 +633,9 @@ type routeStatus struct {
 // routesCondition summarizes the routes' status.parents: True when every route is accepted
 // by every parent of its spec and its references resolve; False (NotAccepted or
 // RefsNotResolved) when a controller reports a problem; Unknown (Pending) while a parent has
-// not reported on the route's current generation.
-func routesCondition(routes []routeStatus) (metav1.ConditionStatus, string, string) {
+// not reported on the route's current generation. While podsPending, a backend without ready
+// endpoints counts as resolved, and waiting says that one did.
+func routesCondition(routes []routeStatus, podsPending bool) (status metav1.ConditionStatus, reason, msg string, waiting bool) {
 	var failed, pending, ok []string
 	failReason := ""
 	for _, r := range routes {
@@ -602,6 +659,11 @@ func routesCondition(routes []routeStatus) (metav1.ConditionStatus, string, stri
 				continue
 			}
 			if refs := findCondition(conds, "ResolvedRefs"); refs != nil && refs.Status != metav1.ConditionTrue {
+				if podsPending && refs.Reason == gwReasonEndpointsNotFound {
+					ok = append(ok, what+" (no ready Forgejo pod behind it yet)")
+					waiting = true
+					continue
+				}
 				failed = append(failed, fmt.Sprintf("%s: references not resolved (%s): %s", what, refs.Reason, refs.Message))
 				if failReason == "" {
 					failReason = reasonRoutesRefsNotResolved
@@ -613,11 +675,11 @@ func routesCondition(routes []routeStatus) (metav1.ConditionStatus, string, stri
 	}
 	switch {
 	case len(failed) > 0:
-		return metav1.ConditionFalse, failReason, strings.Join(append(failed, pending...), "; ")
+		return metav1.ConditionFalse, failReason, strings.Join(append(failed, pending...), "; "), false
 	case len(pending) > 0:
-		return metav1.ConditionUnknown, reasonRoutesPending, strings.Join(pending, "; ")
+		return metav1.ConditionUnknown, reasonRoutesPending, strings.Join(pending, "; "), false
 	}
-	return metav1.ConditionTrue, reasonRoutesAccepted, "Accepted: " + strings.Join(ok, "; ")
+	return metav1.ConditionTrue, reasonRoutesAccepted, "Accepted: " + strings.Join(ok, "; "), waiting
 }
 
 func parentName(routeNamespace string, p gwParentRef) string {

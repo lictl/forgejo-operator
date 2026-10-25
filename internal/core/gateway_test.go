@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -397,8 +399,14 @@ func TestTCPRouteVersionDiscovery(t *testing.T) {
 }
 
 // acceptRoute writes a status.parents entry for every parentRef of the stored route, as a
-// Gateway controller would.
+// Gateway controller would; an unresolved route's backend Service is missing.
 func acceptRoute(t *testing.T, rc *forgejo.ReconcileContext, gvk schema.GroupVersionKind, name, accepted, resolved string) {
+	t.Helper()
+	setRouteParents(t, rc, gvk, name, accepted, resolved, "BackendNotFound")
+}
+
+// setRouteParents is acceptRoute with the reason of the ResolvedRefs condition.
+func setRouteParents(t *testing.T, rc *forgejo.ReconcileContext, gvk schema.GroupVersionKind, name, accepted, resolved, resolvedReason string) {
 	t.Helper()
 	route := getOptional(t, rc, gvk, name)
 	refs := nested(t, route, "spec", "parentRefs").([]any)
@@ -410,7 +418,7 @@ func acceptRoute(t *testing.T, rc *forgejo.ReconcileContext, gvk schema.GroupVer
 			"conditions": []any{
 				map[string]any{testKeyType: testCondAccepted, testKeyStatus: accepted, testKeyReason: testCondAccepted, testKeyMessage: "accepted?",
 					testKeyTransitionTime: testTransitionTime, testKeyObservedGeneration: route.GetGeneration()},
-				map[string]any{testKeyType: "ResolvedRefs", testKeyStatus: resolved, testKeyReason: "BackendNotFound", testKeyMessage: "service not found",
+				map[string]any{testKeyType: "ResolvedRefs", testKeyStatus: resolved, testKeyReason: resolvedReason, testKeyMessage: "service not found",
 					testKeyTransitionTime: testTransitionTime, testKeyObservedGeneration: route.GetGeneration()},
 			},
 		})
@@ -480,19 +488,87 @@ func TestRoutesConditionIgnoresStaleStatus(t *testing.T) {
 		"conditions": cond(2),
 	}}, "status", "parents")
 	routes := []routeStatus{{kind: "HTTPRoute", obj: route, parents: []gwParentRef{parent}}}
-	if s, r, _ := routesCondition(routes); s != metav1.ConditionUnknown || r != reasonRoutesPending {
+	if s, r, _, _ := routesCondition(routes, false); s != metav1.ConditionUnknown || r != reasonRoutesPending {
 		t.Errorf("status of generation 2 for generation 3: %s/%s", s, r)
 	}
 	parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents")
 	parents[0].(map[string]any)["conditions"] = cond(3)
 	_ = unstructured.SetNestedSlice(route.Object, parents, "status", "parents")
-	if s, r, m := routesCondition(routes); s != metav1.ConditionTrue {
+	if s, r, m, _ := routesCondition(routes, false); s != metav1.ConditionTrue {
 		t.Errorf("current status: %s/%s %s", s, r, m)
 	}
 	// Another listener of the same Gateway is another parent.
 	routes[0].parents[0].SectionName = "https"
-	if s, _, _ := routesCondition(routes); s != metav1.ConditionUnknown {
+	if s, _, _, _ := routesCondition(routes, false); s != metav1.ConditionUnknown {
 		t.Errorf("status of the whole Gateway must not count for one listener: %s", s)
+	}
+}
+
+// readyServerPod stores a Forgejo pod that became Ready the given time ago.
+func readyServerPod(t *testing.T, rc *forgejo.ReconcileContext, name string, readyFor time.Duration) {
+	t.Helper()
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: rc.Instance.Namespace, Labels: forgejo.SelectorLabels(rc.Instance)},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().Add(-readyFor)),
+		}}},
+	}
+	if err := rc.Client.Create(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Envoy Gateway reports EndpointsNotFound whenever no Forgejo pod is Ready, which a single
+// replica has on every install, restart, upgrade and restore: RoutesReady stays True without
+// events then, and only a backend still without endpoints a minute after a pod became Ready is
+// a problem.
+func TestRoutesReadyWhileNoPodIsReady(t *testing.T) {
+	f := gatewayInstance()
+	rc, rec := optionalRC(t, f, allOptionalAPIs)
+	runStep(t, rc, ReconcileGateway)
+	setRouteParents(t, rc, forgejo.HTTPRouteGVK, "fj", "True", "False", gwReasonEndpointsNotFound)
+	setRouteParents(t, rc, tcpRouteV1, "fj-ssh", "True", "False", gwReasonEndpointsNotFound)
+
+	res := runStep(t, rc, ReconcileGateway)
+	c := condition(f, forgejov1.ConditionRoutesReady)
+	if c.Status != metav1.ConditionTrue || c.Reason != reasonRoutesAccepted || !strings.Contains(c.Message, "no ready Forgejo pod behind it yet") {
+		t.Fatalf("no pod is Ready: %+v", c)
+	}
+	if res.RequeueAfter != notReadyRequeue {
+		t.Errorf("no pod is Ready: requeue %v, want %v", res.RequeueAfter, notReadyRequeue)
+	}
+
+	readyServerPod(t, rc, "fj-young", 10*time.Second)
+	res = runStep(t, rc, ReconcileGateway)
+	if c := condition(f, forgejov1.ConditionRoutesReady); c.Status != metav1.ConditionTrue {
+		t.Fatalf("a pod Ready for 10s: %+v", c)
+	}
+	if res.RequeueAfter <= 40*time.Second || res.RequeueAfter > 50*time.Second {
+		t.Errorf("a pod Ready for 10s: requeue %v, want when it leaves the grace period", res.RequeueAfter)
+	}
+	if evs := drainEvents(rec); slices.ContainsFunc(evs, func(e string) bool { return strings.HasPrefix(e, "Warning") }) {
+		t.Errorf("no Warning while the pods start: %v", evs)
+	}
+
+	readyServerPod(t, rc, "fj-old", 2*time.Minute)
+	runStep(t, rc, ReconcileGateway)
+	if c := condition(f, forgejov1.ConditionRoutesReady); c.Status != metav1.ConditionFalse || c.Reason != reasonRoutesRefsNotResolved {
+		t.Fatalf("a pod Ready for 2m and still no endpoints: %+v", c)
+	}
+	if evs := strings.Join(drainEvents(rec), "\n"); !strings.Contains(evs, "Warning RefsNotResolved") {
+		t.Errorf("no Warning event in:\n%s", evs)
+	}
+}
+
+func TestRoutesConditionMasksOnlyMissingEndpoints(t *testing.T) {
+	f := gatewayInstance()
+	rc, _ := optionalRC(t, f, allOptionalAPIs)
+	runStep(t, rc, ReconcileGateway)
+	acceptRoute(t, rc, forgejo.HTTPRouteGVK, "fj", "True", "False")
+	acceptRoute(t, rc, tcpRouteV1, "fj-ssh", "True", "True")
+	runStep(t, rc, ReconcileGateway)
+	if c := condition(f, forgejov1.ConditionRoutesReady); c.Status != metav1.ConditionFalse || !strings.Contains(c.Message, "BackendNotFound") {
+		t.Fatalf("a missing Service is a problem even while no pod is Ready: %+v", c)
 	}
 }
 
