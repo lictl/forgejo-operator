@@ -244,9 +244,19 @@ make install                          # CRDs
 go build -o bin/manager ./cmd
 bin/manager --watch-namespace=dev     # run against your kubeconfig, scoped to one namespace
 make manifests generate               # after changing API types or RBAC markers
-go test ./internal/...                # unit tests (the envtest suite needs `make setup-envtest`)
+make test                             # unit tests and the envtest suite
 make forgejo-versions                 # compare the Forgejo version table with upstream releases
 ```
+
+CI runs on Forgejo Actions, in [.forgejo/workflows/ci.yml](.forgejo/workflows/ci.yml), on runners
+with the Docker executor whose socket is mounted into job containers (a `ForgejoRunner` with
+`docker.mountSocket`, see [docs/actions-runners.md](docs/actions-runners.md)). Every push and pull
+request runs `make lint`, `make test` (which also fails on generated files that are not committed)
+and the Prometheus rule tests. Pushes to `main` and `v*` tags then build the image for linux/amd64
+and push it to the instance's container registry as `<host>/<owner>/forgejo-operator:<commit>`
+(the first 12 characters), plus `:main` or the tag. The push needs the repository secret
+`REGISTRY_TOKEN`: an access token with the `write:package` scope of a user who may publish packages
+for the repository's owner (the workflow's own token cannot push packages).
 
 The reconcile pipeline is a table of steps in `internal/controller/forgejo_controller.go`. Each
 step is owned by one package: `core`, `backup`, `upgrade`, `observability` or `autopilot`, and
