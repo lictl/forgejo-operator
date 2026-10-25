@@ -17,6 +17,13 @@ const (
 	CNPGOwnerName    = "forgejo"
 )
 
+// Keys of a database credentials Secret: those of CNPG's app Secret, and the defaults of
+// spec.database.external.credentialsSecret.
+const (
+	credentialsUsernameKey = "username"
+	credentialsPasswordKey = "password"
+)
+
 // CNPGAppSecretName is the credentials Secret CNPG generates for the application owner.
 func CNPGAppSecretName(f *forgejov1.Forgejo) string { return DatabaseClusterName(f) + "-app" }
 
@@ -54,16 +61,18 @@ func ResolveDB(ctx context.Context, c client.Client, f *forgejov1.Forgejo) (*DBC
 		db.Host = ServiceHost(CNPGReadWriteService(f), f.Namespace)
 		db.Port = 5432
 		db.Name = CNPGDatabaseName
-		db.SSLMode = "disable"
+		// CloudNativePG always serves TLS, with a certificate from its own CA: encrypt the
+		// connection (Forgejo, backups, restores) without verifying that certificate.
+		db.SSLMode = "require"
 		db.SecretName = CNPGAppSecretName(f)
-		db.UsernameKey = "username"
-		db.PasswordKey = "password"
+		db.UsernameKey = credentialsUsernameKey
+		db.PasswordKey = credentialsPasswordKey
 	}
 	if db.UsernameKey == "" {
-		db.UsernameKey = "username"
+		db.UsernameKey = credentialsUsernameKey
 	}
 	if db.PasswordKey == "" {
-		db.PasswordKey = "password"
+		db.PasswordKey = credentialsPasswordKey
 	}
 
 	sec := &corev1.Secret{}

@@ -633,7 +633,8 @@ type DatabaseSpec struct {
 	// +optional
 	Type DatabaseType `json:"type,omitempty"`
 
-	// cnpg configures the operator-managed CloudNativePG cluster.
+	// cnpg configures the operator-managed CloudNativePG cluster. Forgejo and the backup and
+	// restore Jobs connect to it over TLS (sslmode require), which CloudNativePG always serves.
 	// +kubebuilder:default={}
 	// +optional
 	CNPG CNPGSpec `json:"cnpg,omitempty"`

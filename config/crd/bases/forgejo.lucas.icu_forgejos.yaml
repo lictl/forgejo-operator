@@ -545,8 +545,9 @@ spec:
                 properties:
                   cnpg:
                     default: {}
-                    description: cnpg configures the operator-managed CloudNativePG
-                      cluster.
+                    description: |-
+                      cnpg configures the operator-managed CloudNativePG cluster. Forgejo and the backup and
+                      restore Jobs connect to it over TLS (sslmode require), which CloudNativePG always serves.
                     properties:
                       enablePodMonitor:
                         description: enablePodMonitor asks CNPG to create a PodMonitor

@@ -82,7 +82,9 @@ What happens:
     (give it the server's major) and before the cluster reports one. It connects with
     `PGHOST`/`PGPORT`/`PGDATABASE`/`PGSSLMODE`, and `PGUSER`/`PGPASSWORD` come from the
     credentials Secret through `secretKeyRef`, so passwords never appear in a pod spec. It
-    writes `db.dump`. With an external database in `sslMode: verify-ca` or `verify-full`,
+    writes `db.dump`. To the operator's CNPG cluster it connects with `PGSSLMODE=require`, like
+    Forgejo: CloudNativePG always serves TLS, with a certificate from its own CA that is not
+    verified. With an external database in `sslMode: verify-ca` or `verify-full`,
     the server certificate is verified against the image's CA bundle
     (`/etc/ssl/certs/ca-certificates.crt` in the CloudNativePG images), the same system
     roots Forgejo itself uses; without a bundle, `verify-full` falls back to libpq's
