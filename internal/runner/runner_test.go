@@ -297,6 +297,47 @@ func TestNoPrivilegedPodWithoutDockerExecutor(t *testing.T) {
 	}
 }
 
+// dockerd gets the MTU of the pod's interface for the default bridge and the job networks, unless
+// spec.docker.args choose one.
+func TestDockerdMatchesPodMTU(t *testing.T) {
+	d := PodSpec(testRunner()).InitContainers[0]
+	if len(d.Command) < 6 || d.Command[0] != "sh" || d.Command[1] != "-c" || d.Command[2] != podMTUScript ||
+		d.Command[4] != dindCommand || d.Command[5] != "dockerd" {
+		t.Fatalf("dockerd command %q", d.Command)
+	}
+	for _, args := range [][]string{{"--mtu=1400"}, {"--default-network-opt=bridge=com.docker.network.driver.mtu=1400"}} {
+		d := PodSpec(testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Docker.Args = args })).InitContainers[0]
+		if d.Command[0] != dindCommand {
+			t.Errorf("%v: the MTU of spec.docker.args is overridden: %q", args, d.Command)
+		}
+	}
+
+	// The script, with a file standing in for the pod's interface and echo for dind.
+	mtuFile := filepath.Join(t.TempDir(), "mtu")
+	script := strings.ReplaceAll(podMTUScript, "/sys/class/net/eth0/mtu", mtuFile)
+	run := func() string {
+		out, err := exec.Command("sh", "-c", script, "sh", "echo", "dockerd", "--group=1000").CombinedOutput()
+		if err != nil {
+			t.Fatal(err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := run(); got != "dockerd --group=1000" {
+		t.Errorf("without an MTU: %q", got)
+	}
+	for content, want := range map[string]string{
+		"1450\n": "dockerd --group=1000 --mtu=1450 --default-network-opt=bridge=com.docker.network.driver.mtu=1450",
+		"junk":   "dockerd --group=1000",
+	} {
+		if err := os.WriteFile(mtuFile, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := run(); got != want {
+			t.Errorf("MTU file %q: %q, want %q", content, got, want)
+		}
+	}
+}
+
 func TestDockerPod(t *testing.T) {
 	r := testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Docker.Args = []string{"--mtu=1400"} })
 	spec := PodSpec(r)

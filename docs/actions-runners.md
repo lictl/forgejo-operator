@@ -57,7 +57,7 @@ jobs:
 | `imagePullPolicy`, `imagePullSecrets` | | For all images of the pods. |
 | `docker.image` | `docker.io/library/docker:29.9.2-dind` | The Docker daemon of the Docker executor. |
 | `docker.mountSocket` | false | Mounts the daemon's socket into job containers at `/var/run/docker.sock` (`container.docker_host: automount`), so that steps can run `docker build` and `docker run`. |
-| `docker.args` | | Extra `dockerd` arguments, e.g. `--mtu=1400`, `--registry-mirror=https://...`. |
+| `docker.args` | | Extra `dockerd` arguments, e.g. `--registry-mirror=https://...`. The daemon's networks get the MTU of the pod's interface (see [Docker](#docker)) unless these choose one (`--mtu`, `com.docker.network.driver.mtu`). |
 | `docker.resources`, `docker.storageSizeLimit` | | Resources of the daemon container (job containers run inside it) and the size limit of its `emptyDir` (`/var/lib/docker`). |
 | `host.image` | `data.forgejo.org/oci/node:22-bookworm` | The image the Host executor runs the runner and the job steps in. |
 | `resources`, `env` | | Of the runner container. `env` is for the runner process (e.g. `HTTP_PROXY`); jobs get variables from `config.runner.envs`. |
@@ -94,7 +94,10 @@ Each pod `<name>-<i>` has:
   runner (owned by group 1000, the runner's group). There is no TCP listener, so nothing else on
   the pod network can reach the daemon. A startup probe (`docker info`) holds the runner back until
   the daemon answers. Images and containers are kept in an `emptyDir` (`/var/lib/docker`), so every
-  pod starts with an empty image cache.
+  pod starts with an empty image cache. The daemon's networks, the default bridge and the network
+  Forgejo Runner creates for each job, get the MTU of the pod's interface (`eth0`): Docker's 1500
+  is larger than many pod networks (1450 on VXLAN overlays such as flannel's, the k3s default),
+  where job containers would lose their full-size packets and stall on downloads and pushes.
 - **`runner`**: `forgejo-runner daemon` as uid 1000 with a read-only root file system, no
   capabilities and no privilege escalation, `DOCKER_HOST=unix:///var/run/dind/docker.sock`.
 
@@ -323,7 +326,7 @@ $ kubectl get events --field-selector involvedObject.name=ci   # StatefulSet Fai
 | `actions/checkout` cannot connect | `ROOT_URL` is not reachable from the job container, or no egress to `DEFAULT_ACTIONS_URL` |
 | `Cannot connect to the Docker daemon` in a step | `docker.mountSocket` is off (it is off by default) |
 | Image pulls hit rate limits | Use the mirrors under `data.forgejo.org/oci/` in labels, or `docker.args: [--registry-mirror=...]` |
-| Job containers stall on large transfers | The cluster network's MTU is below 1500: `docker.args: ["--mtu=1400"]` |
+| Job containers stall on large transfers | A path with a smaller MTU than the pod's interface, or a pod interface other than `eth0`: set both `--mtu=<mtu>` and `--default-network-opt=bridge=com.docker.network.driver.mtu=<mtu>` in `docker.args` |
 
 ## Limitations
 

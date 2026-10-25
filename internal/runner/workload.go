@@ -16,7 +16,30 @@ import (
 const (
 	dockerCLI  = "docker"
 	capDropAll = "ALL"
+	// dindCommand prepares cgroups for a nested daemon, then runs its arguments (the docker:dind image).
+	dindCommand = "dind"
 )
+
+// podMTUScript starts dockerd ("$@") with the MTU of the pod's network interface on the networks it
+// creates: the default bridge (--mtu) and the network Forgejo Runner creates for every job
+// (default-network-opt, Docker 24 and later). Docker uses 1500 otherwise, larger than many pod
+// networks (1450 on VXLAN overlays such as flannel's, the k3s default), where the job containers'
+// full-size packets are dropped and downloads stall. Without a readable MTU, dockerd starts as given.
+const podMTUScript = `mtu=$(cat /sys/class/net/eth0/mtu 2>/dev/null)
+case "$mtu" in
+''|*[!0-9]*) exec "$@" ;;
+esac
+exec "$@" --mtu="$mtu" --default-network-opt=bridge=com.docker.network.driver.mtu="$mtu"`
+
+// setsMTU reports whether spec.docker.args choose dockerd's MTU themselves.
+func setsMTU(args []string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, "--mtu") || strings.Contains(a, "com.docker.network.driver.mtu") {
+			return true
+		}
+	}
+	return false
+}
 
 // Container and volume names of the runner pods.
 const (
@@ -205,7 +228,10 @@ func PodSpec(r *forgejov1.ForgejoRunner) corev1.PodSpec {
 		)
 		// dockerd listens on a UNIX socket only (no TCP port on the pod's network), owned by
 		// group 1000, the runner's group. "dind" prepares cgroups for a nested daemon.
-		args := append([]string{"dind", "dockerd", "--host=unix://" + DockerSocket, "--group=" + "1000"}, r.Spec.Docker.Args...)
+		args := append([]string{dindCommand, "dockerd", "--host=unix://" + DockerSocket, "--group=" + "1000"}, r.Spec.Docker.Args...)
+		if !setsMTU(r.Spec.Docker.Args) {
+			args = append([]string{"sh", "-c", podMTUScript, "sh"}, args...)
+		}
 		initContainers = append(initContainers, corev1.Container{
 			Name:            ContainerDocker,
 			Image:           DindImage(r),
