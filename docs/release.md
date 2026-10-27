@@ -1,33 +1,46 @@
 # Release runbook
 
-Releases are operator versions, independent of the Forgejo server version table.
-No initial version has been selected or published. A suggested first candidate is
-`v0.1.0-rc.1`; choosing and creating it is a separate maintainer action.
+Releases are operator versions, independent of Forgejo server versions. No
+initial version has been selected or published. A possible first candidate is
+`v0.1.0-rc.1`; choosing it and creating a tag are separate maintainer actions.
 
-1. Confirm MIT and retained third-party notices, all CI checks, a clean tree,
-   and the exact commit to release. Run `python3 hack/release-notes.py <planned-tag>`
-   to draft notes from [Conventional Commits](commits.md); review the actual
-   changes and edit the draft into `CHANGELOG.md`. The release workflow reads
-   that changelog section, not commit prefixes or PR labels. Update Chart `version`
-   (without `v`) and `appVersion` (with `v`), plus default image tag. Merge
-   these changes to `main`.
-2. Create an annotated `vX.Y.Z` tag at that commit and push it to GitHub.
-   Start `.github/workflows/release.yml` manually with that tag. It rejects
-   a missing tag, a different Chart version, and a commit outside `main`.
-3. The workflow builds an amd64/arm64 controller once in GHCR, copies its OCI
-   index to Forgejo, packages the Chart once and pushes it to both registries.
-   It then creates release notes from the changelog. Do not treat a partially
-   successful run as a completed release.
-4. Inspect both image indexes for `linux/amd64` and `linux/arm64`, digest
-   equality, Chart metadata and anonymous pull. Set both GHCR packages
-   public if first publication left them private. Test Helm install in an
-   isolated Kind cluster. Check the GitHub Release and mirrored source tag.
+1. Confirm licenses, all CI checks, a clean tree and the exact commit. Run
+   `python3 hack/release-notes.py <planned-tag>` to draft notes from
+   [Conventional Commits](commits.md). Review them into `CHANGELOG.md` and set
+   Chart `version` (without `v`), `appVersion` (with `v`) and default image tag.
+   Both release workflows read this reviewed changelog section.
+2. Create an annotated `vX.Y.Z` tag on `main`. Push it to GitHub and mirror the
+   exact tag object to Forgejo. Verify both sites resolve it to the same commit.
+   Never force-move a published tag.
+3. Manually start `.github/workflows/release.yml` and
+   `.forgejo/workflows/release.yml` with that tag. Each site independently builds
+   linux/amd64 and linux/arm64 controller images and packages the Chart from
+   mirrored source. Each workflow writes only its own OCI registry. Ordinary
+   source pushes and pull requests do not publish packages.
+4. Make both image and Chart packages anonymously readable. GHCR may create
+   packages private initially. With `crane` and Helm available, run
+   `TAG=vX.Y.Z bash hack/verify-release.sh`. It compares each platform image
+   manifest digest, Chart archive bytes and Chart OCI manifest digest. The outer
+   image index digests can differ because independent provenance records are
+   attached; record both. Investigate any payload mismatch. Test Helm install
+   in an isolated Kind cluster.
+5. After both sites pass, create the GitHub Release from the reviewed changelog
+   section, including both registry references and their digests.
 
-If a registry operation fails, rerun with the same tag. The workflow checks
-existing tags/packages and refuses mismatched content; do not force a tag or
-replace a published version. Git source mirroring and OCI mirroring are
-separate operations. A release requires the Forgejo registry token in the
-GitHub repository secret `FORGEJO_REGISTRY_TOKEN`; a distinct
-`FORGEJO_MIRROR_TOKEN` would be needed for automatic source mirroring. Neither
-credential is in the repository. Their creation and permissions require owner
-review. Keep local credentials out of CI.
+On failure, rerun the relevant site's manual workflow with the same tag. The
+script checks existing Chart bytes and image revision; do not overwrite a
+published version. Source mirroring is separate from package publication.
+GitHub uses its repository workflow token for GHCR only. Forgejo's release
+workflow expects the existing `REGISTRY_TOKEN` secret with package-write access
+on that instance; verify it before the first release. Creating or changing a
+persistent credential or runner privilege needs owner review. Neither CI site
+needs a credential for the other registry.
+
+Reproducibility controls include pinned Go and base image indexes, a pinned
+BuildKit image and Buildx version, commit-time `SOURCE_DATE_EPOCH`, normalized image file times
+and `hack/normalize-chart.go`. `hack/normalize-source-times.py` first sets
+all checkout file and directory times to the commit time; BuildKit otherwise
+retains older file times. The Chart helper also normalizes the `.tgz` file time
+that Helm writes into the OCI manifest. Run independent builds to establish
+whether the two CI environments and registries really produce the same payload.
+A same-machine comparison is only a local check.

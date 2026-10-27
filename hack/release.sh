@@ -1,64 +1,83 @@
 #!/usr/bin/env bash
+# Both CI hosts run this script from the same reviewed tag and publish locally.
 set -euo pipefail
 : "${TAG:?set an existing tag}"
-: "${GITHUB_TOKEN:?workflow token required}"
-: "${FORGEJO_REGISTRY_TOKEN:?Forgejo package-write token required}"
+: "${REGISTRY_HOST:?set the local registry}"
+: "${REGISTRY_TOKEN:?package-write credential required on this CI host}"
+: "${REGISTRY_USER:?registry username required}"
+[[ "$REGISTRY_HOST" == ghcr.io || "$REGISTRY_HOST" == git.lucas.icu ]]
 [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo 'Invalid version tag'; exit 1; }
 version="${TAG#v}"
-test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+revision="$(git rev-parse HEAD)"
+test "$revision" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
 git merge-base --is-ancestor HEAD origin/main
-chart_version="$(helm show chart charts/forgejo-operator | sed -n 's/^version: //p')"
-chart_app_version="$(helm show chart charts/forgejo-operator | sed -n 's/^appVersion: //p' | tr -d '"')"
-test "$chart_version" = "$version"
-test "$chart_app_version" = "$TAG"
 awk -v tag="$TAG" '$0 == "## " tag {emit=1; next} /^## / && emit {exit} emit {print}' CHANGELOG.md > /tmp/forgejo-release-notes.md
-test -s /tmp/forgejo-release-notes.md || { echo 'Missing release notes'; exit 1; }
-image="ghcr.io/lictl/forgejo-operator:$TAG"
-mirror_image="git.lucas.icu/lictl/forgejo-operator:$TAG"
-chart="ghcr.io/lictl/charts/forgejo-operator:$version"
-mirror_chart="git.lucas.icu/lictl/charts/forgejo-operator:$version"
-echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
-echo "$FORGEJO_REGISTRY_TOKEN" | docker login git.lucas.icu -u lictl --password-stdin >/dev/null
-if ! command -v crane >/dev/null; then
-  GOBIN=/tmp go install github.com/google/go-containerregistry/cmd/crane@v0.20.6
-  export PATH="/tmp:$PATH"
+test -s /tmp/forgejo-release-notes.md || { echo 'Missing reviewed release notes'; exit 1; }
+export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+tmp="$(mktemp -d)"
+builder="forgejo-release-$$"
+cleanup() { docker buildx rm "$builder" >/dev/null 2>&1 || true; rm -rf "$tmp"; }
+trap cleanup EXIT
+
+# Use the same verified Helm and Go toolchain on both CI hosts.
+curl -fsSL https://get.helm.sh/helm-v4.2.4-linux-amd64.tar.gz -o "$tmp/helm.tar.gz"
+echo "c306b46f719b0a4da32d0f78ee21bf90ce8d602f15b22ab753f0674d1670a7f3  $tmp/helm.tar.gz" | sha256sum -c -
+tar -xzf "$tmp/helm.tar.gz" -C "$tmp" linux-amd64/helm
+export PATH="$tmp/linux-amd64:$tmp:$PATH"
+export GOTOOLCHAIN=go1.26.9
+GOBIN="$tmp" go install github.com/google/go-containerregistry/cmd/crane@v0.20.6
+test "$(helm show chart charts/forgejo-operator | sed -n 's/^version: //p')" = "$version"
+test "$(helm show chart charts/forgejo-operator | sed -n 's/^appVersion: //p' | tr -d '\042')" = "$TAG"
+python3 hack/normalize-source-times.py . "$SOURCE_DATE_EPOCH"
+
+image="$REGISTRY_HOST/lictl/forgejo-operator:$TAG"
+chart="$REGISTRY_HOST/lictl/charts/forgejo-operator:$version"
+echo "$REGISTRY_TOKEN" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin >/dev/null
+echo "$REGISTRY_TOKEN" | helm registry login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin >/dev/null
+remote_digest() {
+  if crane digest "$1" 2>"$tmp/remote-error"; then return 0; fi
+  if grep -Eiq 'MANIFEST_UNKNOWN|NAME_UNKNOWN|404|not found' "$tmp/remote-error"; then return 1; fi
+  cat "$tmp/remote-error" >&2
+  return 2
+}
+
+existing=""
+if existing="$(remote_digest "$image")"; then :; else
+  result=$?
+  test "$result" -eq 1 || exit "$result"
 fi
-existing="$(crane digest "$image" 2>/dev/null || true)"
 if [ -z "$existing" ]; then
-  docker buildx build --platform linux/amd64,linux/arm64 --push \
-    --build-arg VERSION="$TAG" --build-arg VCS_REF="$(git rev-parse HEAD)" \
-    --tag "$image" .
-  existing="$(crane digest "$image")"
+  docker buildx create --name "$builder" --driver docker-container \
+    --driver-opt image=docker.io/moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea --use >/dev/null
+  docker buildx inspect --bootstrap >/dev/null
+  docker buildx build --builder "$builder" --platform linux/amd64,linux/arm64 \
+    --provenance=mode=min --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+    --build-arg VERSION="$TAG" --build-arg VCS_REF="$revision" \
+    --output "type=image,name=$image,push=true,rewrite-timestamp=true,oci-mediatypes=true,compression=gzip,compression-level=6" .
 fi
 for platform in linux/amd64 linux/arm64; do
-  ARCH="$platform" REVISION="$(git rev-parse HEAD)" crane config --platform "$platform" "$image" | python3 -c 'import json,os,sys; x=json.load(sys.stdin)["config"]["Labels"]; assert x["org.opencontainers.image.revision"] == os.environ["REVISION"]'
+  REVISION="$revision" crane config --platform "$platform" "$image" |
+    python3 -c 'import json,os,sys; c=json.load(sys.stdin); assert c["config"]["Labels"]["org.opencontainers.image.revision"] == os.environ["REVISION"]'
 done
-remote="$(crane digest "$mirror_image" 2>/dev/null || true)"
-if [ -z "$remote" ]; then crane cp "$image" "$mirror_image"; else test "$remote" = "$existing"; fi
-test "$(crane digest "$mirror_image")" = "$existing"
-crane manifest "$image" | python3 -c 'import json,sys; d=json.load(sys.stdin); p={(x["platform"]["os"],x["platform"]["architecture"]) for x in d["manifests"] if "platform" in x}; assert {("linux","amd64"),("linux","arm64")} <= p, p'
-helm package charts/forgejo-operator -d /tmp
-chart_digest="$(crane digest "$chart" 2>/dev/null || true)"
-if [ -z "$chart_digest" ]; then
-  echo "$GITHUB_TOKEN" | helm registry login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
-  helm push "/tmp/forgejo-operator-$version.tgz" oci://ghcr.io/lictl/charts
-  chart_digest="$(crane digest "$chart")"
+crane manifest "$image" | python3 -c 'import json,sys; m=json.load(sys.stdin); p={(d["platform"]["os"],d["platform"]["architecture"]) for d in m["manifests"] if "platform" in d}; assert {("linux","amd64"),("linux","arm64")} <= p, p'
+
+helm package charts/forgejo-operator -d "$tmp"
+archive="$tmp/forgejo-operator-$version.tgz"
+normalized="$tmp/normalized-$version.tgz"
+go run -mod=readonly hack/normalize-chart.go "$archive" "$normalized" "$SOURCE_DATE_EPOCH"
+if remote_digest "$chart" >/dev/null; then
+  mkdir -p "$tmp/published"
+  helm pull "oci://$REGISTRY_HOST/lictl/charts/forgejo-operator" --version "$version" --destination "$tmp/published"
+  cmp "$normalized" "$tmp/published/forgejo-operator-$version.tgz"
+else
+  result=$?
+  test "$result" -eq 1 || exit "$result"
+  helm push "$normalized" "oci://$REGISTRY_HOST/lictl/charts"
 fi
-mkdir -p /tmp/forgejo-published-chart
-helm pull "oci://ghcr.io/lictl/charts/forgejo-operator" --version "$version" --destination /tmp/forgejo-published-chart
-cmp "/tmp/forgejo-operator-$version.tgz" "/tmp/forgejo-published-chart/forgejo-operator-$version.tgz"
-remote="$(crane digest "$mirror_chart" 2>/dev/null || true)"
-if [ -z "$remote" ]; then crane cp "$chart" "$mirror_chart"; else test "$remote" = "$chart_digest"; fi
-test "$(crane digest "$mirror_chart")" = "$chart_digest"
-anon_docker="$(mktemp -d)"
-for ref in "$image" "$mirror_image" "$chart" "$mirror_chart"; do
-  DOCKER_CONFIG="$anon_docker" crane digest "$ref" >/dev/null
-done
-helm show chart "oci://ghcr.io/lictl/charts/forgejo-operator" --version "$version" >/dev/null
-helm show chart "oci://git.lucas.icu/lictl/charts/forgejo-operator" --version "$version" >/dev/null
-{
-  cat /tmp/forgejo-release-notes.md
-  printf '\nController: %s (also %s)\nDigest: %s\n' "$image" "$mirror_image" "$existing"
-  printf 'Chart: oci://ghcr.io/lictl/charts/forgejo-operator (also oci://git.lucas.icu/lictl/charts/forgejo-operator), version %s\nDigest: %s\n' "$version" "$chart_digest"
-} > /tmp/forgejo-release-body.md
-gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --title "$TAG" --notes-file /tmp/forgejo-release-body.md
+
+# A release is not complete until both sites are public and independently verified.
+anon_config="$(mktemp -d)"
+DOCKER_CONFIG="$anon_config" crane digest "$image" >/dev/null
+DOCKER_CONFIG="$anon_config" crane digest "$chart" >/dev/null
+rm -rf "$anon_config"
+printf 'Controller %s %s\nChart %s %s\n' "$image" "$(crane digest "$image")" "$chart" "$(crane digest "$chart")"

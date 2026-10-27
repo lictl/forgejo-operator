@@ -1,0 +1,29 @@
+# A maintainer starts this only after the same reviewed tag reaches both remotes.
+name: Release Forgejo packages
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing reviewed vX.Y.Z tag mirrored from GitHub
+        required: true
+        type: string
+jobs:
+  release:
+    runs-on: docker
+    container:
+      image: docker.io/library/docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb
+    steps:
+      - name: Install job tools
+        run: apk add --no-cache bash curl git go nodejs python3
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build and publish Forgejo packages
+        env:
+          REGISTRY_HOST: git.lucas.icu
+          REGISTRY_USER: lictl
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: bash hack/release.sh

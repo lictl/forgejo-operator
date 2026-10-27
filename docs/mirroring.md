@@ -9,7 +9,7 @@ After verifying both remotes and authenticating **as lictl on each host**,
 compare `main` ancestry. Push only `main` and reviewed release tags to the
 existing Forgejo repository; refuse divergence and never use `--force` or
 `git push --mirror`. GitHub Actions and Forgejo Actions are not interchangeable;
-Forgejo's workflow is manual-only. This Git operation does not copy OCI images,
-Charts, issues, releases or package visibility. The release workflow publishes
-the OCI artifacts separately. Automatic source sync requires a narrow
+Forgejo's CI workflow is manual-only. This Git operation does not copy OCI images,
+Charts, issues, releases or package visibility. Each site's manual release
+workflow builds and publishes its own OCI artifacts. Automatic source sync requires a narrow
 Forgejo repository write credential, stored only after owner approval.

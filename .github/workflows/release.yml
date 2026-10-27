@@ -7,7 +7,7 @@ on:
         required: true
         type: string
 permissions:
-  contents: write
+  contents: read
   packages: write
 concurrency:
   group: release-${{ inputs.tag }}
@@ -25,10 +25,17 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
-      - name: Publish immutable OCI artifacts and GitHub release
+      - name: Pin Buildx to the Forgejo job version
+        run: |
+          mkdir -p "$HOME/.docker/cli-plugins"
+          curl -fsSL https://github.com/docker/buildx/releases/download/v0.38.1/buildx-v0.38.1.linux-amd64 -o "$HOME/.docker/cli-plugins/docker-buildx"
+          echo "e25d5cd675092bb5d1d03632fdc46cdf3fede7b514dc5f023a105e00d3ce5ad4  $HOME/.docker/cli-plugins/docker-buildx" | sha256sum -c -
+          chmod +x "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version
+      - name: Build and publish GHCR artifacts
         env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
-          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+          REGISTRY_HOST: ghcr.io
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: bash hack/release.sh

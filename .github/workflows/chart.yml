@@ -32,6 +32,20 @@ jobs:
           python3 hack/update-third-party-licenses.py
           git diff --exit-code -- LICENSES
           test -z "$(git status --porcelain -- LICENSES)"
+      - name: Check Chart archive reproducibility
+        run: |
+          test_dir="$(mktemp -d)"
+          mkdir -p "$test_dir/a" "$test_dir/b" "$test_dir/out-a" "$test_dir/out-b"
+          cp -R charts/forgejo-operator "$test_dir/a/"
+          cp -R charts/forgejo-operator "$test_dir/b/"
+          find "$test_dir/a" -type f -exec touch -t 202001010101 {} +
+          find "$test_dir/b" -type f -exec touch -t 202510101010 {} +
+          helm package "$test_dir/a/forgejo-operator" -d "$test_dir/out-a"
+          helm package "$test_dir/b/forgejo-operator" -d "$test_dir/out-b"
+          chart_version="$(helm show chart charts/forgejo-operator | sed -n 's/^version: //p')"
+          go run -mod=readonly hack/normalize-chart.go "$test_dir/out-a/forgejo-operator-$chart_version.tgz" "$test_dir/a.tgz" 1700000000
+          go run -mod=readonly hack/normalize-chart.go "$test_dir/out-b/forgejo-operator-$chart_version.tgz" "$test_dir/b.tgz" 1700000000
+          cmp "$test_dir/a.tgz" "$test_dir/b.tgz"
       - name: Check two Linux architectures compile
         run: |
           go version
