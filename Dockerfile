@@ -35,7 +35,7 @@ LABEL org.opencontainers.image.source="https://github.com/lictl/forgejo-operator
 WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY LICENSE /licenses/LICENSE
-COPY LICENSES/Apache-2.0.txt /licenses/Apache-2.0.txt
+COPY LICENSES /licenses/LICENSES
 COPY THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 USER 65532:65532
 
