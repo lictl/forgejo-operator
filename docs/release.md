@@ -17,6 +17,9 @@ only after the reviewed version commit passes CI.
    linux/amd64 and linux/arm64 controller images and packages the Chart from
    mirrored source. Each workflow writes only its own OCI registry. Ordinary
    source pushes and pull requests do not publish packages.
+   The workflows execute the current reviewed release driver from `main` but
+   check out the immutable tag for source, Chart contents, and image context.
+   Record the workflow's `main` SHA alongside the tagged source SHA.
 4. Make both image and Chart packages anonymously readable. GHCR may create
    packages private initially. With `crane` and Helm available, run
    `TAG=vX.Y.Z bash hack/verify-release.sh`. It compares each platform image

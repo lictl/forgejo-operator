@@ -38,4 +38,8 @@ jobs:
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
-        run: bash hack/release.sh
+        run: |
+          # Execute the reviewed release driver from main while building tagged source.
+          release_script="$(mktemp)"
+          git show origin/main:hack/release.sh > "$release_script"
+          bash "$release_script"

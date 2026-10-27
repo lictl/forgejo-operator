@@ -56,8 +56,8 @@ if [ -z "$existing" ]; then
     --output "type=image,name=$image,push=true,rewrite-timestamp=true,oci-mediatypes=true,compression=gzip,compression-level=6" .
 fi
 for platform in linux/amd64 linux/arm64; do
-  REVISION="$revision" crane config --platform "$platform" "$image" |
-    python3 -c 'import json,os,sys; c=json.load(sys.stdin); assert c["config"]["Labels"]["org.opencontainers.image.revision"] == os.environ["REVISION"]'
+  crane config --platform "$platform" "$image" |
+    REVISION="$revision" python3 -c 'import json,os,sys; c=json.load(sys.stdin); assert c["config"]["Labels"]["org.opencontainers.image.revision"] == os.environ["REVISION"]'
 done
 crane manifest "$image" | python3 -c 'import json,sys; m=json.load(sys.stdin); p={(d["platform"]["os"],d["platform"]["architecture"]) for d in m["manifests"] if "platform" in d}; assert {("linux","amd64"),("linux","arm64")} <= p, p'
 
