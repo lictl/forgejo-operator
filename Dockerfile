@@ -1,7 +1,9 @@
 # Build the manager binary
-FROM golang:1.26 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.9 AS builder
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=dev
+ARG VCS_REF=unknown
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -24,8 +26,17 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/static:nonroot
+ARG VERSION
+ARG VCS_REF
+LABEL org.opencontainers.image.source="https://github.com/lictl/forgejo-operator" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.licenses="MIT AND Apache-2.0"
 WORKDIR /
 COPY --from=builder /workspace/manager .
+COPY LICENSE /licenses/LICENSE
+COPY LICENSES/Apache-2.0.txt /licenses/Apache-2.0.txt
+COPY THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

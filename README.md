@@ -58,19 +58,22 @@ Optional:
 - Gateway API CRDs and a Gateway controller (Envoy Gateway is the tested reference), for
   HTTPRoute/TCPRoute; cert-manager, for certificates. See [docs/networking.md](docs/networking.md).
 
-Build and deploy the operator. On a local cluster the image is built straight into the docker
-engine the cluster runs on (set `DOCKER_CONTEXT` if that is not your current docker context),
-so no registry is needed:
+Install a published release with Helm (replace the example version with an actual
+published release):
 
 ```bash
-make deploy-local
+helm upgrade --install forgejo-operator \
+  oci://ghcr.io/lictl/charts/forgejo-operator \
+  --version <chart-version> -n forgejo-operator-system --create-namespace --wait
 ```
 
-On other clusters, push an image and deploy it:
-
-```bash
-make docker-build docker-push deploy IMG=<registry>/forgejo-operator:<tag>
-```
+The alternate OCI chart source is
+`oci://git.lucas.icu/lictl/charts/forgejo-operator`. The controller image is
+`ghcr.io/lictl/forgejo-operator:<operator-version>`, mirrored at
+`git.lucas.icu/lictl/forgejo-operator:<operator-version>`. No first release has
+been tagged yet. See [installation](docs/installation.md) for current release
+availability, image overrides, CRD upgrades and prerequisites. For local
+development use `make deploy-local` against an isolated cluster.
 
 This install manages instances in every namespace, with a ClusterRole that writes Secrets,
 Deployments, Jobs and the like cluster-wide, plus `pods/exec` (only to measure volumes for
@@ -248,17 +251,9 @@ make test                             # unit tests and the envtest suite
 make forgejo-versions                 # compare the Forgejo version table with upstream releases
 ```
 
-CI runs on Forgejo Actions, in [.forgejo/workflows/ci.yml](.forgejo/workflows/ci.yml), on runners
-with the Docker executor whose socket is mounted into job containers (a `ForgejoRunner` with
-`docker.mountSocket`, see [docs/actions-runners.md](docs/actions-runners.md)). Every push and pull
-request runs `make lint`, `make test` (which also fails on generated files that are not committed)
-and the Prometheus rule tests. Pushes to `main` and `v*` tags then build the image for linux/amd64
-and push it to the instance's container registry as `<host>/<owner>/forgejo-operator:<commit>`
-(the first 12 characters), plus `:main` or the tag. The push needs the repository secret
-`REGISTRY_TOKEN`: an access token with the `write:package` scope of a user who may publish packages
-for the repository's owner (the workflow's own token cannot push packages). `<host>` is the
-repository variable `REGISTRY`, the instance's public host name; set it when the runners reach
-Forgejo through another address, such as the in-cluster Service that a `ForgejoRunner` uses.
+GitHub Actions is the primary CI. See [development](docs/development.md),
+[release](docs/release.md), and [mirroring](docs/mirroring.md). Forgejo Actions
+is manual only so mirroring a source push cannot publish a second image.
 
 The reconcile pipeline is a table of steps in `internal/controller/forgejo_controller.go`. Each
 step is owned by one package: `core`, `backup`, `upgrade`, `observability` or `autopilot`, and
@@ -268,4 +263,6 @@ backed by `internal/runner`). See [docs/design.md](docs/design.md).
 
 ## License
 
-Apache License 2.0.
+The project is MIT licensed except files with their own license notices, including
+Kubebuilder scaffold files under Apache License 2.0. See [LICENSE](LICENSE) and
+[third-party notices](THIRD_PARTY_NOTICES.md).

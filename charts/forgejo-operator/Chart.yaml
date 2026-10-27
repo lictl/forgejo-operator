@@ -1,0 +1,14 @@
+apiVersion: v2
+name: forgejo-operator
+description: A Helm chart to distribute forgejo-operator
+type: application
+
+version: 0.1.0-dev
+appVersion: "0.1.0-dev"
+
+keywords:
+  - kubernetes
+  - operator
+
+annotations:
+  kubebuilder.io/generated-by: kubebuilder

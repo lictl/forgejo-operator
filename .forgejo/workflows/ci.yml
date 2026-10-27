@@ -1,13 +1,9 @@
-# CI and image builds on Forgejo Actions. The runners need the Docker executor with its socket
-# mounted into job containers (a ForgejoRunner with docker.mountSocket: docs/actions-runners.md):
-# the rule tests and the image build talk to that daemon. See "Development" in README.md.
+# Manual diagnostics on Forgejo Actions. Source pushes and pull requests run CI on GitHub.
+# The rules job requires a Docker-enabled runner; it does not publish packages.
 name: ci
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -42,32 +38,3 @@ jobs:
         run: >
           make test-rules
           PROMTOOL="docker run --rm --volumes-from $(hostname) -w $PWD/test/prometheus --entrypoint promtool prom/prometheus:v3.15.0"
-
-  image:
-    needs: [test, rules]
-    if: github.event_name == 'push'
-    runs-on: docker
-    container:
-      image: docker.io/library/docker:29.9.2-cli
-    steps:
-      - run: apk add --no-cache git nodejs
-      - uses: actions/checkout@v4
-      - name: Build and push the image
-        env:
-          REGISTRY: ${{ vars.REGISTRY }}
-          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
-        # Runners may reach Forgejo through another address than its public one (a ForgejoRunner
-        # uses the in-cluster Service): the repository variable REGISTRY names the public host.
-        run: |
-          registry="${REGISTRY:-${GITHUB_SERVER_URL#*://}}"
-          image="$registry/$GITHUB_REPOSITORY"
-          tags="-t $image:$(echo "$GITHUB_SHA" | cut -c1-12)"
-          case "$GITHUB_REF" in
-            refs/heads/main) tags="$tags -t $image:main" ;;
-            refs/tags/v*) tags="$tags -t $image:$GITHUB_REF_NAME" ;;
-          esac
-          echo "$REGISTRY_TOKEN" | docker login "$registry" -u "$GITHUB_REPOSITORY_OWNER" --password-stdin
-          docker buildx build --platform linux/amd64 $tags \
-            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            --push .

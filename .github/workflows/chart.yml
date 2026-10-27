@@ -1,0 +1,30 @@
+name: Chart
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      - name: Check Helm and generated CRDs
+        run: |
+          helm version --short
+          diff -r config/crd/bases charts/forgejo-operator/crds
+          helm lint --strict charts/forgejo-operator
+          helm template forgejo-operator charts/forgejo-operator --include-crds > /tmp/forgejo-operator-render.yaml
+          ! helm lint --strict charts/forgejo-operator --set rbac.namespaced=true
+      - name: Scan full Git history for new secrets
+        run: docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/gitleaks/gitleaks:v8.30.1 git . --log-opts=--all --redact --no-banner --baseline-path .gitleaks-baseline.json
+      - name: Check two Linux architectures compile
+        run: |
+          go version
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=readonly -o /tmp/manager-amd64 ./cmd
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=readonly -o /tmp/manager-arm64 ./cmd

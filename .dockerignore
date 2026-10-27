@@ -14,3 +14,8 @@
 !internal/**/*.json
 !internal/**/*.sh
 !internal/**/*.tmpl
+
+!LICENSE
+!LICENSES/
+!LICENSES/Apache-2.0.txt
+!THIRD_PARTY_NOTICES.md
