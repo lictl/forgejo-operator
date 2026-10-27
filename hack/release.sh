@@ -41,12 +41,28 @@ remote_digest() {
   return 2
 }
 
+# This one-time exception is limited to the unreleased rc.1 artifacts. Future
+# versions remain immutable, and an unexpected digest is never replaced.
+replaces_rc1_image() {
+  [ "$TAG" = v0.1.0-rc.1 ] || return 1
+  case "$REGISTRY_HOST:$1" in
+    ghcr.io:sha256:a1de7fb19864bd6bd5d5c33606a666a7e31b2788ebefc905451bea0e3b2f3ee1|git.lucas.icu:sha256:821e9f6f5e902a6b8e72c0a9ff86145637688a7a5a0136ac828aff3bd79fbbcb) return 0 ;;
+  esac
+  return 1
+}
+replaces_rc1_chart() {
+  [ "$TAG" = v0.1.0-rc.1 ] && [ "$1" = sha256:6ba004f46e3ddd395d799b82653927d4e1d4d6caf03d34a9481b487c4cf2d15e ]
+}
+
 existing=""
 if existing="$(remote_digest "$image")"; then :; else
   result=$?
   test "$result" -eq 1 || exit "$result"
 fi
-if [ -z "$existing" ]; then
+if [ -z "$existing" ] || replaces_rc1_image "$existing"; then
+  if [ -n "$existing" ]; then
+    test "$(remote_digest "$image")" = "$existing" || { echo 'Image changed during rc.1 replacement'; exit 1; }
+  fi
   docker buildx create --name "$builder" --driver docker-container \
     --driver-opt image=docker.io/moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea --use >/dev/null
   docker buildx inspect --bootstrap >/dev/null
@@ -65,13 +81,19 @@ helm package charts/forgejo-operator -d "$tmp"
 archive="$tmp/forgejo-operator-$version.tgz"
 normalized="$tmp/normalized-$version.tgz"
 go run -mod=readonly hack/normalize-chart.go "$archive" "$normalized" "$SOURCE_DATE_EPOCH"
-if remote_digest "$chart" >/dev/null; then
+chart_existing=""
+if chart_existing="$(remote_digest "$chart")"; then :; else
+  result=$?
+  test "$result" -eq 1 || exit "$result"
+fi
+if [ -n "$chart_existing" ] && ! replaces_rc1_chart "$chart_existing"; then
   mkdir -p "$tmp/published"
   helm pull "oci://$REGISTRY_HOST/lictl/charts/forgejo-operator" --version "$version" --destination "$tmp/published"
   cmp "$normalized" "$tmp/published/forgejo-operator-$version.tgz"
 else
-  result=$?
-  test "$result" -eq 1 || exit "$result"
+  if [ -n "$chart_existing" ]; then
+    test "$(remote_digest "$chart")" = "$chart_existing" || { echo 'Chart changed during rc.1 replacement'; exit 1; }
+  fi
   helm push "$normalized" "oci://$REGISTRY_HOST/lictl/charts"
 fi
 

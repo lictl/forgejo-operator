@@ -9,17 +9,19 @@ only after the reviewed version commit passes CI.
    [Conventional Commits](commits.md). Review them into `CHANGELOG.md` and set
    Chart `version` (without `v`), `appVersion` (with `v`) and default image tag.
    Both release workflows read this reviewed changelog section.
-2. Create an annotated `vX.Y.Z` tag on `main`. Push it to GitHub and mirror the
-   exact tag object to Forgejo. Verify both sites resolve it to the same commit.
-   Never force-move a published tag.
-3. Manually start `.github/workflows/release.yml` and
-   `.forgejo/workflows/release.yml` with that tag. Each site independently builds
+2. Create an annotated `vX.Y.Z` tag on the tested `main` commit. Push the same
+   tag object to GitHub and Forgejo. A version tag push automatically starts
+   `.github/workflows/release.yml` and `.forgejo/workflows/release.yml` on the
+   respective sites. Verify both tags resolve to the same commit. Do not move
+   published tags. A manual dispatch with the existing tag remains available
+   to retry a failed job.
+3. Each site independently builds
    linux/amd64 and linux/arm64 controller images and packages the Chart from
    mirrored source. Each workflow writes only its own OCI registry. Ordinary
    source pushes and pull requests do not publish packages.
-   The workflows execute the current reviewed release driver from `main` but
-   check out the immutable tag for source, Chart contents, and image context.
-   Record the workflow's `main` SHA alongside the tagged source SHA.
+   The workflows execute the release driver and build context from the tag.
+   Tag publication does not wait for other CI workflows: check all required CI
+   on the exact commit before pushing the tag.
 4. Make both image and Chart packages anonymously readable. GHCR may create
    packages private initially. With `crane` and Helm available, run
    `TAG=vX.Y.Z bash hack/verify-release.sh`. It compares each platform image
@@ -32,8 +34,11 @@ only after the reviewed version commit passes CI.
    the tagged source commit, and the cross-registry verification result.
 
 On failure, rerun the relevant site's manual workflow with the same tag. The
-script checks existing Chart bytes and image revision; do not overwrite a
-published version. Source mirroring is separate from package publication.
+script checks existing Chart bytes and image revision; ordinary releases never
+overwrite a differing published version. A narrowly guarded exception allows
+the first, unused `v0.1.0-rc.1` candidate to replace only the recorded old
+image and Chart digests. If a registry rejects that replacement, stop rather
+than deleting packages. Source mirroring is separate from package publication.
 GitHub uses its repository workflow token for GHCR only. Forgejo's release
 workflow expects the existing `REGISTRY_TOKEN` secret with package-write access
 on that instance; verify it before the first release. Creating or changing a

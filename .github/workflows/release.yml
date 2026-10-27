@@ -1,5 +1,8 @@
 name: Release
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -10,7 +13,7 @@ permissions:
   contents: read
   packages: write
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
   cancel-in-progress: false
 jobs:
   release:
@@ -19,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
@@ -37,9 +40,6 @@ jobs:
           REGISTRY_HOST: ghcr.io
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
         run: |
-          # Execute the reviewed release driver from main while building tagged source.
-          release_script="$(mktemp)"
-          git show origin/main:hack/release.sh > "$release_script"
-          bash "$release_script"
+          bash hack/release.sh

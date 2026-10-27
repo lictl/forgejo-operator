@@ -1,6 +1,8 @@
-# A maintainer starts this only after the same reviewed tag reaches both remotes.
 name: Release Forgejo packages
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -9,6 +11,7 @@ on:
         type: string
 jobs:
   release:
+    if: github.repository == 'lictl/forgejo-operator'
     runs-on: docker
     container:
       image: docker.io/library/docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb
@@ -17,7 +20,7 @@ jobs:
         run: apk add --no-cache bash curl git go nodejs python3
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
       - name: Build and publish Forgejo packages
@@ -25,9 +28,6 @@ jobs:
           REGISTRY_HOST: git.lucas.icu
           REGISTRY_USER: lictl
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
         run: |
-          # Execute the reviewed release driver from main while building tagged source.
-          release_script="$(mktemp)"
-          git show origin/main:hack/release.sh > "$release_script"
-          bash "$release_script"
+          bash hack/release.sh
