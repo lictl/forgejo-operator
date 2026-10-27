@@ -19,7 +19,7 @@ manager:
     repository: ghcr.io/lictl/forgejo-operator
     ## Image tag (defaults to Chart.appVersion if not set)
     ##
-    tag: "0.1.0-dev"
+    tag: "v0.1.0-rc.1"
     pullPolicy: IfNotPresent
 
   ## Arguments

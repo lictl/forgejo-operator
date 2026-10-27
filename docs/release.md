@@ -1,8 +1,8 @@
 # Release runbook
 
-Releases are operator versions, independent of Forgejo server versions. No
-initial version has been selected or published. A possible first candidate is
-`v0.1.0-rc.1`; choosing it and creating a tag are separate maintainer actions.
+Releases are operator versions, independent of Forgejo server versions. The
+first release candidate is `v0.1.0-rc.1`; its tag and packages must be created
+only after the reviewed version commit passes CI.
 
 1. Confirm licenses, all CI checks, a clean tree and the exact commit. Run
    `python3 hack/release-notes.py <planned-tag>` to draft notes from
@@ -24,8 +24,9 @@ initial version has been selected or published. A possible first candidate is
    image index digests can differ because independent provenance records are
    attached; record both. Investigate any payload mismatch. Test Helm install
    in an isolated Kind cluster.
-5. After both sites pass, create the GitHub Release from the reviewed changelog
-   section, including both registry references and their digests.
+5. After both sites pass, create a prerelease on GitHub and Forgejo from the
+   reviewed changelog section. Include both registry references, their digests,
+   the tagged source commit, and the cross-registry verification result.
 
 On failure, rerun the relevant site's manual workflow with the same tag. The
 script checks existing Chart bytes and image revision; do not overwrite a
