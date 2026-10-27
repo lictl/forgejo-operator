@@ -18,9 +18,12 @@ jobs:
       - name: Check Helm and generated CRDs
         run: |
           helm version --short
+          cmp LICENSE charts/forgejo-operator/LICENSE
           diff -r config/crd/bases charts/forgejo-operator/crds
           helm lint --strict charts/forgejo-operator
           helm template forgejo-operator charts/forgejo-operator --include-crds > /tmp/forgejo-operator-render.yaml
+          helm package charts/forgejo-operator -d /tmp
+          helm show readme /tmp/forgejo-operator-*.tgz | grep -q 'Helm chart'
           ! helm lint --strict charts/forgejo-operator --set rbac.namespaced=true
       - name: Scan full Git history for new secrets
         run: docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/gitleaks/gitleaks:v8.30.1 git . --log-opts=--all --redact --no-banner --baseline-path .gitleaks-baseline.json
