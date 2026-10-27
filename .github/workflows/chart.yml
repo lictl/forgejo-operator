@@ -46,6 +46,8 @@ jobs:
           go run -mod=readonly hack/normalize-chart.go "$test_dir/out-a/forgejo-operator-$chart_version.tgz" "$test_dir/a.tgz" 1700000000
           go run -mod=readonly hack/normalize-chart.go "$test_dir/out-b/forgejo-operator-$chart_version.tgz" "$test_dir/b.tgz" 1700000000
           cmp "$test_dir/a.tgz" "$test_dir/b.tgz"
+      - name: Check source mode and time normalization
+        run: python3 hack/test-normalize-source-times.py
       - name: Check two Linux architectures compile
         run: |
           go version

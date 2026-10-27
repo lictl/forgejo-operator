@@ -43,8 +43,9 @@ needs a credential for the other registry.
 Reproducibility controls include pinned Go and base image indexes, a pinned
 BuildKit image and Buildx version, commit-time `SOURCE_DATE_EPOCH`, normalized image file times
 and `hack/normalize-chart.go`. `hack/normalize-source-times.py` first sets
-all checkout file and directory times to the commit time; BuildKit otherwise
-retains older file times. The Chart helper also normalizes the `.tgz` file time
+checkout file modes from the Git index, directory modes to 0755, and all file
+and directory times to the commit time. Both differ across CI checkouts by
+default. The Chart helper also normalizes the `.tgz` file time
 that Helm writes into the OCI manifest. Run independent builds to establish
 whether the two CI environments and registries really produce the same payload.
 A same-machine comparison is only a local check.
