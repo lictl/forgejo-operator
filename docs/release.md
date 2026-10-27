@@ -5,7 +5,10 @@ No initial version has been selected or published. A suggested first candidate i
 `v0.1.0-rc.1`; choosing and creating it is a separate maintainer action.
 
 1. Confirm MIT and retained third-party notices, all CI checks, a clean tree,
-   and the exact commit to release. Update `CHANGELOG.md`, Chart `version`
+   and the exact commit to release. Run `python3 hack/release-notes.py <planned-tag>`
+   to draft notes from [Conventional Commits](commits.md); review the actual
+   changes and edit the draft into `CHANGELOG.md`. The release workflow reads
+   that changelog section, not commit prefixes or PR labels. Update Chart `version`
    (without `v`) and `appVersion` (with `v`), plus default image tag. Merge
    these changes to `main`.
 2. Create an annotated `vX.Y.Z` tag at that commit and push it to GitHub.

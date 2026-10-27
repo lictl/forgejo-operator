@@ -8,3 +8,7 @@ For alert changes run `make test-rules`; for Chart changes run `helm lint
 --strict charts/forgejo-operator` and render the chart. E2E must use a
 dedicated Kind cluster. Never commit credentials, kubeconfigs, private logs
 or production manifests. Existing file license notices must be retained.
+
+Use the [commit message rules](docs/commits.md) for new commits and PR squash
+messages. In particular, mark breaking API or behavior changes with `!` and a
+`BREAKING CHANGE:` footer so maintainers can plan the version and migration.

@@ -58,6 +58,10 @@ Ensure you run them against a dedicated [Kind](https://kind.sigs.k8s.io/) cluste
 
 ## After Making Changes
 
+Use the [commit message rules](docs/commits.md) for new commits. A breaking
+change needs `!` and a `BREAKING CHANGE:` footer; release notes are drafted
+from these messages and reviewed into `CHANGELOG.md` before release.
+
 **After editing `*_types.go` or markers:**
 ```
 make manifests  # Regenerate CRDs/RBAC from markers
