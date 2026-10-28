@@ -251,6 +251,11 @@ spec:
   until that has settled, so a dump is
   never taken mid-migration and labelled with the old image. A deferred run does not count
   as missed for `BackupHealthy`.
+* While the instance is Broken (an identity Secret, the data volume or the CNPG cluster of an
+  instance that has run is missing or belongs to another instance, see
+  [troubleshooting.md](troubleshooting.md#broken-instances)), neither scheduled backups nor
+  retention run, locally or remotely: backups of what is left would push out the backups from
+  before the incident, which are what you restore from. `BackupHealthy` is `Unknown` meanwhile.
 * Under `retainPolicy: Delete`, scheduled and pre-upgrade backups get an owner reference to
   the `Forgejo` object and are deleted with it. Manual backups never get one. With `Retain`,
   no backup carries a reference to the instance, and they outlive it. Changing

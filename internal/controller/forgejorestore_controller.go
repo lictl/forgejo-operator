@@ -230,7 +230,7 @@ func (r *ForgejoRestoreReconciler) validateRemote(ctx context.Context, rs *forge
 	restoreData := forgejo.BoolOr(rs.Spec.RestoreData, true) && m.IncludesData
 	sec := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err == nil {
-		if have := backup.SecretKeyFingerprint(sec.Data); m.SecretKeyFingerprint != "" && have != "" && have != m.SecretKeyFingerprint {
+		if have := forgejo.SecretKeyFingerprint(sec.Data); m.SecretKeyFingerprint != "" && have != "" && have != m.SecretKeyFingerprint {
 			r.eventOn(rs, corev1.EventTypeWarning, "IdentityMismatch",
 				"The backup was taken by %s/%s, whose SECRET_KEY differs from this instance's: two-factor secrets, Actions secrets and "+
 					"mirror credentials of the restored database cannot be decrypted. To recreate that instance with its identity, "+
@@ -274,8 +274,7 @@ func (r *ForgejoRestoreReconciler) begin(ctx context.Context, rs *forgejov1.Forg
 			return ctrl.Result{}, r.fail(ctx, rs, f, "NewerDump", msg+"; nothing was changed")
 		}
 	}
-	if u := forgejo.DatabaseUpgrade(f); forgejo.DatabaseUpgradeInFlight(f) && u.RestoreName != rs.Name {
-		// Only the upgrade's own rollback restore runs meanwhile.
+	if u := forgejo.DatabaseUpgrade(f); forgejo.DatabaseUpgradeInFlight(f) {
 		return r.wait(ctx, rs, fmt.Sprintf("Waiting for the PostgreSQL major upgrade to %s to finish (phase %s)", u.ToImage, u.Phase))
 	}
 

@@ -10,42 +10,27 @@
 ## Meaning
 
 A PostgreSQL major upgrade of the instance's CNPG cluster (a newer major in
-`spec.database.cnpg.imageName`) failed (`result="failed"`) or was rolled back automatically
+`spec.database.cnpg.imageName`) failed (`result="failed"`) or was reverted to the old major
 (`result="rolledback"`) within the last hour. The image is recorded in
 `status.database.upgrade.failedImage` and is not tried again until `spec.database.cnpg.imageName`
-changes or the retry annotation is set (after a failed rollback restore: only once a restore of
-the database has succeeded). See [upgrades.md](../upgrades.md#postgresql-major-upgrades).
+changes or the retry annotation is set. The operator never rolls a PostgreSQL upgrade back from a
+backup. See [upgrades.md](../upgrades.md#failures-of-a-postgresql-upgrade).
 
 ## Impact
 
-- **Reverted** (`RolledBack`, the message says "nothing had to be restored"): pg_upgrade failed
-  or could not start; CloudNativePG started the untouched old data again (same system ID). No
-  data was lost; Forgejo was down for the attempt.
-- **Rolled back from the backup** (`RolledBack`, the message names a `ForgejoRestore`): the
-  cluster was recreated on the old image and the cold pre-upgrade backup restored into it.
-  Forgejo was stopped from the backup on, so nothing written by users is lost.
-  `Degraded=True/PostgresUpgradeRolledBack`.
+- **Reverted** (`RolledBack`): `pg_upgrade` failed, could not start, or did not start within
+  `spec.upgrade.timeout`; CloudNativePG started the untouched old data again (same system ID).
+  No data was lost; Forgejo was down for the attempt. `Degraded=True/PostgresUpgradeRolledBack`.
 - **Aborted before the new image was written** (`Failed`): the old major keeps running; nothing
   changed.
-- **Rollback failed** (`Failed`, `rollbackRestoreFailed: true`): the recreated database may be
-  empty or half-restored, so **Forgejo stays scaled to zero** until a `ForgejoRestore` restores
-  the database from a backup (a restore of the data volume alone, `restoreDatabase: false`, does
-  not end this). No upgrade starts meanwhile: another image and the retry annotation wait
-  (`DatabaseUpgrading=False/WaitingForRestore`). `ForgejoDown`, `ForgejoNotReady` and the
-  burn-rate alerts keep firing.
-- **Not rolled back, cluster kept** (`Failed`, the message says "could not be rolled back" or
-  "pg_upgrade never started"): the pre-upgrade backup could not restore the database (missing,
-  being deleted, without a dump of the old major, or its volume gone), or a revert whose
-  `pg_upgrade` never started did not bring the old data back in time. Nothing was deleted: the
-  Cluster keeps its data (on the new major after a failed verification, otherwise the untouched
-  old data), and Forgejo runs on it once it serves.
-- **Failed without rollback** (`spec.upgrade.autoRollback: false`): the cluster stays on the new
-  major (or on a revert that did not come up); Forgejo may not serve.
-
-On the new major (a failed verification without rollback, or with the cluster kept),
-`Degraded=True/PostgresUpgradeFailed` stays although the Cluster runs the failed image, until
-`spec.database.cnpg.imageName` changes or the retry annotation keeps the new major (Mitigation,
-step 2).
+- **Revert did not come back although `pg_upgrade` never started** (`Failed`, "pg_upgrade never
+  started"): nothing was changed; Forgejo runs once the cluster serves again.
+- **Held for a person** (`Failed`, `holdsForgejo: true`, condition `Broken=True` with reason
+  `DatabaseUpgradeFailed`, which also fires [ForgejoBroken](ForgejoBroken.md)): the old data did
+  not come back after `pg_upgrade` had started, Forgejo did not start on the new major, or the
+  cluster disappeared. **Forgejo stays scaled to zero**; nothing was rolled back or deleted.
+  Scheduled backups, retention, other upgrades and volume growth wait. `ForgejoDown`,
+  `ForgejoNotReady` and the burn-rate alerts keep firing.
 
 ## Diagnosis
 
@@ -69,36 +54,33 @@ increase(forgejo_operator_database_upgrades_total{namespace="<ns>", name="<name>
 - The new image is built on another Debian release than the old one, under a tag that does not
   say so: pg_upgrade then fails at `pg_controldata` (the operator refuses tags that name another
   release, `PostgresUpgradePathUnsupported`).
+- CloudNativePG's upgrade Job does not get to run (its pod stays `Pending`: node capacity, a
+  quota, a local volume on an unavailable node), or CloudNativePG does not create it.
 - `pg_upgrade` refuses the old cluster: failed-upgrade directories left from an earlier attempt
   (`*.failed_*` next to `pgdata`), extensions or settings the new major does not accept.
-- Forgejo does not become available on the new major within `spec.upgrade.timeout` (slow start,
-  a crash loop): the cluster is rolled back from the backup.
-- The restore of the rollback failed: see the `ForgejoRestore` named in `status.database.upgrade.restoreName`.
-- The pre-upgrade backup was deleted, or its volume lost, before the rollback needed it: the
-  Cluster was kept.
+- Forgejo does not become available on the new major within `spec.upgrade.timeout` (slow start
+  without planner statistics, a crash loop, Valkey or the bucket unavailable at that moment).
 
 ## Mitigation
 
-1. Read `status.database.upgrade.failureReason` and the upgrade Job's log; fix the cause.
-2. Except when `rollbackRestoreFailed` is true (step 3 first): retry the same image with
-   `kubectl -n $NS annotate fj $N forgejo.lucas.icu/retry-database-upgrade=true`, or set
-   `spec.database.cnpg.imageName` to another image of the new major. When the Cluster already
-   runs the failed image (on the new major, see Impact), the annotation upgrades nothing: it
-   clears the failure and keeps the new major, so set it only once Forgejo works on it
-   (`DatabaseUpgradeRetry` event).
-3. Rollback restore failed: once its cause is fixed, restore the pre-upgrade backup
-   (`status.database.upgrade.backupName`) with a database-only `ForgejoRestore`
-   (`restoreData: false`), or another backup of the old major if that one is gone; Forgejo starts
-   when it reaches `ScalingUp`. Only a restore of the database counts: one with
-   `restoreDatabase: false` leaves Forgejo stopped. A retry or another image asked for meanwhile
-   starts once that restore has completed.
-4. Failed without rollback, or not rolled back with the cluster kept, and you want the old major
-   back: follow
-   [upgrades.md, Rolling back a PostgreSQL upgrade](../upgrades.md#rolling-back-a-postgresql-upgrade).
+1. Read `status.database.upgrade.failureReason`, the events and the upgrade Job's log; fix the
+   cause.
+2. **Held, the cluster serves the new major** (a failed verification): once Forgejo can start,
+   `kubectl -n $NS annotate fj $N forgejo.lucas.icu/retry-database-upgrade=true` starts it on the
+   new major again and clears the failure (`DatabaseUpgradeRetry` event).
+3. **Held, the cluster does not serve** (the old data did not come back, or the cluster is gone):
+   check the cluster's pods first. To give up on it, follow
+   [upgrades.md, Rolling back a PostgreSQL upgrade](../upgrades.md#rolling-back-a-postgresql-upgrade):
+   annotate `forgejo.lucas.icu/recreate-database=true`, delete the Cluster, and restore the
+   pre-upgrade backup (`status.database.upgrade.backupName`) with a database-only
+   `ForgejoRestore` (`restoreData: false`). Forgejo starts when the restore reaches `ScalingUp`.
+   Only a restore of the database counts: one with `restoreDatabase: false` leaves Forgejo
+   stopped.
+4. **Reverted or aborted**: retry the same image with the annotation of step 2, or set
+   `spec.database.cnpg.imageName` to another image of the new major.
 
 ## Escalation
 
-Escalate immediately (page) when `rollbackRestoreFailed` is true: Forgejo is down until a backup
-is restored. Escalate to the operator's maintainers with `status.database`, the events and the
+Escalate immediately (page) when `holdsForgejo` is true: Forgejo is down until a person acts. Escalate to the operator's maintainers with `status.database`, the events and the
 upgrade Job's log when an upgrade between verified majors (17 and 18) fails without a reason in
 the image or the cluster's settings.

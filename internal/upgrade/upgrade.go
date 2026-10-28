@@ -111,6 +111,13 @@ func idle(rc *forgejo.ReconcileContext, desired, current string, retry bool) {
 	case desired == current:
 		settle(rc, current)
 		return
+	case forgejo.IsBroken(f) && !forgejo.DatabaseUpgradeHoldsWorkload(f):
+		// A database created again waits for its restore (or the identity is in doubt): a
+		// pre-upgrade backup now would back up what is left, and its rollback restore would count
+		// as the restore the hold waits for.
+		rc.SetCondition(forgejov1.ConditionUpgrading, metav1.ConditionFalse, "WaitingForBroken",
+			fmt.Sprintf("The change to %s starts once the instance is no longer Broken (condition Broken)", desired))
+		return
 	case rc.DatabaseUpgrading || forgejo.DatabaseUpgradeHoldsWorkload(f):
 		// One upgrade at a time: the PostgreSQL major upgrade stops Forgejo and verifies the
 		// running version on the new major. A retry annotation waits as well.

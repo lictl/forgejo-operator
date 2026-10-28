@@ -633,8 +633,12 @@ func TestReconcileBootstrapCreatesAndFollowsTheRestore(t *testing.T) {
 	f := restoreFromInstance(store)
 	f.Status.RestoredFrom = &forgejov1.RestoredFromStatus{Phase: forgejov1.RestoredFromRestoringData, IdentityRestoredTime: &metav1.Time{Time: time.Now()},
 		Location: testRemoteLocation, BackupName: "b1"}
-	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsSecret, Namespace: remoteNS}}
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, secrets).Build()
+	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsSecret, Namespace: remoteNS},
+		Data: map[string][]byte{forgejo.SecretKeySecretKey: []byte("restored")}}
+	// Left by an instance of the same name (restore-from-overwrite): another identity, another image.
+	leftover := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: forgejo.DataPVCName(f), Namespace: remoteNS,
+		Annotations: map[string]string{forgejo.AnnotationIdentity: "0123456789abcdef", forgejo.AnnotationRunningImage: "forgejo:17"}}}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, secrets, leftover).Build()
 	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
 
 	// The database is not ready yet: no restore.
@@ -680,6 +684,11 @@ func TestReconcileBootstrapCreatesAndFollowsTheRestore(t *testing.T) {
 	_ = c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: testSecretsSecret}, secrets)
 	if secrets.Annotations[forgejo.AnnotationRestoredFrom] != testRemoteLocation {
 		t.Errorf("restore not recorded on the Secret: %v", secrets.Annotations)
+	}
+	// The volume holds the backup's data now: the restored identity, and no image that ran on it.
+	_ = c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: leftover.Name}, leftover)
+	if a := leftover.Annotations; a[forgejo.AnnotationIdentity] != forgejo.SecretKeyFingerprint(secrets.Data) || a[forgejo.AnnotationRunningImage] != "" {
+		t.Errorf("volume annotations %v", a)
 	}
 }
 

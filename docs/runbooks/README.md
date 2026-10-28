@@ -20,6 +20,7 @@ working hours). The two burn-rate alerts follow the same split.
 | [ForgejoAvailabilitySlowBurn](ForgejoAvailabilitySlowBurn.md) | warning | instance (SLO) | The availability error budget burns 3x (1d/2h) or 1x (3d/6h) faster than sustainable |
 | [ForgejoDown](ForgejoDown.md) | critical | instance | Prometheus scrapes no Forgejo pod for 5m |
 | [ForgejoNotReady](ForgejoNotReady.md) | warning | instance | The instance has not been Ready for 10m |
+| [ForgejoBroken](ForgejoBroken.md) | critical | instance | The operator found something it does not repair (condition `Broken`) for 2m |
 | [ForgejoHealthCheckFailing](ForgejoHealthCheckFailing.md) | warning | instance | More than 3 operator probes of `/api/healthz` failed in 10m |
 | [ForgejoHealthProbeUnreachable](ForgejoHealthProbeUnreachable.md) | warning | instance | The operator's probes have not reached Forgejo for 15m |
 | [ForgejoOperatorMetricsMissing](ForgejoOperatorMetricsMissing.md) | warning | instance | The instance's operator metrics have been missing for 15m |

@@ -99,7 +99,7 @@ Reusable procedures (referenced below; run ADMIN(N) first):
    metadata: {name: f17, namespace: e2e-runners}
    spec:
      image: codeberg.org/forgejo/forgejo:17
-     database: {cnpg: {instances: 1, storage: {size: 1Gi}}}
+     database: {cnpg: {storage: {size: 1Gi}}}
      storage: {size: 2Gi}
      objectStorage:
        s3:
@@ -115,7 +115,7 @@ Reusable procedures (referenced below; run ADMIN(N) first):
    metadata: {name: f15, namespace: e2e-runners}
    spec:
      image: codeberg.org/forgejo/forgejo:15
-     database: {cnpg: {instances: 1, storage: {size: 1Gi}}}
+     database: {cnpg: {storage: {size: 1Gi}}}
      storage: {size: 2Gi}
    ```
    Within 8 min both have `status.phase=Running` and `Ready=True`; `status.version` of `f17` starts with `17.`, of `f15` with `15.`; `f17` has `ObjectStorageReady=True`.

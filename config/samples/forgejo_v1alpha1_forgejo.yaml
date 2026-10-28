@@ -26,11 +26,11 @@ spec:
   #   className: nginx
   #   tlsSecretName: git-example-com-tls
   database:
-    # An operator-managed CloudNativePG cluster "<name>-db".
+    # An operator-managed CloudNativePG cluster "<name>-db" of one instance, for a quick start
+    # or a small installation; for a replicated database use type: External.
     cnpg:
-      instances: 1
       # The default. A newer major here is an orchestrated upgrade: cold database backup,
-      # CloudNativePG's pg_upgrade, verification, rollback on failure (docs/upgrades.md).
+      # CloudNativePG's pg_upgrade, verification (docs/upgrades.md).
       imageName: ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie
       storage:
         size: 5Gi

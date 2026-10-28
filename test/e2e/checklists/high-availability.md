@@ -76,7 +76,7 @@ spec:
   image: codeberg.org/forgejo/forgejo:17
   replicas: 3
   highAvailability: {enabled: true}
-  database: {cnpg: {instances: 1, storage: {size: 2Gi}}}
+  database: {cnpg: {storage: {size: 2Gi}}}
   storage: {size: 2Gi}
   resources:
     requests: {cpu: 50m, memory: 192Mi}
@@ -162,7 +162,7 @@ Start a sampler that every 2 s records the number of cron runner pods that are `
 
 ## H8 — One replica without HA (`solo`)
 
-First create a decoy StatefulSet `solo-cron` that is not the operator's: `kubectl -n e2e-ha create -f -` of `apiVersion: apps/v1, kind: StatefulSet, metadata: {name: solo-cron}, spec: {replicas: 1, selector: {matchLabels: {app: decoy}}, template: {metadata: {labels: {app: decoy}}, spec: {containers: [{name: c, image: registry.k8s.io/pause:3.10}]}}}` (pull the image if needed). Then apply Forgejo `solo` (namespace `e2e-ha`) with `image: codeberg.org/forgejo/forgejo:17`, `database: {cnpg: {instances: 1, storage: {size: 1Gi}}}`, `storage: {size: 1Gi}`, the resources of `ha17`, and no `replicas` or `highAvailability`.
+First create a decoy StatefulSet `solo-cron` that is not the operator's: `kubectl -n e2e-ha create -f -` of `apiVersion: apps/v1, kind: StatefulSet, metadata: {name: solo-cron}, spec: {replicas: 1, selector: {matchLabels: {app: decoy}}, template: {metadata: {labels: {app: decoy}}, spec: {containers: [{name: c, image: registry.k8s.io/pause:3.10}]}}}` (pull the image if needed). Then apply Forgejo `solo` (namespace `e2e-ha`) with `image: codeberg.org/forgejo/forgejo:17`, `database: {cnpg: {storage: {size: 1Gi}}}`, `storage: {size: 1Gi}`, the resources of `ha17`, and no `replicas` or `highAvailability`.
 
 1. **H8.1 running**: within 8 min `Running`, `Ready=True`.
 2. **H8.2 no cron runner, no Valkey**: `kubectl -n e2e-ha get deploy,sts,svc,pdb -l app.kubernetes.io/instance=solo -o name` lists only `deployment.apps/solo`, `service/solo-http` and `service/solo-ssh` (no `solo-cron`, no `solo-valkey`, no PDB); `kubectl -n e2e-ha get secret solo-config -o jsonpath='{.data}'` has only the key `app.ini`; `status.highAvailability` is absent and there is no `ValkeyReady` condition.

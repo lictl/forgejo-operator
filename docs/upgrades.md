@@ -325,7 +325,13 @@ With `spec.database.type: CNPG` (the default), changing `spec.database.cnpg.imag
 image of a newer PostgreSQL major upgrades the cluster in place with CloudNativePG's offline
 `pg_upgrade`, orchestrated like a Forgejo upgrade: Forgejo is stopped, a cold backup of the
 database is taken with the old PostgreSQL image, CloudNativePG upgrades, and Forgejo is started
-and verified on the new major. A failure is rolled back. The code is
+and verified on the new major. A failure that left the old data untouched is reverted in place.
+Nothing is rolled back from a backup by the operator: a failure after which the data may have
+changed, or on which Forgejo does not start, keeps Forgejo stopped and the instance
+[Broken](troubleshooting.md#broken-instances) until a person decides
+([Failures](#failures-of-a-postgresql-upgrade)). The bundled cluster is a single instance, for a
+quick start or a small installation; for a replicated or otherwise managed PostgreSQL use
+`spec.database.type: External`, which the operator never upgrades. The code is
 `internal/upgrade/database*.go`, step `database-upgrade`, which runs before the `database` step
 and decides which image that step writes to Cluster `<name>-db`.
 
@@ -335,8 +341,7 @@ spec:
     cnpg:
       imageName: ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie   # the default
   upgrade:
-    autoRollback: true   # default; also rolls back a PostgreSQL upgrade from its backup
-    timeout: 15m         # default; Forgejo on the new major must come up within it (a revert: at least 15m)
+    timeout: 15m         # default; pg_upgrade must have started, and Forgejo on the new major come up, within it
 ```
 
 External databases (`spec.database.type: External`) are never upgraded by the operator: their
@@ -390,9 +395,9 @@ would refuse it on every pass.
 An upgrade does not start (`DatabaseUpgrading=False`, the current image keeps running) while a
 `ForgejoRestore` of the instance has not finished, also one that still waits in `Pending` and one
 in `ScalingUp` whose first pod migrates the restored database, while a failed restore holds the
-instance in maintenance, while `spec.restoreFrom` is being restored, and after a rollback whose
-restore failed until a restore has lifted that hold (`WaitingForRestore`, see
-[Failures](#failures-of-a-postgresql-upgrade)); while a Forgejo upgrade is in flight or holds the
+instance in maintenance, while `spec.restoreFrom` is being restored, and while a failed upgrade
+holds Forgejo stopped, until a restore or the retry annotation has lifted that hold
+(`WaitingForRestore`, see [Failures](#failures-of-a-postgresql-upgrade)); while a Forgejo upgrade is in flight or holds the
 workload (`WaitingForForgejoUpgrade`), before Forgejo has rolled out for the first time
 (`WaitingForFirstRollout`), while the CNPG cluster is not healthy (`WaitingForDatabase`), and
 while the SSH host keys or the bucket of `spec.objectStorage` are unusable
@@ -404,12 +409,12 @@ verify it.
 ```
                  version gate
 spec.database ─────────────► Pending ─► BackingUp ─► Upgrading ─────────────────► Verifying ─► Succeeded
-.cnpg.imageName                 │           │            │ Job failed or                │ Forgejo fails
-                                ▼           ▼            ▼ image not pulled             ▼ on the new major
-                           Cancelled     Failed      Reverting ──────────────────► RollingBack ─► RolledBack
-                                       (nothing          │ old data back  (not back,    │ backup unusable: Failed (Cluster kept)
-                                        changed)         ▼ (same system  pg_upgrade     │ restore failed: Failed (Forgejo stays stopped)
-                                                    RolledBack     ID)   had started)
+.cnpg.imageName                 │           │            │ Job failed, image not        │ Forgejo fails on the new
+                                ▼           ▼            ▼ pulled, or no pg_upgrade     ▼ major, cluster gone
+                           Cancelled     Failed      Reverting ─────────────────► Failed, Forgejo held (Broken)
+                                       (nothing          │ old data back  (not back,
+                                        changed)         ▼ (same system  pg_upgrade had started)
+                                                    RolledBack     ID)
                                                     (not back, pg_upgrade never started: Failed, Cluster kept)
 ```
 
@@ -419,19 +424,17 @@ spec.database ─────────────► Pending ─► BackingU
 | `BackingUp` | Forgejo and the cron runner are stopped (the HPA is removed meanwhile). Once no Forgejo pod, runner registration pod and backup or restore pod of the instance is left, `ForgejoBackup <name>-pre-pg<major>-<start>` (`reason: PreUpgrade`, **database only**) dumps the database with the running, old PostgreSQL image. Its pods must stop within 15 minutes of `startTime`, else the upgrade is aborted | 0 | old |
 | `Upgrading` | The new image is written to the Cluster in the pass that records `rolloutStartTime`. CloudNativePG stops PostgreSQL and runs `pg_upgrade --link` in Job `<primary>-major-upgrade` | 0 | new |
 | `Verifying` | The data is on the new major (`status.pgDataImageInfo`). Forgejo starts with one replica once the database serves again; the upgrade succeeds when the Deployment is available on a new system ID. Only pods started for the verification are judged: a pod created before the new image was written, or one that has finished (evicted, stopped by a node shutdown), ran on the old major | 1 | new |
-| `Succeeded` | The usual replicas, cron runner and HPA come back. Replicas of an instances: 2 cluster are cloned again by CloudNativePG meanwhile (`DatabaseReady` reports it) | usual | new |
-| `Reverting` | `pg_upgrade` failed or could not start: the old image is written back, CloudNativePG deletes the upgrade Job and starts the old data again. `pgUpgradeStarted` records whether the container that runs `pg_upgrade` had started | 0 | old |
-| `RollingBack` | The old data does not come back after `pg_upgrade` had started, or Forgejo fails on the new major: the Cluster is deleted (only while the pre-upgrade backup can restore it) and created again on the old image, and the backup is restored into it | 0 | old (recreated) |
-| `RolledBack` | The old major runs: `failedImage` is the new image, `Degraded=True/PostgresUpgradeRolledBack` until `spec.database.cnpg.imageName` changes | usual | old |
-| `Failed` | See [Failures](#failures-of-a-postgresql-upgrade) | see there | old, or new without `autoRollback` or when the backup could not restore the old one |
+| `Succeeded` | The usual replicas, cron runner and HPA come back | usual | new |
+| `Reverting` | `pg_upgrade` failed, could not start, or had not started within `spec.upgrade.timeout`: the old image is written back, CloudNativePG deletes the upgrade Job and starts the old data again. `pgUpgradeStarted` records whether the container that runs `pg_upgrade` had started | 0 | old |
+| `RolledBack` | The old major runs again with its untouched data: `failedImage` is the new image, `Degraded=True/PostgresUpgradeRolledBack` until `spec.database.cnpg.imageName` changes | usual | old |
+| `Failed` | See [Failures](#failures-of-a-postgresql-upgrade). With `holdsForgejo: true` Forgejo stays stopped and the instance is Broken | usual, or 0 with `holdsForgejo` | old or new, as it is |
 | `Cancelled` | `spec.database.cnpg.imageName` changed before the new image was written | usual | old |
 
 The state is persisted in `status.database.upgrade`, so an operator restart resumes it; the
 backup and the restore have names derived from `startTime` and are created only once the phase
 that needs them is saved. While it is in flight, `DatabaseUpgrading=True` (reason = phase),
 `status.phase` is `Upgrading` and `Progressing=True`. On a local cluster a 17 → 18 upgrade of a
-small database took about 75 s, the `pg_upgrade` Job 40 s of it; with two instances another 20 s
-for cloning the replica.
+small database took about 75 s, the `pg_upgrade` Job 40 s of it.
 
 **One upgrade at a time.** While a PostgreSQL upgrade is in flight:
 
@@ -455,24 +458,30 @@ for cloning the replica.
 | Situation | Outcome |
 |-----------|---------|
 | The pre-upgrade backup fails, Forgejo's pods do not stop within 15 minutes, or the Cluster does not show the new image 2 minutes after it was written (e.g. refused by CloudNativePG) | `Failed` before anything changed: the old major keeps running, Forgejo starts again |
-| CloudNativePG's upgrade Job fails (`BackoffLimitExceeded`), or its pod cannot pull an image for 2 minutes | `Reverting`: the old image is written back. `RolledBack` once the primary serves the old major with the **same system ID** (replicas that are still starting are CloudNativePG's to bring back): nothing was restored, nothing lost |
-| The Job runs longer than `spec.upgrade.timeout` | Only reported (`DatabaseUpgradeSlow` event, message): aborting `pg_upgrade --link` can leave the old data unusable |
-| The old data does not come back within `spec.upgrade.timeout`, and at least 15 minutes, after `pg_upgrade` had started (a `pg_upgrade --link` that failed after it started linking leaves the old data directory unusable) | `RollingBack` |
-| The old data does not come back within that time although `pg_upgrade` never started (`pgUpgradeStarted: false`: an image that cannot be pulled) | `Failed`, nothing deleted: the old data is untouched, so the Cluster keeps it and is not rolled back from the backup; Forgejo starts once the cluster serves again |
-| Forgejo crash-loops on the new major, or is not available within `spec.upgrade.timeout` of `Verifying` | `RollingBack`: the old data directory is gone after a successful `pg_upgrade` |
-| `RollingBack`: Forgejo is stopped, Cluster `<name>-db` deleted; once its pods, volumes, Secrets and Services are gone, it is created again on the old image (with at least the old volume size, a new system ID and a new `<name>-db-app` password), and once it has served for 15 s (`DatabaseReady`), `ForgejoRestore <name>-pg-rollback-<start>` restores the pre-upgrade backup (database only: Forgejo was stopped from the backup on, so the data volume matches) | `RolledBack` when the restore reaches `ScalingUp` |
-| `RollingBack`, but the pre-upgrade backup, read again before the Cluster is deleted, cannot restore it: it is missing or being deleted, not `Completed`, records no database dump or one of another major than the old one, or its volume is missing or being deleted | `Failed` without deleting anything (`DatabaseUpgradeRollbackFailed` event), as with `autoRollback: false`: the Cluster keeps its data; restore a backup by hand |
-| The rollback's restore fails | `Failed` with `rollbackRestoreFailed: true`: the recreated database may be empty, so **Forgejo stays stopped** until a `ForgejoRestore` created afterwards has restored the database from a backup (one with `restoreDatabase: false` does not count); `DatabaseUpgradeRollbackRestored` event. Meanwhile no upgrade starts: another image of the new major and the retry annotation wait (`DatabaseUpgrading=False/WaitingForRestore`, the annotation stays) and start once that restore has finished; a change of `spec.database.cnpg.imageName` does not lift the hold either |
-| A failure with `spec.upgrade.autoRollback: false` | `Failed`: the cluster keeps the new major (or the revert that did not come up); restore the backup by hand |
+| CloudNativePG's upgrade Job fails (`BackoffLimitExceeded`), or its pod cannot pull an image for 2 minutes | `Reverting`: the old image is written back. `RolledBack` once the primary serves the old major with the **same system ID**: nothing was restored, nothing lost |
+| `pg_upgrade` has not started within `spec.upgrade.timeout` of writing the new image (the Job's pod stays `Pending`, or CloudNativePG creates no Job) | `Reverting`, as above: the old data is untouched |
+| The Job runs longer than `spec.upgrade.timeout` after `pg_upgrade` started | Only reported (`DatabaseUpgradeSlow` event, message): aborting `pg_upgrade --link` can leave the old data unusable |
+| The old data does not come back within `spec.upgrade.timeout`, and at least 15 minutes, although `pg_upgrade` never started (`pgUpgradeStarted: false`) | `Failed`, nothing changed: the old data is untouched, and Forgejo starts once the cluster serves again (`DatabaseUpgradeRevertFailed` event). Check the cluster's pods |
+| The old data does not come back within that time after `pg_upgrade` had started (a `pg_upgrade --link` that failed after it started linking can leave the old data directory unusable) | `Failed` with `holdsForgejo: true` |
+| Forgejo crash-loops on the new major, or is not available within `spec.upgrade.timeout` of `Verifying` | `Failed` with `holdsForgejo: true`: the data stays on the new major |
+| The Cluster disappears during the upgrade | `Failed` with `holdsForgejo: true`; the identity check also reports it (`DatabaseMissing`) |
 
-A failure that kept the new major (`autoRollback: false` after `pg_upgrade` succeeded, or a
-rollback that kept the Cluster) stays reported, with `Degraded=True/PostgresUpgradeFailed`,
-although the Cluster runs the failed image, until `spec.database.cnpg.imageName` changes or the
-retry annotation keeps the new major (below).
+With `holdsForgejo: true` **nothing is rolled back or deleted**: Forgejo stays stopped, condition
+`Broken` is `True` with reason `DatabaseUpgradeFailed` (alert
+[ForgejoBroken](runbooks/ForgejoBroken.md)), `Degraded=True/PostgresUpgradeFailed`, and
+`status.database.upgrade.message` names the pre-upgrade backup. Scheduled backups, retention, other
+upgrades and volume growth wait. The hold ends when
 
-A rollback from the backup loses nothing users wrote: Forgejo is stopped from the backup on, and
-an upgrade succeeds as soon as Forgejo is available on the new major, so a rollback only follows
-a Forgejo that never served on it.
+- the cluster serves the new major and you set the retry annotation (below): Forgejo starts on it
+  again, which also clears the failure; or
+- a `ForgejoRestore` of the database created after the failure reaches `ScalingUp`
+  (`DatabaseUpgradeRestored` event); one with `restoreDatabase: false` does not count. Restore into
+  the cluster as it is, or recreate it first, see
+  [Rolling back a PostgreSQL upgrade](#rolling-back-a-postgresql-upgrade).
+
+A change of `spec.database.cnpg.imageName` does not end the hold. Nothing users wrote is lost by
+the hold: Forgejo is stopped from the backup on, and an upgrade succeeds as soon as Forgejo is
+available on the new major.
 
 **Retrying.** A failed image (`status.database.upgrade.failedImage`) is not tried again
 automatically. Set another image of the new major, or retry the same one (with a new backup):
@@ -483,33 +492,42 @@ kubectl annotate fj <name> forgejo.lucas.icu/retry-database-upgrade=true
 
 The annotation is removed once read, as for Forgejo upgrades. When the Cluster already runs the
 failed image (a failure that kept the new major), there is nothing to upgrade again: the
-annotation clears the failure instead (`failedImage`, `Degraded`; a `DatabaseUpgradeRetry` event)
-and the instance stays on the new major; to go back, see
-[Rolling back a PostgreSQL upgrade](#rolling-back-a-postgresql-upgrade). After a rollback whose
-restore failed (`rollbackRestoreFailed: true`) restore the database from a backup first: until
-then neither starts an upgrade, since it would back up and upgrade a database that may be empty.
-A Job failure that leaves `*.failed_*` directories next to the old data makes every later
-`pg_upgrade` of that cluster fail too; CloudNativePG's documentation describes how to clean them
-up.
+annotation clears the failure instead (`failedImage`, `Degraded`, the hold and `Broken`; a
+`DatabaseUpgradeRetry` event) and Forgejo starts on the new major; to go back, see
+[Rolling back a PostgreSQL upgrade](#rolling-back-a-postgresql-upgrade). While the hold keeps
+Forgejo stopped on a cluster that does not serve the new major, the annotation waits
+(`DatabaseUpgrading=False/WaitingForRestore`) until a restore has lifted the hold. A Job failure
+that leaves `*.failed_*` directories next to the old data makes every later `pg_upgrade` of that
+cluster fail too; CloudNativePG's documentation describes how to clean them up.
 
 ### Rolling back a PostgreSQL upgrade
 
-There is no way back in place after `Succeeded`: `pg_upgrade` deleted the old data directory and
-CloudNativePG refuses an older major (`PostgresDowngradeRefused`). To return to the old major,
-recreate the cluster from a backup taken with it, such as the pre-upgrade backup
-(`status.database.upgrade.backupName`; its `status.postgresImage` is the old image). Everything
-written after that backup is lost; a backup taken on the new major cannot be restored into the old
-one (`NewerDump`).
+There is no way back in place once `pg_upgrade` has run: it replaced the old data directory, and
+CloudNativePG refuses an older major (`PostgresDowngradeRefused`). To return to the old major, or
+to replace a cluster whose data is unusable, create the cluster again from a backup taken with the
+major you want, such as the pre-upgrade backup (`status.database.upgrade.backupName`; its
+`status.postgresImage` is the old image). Everything written after that backup is lost; a backup
+taken on the new major cannot be restored into the old one (`NewerDump`).
 
-1. Stop Forgejo: `spec.replicas: 0` (and disable horizontal autoscaling).
-2. Set `spec.database.cnpg.imageName` to the old image (`Degraded=True/PostgresDowngradeRefused`
-   until the next step).
-3. Delete the Cluster: `kubectl delete cluster.postgresql.cnpg.io <name>-db`. The operator creates
-   it again, empty, on the old image once the deleted Cluster's pods, volumes, Secrets and
-   Services are gone, since a new Cluster of the same name would take them over; meanwhile
-   `DatabaseReady=False/ClusterDeleting` names what is left. Delete what is not being deleted
-   (for example a volume orphaned with `--cascade=orphan`).
-4. Restore the backup into it once `DatabaseReady=True`:
+1. Set `spec.database.cnpg.imageName` to the image the new cluster should run (the old one to go
+   back; `Degraded=True/PostgresDowngradeRefused` until the next step).
+2. Ask for the cluster to be created again, then delete it:
+
+   ```sh
+   kubectl annotate fj <name> forgejo.lucas.icu/recreate-database=true
+   kubectl delete cluster.postgresql.cnpg.io <name>-db
+   ```
+
+   Without the annotation the operator reports a missing cluster of an instance that has run as
+   `Broken=True/DatabaseMissing` and creates nothing. The annotation acts only while the cluster
+   is missing or being deleted, and on the cluster it creates for it (marked
+   `forgejo.lucas.icu/restore-pending=true`); on any other cluster it has no effect. With it,
+   Forgejo stays stopped
+   (`Broken=True/DatabaseRestorePending`), and the operator creates the cluster again, empty, once
+   the deleted Cluster's pods, volumes, Secrets and Services are gone, since a new Cluster of the
+   same name would take them over; meanwhile `DatabaseReady=False/ClusterDeleting` names what is
+   left. Delete what is not being deleted (for example a volume orphaned with `--cascade=orphan`).
+3. Restore the backup into it once `DatabaseReady=True`:
 
    ```yaml
    apiVersion: forgejo.lucas.icu/v1alpha1
@@ -522,7 +540,10 @@ one (`NewerDump`).
      restoreData: false
    ```
 
-5. Set `spec.replicas` back.
+   Once it reaches `ScalingUp`, the operator removes the cluster's mark and the annotation, and
+   Forgejo starts (`DatabaseRestored` event; it also ends a failed upgrade's hold). While the
+   instance is Broken, a change of `spec.image` waits (`Upgrading=False/WaitingForBroken`): its
+   pre-upgrade backup would back up the empty database.
 
 ### After the upgrade
 
@@ -553,7 +574,6 @@ status:
       toMajor: 18
       fromSystemID: "7700285381722689561"
       backupName: fj-pre-pg18-20261024172151
-      restoreName: ""                   # fj-pg-rollback-<start> after a rollback from the backup
       startTime: ...
       rolloutStartTime: ...             # the new image was written
       pgUpgradeStarted: true            # the container that runs pg_upgrade started
@@ -561,8 +581,7 @@ status:
       completionTime: ...
       failedImage: ""
       failureReason: ""
-      storageSize: ""                   # the deleted Cluster's volume size (rollback)
-      rollbackRestoreFailed: false
+      holdsForgejo: false               # true: Forgejo stays stopped for a person (Broken)
       message: Upgraded PostgreSQL from 17 (...) to 18 (...) in 1m11s; system ID ...
 ```
 
@@ -576,8 +595,8 @@ status:
 - Events (action `DatabaseUpgrade`): `DatabaseUpgradeStarted`, `DatabaseUpgradeBackup`,
   `DatabaseUpgradeBackupCompleted`, `DatabaseUpgradeApplying`, `DatabaseUpgradeVerifying`,
   `DatabaseUpgradeSucceeded`, `DatabaseUpgradeFailed`, `DatabaseUpgradeSlow`,
-  `DatabaseUpgradeRollingBack`, `DatabaseUpgradeRolledBack`, `DatabaseUpgradeRollbackFailed`,
-  `DatabaseUpgradeRollbackRestored`, `DatabaseUpgradeCancelled`, `DatabaseUpgradeQueued`,
+  `DatabaseUpgradeRevertFailed`, `DatabaseUpgradeRestored`, `DatabaseRestored`,
+  `DatabaseUpgradeCancelled`, `DatabaseUpgradeQueued`,
   `DatabaseUpgradePaused`, `DatabaseUpgradeResumed`, `DatabaseUpgradeRetry`,
   `PostgresDowngradeRefused`, `PostgresUpgradePathUnsupported`, `PostgresVersionUnsupported`,
   `UnsupportedVersion`, `UnverifiedVersion`.

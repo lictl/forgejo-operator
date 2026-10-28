@@ -81,29 +81,3 @@ func TestReconcileCNPGWritesTheGatedImage(t *testing.T) {
 		t.Fatalf("spec.imageName %s", image)
 	}
 }
-
-// A Cluster that a rollback recreates gets at least the size of the deleted one.
-func TestMutateCNPGClusterStorageFloor(t *testing.T) {
-	f := testInstance()
-	for _, tt := range []struct{ floor, want string }{{"", size5Gi}, {size8Gi, size8Gi}, {"1Gi", size5Gi}, {"bogus", size5Gi}} {
-		c := &unstructured.Unstructured{Object: map[string]any{}}
-		if err := mutateCNPGCluster(f, c, testPG17, tt.floor); err != nil {
-			t.Fatal(err)
-		}
-		if size, _, _ := unstructured.NestedString(c.Object, "spec", "storage", "size"); size != tt.want {
-			t.Errorf("floor %q: size %s, want %s", tt.floor, size, tt.want)
-		}
-	}
-	// An existing Cluster is not given the floor (it only grows through autopilot).
-	c := &unstructured.Unstructured{Object: map[string]any{}}
-	if err := unstructured.SetNestedField(c.Object, size5Gi, "spec", "storage", "size"); err != nil {
-		t.Fatal(err)
-	}
-	c.SetResourceVersion("1")
-	if err := mutateCNPGCluster(f, c, testPG17, size8Gi); err != nil {
-		t.Fatal(err)
-	}
-	if size, _, _ := unstructured.NestedString(c.Object, "spec", "storage", "size"); size != size5Gi {
-		t.Errorf("existing cluster: size %s", size)
-	}
-}

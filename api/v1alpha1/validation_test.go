@@ -253,8 +253,6 @@ func TestForgejoValidation(t *testing.T) {
 		{name: "External without external", obj: fj("  database: {type: External}"), want: "type External requires external"},
 		{name: "external with CNPG", obj: fj("  database:\n    external: {host: pg, credentialsSecret: {name: pg}}"), want: "external requires type External"},
 		{name: "external without credentials", obj: fj("  database:\n    type: External\n    external: {host: pg}"), want: errCredentials},
-		{name: "External with CNPG instances", obj: fj("  database:\n    type: External\n    external: {host: pg, credentialsSecret: {name: pg}}\n    cnpg: {instances: 3}"),
-			want: "cnpg settings apply to type CNPG only"},
 		{name: "External with CNPG parameters", obj: fj("  database:\n    type: External\n    external: {host: pg, credentialsSecret: {name: pg}}\n    cnpg: {parameters: {max_connections: \"200\"}}"),
 			want: "cnpg settings apply to type CNPG only"},
 		{name: "External with postgres image", obj: fj("  database:\n    type: External\n    external: {host: pg, port: 5433, credentialsSecret: {name: pg}}\n    cnpg: {imageName: \"ghcr.io/cloudnative-pg/postgresql:16\", resources: {}}")},

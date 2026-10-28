@@ -31,6 +31,13 @@ func ReconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 	err := apply(ctx, rc, pvc, rc.OwnerRefsEnabled(), func() error {
 		pvc.Labels = mergeMaps(pvc.Labels, forgejo.Labels(f, forgejo.ComponentServer))
 		if pvc.ResourceVersion == "" {
+			if rc.IdentityInitialized {
+				// Deleted after the identity step's check in this pass; it reports it in the next.
+				return fmt.Errorf("not creating an empty PVC %s for an instance that has run", pvc.Name)
+			}
+			if rc.IdentityFingerprint != "" {
+				pvc.Annotations = mergeMaps(pvc.Annotations, map[string]string{forgejo.AnnotationIdentity: rc.IdentityFingerprint})
+			}
 			pvc.Spec.AccessModes = f.Spec.Storage.AccessModes
 			if len(pvc.Spec.AccessModes) == 0 {
 				pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}

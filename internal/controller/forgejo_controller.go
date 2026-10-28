@@ -63,6 +63,7 @@ import (
 )
 
 const (
+	stepIdentity         = "identity"
 	stepSecrets          = "secrets"
 	stepDatabase         = "database"
 	stepHighAvailability = "high-availability"
@@ -118,6 +119,12 @@ type namedStep struct {
 	// pass, i.e. returned neither an error nor Stop; otherwise it is skipped. A step without
 	// needs runs on every pass, so a failure elsewhere cannot starve it.
 	needs []string
+	// waitWhileBroken stops the step while condition Broken is True, whatever its reason: the
+	// identity step stops the steps that need it, but a failed PostgreSQL upgrade that holds
+	// Forgejo does not stop the chain, and neither backups and retention nor volume growth may
+	// act on what is left meanwhile. The condition persists, so this also holds in a pass whose
+	// identity step did not run.
+	waitWhileBroken bool
 }
 
 // Step names referenced by the orchestrator itself.
@@ -134,7 +141,7 @@ const (
 	stepRestoreFrom      = "restore-from"
 )
 
-// steps run in order. maintenance → restore-guard → secrets → database → high-availability
+// steps run in order. maintenance → restore-guard → identity → secrets → database → high-availability
 // → storage → upgrade → tuning → config → config-guard → workload form a chain (which
 // ssh-host-keys joins at config, and database-upgrade at database): each produces outputs the
 // next ones consume, so a failure or
@@ -151,7 +158,12 @@ var steps = []namedStep{
 	// spec.restoreFrom: the identity Secrets come from the backup, before the secrets and
 	// ssh-host-keys steps would generate new ones (a no-op otherwise).
 	{name: stepRestoreIdentity, fn: backup.ReconcileRestoreIdentity, needs: []string{stepRestoreGuard}},
-	{name: stepSecrets, fn: core.ReconcileSecrets, needs: []string{stepRestoreIdentity}},
+	// The identity Secret, the data volume and the CNPG cluster must belong together before
+	// anything is generated or created. Broken stops it: every step that would generate,
+	// create, roll out, back up, prune, upgrade or grow volumes needs it, directly or through
+	// secrets; the ones that only report or serve (health, routes, monitoring) keep running.
+	{name: stepIdentity, fn: core.ReconcileIdentity, needs: []string{stepRestoreIdentity}},
+	{name: stepSecrets, fn: core.ReconcileSecrets, needs: []string{stepIdentity}},
 	// Owner references of the ForgejoBackups and the backup PVC follow
 	// spec.storage.retainPolicy. It reads only the instance and its backups, so a database
 	// or Valkey that is down must not delay it (the instance may be deleted meanwhile).
@@ -159,7 +171,7 @@ var steps = []namedStep{
 	// PostgreSQL major upgrades: chooses the image the database step writes (rc.DatabaseImage)
 	// and stops Forgejo around CNPG's pg_upgrade. Not after database, which stops while CNPG
 	// upgrades; it needs only the final maintenance flags (restores and upgrades never overlap).
-	{name: stepDatabaseUpgrade, fn: upgrade.ReconcileDatabase, needs: []string{stepRestoreGuard}},
+	{name: stepDatabaseUpgrade, fn: upgrade.ReconcileDatabase, needs: []string{stepRestoreGuard, stepIdentity}},
 	{name: stepDatabase, fn: core.ReconcileDatabase, needs: []string{stepSecrets, stepDatabaseUpgrade}},
 	{name: stepHighAvailability, fn: autopilot.ReconcileHA, needs: []string{stepDatabase}},
 	{name: stepStorage, fn: core.ReconcileStorage, needs: []string{stepHighAvailability}},
@@ -192,7 +204,7 @@ var steps = []namedStep{
 	// Creates and prunes ForgejoBackup objects; the backup controller itself waits for the
 	// database. rc.Maintenance comes from the guard; rc.Upgrading from the upgrade step, or
 	// from status.upgrade when that step was skipped.
-	{name: stepBackupSchedule, fn: backup.ReconcileSchedule, needs: []string{stepRestoreGuard}},
+	{name: stepBackupSchedule, fn: backup.ReconcileSchedule, needs: []string{stepRestoreGuard, stepIdentity}, waitWhileBroken: true},
 	// rc.Maintenance suspends probing during a restore.
 	{name: stepHealth, fn: observability.ReconcileHealth, needs: []string{stepRestoreGuard}},
 	// The Valkey replication group as its Sentinels see it (ValkeyReady, roles, failovers).
@@ -205,7 +217,7 @@ var steps = []namedStep{
 	// volume is a common reason why the database step stops, and growing it must not wait
 	// for that step. Last, so that it sees this pass's rc.Maintenance, rc.Upgrading and
 	// rc.RestoreMigrating, and its file-system-resize restart follows the workload update.
-	{name: stepStorageAutopilot, fn: autopilot.ReconcileStorage},
+	{name: stepStorageAutopilot, fn: autopilot.ReconcileStorage, waitWhileBroken: true},
 }
 
 // pipelineResult is the outcome of one pass over the steps.
@@ -267,6 +279,10 @@ func runPipeline(ctx context.Context, rc *forgejo.ReconcileContext, steps []name
 			if s.name == stepUpgrade || s.name == stepDatabaseUpgrade {
 				inferUpgrading(rc)
 			}
+			continue
+		}
+		if s.waitWhileBroken && forgejo.IsBroken(rc.Instance) {
+			p.stopped = append(p.stopped, s.name)
 			continue
 		}
 		res, err := s.fn(ctx, rc)

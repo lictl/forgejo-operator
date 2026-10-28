@@ -101,8 +101,8 @@ func TestReadCNPGClusterAndRunningImage(t *testing.T) {
 		t.Error("Verifying is in flight")
 	}
 	now := metav1.Now()
-	f.Status.Database.Upgrade = &forgejov1.DatabaseUpgradeStatus{Phase: forgejov1.DatabaseUpgradeFailed, RollbackRestoreFailed: true, CompletionTime: &now}
+	f.Status.Database.Upgrade = &forgejov1.DatabaseUpgradeStatus{Phase: forgejov1.DatabaseUpgradeFailed, HoldsForgejo: true, CompletionTime: &now}
 	if DatabaseUpgradeInFlight(f) || !DatabaseUpgradeHoldsWorkload(f) {
-		t.Error("a failed rollback restore holds the workload and is not in flight")
+		t.Error("a failure that holds Forgejo holds the workload and is not in flight")
 	}
 }

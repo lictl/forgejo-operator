@@ -12,10 +12,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,11 +29,6 @@ import (
 // aborted instead of keeping Forgejo stopped.
 const dbAcceptGrace = 2 * time.Minute
 
-// dbSettle is how long a recreated cluster must have been reported ready (DatabaseReady) before
-// the rollback restores into it: right after CloudNativePG reports a new cluster healthy, its
-// Service may not route to the primary yet, and a restore that cannot connect fails.
-const dbSettle = 15 * time.Second
-
 // dbQueued, dbPaused and dbSlow remember, per instance, an image change reported while an
 // upgrade is in flight, a pause reported for the current maintenance window, and a slow Job
 // reported once, so that their events are not repeated on every pass.
@@ -49,12 +41,6 @@ type dbMachine struct {
 	u   *forgejov1.DatabaseUpgradeStatus
 	// c is the live CNPG Cluster, nil when it does not exist.
 	c *forgejo.CNPGCluster
-	// stopped keeps Forgejo at zero replicas while rolling back, until the restore has
-	// replaced the database.
-	stopped bool
-	// stop makes the step return Stop: the database step must not touch the Cluster while a
-	// rollback deletes it (it would update the old one or create the new one too early).
-	stop bool
 	// cancelling is set while a withdrawn upgrade waits for its pre-upgrade backup to finish.
 	cancelling bool
 }
@@ -86,8 +72,6 @@ func (m *dbMachine) run(desired string) error {
 		err = m.verifying()
 	case forgejov1.DatabaseUpgradeReverting:
 		err = m.reverting()
-	case forgejov1.DatabaseUpgradeRollingBack:
-		err = m.rollingBack()
 	}
 	m.apply(desired)
 	return err
@@ -110,12 +94,6 @@ func (m *dbMachine) apply(desired string) {
 	case forgejov1.DatabaseUpgradeVerifying:
 		// One Forgejo pod (rc.Upgrading), once the database step lets the workload through.
 		rc.DatabaseImage = u.ToImage
-	case forgejov1.DatabaseUpgradeRollingBack:
-		rc.DatabaseImage = u.FromImage
-		rc.DatabaseStorageFloor = u.StorageSize
-		if m.stopped {
-			rc.ReplicasOverride = zero
-		}
 	case forgejov1.DatabaseUpgradeSucceeded:
 		rc.DatabaseImage = u.ToImage
 		return
@@ -154,9 +132,9 @@ func (m *dbMachine) reportQueued(desired string) {
 
 // heldByMaintenance reports whether a restore that is not this upgrade's own keeps the instance
 // in maintenance in a phase that must wait for it: before the backup (which would be taken of
-// data a restore is replacing), during the verification (Forgejo is stopped), and before the
-// rollback's restore. While CloudNativePG upgrades or reverts the cluster nothing waits:
-// restores do not start then (the restore controller waits for the upgrade).
+// data a restore is replacing) and during the verification (Forgejo is stopped). While
+// CloudNativePG upgrades or reverts the cluster nothing waits: restores do not start then (the
+// restore controller waits for the upgrade).
 func (m *dbMachine) heldByMaintenance() bool {
 	rc, u := m.rc, m.u
 	if !rc.Maintenance {
@@ -165,11 +143,6 @@ func (m *dbMachine) heldByMaintenance() bool {
 	switch u.Phase {
 	case forgejov1.DatabaseUpgradeUpgrading, forgejov1.DatabaseUpgradeReverting:
 		return false
-	case forgejov1.DatabaseUpgradeRollingBack:
-		if b := rc.Instance.Status.Backup; u.RestoreName != "" && b != nil && b.ActiveRestore == u.RestoreName {
-			return false
-		}
-		m.stopped = true
 	}
 	return true
 }
@@ -387,11 +360,14 @@ func (m *dbMachine) abort(reason string) {
 
 // upgrading watches CloudNativePG's in-place upgrade: the data on the new major means success;
 // a failed upgrade Job, or one whose pod cannot pull its images, means pg_upgrade did not (or
-// never) run to the end, and the old image is written back.
+// never) run to the end, and the old image is written back. So does a timeout before pg_upgrade
+// started (a Job pod that stays Pending, a Job CloudNativePG never creates); once it has
+// started, pg_upgrade is never interrupted.
 func (m *dbMachine) upgrading() error {
 	rc, u, c := m.rc, m.u, m.c
 	if c == nil {
-		m.toRollingBack(fmt.Sprintf("CNPG cluster %s disappeared during the upgrade", forgejo.DatabaseClusterName(rc.Instance)))
+		m.failHeld(fmt.Sprintf("CNPG cluster %s disappeared during the upgrade", forgejo.DatabaseClusterName(rc.Instance)),
+			"Recreate it from the pre-upgrade backup (docs/upgrades.md, \"Rolling back a PostgreSQL upgrade\").")
 		return nil
 	}
 	if c.DataMajor == int(u.ToMajor) {
@@ -439,6 +415,14 @@ func (m *dbMachine) upgrading() error {
 	u.Message = fmt.Sprintf("Upgrading PostgreSQL from %d to %d for %s: CloudNativePG %q", u.FromMajor, u.ToMajor, elapsed, c.Phase)
 	if job != nil {
 		u.Message += fmt.Sprintf(", Job %s running", job.Name)
+	}
+	if elapsed > timeout && !u.PGUpgradeStarted {
+		why := "CloudNativePG created no upgrade Job"
+		if job != nil {
+			why = fmt.Sprintf("the container of upgrade Job %s that runs pg_upgrade did not start", job.Name)
+		}
+		m.toReverting(fmt.Sprintf("%s within spec.upgrade.timeout (%s)", why, timeout))
+		return nil
 	}
 	if elapsed > timeout {
 		u.Message += fmt.Sprintf("; this takes longer than spec.upgrade.timeout (%s), but pg_upgrade is never interrupted", timeout)
@@ -549,7 +533,8 @@ func (m *dbMachine) toVerifying(why string) {
 func (m *dbMachine) verifying() error {
 	rc, u, c, f := m.rc, m.u, m.c, m.rc.Instance
 	if c == nil {
-		m.toRollingBack(fmt.Sprintf("CNPG cluster %s disappeared after the upgrade", forgejo.DatabaseClusterName(f)))
+		m.failHeld(fmt.Sprintf("CNPG cluster %s disappeared after the upgrade", forgejo.DatabaseClusterName(f)),
+			"Recreate it from the pre-upgrade backup (docs/upgrades.md, \"Rolling back a PostgreSQL upgrade\").")
 		return nil
 	}
 	newSystem := c.DataMajor == int(u.ToMajor) && c.SystemID != "" && (u.FromSystemID == "" || c.SystemID != u.FromSystemID)
@@ -617,22 +602,28 @@ func (m *dbMachine) succeed(c *forgejo.CNPGCluster) {
 	clearDatabaseDegraded(m.rc)
 }
 
-// verifyFailed rolls back from the pre-upgrade backup, or keeps the new major when
-// spec.upgrade.autoRollback is false. The old data directory is gone after a successful
-// pg_upgrade, so going back means recreating the cluster.
+// verifyFailed keeps the new major and Forgejo stopped for a person: the old data directory is
+// gone after a successful pg_upgrade, so going back would mean recreating the cluster from the
+// backup, which the operator does not do by itself.
 func (m *dbMachine) verifyFailed(reason string) {
-	rc, u, f := m.rc, m.u, m.rc.Instance
-	rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeFailed", dbEventAction, "Upgrade of PostgreSQL from %s to %s failed: %s",
-		u.FromImage, u.ToImage, reason)
-	if forgejo.BoolOr(f.Spec.Upgrade.AutoRollback, true) {
-		m.toRollingBack(reason)
-		return
-	}
+	u := m.u
+	m.failHeld(reason, fmt.Sprintf(
+		"The data is on PostgreSQL %d. Fix the cause and set the annotation %s=true to start Forgejo on it again, or go back to "+
+			"PostgreSQL %d with the pre-upgrade backup (docs/upgrades.md, \"Rolling back a PostgreSQL upgrade\").",
+		u.ToMajor, AnnotationRetryDatabase, u.FromMajor))
+}
+
+// failHeld ends an upgrade that failed in a way the operator does not repair. Nothing is rolled
+// back or deleted: Forgejo stays stopped, and the instance is Broken, until a person acts
+// (holdForDatabaseRestore). next says what they can do.
+func (m *dbMachine) failHeld(reason, next string) {
+	u := m.u
 	u.FailureReason = reason
+	u.HoldsForgejo = true
 	m.finish(forgejov1.DatabaseUpgradeFailed, "failed", fmt.Sprintf(
-		"Upgrade of PostgreSQL to %s failed: %s. It was not rolled back because spec.upgrade.autoRollback is false: the cluster stays on "+
-			"PostgreSQL %d. To go back, restore pre-upgrade backup %s into a cluster of PostgreSQL %d (docs/upgrades.md).",
-		u.ToImage, reason, u.ToMajor, u.BackupName, u.FromMajor))
+		"Upgrade of PostgreSQL from %s to %s failed: %s. Forgejo stays stopped; pre-upgrade backup %s (database only) holds the "+
+			"database from before the upgrade. %s", u.FromImage, u.ToImage, reason, u.BackupName, next))
+	m.rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeFailed", dbEventAction, "%s", u.Message)
 }
 
 // dbRevertTimeout is the least time a revert waits for the old data to come back: CloudNativePG
@@ -641,18 +632,17 @@ func (m *dbMachine) verifyFailed(reason string) {
 const dbRevertTimeout = 15 * time.Minute
 
 // reverting waits for the old data to come back after the old image was written: the old
-// major with the same system identifier, served by the primary (replicas may still be
-// starting; CloudNativePG brings them back by itself). When it does not within
-// spec.upgrade.timeout, and at least dbRevertTimeout, the cluster is rolled back from the
-// backup only if pg_upgrade had started: a pg_upgrade --link that failed after linking can
-// leave the old data directory unusable. If it never started (an image that cannot be pulled),
-// the old data is untouched, and deleting the Cluster would only lose it: the upgrade fails
-// and the Cluster is kept as it is.
+// major with the same system identifier, served by the primary. When it does not within
+// spec.upgrade.timeout, and at least dbRevertTimeout, the upgrade fails. If pg_upgrade never
+// started (an image that cannot be pulled), the old data is untouched and Forgejo starts once
+// the cluster serves again. If it had started, a pg_upgrade --link that failed after linking can
+// have left the old data directory unusable: Forgejo stays stopped for a person.
 func (m *dbMachine) reverting() error {
 	rc, u, c, f := m.rc, m.u, m.c, m.rc.Instance
 	switch {
 	case c == nil:
-		m.toRollingBack(fmt.Sprintf("CNPG cluster %s disappeared while it was reverted", forgejo.DatabaseClusterName(f)))
+		m.failHeld(fmt.Sprintf("CNPG cluster %s disappeared while it was reverted", forgejo.DatabaseClusterName(f)),
+			"Recreate it from the pre-upgrade backup (docs/upgrades.md, \"Rolling back a PostgreSQL upgrade\").")
 		return nil
 	case c.DataMajor == int(u.ToMajor):
 		// The Job succeeded between the failure report and the revert (CNPG then refuses the
@@ -680,24 +670,19 @@ func (m *dbMachine) reverting() error {
 	if u.PhaseStartTime != nil && time.Since(u.PhaseStartTime.Time) > timeout {
 		reason := fmt.Sprintf("%s; the old data did not come back within %s after %s was written back (CloudNativePG %q: %s)",
 			u.FailureReason, timeout, u.FromImage, c.Phase, serving)
-		switch {
-		case !u.PGUpgradeStarted:
+		if !u.PGUpgradeStarted {
 			u.FailureReason = reason
 			m.finish(forgejov1.DatabaseUpgradeFailed, "failed", fmt.Sprintf(
 				"Upgrade of PostgreSQL to %s failed: %s. pg_upgrade never started, so the old data is untouched: CNPG cluster %s is "+
-					"kept as it is and not rolled back from the backup, and Forgejo starts once the cluster serves again. Check its pods.",
+					"kept as it is, and Forgejo starts once the cluster serves again. Check its pods.",
 				u.ToImage, reason, c.Name))
-			rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeRollbackFailed", dbEventAction, "%s", u.Message)
-		case forgejo.BoolOr(f.Spec.Upgrade.AutoRollback, true):
-			m.toRollingBack(reason)
-		default:
-			u.FailureReason = reason
-			m.finish(forgejov1.DatabaseUpgradeFailed, "failed", fmt.Sprintf(
-				"Upgrade of PostgreSQL to %s failed: %s. It was not rolled back from the backup because spec.upgrade.autoRollback is "+
-					"false: restore pre-upgrade backup %s (database only) into a cluster of PostgreSQL %d (docs/upgrades.md).",
-				u.ToImage, reason, u.BackupName, u.FromMajor))
-			rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeRollbackFailed", dbEventAction, "%s", u.Message)
+			rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeRevertFailed", dbEventAction, "%s", u.Message)
+			return nil
 		}
+		m.failHeld(reason, fmt.Sprintf(
+			"pg_upgrade had started, so the data of CNPG cluster %s may be unusable. Check its pods; if PostgreSQL %d does not come "+
+				"back, recreate the cluster from the pre-upgrade backup (docs/upgrades.md, \"Rolling back a PostgreSQL upgrade\").",
+			c.Name, u.FromMajor))
 		return nil
 	}
 	u.Message = fmt.Sprintf("Reverting to %s: CloudNativePG deletes the upgrade Job and starts the old data (%q, %d of %d instances ready)",
@@ -720,173 +705,6 @@ func revertedData(u *forgejov1.DatabaseUpgradeStatus, c *forgejo.CNPGCluster) st
 		return fmt.Sprintf("system ID %s instead of %s", c.SystemID, u.FromSystemID)
 	}
 	return ""
-}
-
-// toRollingBack starts the rollback from the pre-upgrade backup.
-func (m *dbMachine) toRollingBack(reason string) {
-	u, f := m.u, m.rc.Instance
-	u.FailureReason = reason
-	u.RestoreName = objectName(f, "pg-rollback", *u.StartTime)
-	if m.c != nil && quantityLess(u.StorageSize, m.c.StorageSize) {
-		// Also recorded when the Cluster is deleted; recorded here already, in case that pass's
-		// status write is lost.
-		u.StorageSize = m.c.StorageSize
-	}
-	m.stopped = true
-	m.transition(forgejov1.DatabaseUpgradeRollingBack, fmt.Sprintf(
-		"Rolling back to %s: %s. CNPG cluster %s is recreated on %s and pre-upgrade backup %s is restored into it",
-		u.FromImage, reason, forgejo.DatabaseClusterName(f), u.FromImage, u.BackupName))
-	m.rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeRollingBack", dbEventAction, "%s", u.Message)
-}
-
-// rollingBack recreates the cluster on the old image and restores the pre-upgrade backup into
-// it: Forgejo is stopped, the Cluster is deleted, and once it and its pods, volumes and Secrets
-// are gone, the database step creates it again (this step stops meanwhile, so that the database
-// step neither updates the old Cluster nor creates the new one too early). The restore is
-// database only: Forgejo was stopped from the backup on, so its data volume matches the dump.
-func (m *dbMachine) rollingBack() error {
-	rc, u, f := m.rc, m.u, m.rc.Instance
-	rs := &forgejov1.ForgejoRestore{}
-	err := rc.Client.Get(m.ctx, types.NamespacedName{Namespace: f.Namespace, Name: u.RestoreName}, rs)
-	if err == nil {
-		m.followRestore(rs)
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
-	m.stopped = true
-	rc.Requeue(5 * time.Second)
-	name := forgejo.DatabaseClusterName(f)
-	c := m.c
-	switch {
-	case c != nil && c.Deleting:
-		m.stop = true
-		u.Message = fmt.Sprintf("Rolling back to %s: waiting for CNPG cluster %s to be deleted", u.FromImage, name)
-		return nil
-	case c != nil && u.StartTime != nil && c.Created.Before(u.StartTime):
-		// The cluster of the failed upgrade. It holds the only copy of the data until the
-		// backup is restored, so it goes only while that backup can restore it (read again in
-		// every pass up to the deletion). Forgejo stops first (the workload step scales it to
-		// zero in the passes that wait here); a pod that does not stop within stopTimeout (an
-		// unreachable node) cannot write to a deleted database either.
-		if why, err := m.rollbackBackupUnusable(); err != nil {
-			return err
-		} else if why != "" {
-			m.keepCluster(c, why)
-			return nil
-		}
-		n, err := backup.ServerPodsRunning(m.ctx, rc.Client, f)
-		if err != nil {
-			return err
-		}
-		if n > 0 && (u.PhaseStartTime == nil || time.Since(u.PhaseStartTime.Time) < stopTimeout) {
-			u.Message = fmt.Sprintf("Rolling back to %s: waiting for %d Forgejo pod(s) to stop before CNPG cluster %s is recreated", u.FromImage, n, name)
-			return nil
-		}
-		if quantityLess(u.StorageSize, c.StorageSize) {
-			u.StorageSize = c.StorageSize
-		}
-		obj := &unstructured.Unstructured{}
-		obj.SetGroupVersionKind(forgejo.CNPGClusterGVK)
-		obj.SetNamespace(f.Namespace)
-		obj.SetName(name)
-		if err := rc.Client.Delete(m.ctx, obj, client.Preconditions{UID: &c.UID},
-			client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-			return fmt.Errorf("deleting CNPG cluster %s: %w", name, err)
-		}
-		m.stop = true
-		u.Message = fmt.Sprintf("Rolling back to %s: deleted CNPG cluster %s (PostgreSQL %d) to recreate it on %s", u.FromImage, name,
-			c.DataMajor, u.FromImage)
-		rc.Event(corev1.EventTypeNormal, "DatabaseUpgradeRollingBack", dbEventAction,
-			"Deleted CNPG cluster %s to recreate it on %s and restore pre-upgrade backup %s into it", name, u.FromImage, u.BackupName)
-		return nil
-	case c == nil:
-		left, err := clusterLeftovers(m.ctx, rc)
-		if err != nil {
-			return err
-		}
-		if len(left) > 0 {
-			// A new cluster of the same name would pick up the old volumes.
-			m.stop = true
-			u.Message = fmt.Sprintf("Rolling back to %s: waiting for %s of the deleted CNPG cluster %s to go", u.FromImage, describe(left), name)
-			return nil
-		}
-		// The database step creates the Cluster in this pass (rc.DatabaseImage is the old image).
-		u.Message = fmt.Sprintf("Rolling back to %s: creating CNPG cluster %s again on %s", u.FromImage, name, u.FromImage)
-		return nil
-	case c.DataMajor != int(u.FromMajor) || !c.Healthy():
-		u.Message = fmt.Sprintf("Rolling back to %s: waiting for the recreated CNPG cluster %s (%q, %d of %d instances ready)",
-			u.FromImage, name, c.Phase, c.ReadyInstances, c.SpecInstances)
-		return nil
-	}
-	if ready := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionDatabaseReady); ready == nil ||
-		ready.Status != metav1.ConditionTrue || (u.PhaseStartTime != nil && ready.LastTransitionTime.Before(u.PhaseStartTime)) ||
-		time.Since(ready.LastTransitionTime.Time) < dbSettle {
-		u.Message = fmt.Sprintf("Rolling back to %s: waiting for the recreated CNPG cluster %s to serve (DatabaseReady)", u.FromImage, name)
-		return nil
-	}
-	if err := m.createRestore(); err != nil {
-		return err
-	}
-	u.Message = fmt.Sprintf("Rolling back to %s: restoring pre-upgrade backup %s into the recreated cluster (ForgejoRestore %s)",
-		u.FromImage, u.BackupName, u.RestoreName)
-	return nil
-}
-
-// rollbackBackupUnusable explains why the pre-upgrade backup cannot restore the database into a
-// cluster of the old major, or returns "": it exists and is not being deleted, is Completed with
-// a database dump that pg_dump of the old major wrote, and its volume exists. Everything is read
-// live: it decides whether the Cluster that holds the data may be deleted. (That the files are
-// intact only the restore can tell.)
-func (m *dbMachine) rollbackBackupUnusable() (string, error) {
-	rc, u, f := m.rc, m.u, m.rc.Instance
-	b := &forgejov1.ForgejoBackup{}
-	if err := rc.APIReader.Get(m.ctx, types.NamespacedName{Namespace: f.Namespace, Name: u.BackupName}, b); err != nil {
-		if apierrors.IsNotFound(err) {
-			return fmt.Sprintf("pre-upgrade backup %s does not exist", u.BackupName), nil
-		}
-		return "", fmt.Errorf("reading pre-upgrade backup %s: %w", u.BackupName, err)
-	}
-	name := "pre-upgrade backup " + b.Name
-	dump := forgejo.ParsePostgresImage(b.Status.PostgresImage)
-	switch {
-	case !b.DeletionTimestamp.IsZero():
-		return name + " is being deleted", nil
-	case b.Spec.ForgejoRef.Name != f.Name:
-		return fmt.Sprintf("%s belongs to Forgejo %s", name, b.Spec.ForgejoRef.Name), nil
-	case b.Status.Phase != forgejov1.BackupPhaseCompleted:
-		return fmt.Sprintf("%s is %q, not Completed", name, b.Status.Phase), nil
-	case b.Status.DatabaseSizeBytes <= 0:
-		return name + " records no database dump (status.databaseSizeBytes)", nil
-	case b.Status.PostgresImage != u.FromImage && (!dump.OK || dump.Major != int(u.FromMajor)):
-		return fmt.Sprintf("the dump of %s was written by %q, not by PostgreSQL %d", name, b.Status.PostgresImage, u.FromMajor), nil
-	case b.Status.PVCName == "":
-		return name + " records no volume", nil
-	}
-	pvc := &corev1.PersistentVolumeClaim{}
-	if err := rc.APIReader.Get(m.ctx, types.NamespacedName{Namespace: f.Namespace, Name: b.Status.PVCName}, pvc); err != nil {
-		if apierrors.IsNotFound(err) {
-			return fmt.Sprintf("the volume of %s (PVC %s) does not exist", name, b.Status.PVCName), nil
-		}
-		return "", fmt.Errorf("reading backup volume %s: %w", b.Status.PVCName, err)
-	}
-	if !pvc.DeletionTimestamp.IsZero() {
-		return fmt.Sprintf("the volume of %s (PVC %s) is being deleted", name, b.Status.PVCName), nil
-	}
-	return "", nil
-}
-
-// keepCluster ends a rollback that cannot restore the database without deleting anything, as
-// if spec.upgrade.autoRollback were false: the Cluster keeps the data it has.
-func (m *dbMachine) keepCluster(c *forgejo.CNPGCluster, why string) {
-	u := m.u
-	u.RestoreName, u.StorageSize = "", ""
-	m.finish(forgejov1.DatabaseUpgradeFailed, "failed", fmt.Sprintf(
-		"Upgrade of PostgreSQL to %s failed (%s) and could not be rolled back: %s. CNPG cluster %s was not deleted and keeps its data "+
-			"(PostgreSQL %d, %s); restore a backup by hand (docs/upgrades.md, \"Rolling back a PostgreSQL upgrade\").",
-		u.ToImage, u.FailureReason, why, c.Name, c.DataMajor, c.SpecImage))
-	m.rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeRollbackFailed", dbEventAction, "%s", u.Message)
 }
 
 // clusterLeftovers names the pods, volumes, Secrets and Services of the deleted Cluster that
@@ -937,69 +755,6 @@ func ownedByCluster(refs []metav1.OwnerReference, name string) bool {
 	})
 }
 
-// createRestore creates the database-only restore of the pre-upgrade backup.
-func (m *dbMachine) createRestore() error {
-	rc, f, u := m.rc, m.rc.Instance, m.u
-	rs := &forgejov1.ForgejoRestore{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      u.RestoreName,
-			Namespace: f.Namespace,
-			Labels:    map[string]string{forgejo.LabelForgejo: f.Name},
-		},
-		Spec: forgejov1.ForgejoRestoreSpec{
-			ForgejoRef:      forgejov1.ForgejoRef{Name: f.Name},
-			BackupName:      u.BackupName,
-			RestoreDatabase: ptr.To(true),
-			RestoreData:     ptr.To(false),
-		},
-	}
-	if err := controllerutil.SetOwnerReference(f, rs, rc.Scheme); err != nil {
-		return err
-	}
-	if err := rc.Client.Create(m.ctx, rs); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return nil
-		}
-		return fmt.Errorf("creating rollback restore %s: %w", rs.Name, err)
-	}
-	rc.Event(corev1.EventTypeNormal, "DatabaseUpgradeRollingBack", dbEventAction,
-		"Restoring pre-upgrade backup %s into the recreated CNPG cluster with ForgejoRestore %s", u.BackupName, rs.Name)
-	return nil
-}
-
-// followRestore ends the rollback with the outcome of its restore.
-func (m *dbMachine) followRestore(rs *forgejov1.ForgejoRestore) {
-	rc, u := m.rc, m.u
-	switch rs.Status.Phase {
-	case forgejov1.RestorePhaseFailed:
-		u.RollbackRestoreFailed = true
-		m.finish(forgejov1.DatabaseUpgradeFailed, "failed", fmt.Sprintf(
-			"Upgrade of PostgreSQL to %s failed (%s) and its rollback failed too: ForgejoRestore %s of pre-upgrade backup %s into the "+
-				"recreated cluster failed: %s.", u.ToImage, u.FailureReason, rs.Name, u.BackupName, rs.Status.Message))
-		rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeRollbackFailed", dbEventAction, "%s", u.Message)
-	case forgejov1.RestorePhaseScalingUp, forgejov1.RestorePhaseCompleted:
-		m.finish(forgejov1.DatabaseUpgradeRolledBack, "rolledback", fmt.Sprintf(
-			"Upgrade of PostgreSQL to %s failed (%s) and was rolled back: CNPG cluster %s was recreated on %s and pre-upgrade backup %s "+
-				"was restored into it.", u.ToImage, u.FailureReason, forgejo.DatabaseClusterName(rc.Instance), u.FromImage, u.BackupName))
-		rc.RecordAutoPilotAction("DatabaseUpgradeRolledBack", u.Message)
-	default:
-		m.stopped = true
-		u.Message = fmt.Sprintf("Rolling back to %s: restoring pre-upgrade backup %s into the recreated cluster (ForgejoRestore %s %s)",
-			u.FromImage, u.BackupName, rs.Name, phaseOrPending(rs.Status.Phase))
-		if rs.Status.Message != "" {
-			u.Message += ": " + rs.Status.Message
-		}
-		rc.Requeue(5 * time.Second)
-	}
-}
-
-func phaseOrPending(p forgejov1.RestorePhase) string {
-	if p == "" {
-		return string(forgejov1.RestorePhasePending)
-	}
-	return string(p)
-}
-
 // finish moves the upgrade to a terminal phase and counts it (result "" is not counted). A
 // failed image is held until spec.database.cnpg.imageName changes or a retry is requested.
 func (m *dbMachine) finish(p forgejov1.DatabaseUpgradePhase, result, msg string) {
@@ -1015,18 +770,4 @@ func (m *dbMachine) finish(p forgejov1.DatabaseUpgradePhase, result, msg string)
 		forgejo.DatabaseUpgradeTotal.WithLabelValues(f.Namespace, f.Name, result).Inc()
 	}
 	m.rc.Requeue(time.Second)
-}
-
-// quantityLess reports a < b for two quantity strings; an unparsable or empty a is smaller, an
-// unparsable or empty b is not larger.
-func quantityLess(a, b string) bool {
-	qb, err := resource.ParseQuantity(b)
-	if err != nil {
-		return false
-	}
-	qa, err := resource.ParseQuantity(a)
-	if err != nil {
-		return true
-	}
-	return qa.Cmp(qb) < 0
 }

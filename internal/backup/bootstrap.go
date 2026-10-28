@@ -84,9 +84,7 @@ func restoreFromSource(src *forgejov1.RemoteBackupSource) string {
 
 // Bootstrapping reports whether f is still being created from spec.restoreFrom. Until the
 // bootstrap completes no backup of the instance is taken.
-func Bootstrapping(f *forgejov1.Forgejo) bool {
-	return f.Spec.RestoreFrom != nil && (f.Status.RestoredFrom == nil || f.Status.RestoredFrom.Phase != forgejov1.RestoredFromCompleted)
-}
+func Bootstrapping(f *forgejov1.Forgejo) bool { return forgejo.Bootstrapping(f) }
 
 // BootstrapRestoreName is the ForgejoRestore that restores the database and the data volume of
 // spec.restoreFrom.
@@ -183,7 +181,10 @@ func completeBootstrap(rc *forgejo.ReconcileContext, msg string) {
 }
 
 // markRestored records on "<name>-secrets" that spec.restoreFrom was restored (see
-// recoverBootstrap). It runs before Forgejo starts on the restored data.
+// recoverBootstrap). It runs before Forgejo starts on the restored data. First the data volume
+// and the CNPG cluster are stamped with the restored identity (forgejo.AnnotationIdentity), and
+// what ran on them before is forgotten (forgejo.AnnotationRunningImage): they now hold the
+// backup's data, also when they existed before the instance (restore-from-overwrite).
 func markRestored(ctx context.Context, rc *forgejo.ReconcileContext) error {
 	f := rc.Instance
 	sec := &corev1.Secret{}
@@ -193,6 +194,15 @@ func markRestored(ctx context.Context, rc *forgejo.ReconcileContext) error {
 	where := restoreFromLocation(f)
 	if sec.Annotations[forgejo.AnnotationRestoredFrom] == where {
 		return nil
+	}
+	data, err := forgejo.ReadDataObjects(ctx, rc)
+	if err != nil {
+		return err
+	}
+	for _, o := range data.Present() {
+		if err := forgejo.ResetIdentity(ctx, rc.Client, o.Object, forgejo.SecretKeyFingerprint(sec.Data)); err != nil {
+			return fmt.Errorf("recording the restored identity on %s %s: %w", o.Kind, o.Object.GetName(), err)
+		}
 	}
 	orig := sec.DeepCopy()
 	if sec.Annotations == nil {

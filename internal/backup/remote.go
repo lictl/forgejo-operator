@@ -145,7 +145,7 @@ type RemoteManifest struct {
 	CompletedAt string `json:"completedAt,omitempty"`
 	// KeyFingerprint identifies the encryption key (rclone.Cipher.Fingerprint).
 	KeyFingerprint string `json:"keyFingerprint"`
-	// SecretKeyFingerprint identifies the instance's SECRET_KEY (see SecretKeyFingerprint).
+	// SecretKeyFingerprint identifies the instance's SECRET_KEY (see forgejo.SecretKeyFingerprint).
 	SecretKeyFingerprint string `json:"secretKeyFingerprint,omitempty"`
 	// UploadedAt and Files are added by the upload Job.
 	UploadedAt string                       `json:"uploadedAt,omitempty"`
@@ -329,20 +329,6 @@ func sanitisedInstance(f *forgejov1.Forgejo) *IdentityInstance {
 		Metadata:   IdentityMeta{Name: f.Name, Namespace: f.Namespace, Labels: f.Labels, Annotations: ann},
 		Spec:       *f.Spec.DeepCopy(),
 	}
-}
-
-// SecretKeyFingerprint identifies the SECRET_KEY of "<name>-secrets" (its data) without
-// revealing it, so that a restore can tell whether a backup was taken by an instance with the
-// same identity. 16 hex digits.
-func SecretKeyFingerprint(data map[string][]byte) string {
-	key := data[forgejo.SecretKeySecretKey]
-	if len(key) == 0 {
-		return ""
-	}
-	h := sha256.New()
-	h.Write([]byte("forgejo-operator secret-key fingerprint v1\x00"))
-	h.Write(key)
-	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // ConfigError is a problem with the Secrets or the spec of a remote location, which waiting

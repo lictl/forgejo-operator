@@ -120,7 +120,7 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 		ClusterName: name,
 		Host:        forgejo.ServiceHost(forgejo.CNPGReadWriteService(f), f.Namespace),
 		SecretName:  forgejo.CNPGAppSecretName(f),
-		Instances:   cnpgInstances(f),
+		Instances:   cnpgInstances,
 	}
 	if prev := f.Status.Database; prev != nil {
 		// The database-upgrade step's record, and what is known of the data until the Cluster
@@ -140,7 +140,20 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 	cluster.SetName(name)
 	cluster.SetNamespace(f.Namespace)
 	if err := apply(ctx, rc, cluster, rc.OwnerRefsEnabled(), func() error {
-		return mutateCNPGCluster(f, cluster, databaseImage(rc), rc.DatabaseStorageFloor)
+		if cluster.GetResourceVersion() == "" {
+			if rc.IdentityInitialized && !rc.DatabaseRecreate {
+				// Deleted after the identity step's check in this pass; it reports it in the next.
+				return fmt.Errorf("not creating an empty CNPG cluster %s for an instance that has run", name)
+			}
+			if rc.IdentityFingerprint != "" {
+				cluster.SetAnnotations(mergeMaps(cluster.GetAnnotations(), map[string]string{forgejo.AnnotationIdentity: rc.IdentityFingerprint}))
+			}
+			if rc.DatabaseRecreate {
+				// Empty: Forgejo waits for a restore of the database into it.
+				cluster.SetAnnotations(mergeMaps(cluster.GetAnnotations(), map[string]string{forgejo.AnnotationRestorePending: valueTrue}))
+			}
+		}
+		return mutateCNPGCluster(f, cluster, databaseImage(rc))
 	}); err != nil {
 		return forgejo.StepResult{}, fmt.Errorf("CNPG cluster %s: %w", name, err)
 	}
@@ -167,8 +180,9 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 		return dbNotReady(rc, "ClusterNotReady", summary, dbNotReadyRequeue)
 	}
 	if !healthy {
-		// A lost replica must not stop the pipeline (and with it backups and restores) while
-		// the primary serves Forgejo; only an unavailable primary does.
+		// A cluster outside its healthy phase (CNPG applying a change) must not stop the
+		// pipeline (and with it backups and restores) while the primary serves Forgejo; only an
+		// unavailable primary does.
 		if why, err := cnpgPrimaryUnavailable(ctx, rc, phase, current, target, ready); err != nil {
 			return forgejo.StepResult{}, err
 		} else if why != "" {
@@ -209,12 +223,8 @@ func cnpgPrimaryUnavailable(ctx context.Context, rc *forgejo.ReconcileContext, p
 
 func podReady(pod *corev1.Pod) bool { return forgejo.PodReady(pod) }
 
-func cnpgInstances(f *forgejov1.Forgejo) int32 {
-	if n := f.Spec.Database.CNPG.Instances; n > 0 {
-		return n
-	}
-	return 1
-}
+// cnpgInstances is the size of the CNPG cluster: the bundled database is a single instance.
+const cnpgInstances = 1
 
 // databaseImage is the PostgreSQL image the database step writes: the database-upgrade step's
 // choice (rc.DatabaseImage), else spec.database.cnpg.imageName.
@@ -227,9 +237,8 @@ func databaseImage(rc *forgejo.ReconcileContext) string {
 
 // mutateCNPGCluster sets only the fields the operator manages, leaving CNPG's defaults alone.
 // image is written as spec.imageName, except a major older than the cluster's data, which
-// CNPG's webhook refuses (the database-upgrade step reports such a downgrade). storageFloor,
-// when set, is the least volume size of a Cluster that is created.
-func mutateCNPGCluster(f *forgejov1.Forgejo, c *unstructured.Unstructured, image, storageFloor string) error {
+// CNPG's webhook refuses (the database-upgrade step reports such a downgrade).
+func mutateCNPGCluster(f *forgejov1.Forgejo, c *unstructured.Unstructured, image string) error {
 	spec := f.Spec.Database.CNPG
 	creating := c.GetResourceVersion() == ""
 	c.SetLabels(mergeMaps(c.GetLabels(), forgejo.Labels(f, forgejo.ComponentDatabase)))
@@ -238,7 +247,7 @@ func mutateCNPGCluster(f *forgejov1.Forgejo, c *unstructured.Unstructured, image
 	set := func(v any, path ...string) error {
 		return unstructured.SetNestedField(obj, v, append([]string{"spec"}, path...)...)
 	}
-	if err := set(int64(cnpgInstances(f)), "instances"); err != nil {
+	if err := set(int64(cnpgInstances), "instances"); err != nil {
 		return err
 	}
 	if cur := forgejo.ReadCNPGCluster(c); !creating && cur.DataMajor > 0 && cur.SpecImage != "" {
@@ -251,11 +260,6 @@ func mutateCNPGCluster(f *forgejov1.Forgejo, c *unstructured.Unstructured, image
 	}
 
 	size := forgejo.QuantityOr(spec.Storage.Size, "5Gi")
-	if creating && storageFloor != "" {
-		if floor, err := resource.ParseQuantity(storageFloor); err == nil && size.Cmp(floor) < 0 {
-			size = floor
-		}
-	}
 	if cur, found, _ := unstructured.NestedString(obj, "spec", "storage", "size"); !found || quantityLess(cur, size.String()) {
 		if err := set(size.String(), "storage", "size"); err != nil {
 			return err

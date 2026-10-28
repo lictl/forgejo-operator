@@ -32,7 +32,7 @@ func upgradingInstance(phase forgejov1.DatabaseUpgradePhase) *forgejov1.Forgejo 
 	f.Status.Image = testImage16
 	f.Status.Database = &forgejov1.DatabaseStatus{Type: forgejov1.DatabaseTypeCNPG, Image: testPG17, MajorVersion: 17,
 		Upgrade: &forgejov1.DatabaseUpgradeStatus{Phase: phase, FromImage: testPG17, ToImage: testPG18, FromMajor: 17, ToMajor: 18,
-			BackupName: "fb-pre-pg18-1", RestoreName: "fb-pg-rollback-1"}}
+			BackupName: "fb-pre-pg18-1"}}
 	return f
 }
 
@@ -63,8 +63,8 @@ func TestDumpTooNew(t *testing.T) {
 	}
 }
 
-// Restores wait while PostgreSQL is upgraded, except the upgrade's own rollback restore; a dump
-// of a newer major than the server's is refused.
+// Restores wait while PostgreSQL is upgraded; a dump of a newer major than the server's is
+// refused.
 func TestRestoresAroundADatabaseUpgrade(t *testing.T) {
 	s := scheme(t)
 	b := completedBackup("b1")
@@ -75,18 +75,11 @@ func TestRestoresAroundADatabaseUpgrade(t *testing.T) {
 	rs.Spec.BackupName = "b1"
 	rs.Finalizers = []string{forgejo.FinalizerName}
 	rs.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
-	own := newRestore("fb-pg-rollback-1", "")
-	own.Spec.BackupName = "b1"
-	own.Finalizers = []string{forgejo.FinalizerName}
-	own.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, b, rs, own).WithStatusSubresource(rs, own).Build()
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, b, rs).WithStatusSubresource(rs).Build()
 
 	got := reconcileRestore(t, c, s, rs.Name, 1)
 	if got.Status.Phase != forgejov1.RestorePhasePending || !strings.Contains(got.Status.Message, "PostgreSQL major upgrade") {
 		t.Fatalf("phase %s (%s), want Pending, waiting for the upgrade", got.Status.Phase, got.Status.Message)
-	}
-	if got = reconcileRestore(t, c, s, own.Name, 1); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
-		t.Fatalf("own restore: phase %s (%s)", got.Status.Phase, got.Status.Message)
 	}
 
 	// A backup of PostgreSQL 18 into a cluster of 17.

@@ -121,7 +121,7 @@ func (r *ForgejoBackupReconciler) startUpload(ctx context.Context, b *forgejov1.
 		IncludesData: b.Status.IncludesData, KeyFingerprint: cipher.Fingerprint(),
 	}
 	if s := id.Secret(backup.IdentityRoleSecrets); s != nil {
-		m.SecretKeyFingerprint = backup.SecretKeyFingerprint(s.Data)
+		m.SecretKeyFingerprint = forgejo.SecretKeyFingerprint(s.Data)
 	}
 	if b.Status.CompletionTime != nil {
 		m.CompletedAt = b.Status.CompletionTime.UTC().Format(time.RFC3339)
