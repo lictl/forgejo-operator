@@ -50,6 +50,7 @@ tests:
     alert_rule_test:
       - {eval_time: 4h, alertname: ForgejoDown, exp_alerts: []}
       - {eval_time: 4h, alertname: ForgejoOperatorMetricsMissing, exp_alerts: []}
+      - {eval_time: 4h, alertname: ForgejoBroken, exp_alerts: []}
       - {eval_time: 4h, alertname: ForgejoNotReady, exp_alerts: []}
       - {eval_time: 4h, alertname: ForgejoHealthCheckFailing, exp_alerts: []}
       - {eval_time: 4h, alertname: ForgejoHealthProbeUnreachable, exp_alerts: []}
@@ -106,6 +107,27 @@ tests:
             exp_annotations:
               summary: Forgejo ns/fj has not been Ready for 10 minutes
               runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoNotReady.md
+
+  - name: a Broken instance alerts while its pod still serves
+    interval: 1m
+    input_series:
+      - series: 'up{namespace="ns", job="fj-http", instance="10.0.0.1:3000"}'
+        values: '1x20'
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '1x20'
+      - series: 'forgejo_operator_instance_info{namespace="ns", name="fj", image="i", version="15.0.10", phase="Broken"}'
+        values: '1x20'
+    alert_rule_test:
+      # Pending for 2 minutes.
+      - {eval_time: 1m, alertname: ForgejoBroken, exp_alerts: []}
+      - {eval_time: 6m, alertname: ForgejoDown, exp_alerts: []}
+      - eval_time: 3m
+        alertname: ForgejoBroken
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: Forgejo ns/fj is Broken and the operator has stopped changing it
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBroken.md
 
   - name: no scrape target is down as well
     interval: 1m

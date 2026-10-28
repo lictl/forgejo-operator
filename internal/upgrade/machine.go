@@ -389,14 +389,13 @@ func (m *machine) rollingOut() error {
 	return nil
 }
 
-// verified reports whether the new image is verified: core reports it as the running image
-// (status.image), and the Deployment has rolled it out with every replica available. The
-// second check keeps the machine from relying on when core updates status.image.
+// verified reports whether the Deployment has rolled out the new image with every replica
+// available. It goes by the live Deployment, before the timeout and the restart counts are
+// looked at: core writes status.image only at the end of a pass, so the first pass after the
+// operator was away (a crash, an operator rollout, spec.paused) would otherwise roll back an
+// upgrade whose pods became available meanwhile, and with it every write since.
 func (m *machine) verified() (bool, error) {
 	rc, u, f := m.rc, m.u, m.rc.Instance
-	if f.Status.Image != u.ToImage {
-		return false, nil
-	}
 	dep := &appsv1.Deployment{}
 	err := rc.Client.Get(m.ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep)
 	if apierrors.IsNotFound(err) {
@@ -405,7 +404,14 @@ func (m *machine) verified() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return rolledOut(dep, u.ToImage), nil
+	if !rolledOut(dep, u.ToImage) {
+		return false, nil
+	}
+	// Verified as core's status step verifies it. Recorded now: a Deployment change later in
+	// this pass (a new config hash) would keep that step from doing so, and an idle instance
+	// whose status.image lags behind its finished upgrade would start the upgrade again.
+	f.Status.Image = u.ToImage
+	return true, nil
 }
 
 // leftover reports a pod of the failed attempt that a retry started with.

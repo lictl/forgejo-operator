@@ -162,6 +162,9 @@ type CNPGCluster struct {
 	SystemID                      string
 	ReadyInstances                int64
 	CurrentPrimary, TargetPrimary string
+	// RestorePending is the annotation AnnotationRestorePending: the operator created the
+	// cluster again, empty, for AnnotationRecreateDatabase.
+	RestorePending bool
 }
 
 // ReadCNPGCluster reads the fields the operator uses from a Cluster.
@@ -197,6 +200,7 @@ func ReadCNPGCluster(u *unstructured.Unstructured) *CNPGCluster {
 		ReadyInstances: num("status", "readyInstances"),
 		CurrentPrimary: str("status", "currentPrimary"),
 		TargetPrimary:  str("status", "targetPrimary"),
+		RestorePending: u.GetAnnotations()[AnnotationRestorePending] == "true",
 	}
 	if c.SpecInstances == 0 {
 		c.SpecInstances = 1
@@ -292,7 +296,7 @@ func DatabaseUpgrade(f *forgejov1.Forgejo) *forgejov1.DatabaseUpgradeStatus {
 func DatabaseUpgradeInFlightPhase(p forgejov1.DatabaseUpgradePhase) bool {
 	switch p {
 	case forgejov1.DatabaseUpgradePending, forgejov1.DatabaseUpgradeBackingUp, forgejov1.DatabaseUpgradeUpgrading,
-		forgejov1.DatabaseUpgradeVerifying, forgejov1.DatabaseUpgradeReverting, forgejov1.DatabaseUpgradeRollingBack:
+		forgejov1.DatabaseUpgradeVerifying, forgejov1.DatabaseUpgradeReverting:
 		return true
 	}
 	return false
@@ -306,10 +310,11 @@ func DatabaseUpgradeInFlight(f *forgejov1.Forgejo) bool {
 	return u != nil && DatabaseUpgradeInFlightPhase(u.Phase)
 }
 
-// DatabaseUpgradeHoldsWorkload reports a PostgreSQL major upgrade whose rollback restore
-// failed: the recreated database may be empty or half-restored, so Forgejo stays stopped until
-// a later ForgejoRestore has restored a backup.
+// DatabaseUpgradeHoldsWorkload reports a PostgreSQL major upgrade that failed in a way the
+// operator does not repair (status.database.upgrade.holdsForgejo): Forgejo stays stopped until
+// a person acts (upgrade.holdForDatabaseRestore), and backups, Forgejo upgrades and new
+// database upgrades wait.
 func DatabaseUpgradeHoldsWorkload(f *forgejov1.Forgejo) bool {
 	u := DatabaseUpgrade(f)
-	return u != nil && u.Phase == forgejov1.DatabaseUpgradeFailed && u.RollbackRestoreFailed
+	return u != nil && u.Phase == forgejov1.DatabaseUpgradeFailed && u.HoldsForgejo
 }

@@ -164,6 +164,18 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) (*ruleSpec, error) {
 			"need) and allow Prometheus's ServiceAccount to GET the /metrics non-resource URL (the operator's "+
 			"metrics-reader ClusterRole). See docs/observability.md, \"Scraping the operator\".", ref))
 
+	// Broken: the operator found something it does not repair and changes nothing until a
+	// person acts, whether or not pods still serve.
+	add("ForgejoBroken", "critical", "2m",
+		fmt.Sprintf(`max(forgejo_operator_instance_info{%s, phase=%q}) > 0`, op, forgejov1.PhaseBroken),
+		fmt.Sprintf("Forgejo %s is Broken and the operator has stopped changing it", ref),
+		fmt.Sprintf("The operator found the instance in a state it does not repair: an identity Secret, the data volume or "+
+			"the CNPG cluster of an instance that has run is missing or belongs to another instance, a PostgreSQL major "+
+			"upgrade failed after it may have changed the data, or a recreated database waits for its restore. Running pods "+
+			"are left alone, and backups, retention, "+
+			"upgrades and autopilot wait. The Broken condition of `kubectl describe fj %s %s` says what is missing and how "+
+			"to restore it.", f.Name, kc))
+
 	// An instance intentionally scaled to zero is never Ready; with an HPA the floor is at
 	// least one replica, so it must be Ready again.
 	if forgejo.DesiredReplicas(f) > 0 || forgejo.HorizontalAutoscalingEnabled(f) {

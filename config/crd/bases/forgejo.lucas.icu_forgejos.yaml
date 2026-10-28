@@ -559,21 +559,14 @@ spec:
                           imageName is the PostgreSQL operand image, with a tag that starts with its major version
                           (CloudNativePG images: MM-TYPE-OS, MM.mm-TYPE-OS, MM.mm-TS-TYPE-OS). A change within the
                           major is rolled out by CloudNativePG. A newer major is an orchestrated upgrade: cold
-                          database backup, CloudNativePG's in-place pg_upgrade, verification, rollback on failure
-                          (docs/upgrades.md, "PostgreSQL major upgrades"); it must keep the image's Debian release
+                          database backup, CloudNativePG's in-place pg_upgrade, verification (docs/upgrades.md,
+                          "PostgreSQL major upgrades"); it must keep the image's Debian release
                           (trixie, bookworm, ...). Older majors are refused. Backup and restore Jobs run pg_dump and
                           pg_restore from the image of the running cluster (status.database.image), and with type
                           External from this one.
                         maxLength: 512
                         minLength: 1
                         type: string
-                      instances:
-                        default: 1
-                        description: instances is the number of PostgreSQL instances
-                          (1 primary + N-1 replicas).
-                        format: int32
-                        minimum: 1
-                        type: integer
                       parameters:
                         additionalProperties:
                           type: string
@@ -726,11 +719,10 @@ spec:
                     used
                   reason: FieldValueForbidden
                   rule: '!has(self.type) || self.type != ''External'' || !has(self.cnpg)
-                    || ((!has(self.cnpg.instances) || self.cnpg.instances == 1) &&
-                    !has(self.cnpg.parameters) && (!has(self.cnpg.storage) || !has(self.cnpg.storage.storageClassName))
-                    && (!has(self.cnpg.enablePodMonitor) || !self.cnpg.enablePodMonitor)
-                    && (!has(self.cnpg.resources) || (!has(self.cnpg.resources.requests)
-                    && !has(self.cnpg.resources.limits))))'
+                    || (!has(self.cnpg.parameters) && (!has(self.cnpg.storage) ||
+                    !has(self.cnpg.storage.storageClassName)) && (!has(self.cnpg.enablePodMonitor)
+                    || !self.cnpg.enablePodMonitor) && (!has(self.cnpg.resources)
+                    || (!has(self.cnpg.resources.requests) && !has(self.cnpg.resources.limits))))'
                 - fieldPath: .cnpg.imageName
                   message: 'cnpg.imageName needs a tag that starts with the PostgreSQL
                     major version, e.g. ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie
@@ -3392,10 +3384,10 @@ spec:
                     type: boolean
                   autoRollback:
                     description: |-
-                      autoRollback restores the pre-upgrade backup and reverts the image when the new version
-                      does not become healthy within timeout. A PostgreSQL major upgrade that cannot be reverted
-                      in place is rolled back by recreating the CNPG cluster on the old image and restoring its
-                      pre-upgrade backup. Defaults to true.
+                      autoRollback restores the pre-upgrade backup and reverts the image when the new Forgejo
+                      version does not become healthy within timeout. Defaults to true. PostgreSQL major
+                      upgrades are never rolled back from a backup: one that fails after pg_upgrade may have
+                      changed the data keeps Forgejo stopped for a person (status.database.upgrade.holdsForgejo).
                     type: boolean
                   backupBeforeUpgrade:
                     description: backupBeforeUpgrade takes a ForgejoBackup before
@@ -3791,6 +3783,16 @@ spec:
                           fromSystemID is the system identifier before the upgrade: a cluster that comes back with
                           it after a revert runs the untouched old data.
                         type: string
+                      holdsForgejo:
+                        description: |-
+                          holdsForgejo is set when the upgrade failed in a way the operator does not repair:
+                          pg_upgrade may have changed the data and the old data did not come back, the cluster
+                          disappeared, or Forgejo did not start on the new major. Nothing is rolled back or deleted;
+                          Forgejo stays stopped and condition Broken (reason DatabaseUpgradeFailed) is True until a
+                          ForgejoRestore created after the failure has restored the database, or, while the cluster
+                          serves the new major, the annotation forgejo.lucas.icu/retry-database-upgrade=true starts
+                          Forgejo on it again.
+                        type: boolean
                       message:
                         type: string
                       pgUpgradeStarted:
@@ -3798,8 +3800,8 @@ spec:
                           pgUpgradeStarted is set once the container of CloudNativePG's upgrade Job that runs
                           pg_upgrade has started (or its pods are gone, so that nobody can tell): from then on
                           pg_upgrade --link may have changed the old data directory. A revert whose old data does
-                          not come back is rolled back from the backup only when it is set; otherwise the old data
-                          is untouched and the Cluster is never deleted.
+                          not come back then fails with holdsForgejo; without it the old data is untouched, and a
+                          timeout before pg_upgrade started reverts.
                         type: boolean
                       phase:
                         description: DatabaseUpgradePhase tracks an orchestrated PostgreSQL
@@ -3810,7 +3812,6 @@ spec:
                         - Upgrading
                         - Verifying
                         - Reverting
-                        - RollingBack
                         - Succeeded
                         - RolledBack
                         - Failed
@@ -3823,15 +3824,6 @@ spec:
                           from it.
                         format: date-time
                         type: string
-                      restoreName:
-                        description: restoreName is the ForgejoRestore of a rollback
-                          that recreated the cluster.
-                        type: string
-                      rollbackRestoreFailed:
-                        description: |-
-                          rollbackRestoreFailed is set when the restore into the recreated cluster failed: Forgejo
-                          stays stopped until a later ForgejoRestore has restored a backup.
-                        type: boolean
                       rolloutStartTime:
                         description: rolloutStartTime is when the new image was written
                           to the CNPG Cluster.
@@ -3839,11 +3831,6 @@ spec:
                         type: string
                       startTime:
                         format: date-time
-                        type: string
-                      storageSize:
-                        description: |-
-                          storageSize of the volumes of the Cluster a rollback deleted; the recreated Cluster gets
-                          at least that much.
                         type: string
                       toImage:
                         type: string
@@ -3962,6 +3949,7 @@ spec:
                 - Degraded
                 - Failed
                 - Paused
+                - Broken
                 type: string
               readyReplicas:
                 format: int32

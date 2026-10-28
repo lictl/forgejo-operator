@@ -36,6 +36,24 @@ groups:
       forgejo: fj
       namespace: ns
       severity: warning
+  - alert: ForgejoBroken
+    annotations:
+      description: 'The operator found the instance in a state it does not repair:
+        an identity Secret, the data volume or the CNPG cluster of an instance that
+        has run is missing or belongs to another instance, a PostgreSQL major upgrade
+        failed after it may have changed the data, or a recreated database waits for
+        its restore. Running pods are left alone, and backups, retention, upgrades
+        and autopilot wait. The Broken condition of `kubectl describe fj fj -n ns`
+        says what is missing and how to restore it.'
+      runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBroken.md
+      summary: Forgejo ns/fj is Broken and the operator has stopped changing it
+    expr: max(forgejo_operator_instance_info{namespace="ns", name="fj", phase="Broken"})
+      > 0
+    for: 2m
+    labels:
+      forgejo: fj
+      namespace: ns
+      severity: critical
   - alert: ForgejoNotReady
     annotations:
       description: The operator reports the instance as not Ready. Run `kubectl describe

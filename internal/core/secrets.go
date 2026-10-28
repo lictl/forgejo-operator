@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,7 +40,9 @@ const secretKeyAdminSyncSalt = "admin-sync-salt"
 const secretKeyPodDigestSalt = "pod-digest-salt"
 
 // ReconcileSecrets ensures "<name>-secrets" (SECRET_KEY, INTERNAL_TOKEN, JWT secrets,
-// metrics token) and the admin credentials secret exist. Never rotates existing values.
+// metrics token) and the admin credentials secret exist. Never rotates existing values, and
+// never generates forgejo.IdentitySecretKeys for an instance that has run (the identity step
+// reports their absence as Broken).
 func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	generators := map[string]func() (string, error){
@@ -61,6 +64,10 @@ func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 			if len(sec.Data[key]) > 0 {
 				continue
 			}
+			if rc.IdentityInitialized && slices.Contains(forgejo.IdentitySecretKeys, key) {
+				// Removed after the identity step's check in this pass; it reports it in the next.
+				return fmt.Errorf("%s lacks %s, which is not generated for an instance that has run", sec.Name, key)
+			}
 			v, err := gen()
 			if err != nil {
 				return err
@@ -73,6 +80,7 @@ func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 	}
 	// From the Secret as applied, so that a lagging cache cannot hand out another value.
 	rc.PodDigestSalt = string(sec.Data[secretKeyPodDigestSalt])
+	rc.IdentityFingerprint = forgejo.SecretKeyFingerprint(sec.Data)
 
 	if err := ensureBackupKey(ctx, rc); err != nil {
 		return forgejo.StepResult{}, err

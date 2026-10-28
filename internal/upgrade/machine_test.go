@@ -163,6 +163,55 @@ func TestKeptFailureHoldsSingleReplica(t *testing.T) {
 	}
 }
 
+// availableDeployment is the server Deployment with every one of its replicas available on image.
+func availableDeployment(image string, replicas int32) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: "ns", Generation: 2},
+		Spec: appsv1.DeploymentSpec{Replicas: ptr.To(replicas), Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: serverContainer, Image: image}}}}},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: replicas, UpdatedReplicas: replicas, AvailableReplicas: replicas},
+	}
+}
+
+// The operator was away past the timeout (status.image still the old image) while the new pod
+// crashed a few times and then became available: the upgrade succeeds instead of rolling back.
+func TestAvailableRolloutWinsOverTimeoutAndRestarts(t *testing.T) {
+	f := fixture(&forgejov1.UpgradeStatus{
+		Phase: forgejov1.UpgradePhaseVerifying, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup,
+		StartTime: ago(2 * time.Hour), RolloutStartTime: ago(time.Hour),
+	})
+	pod := serverPod(f, "new", imgB, ago(time.Hour), corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}, 0)
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: serverContainer, Ready: true, RestartCount: 5,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
+	rc, c := reconcile(t, f, availableDeployment(imgB, 1), pod)
+	u := f.Status.Upgrade
+	if u.Phase != forgejov1.UpgradePhaseSucceeded || u.RestoreName != "" || rc.TargetImage != imgB || f.Status.Image != imgB {
+		t.Fatalf("phase %s, restore %q, target %s, status.image %s", u.Phase, u.RestoreName, rc.TargetImage, f.Status.Image)
+	}
+	restores := &forgejov1.ForgejoRestoreList{}
+	if err := c.List(context.Background(), restores); err != nil || len(restores.Items) != 0 {
+		t.Fatalf("restores %v, err %v", restores.Items, err)
+	}
+
+	// The next pass stays idle: status.image no longer lags behind the finished upgrade.
+	if rc = reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseSucceeded || rc.Upgrading {
+		t.Fatalf("phase %s, upgrading %v", f.Status.Upgrade.Phase, rc.Upgrading)
+	}
+
+	// Not every replica is available past the timeout: still rolled back.
+	f = fixture(&forgejov1.UpgradeStatus{
+		Phase: forgejov1.UpgradePhaseVerifying, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup,
+		StartTime: ago(2 * time.Hour), RolloutStartTime: ago(time.Hour),
+	})
+	partial := availableDeployment(imgB, 2)
+	partial.Status.AvailableReplicas = 1
+	reconcile(t, f, partial)
+	if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseRollingBack || f.Status.Image != imgA {
+		t.Fatalf("phase %s, status.image %s", u.Phase, f.Status.Image)
+	}
+}
+
 func TestBackingUpGivesUpOnPodsThatDoNotStop(t *testing.T) {
 	f := fixture(&forgejov1.UpgradeStatus{
 		Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(16 * time.Minute),

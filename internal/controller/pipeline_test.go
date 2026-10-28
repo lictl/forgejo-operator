@@ -34,7 +34,7 @@ func stubSteps(outcome func(name string, rc *forgejo.ReconcileContext) (forgejo.
 	ran := &[]string{}
 	out := make([]namedStep, len(steps))
 	for i, s := range steps {
-		out[i] = namedStep{name: s.name, needs: s.needs, fn: func(_ context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
+		out[i] = namedStep{name: s.name, needs: s.needs, waitWhileBroken: s.waitWhileBroken, fn: func(_ context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 			*ran = append(*ran, s.name)
 			if outcome == nil {
 				return forgejo.StepResult{}, nil
@@ -103,7 +103,7 @@ func TestPipelineValkeyStop(t *testing.T) {
 	})
 	rc := newRC()
 	p := runPipeline(context.Background(), rc, st)
-	want := []string{stepMaintenance, stepRestoreGuard, stepRestoreIdentity, stepSecrets, stepBackupOwnership, stepDatabaseUpgrade, stepDatabase, stepHighAvailability,
+	want := []string{stepMaintenance, stepRestoreGuard, stepRestoreIdentity, stepIdentity, stepSecrets, stepBackupOwnership, stepDatabaseUpgrade, stepDatabase, stepHighAvailability,
 		stepSSHHostKeys, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepBackupSchedule, stepHealth, stepValkeyStatus,
 		stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
@@ -242,9 +242,23 @@ func TestStepTableWiring(t *testing.T) {
 		t.Errorf("upgrade must need %s (needs %v)", stepObjectStorage, byName[stepUpgrade].needs)
 	}
 	// spec.restoreFrom: the identity Secrets come from the backup before anything generates
-	// them, and the backup's ForgejoRestore needs the database and the data volume.
-	if !slices.Equal(byName["secrets"].needs, []string{stepRestoreIdentity}) || order[stepRestoreIdentity] > order["secrets"] {
-		t.Errorf("secrets must need %s (needs %v)", stepRestoreIdentity, byName["secrets"].needs)
+	// them, and the backup's ForgejoRestore needs the database and the data volume. The identity
+	// check comes between them, before anything generates or creates identity or data.
+	if !slices.Equal(byName[stepIdentity].needs, []string{stepRestoreIdentity}) || order[stepRestoreIdentity] > order[stepIdentity] {
+		t.Errorf("identity must need %s (needs %v)", stepRestoreIdentity, byName[stepIdentity].needs)
+	}
+	if !slices.Equal(byName["secrets"].needs, []string{stepIdentity}) || order[stepIdentity] > order["secrets"] {
+		t.Errorf("secrets must need %s (needs %v)", stepIdentity, byName["secrets"].needs)
+	}
+	for _, name := range []string{stepDatabaseUpgrade, stepBackupSchedule} {
+		if !slices.Contains(byName[name].needs, stepIdentity) {
+			t.Errorf("%s must need %s (needs %v)", name, stepIdentity, byName[name].needs)
+		}
+	}
+	for _, name := range []string{stepBackupSchedule, stepStorageAutopilot} {
+		if !byName[name].waitWhileBroken {
+			t.Errorf("%s must wait while the instance is Broken", name)
+		}
 	}
 	if !slices.Equal(byName[stepRestoreFrom].needs, []string{stepStorage}) {
 		t.Errorf("%s needs %v, want storage", stepRestoreFrom, byName[stepRestoreFrom].needs)
@@ -411,7 +425,7 @@ func TestPipelineDatabaseUpgradeStopsTheDatabaseStep(t *testing.T) {
 			return forgejo.StepResult{}, nil
 		})
 		rc := newRC()
-		rc.Instance.Status.Database = &forgejov1.DatabaseStatus{Upgrade: &forgejov1.DatabaseUpgradeStatus{Phase: forgejov1.DatabaseUpgradeRollingBack}}
+		rc.Instance.Status.Database = &forgejov1.DatabaseStatus{Upgrade: &forgejov1.DatabaseUpgradeStatus{Phase: forgejov1.DatabaseUpgradeReverting}}
 		runPipeline(context.Background(), rc, st)
 		for _, skipped := range []string{stepDatabase, stepHighAvailability, stepUpgrade, stepWorkload} {
 			if slices.Contains(*ran, skipped) {
@@ -426,5 +440,22 @@ func TestPipelineDatabaseUpgradeStopsTheDatabaseStep(t *testing.T) {
 		if !upgradingAtSchedule || !dbUpgradingAtSchedule {
 			t.Errorf("fail=%v: the backup schedule saw upgrading=%v, database upgrading=%v", fail, upgradingAtSchedule, dbUpgradingAtSchedule)
 		}
+	}
+}
+
+// A Broken instance (here a failed PostgreSQL upgrade that holds Forgejo, which does not stop the
+// identity step) takes no scheduled backups, prunes none and grows no volume.
+func TestPipelineBrokenStopsBackupsAndVolumeGrowth(t *testing.T) {
+	st, ran := stubSteps(func(string, *forgejo.ReconcileContext) (forgejo.StepResult, error) { return forgejo.StepResult{}, nil })
+	rc := newRC()
+	rc.SetBroken(forgejo.BrokenDatabaseUpgradeFailed, "held")
+	p := runPipeline(context.Background(), rc, st)
+	for _, name := range []string{stepBackupSchedule, stepStorageAutopilot} {
+		if slices.Contains(*ran, name) || !slices.Contains(p.stopped, name) {
+			t.Errorf("%s ran on a Broken instance", name)
+		}
+	}
+	if !slices.Contains(*ran, stepHealth) || !slices.Contains(*ran, stepDatabase) {
+		t.Errorf("health or database did not run: %v", *ran)
 	}
 }

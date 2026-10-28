@@ -53,9 +53,10 @@ type ReconcileContext struct {
 	// is, otherwise the image a PostgreSQL major upgrade (or its refusal) keeps or requires.
 	// Empty means spec.database.cnpg.imageName.
 	DatabaseImage string
-	// DatabaseStorageFloor is the least size the database step gives the volumes of a CNPG
-	// Cluster it creates: the size of the Cluster a PostgreSQL upgrade's rollback deleted.
-	DatabaseStorageFloor string
+	// DatabaseRecreate lets the database step create the CNPG cluster of an instance that has
+	// run: the identity step sets it while the annotation AnnotationRecreateDatabase asks for an
+	// empty cluster to restore a backup into.
+	DatabaseRecreate bool
 	// DatabaseUpgrading is true while a PostgreSQL major upgrade is orchestrated
 	// (status.database.upgrade in flight). Upgrading is set as well, so the workload, backups,
 	// autopilot and the status treat it like a Forgejo upgrade; Forgejo upgrades wait for it.
@@ -145,6 +146,14 @@ type ReconcileContext struct {
 	// autonomous actions that replace pods and upgrades wait, and a crash loop meanwhile is
 	// not blamed on app.ini.
 	ObjectStorageUnavailable bool
+	// IdentityFingerprint is the SecretKeyFingerprint of "<name>-secrets", set by the identity
+	// step (and by the secrets step for a new instance). New data volumes and CNPG clusters
+	// carry it (AnnotationIdentity).
+	IdentityFingerprint string
+	// IdentityInitialized is set by the identity step when the instance has run: status.image
+	// is set, or its data volume or CNPG cluster carries AnnotationRunningImage. The secrets,
+	// database and storage steps then never generate or create identity or data again.
+	IdentityInitialized bool
 	// ReplicasOverride, when set, replaces the computed replica count.
 	ReplicasOverride *int32
 	// HPAManaged is true when an HPA owns the replica count.

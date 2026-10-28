@@ -13,8 +13,9 @@ spec:
     enabled: true
   storage:
     accessModes: [ReadWriteMany]
-  database:
-    cnpg: {instances: 3}
+  database:                   # a replicated PostgreSQL you run
+    type: External
+    external: {host: git-db-rw, sslMode: require, credentialsSecret: {name: git-db-app}}
   objectStorage: {...}        # recommended, see docs/object-storage.md
 ```
 
@@ -37,8 +38,11 @@ What it does **not** cover:
   single node (all pods share that node's mount); on it the cron runner is placed next to a
   server pod ([Spreading](#spreading)). The volume, and the storage behind it, stays a
   single point of failure unless the storage itself is replicated.
-- **The database.** PostgreSQL is CloudNativePG's job: use `spec.database.cnpg.instances` of 2
-  or more for failover. `CONN_MAX_LIFETIME` (auto-tuning) moves the pools to a new primary.
+- **The database.** The bundled database (`spec.database.cnpg`) is a single PostgreSQL instance,
+  for a quick start or a small installation. For failover, run a replicated PostgreSQL yourself
+  (for example your own CloudNativePG Cluster with several instances) and point
+  `spec.database.type: External` at its read-write Service. `CONN_MAX_LIFETIME` (auto-tuning)
+  moves the pools to a new primary.
 - **Upgrades and restores.** `forgejo migrate` takes no lock, so an upgrade still stops every
   pod for the cold pre-upgrade backup and migrates in a single pod, and a restore scales the
   instance to zero ([upgrades.md](upgrades.md), [backup-restore.md](backup-restore.md)). A

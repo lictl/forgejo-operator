@@ -114,7 +114,8 @@ kubectl patch fj forgejo-sample -n forgejo --type merge \
 kubectl get fj forgejo-sample -n forgejo -o jsonpath='{.status.upgrade}'
 
 # PostgreSQL major upgrade (new instances start on 18): cold database backup, CNPG's pg_upgrade,
-# verification, rollback on failure (docs/upgrades.md, "PostgreSQL major upgrades")
+# verification; a failure that may have changed the data stops Forgejo for a person
+# (docs/upgrades.md, "PostgreSQL major upgrades")
 kubectl patch fj forgejo-sample -n forgejo --type merge \
   -p '{"spec":{"database":{"cnpg":{"imageName":"ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie"}}}}'
 kubectl get fj forgejo-sample -n forgejo -o jsonpath='{.status.database.upgrade}'
@@ -226,7 +227,9 @@ spec:
     schedule: "0 3 * * *"
     retention: 14
   database:
-    cnpg: {instances: 3}
+    # A replicated PostgreSQL you run, here your own CloudNativePG Cluster "git-db".
+    type: External
+    external: {host: git-db-rw, sslMode: require, credentialsSecret: {name: git-db-app}}
   ingress:
     enabled: true
     host: git.example.com

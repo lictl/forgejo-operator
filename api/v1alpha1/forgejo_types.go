@@ -86,10 +86,16 @@ const (
 	// is orchestrated (the reason is its phase). Only reported for database type CNPG; see
 	// docs/upgrades.md, "PostgreSQL major upgrades".
 	ConditionDatabaseUpgrading = "DatabaseUpgrading"
+	// ConditionBroken is True when the operator found the instance in a state it does not
+	// repair, such as a missing Secret "<name>-secrets", data volume or CNPG cluster of an
+	// instance that has run. It then changes nothing about the instance until a person restores
+	// what is missing; running pods are left alone. The reason says what is wrong. Only reported
+	// while it is True; see docs/troubleshooting.md, "Broken instances".
+	ConditionBroken = "Broken"
 )
 
 // ForgejoPhase is a coarse, human-readable summary of the instance state.
-// +kubebuilder:validation:Enum=Pending;Provisioning;Running;Upgrading;Restoring;Degraded;Failed;Paused
+// +kubebuilder:validation:Enum=Pending;Provisioning;Running;Upgrading;Restoring;Degraded;Failed;Paused;Broken
 type ForgejoPhase string
 
 const (
@@ -101,6 +107,8 @@ const (
 	PhaseDegraded     ForgejoPhase = "Degraded"
 	PhaseFailed       ForgejoPhase = "Failed"
 	PhasePaused       ForgejoPhase = "Paused"
+	// PhaseBroken: condition Broken is True; the operator waits for a person.
+	PhaseBroken ForgejoPhase = "Broken"
 )
 
 // ForgejoSpec defines the desired state of a Forgejo instance.
@@ -626,7 +634,7 @@ const (
 // DatabaseSpec selects the PostgreSQL backend.
 // +kubebuilder:validation:XValidation:rule="!has(self.type) || self.type != 'External' || has(self.external)",message="type External requires external (host and credentialsSecret)",fieldPath=".external",reason="FieldValueRequired"
 // +kubebuilder:validation:XValidation:rule="!has(self.external) || (has(self.type) && self.type == 'External')",message="external requires type External",fieldPath=".type",reason="FieldValueInvalid"
-// +kubebuilder:validation:XValidation:rule="!has(self.type) || self.type != 'External' || !has(self.cnpg) || ((!has(self.cnpg.instances) || self.cnpg.instances == 1) && !has(self.cnpg.parameters) && (!has(self.cnpg.storage) || !has(self.cnpg.storage.storageClassName)) && (!has(self.cnpg.enablePodMonitor) || !self.cnpg.enablePodMonitor) && (!has(self.cnpg.resources) || (!has(self.cnpg.resources.requests) && !has(self.cnpg.resources.limits))))",message="cnpg settings apply to type CNPG only; with type External only cnpg.imageName (the image of backup and restore Jobs) is used",fieldPath=".cnpg",reason="FieldValueForbidden"
+// +kubebuilder:validation:XValidation:rule="!has(self.type) || self.type != 'External' || !has(self.cnpg) || (!has(self.cnpg.parameters) && (!has(self.cnpg.storage) || !has(self.cnpg.storage.storageClassName)) && (!has(self.cnpg.enablePodMonitor) || !self.cnpg.enablePodMonitor) && (!has(self.cnpg.resources) || (!has(self.cnpg.resources.requests) && !has(self.cnpg.resources.limits))))",message="cnpg settings apply to type CNPG only; with type External only cnpg.imageName (the image of backup and restore Jobs) is used",fieldPath=".cnpg",reason="FieldValueForbidden"
 // +kubebuilder:validation:XValidation:rule="(has(self.type) && self.type == 'External') || !has(self.cnpg) || !has(self.cnpg.imageName) || self.cnpg.imageName.matches('^([^@]*/)?[^/:@]+:[0-9][^/:@]*(@[^@/]+)?$')",message="cnpg.imageName needs a tag that starts with the PostgreSQL major version, e.g. ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie (a digest may follow it): CloudNativePG reads the major version from the tag, and refuses a digest alone or 'latest'",fieldPath=".cnpg.imageName",reason="FieldValueInvalid"
 type DatabaseSpec struct {
 	// +kubebuilder:default=CNPG
@@ -644,19 +652,16 @@ type DatabaseSpec struct {
 	External *ExternalDatabaseSpec `json:"external,omitempty"`
 }
 
-// CNPGSpec configures the CloudNativePG Cluster created for Forgejo.
+// CNPGSpec configures the CloudNativePG Cluster created for Forgejo: a single PostgreSQL
+// instance, for a quick start or a small installation. For a replicated or otherwise managed
+// PostgreSQL, run it yourself (for example your own CloudNativePG Cluster) and use database type
+// External.
 type CNPGSpec struct {
-	// instances is the number of PostgreSQL instances (1 primary + N-1 replicas).
-	// +kubebuilder:default=1
-	// +kubebuilder:validation:Minimum=1
-	// +optional
-	Instances int32 `json:"instances,omitempty"`
-
 	// imageName is the PostgreSQL operand image, with a tag that starts with its major version
 	// (CloudNativePG images: MM-TYPE-OS, MM.mm-TYPE-OS, MM.mm-TS-TYPE-OS). A change within the
 	// major is rolled out by CloudNativePG. A newer major is an orchestrated upgrade: cold
-	// database backup, CloudNativePG's in-place pg_upgrade, verification, rollback on failure
-	// (docs/upgrades.md, "PostgreSQL major upgrades"); it must keep the image's Debian release
+	// database backup, CloudNativePG's in-place pg_upgrade, verification (docs/upgrades.md,
+	// "PostgreSQL major upgrades"); it must keep the image's Debian release
 	// (trixie, bookworm, ...). Older majors are refused. Backup and restore Jobs run pg_dump and
 	// pg_restore from the image of the running cluster (status.database.image), and with type
 	// External from this one.
@@ -1095,10 +1100,10 @@ type UpgradeSpec struct {
 	// +optional
 	BackupBeforeUpgrade *bool `json:"backupBeforeUpgrade,omitempty"`
 
-	// autoRollback restores the pre-upgrade backup and reverts the image when the new version
-	// does not become healthy within timeout. A PostgreSQL major upgrade that cannot be reverted
-	// in place is rolled back by recreating the CNPG cluster on the old image and restoring its
-	// pre-upgrade backup. Defaults to true.
+	// autoRollback restores the pre-upgrade backup and reverts the image when the new Forgejo
+	// version does not become healthy within timeout. Defaults to true. PostgreSQL major
+	// upgrades are never rolled back from a backup: one that fails after pg_upgrade may have
+	// changed the data keeps Forgejo stopped for a person (status.database.upgrade.holdsForgejo).
 	// +optional
 	AutoRollback *bool `json:"autoRollback,omitempty"`
 
@@ -1635,7 +1640,7 @@ type DatabaseStatus struct {
 }
 
 // DatabaseUpgradePhase tracks an orchestrated PostgreSQL major upgrade.
-// +kubebuilder:validation:Enum=Pending;BackingUp;Upgrading;Verifying;Reverting;RollingBack;Succeeded;RolledBack;Failed;Cancelled
+// +kubebuilder:validation:Enum=Pending;BackingUp;Upgrading;Verifying;Reverting;Succeeded;RolledBack;Failed;Cancelled
 type DatabaseUpgradePhase string
 
 const (
@@ -1651,13 +1656,10 @@ const (
 	DatabaseUpgradeVerifying DatabaseUpgradePhase = "Verifying"
 	// DatabaseUpgradeReverting: pg_upgrade failed or could not start; the old image is written
 	// back and CNPG restarts the untouched old data.
-	DatabaseUpgradeReverting DatabaseUpgradePhase = "Reverting"
-	// DatabaseUpgradeRollingBack: the cluster is recreated on the old image and the
-	// pre-upgrade backup is restored into it.
-	DatabaseUpgradeRollingBack DatabaseUpgradePhase = "RollingBack"
-	DatabaseUpgradeSucceeded   DatabaseUpgradePhase = "Succeeded"
-	DatabaseUpgradeRolledBack  DatabaseUpgradePhase = "RolledBack"
-	DatabaseUpgradeFailed      DatabaseUpgradePhase = "Failed"
+	DatabaseUpgradeReverting  DatabaseUpgradePhase = "Reverting"
+	DatabaseUpgradeSucceeded  DatabaseUpgradePhase = "Succeeded"
+	DatabaseUpgradeRolledBack DatabaseUpgradePhase = "RolledBack"
+	DatabaseUpgradeFailed     DatabaseUpgradePhase = "Failed"
 	// DatabaseUpgradeCancelled: spec.database.cnpg.imageName changed again before the new
 	// image was written.
 	DatabaseUpgradeCancelled DatabaseUpgradePhase = "Cancelled"
@@ -1683,9 +1685,6 @@ type DatabaseUpgradeStatus struct {
 	// backupName is the cold, database-only pre-upgrade ForgejoBackup.
 	// +optional
 	BackupName string `json:"backupName,omitempty"`
-	// restoreName is the ForgejoRestore of a rollback that recreated the cluster.
-	// +optional
-	RestoreName string `json:"restoreName,omitempty"`
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
 	// rolloutStartTime is when the new image was written to the CNPG Cluster.
@@ -1694,8 +1693,8 @@ type DatabaseUpgradeStatus struct {
 	// pgUpgradeStarted is set once the container of CloudNativePG's upgrade Job that runs
 	// pg_upgrade has started (or its pods are gone, so that nobody can tell): from then on
 	// pg_upgrade --link may have changed the old data directory. A revert whose old data does
-	// not come back is rolled back from the backup only when it is set; otherwise the old data
-	// is untouched and the Cluster is never deleted.
+	// not come back then fails with holdsForgejo; without it the old data is untouched, and a
+	// timeout before pg_upgrade started reverts.
 	// +optional
 	PGUpgradeStarted bool `json:"pgUpgradeStarted,omitempty"`
 	// phaseStartTime is when the current phase began; the timeouts of Verifying
@@ -1711,14 +1710,15 @@ type DatabaseUpgradeStatus struct {
 	FailedImage string `json:"failedImage,omitempty"`
 	// +optional
 	FailureReason string `json:"failureReason,omitempty"`
-	// storageSize of the volumes of the Cluster a rollback deleted; the recreated Cluster gets
-	// at least that much.
+	// holdsForgejo is set when the upgrade failed in a way the operator does not repair:
+	// pg_upgrade may have changed the data and the old data did not come back, the cluster
+	// disappeared, or Forgejo did not start on the new major. Nothing is rolled back or deleted;
+	// Forgejo stays stopped and condition Broken (reason DatabaseUpgradeFailed) is True until a
+	// ForgejoRestore created after the failure has restored the database, or, while the cluster
+	// serves the new major, the annotation forgejo.lucas.icu/retry-database-upgrade=true starts
+	// Forgejo on it again.
 	// +optional
-	StorageSize string `json:"storageSize,omitempty"`
-	// rollbackRestoreFailed is set when the restore into the recreated cluster failed: Forgejo
-	// stays stopped until a later ForgejoRestore has restored a backup.
-	// +optional
-	RollbackRestoreFailed bool `json:"rollbackRestoreFailed,omitempty"`
+	HoldsForgejo bool `json:"holdsForgejo,omitempty"`
 	// +optional
 	Message string `json:"message,omitempty"`
 }

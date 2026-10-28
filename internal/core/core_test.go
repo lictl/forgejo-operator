@@ -375,7 +375,6 @@ func TestCNPGPrimaryUnavailable(t *testing.T) {
 func TestReconcileCNPGDegradedKeepsPipelineRunning(t *testing.T) {
 	ctx := context.Background()
 	f := testInstance()
-	f.Spec.Database.CNPG.Instances = 3
 	f.Status.Image = img16
 	appSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: forgejo.CNPGAppSecretName(f), Namespace: f.Namespace},
@@ -390,7 +389,7 @@ func TestReconcileCNPGDegradedKeepsPipelineRunning(t *testing.T) {
 	cluster.SetName(forgejo.DatabaseClusterName(f))
 	cluster.SetNamespace(f.Namespace)
 	cluster.Object["status"] = map[string]any{
-		"phase": testPhaseNewReplica, "readyInstances": int64(2),
+		"phase": "Applying configuration", "readyInstances": int64(1),
 		"currentPrimary": testClusterPodDB1, "targetPrimary": testClusterPodDB1,
 	}
 
