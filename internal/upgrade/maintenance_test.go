@@ -79,17 +79,13 @@ func TestSucceedsOnlyOnceDeploymentRolledOut(t *testing.T) {
 		t.Fatalf("unobserved generation: phase %s", f.Status.Upgrade.Phase)
 	}
 
-	// A rolled-out Deployment alone is not enough either.
+	// The rolled-out Deployment decides, also while status.image still names the old image
+	// (core had no pass to record it), and status.image follows.
 	replace(t, c, deployment(imgB, true))
 	f.Status.Image = imgA
-	if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseVerifying {
-		t.Fatalf("status.image %s: phase %s", f.Status.Image, f.Status.Upgrade.Phase)
-	}
-
-	f.Status.Image = imgB
 	rc := reconcileWith(t, c, c.Scheme(), f)
-	if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseSucceeded || rc.TargetImage != imgB || rc.Upgrading {
-		t.Fatalf("phase %s, target %s, upgrading %v", u.Phase, rc.TargetImage, rc.Upgrading)
+	if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseSucceeded || rc.TargetImage != imgB || rc.Upgrading || f.Status.Image != imgB {
+		t.Fatalf("phase %s, target %s, upgrading %v, status.image %s", u.Phase, rc.TargetImage, rc.Upgrading, f.Status.Image)
 	}
 }
 
