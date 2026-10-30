@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -572,6 +573,7 @@ func TestDatabaseUpgradeJobFailureReverts(t *testing.T) {
 // grace. A running pg_upgrade is never interrupted, however long it takes.
 func TestDatabaseUpgradePodChecks(t *testing.T) {
 	waitingPull := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: waitingImagePullBackOff, Message: "not found"}}
+	creating := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}
 	t.Run("pull grace", func(t *testing.T) {
 		f := upgrading(time.Minute)
 		job := upgradeJob()
@@ -616,15 +618,26 @@ func TestDatabaseUpgradePodChecks(t *testing.T) {
 			t.Error("DatabaseUpgradeSlow repeated")
 		}
 	})
+	t.Run("a short spec.upgrade.timeout does not cut the start short", func(t *testing.T) {
+		f := upgrading(3 * time.Minute)
+		f.Spec.Upgrade.Timeout = &metav1.Duration{Duration: 5 * time.Second}
+		job := upgradeJob()
+		pending := upgradePod(job.Name, ago(3*time.Minute), creating)
+		pending.Status.Phase = corev1.PodPending
+		dbPass(t, dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pending), f)
+		if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeUpgrading {
+			t.Fatalf("phase %s: %s", u.Phase, u.FailureReason)
+		}
+	})
 	t.Run("pg_upgrade does not start within the timeout", func(t *testing.T) {
 		f := upgrading(20 * time.Minute)
 		job := upgradeJob()
-		pending := upgradePod(job.Name, ago(19*time.Minute), corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}})
+		pending := upgradePod(job.Name, ago(19*time.Minute), creating)
 		pending.Status.Phase = corev1.PodPending
 		c := dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pending)
 		rc, _ := dbPass(t, c, f)
 		if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeReverting || rc.DatabaseImage != pg17 || u.PGUpgradeStarted ||
-			!strings.Contains(u.FailureReason, "did not start within spec.upgrade.timeout") {
+			!strings.Contains(u.FailureReason, "did not start within 15m0s") {
 			t.Fatalf("phase %s, image %s: %s", u.Phase, rc.DatabaseImage, u.FailureReason)
 		}
 		// Without any Job either.
@@ -860,10 +873,16 @@ func TestDatabaseRecreateHoldsUntilARestore(t *testing.T) {
 	ctx := context.Background()
 	f := dbInstance(pg17)
 	f.Annotations = map[string]string{forgejo.AnnotationRecreateDatabase: valueTrue}
-	c := dbClient(t, f.DeepCopy(), restore("earlier", forgejov1.RestorePhaseCompleted, ago(time.Hour)))
+	running := availableDeployment(imgA, 1)
+	c := dbClient(t, f.DeepCopy(), restore("earlier", forgejov1.RestorePhaseCompleted, ago(time.Hour)), running)
 	rc, res := dbPass(t, c, f)
 	if !zeroReplicas(rc) || res.Stop || brokenReason(f) != forgejo.BrokenDatabaseRestorePending || rc.DatabaseImage != pg17 {
 		t.Fatalf("before the cluster: override %v, stop %v, Broken %q", rc.ReplicasOverride, res.Stop, brokenReason(f))
+	}
+	// Scaled down at once, also in passes whose workload step does not run.
+	dep := &appsv1.Deployment{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "fj"}, dep); err != nil || dep.Spec.Replicas == nil || *dep.Spec.Replicas != 0 {
+		t.Fatalf("Deployment replicas %v, err %v", dep.Spec.Replicas, err)
 	}
 	// The database step created it, marked; a restore from before it does not count.
 	recreated := cnpgCluster(pg17, pg17, 17, sysNew, true, time.Now().Add(-time.Minute))

@@ -232,11 +232,12 @@ groups:
       severity: warning
   - alert: ForgejoDatabaseUpgradeFailed
     annotations:
-      description: A PostgreSQL major upgrade of the CNPG cluster failed or was rolled
-        back in the last hour. status.database.upgrade of `kubectl get fj fj -n ns
-        -o yaml` names the failed image and the reason; it is not retried until spec.database.cnpg.imageName
-        changes. With rollbackRestoreFailed Forgejo stays stopped until a backup is
-        restored. See docs/upgrades.md, "PostgreSQL major upgrades".
+      description: A PostgreSQL major upgrade of the CNPG cluster failed or was reverted
+        in the last hour. status.database.upgrade of `kubectl get fj fj -n ns -o yaml`
+        names the failed image and the reason; it is not retried until spec.database.cnpg.imageName
+        changes or the annotation forgejo.lucas.icu/retry-database-upgrade=true is
+        set. With holdsForgejo Forgejo stays stopped, and the instance is Broken,
+        until a person acts. See docs/upgrades.md, "Failures of a PostgreSQL upgrade".
       runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoDatabaseUpgradeFailed.md
       summary: A PostgreSQL major upgrade of Forgejo ns/fj failed
     expr: sum by (namespace, name) (increase(forgejo_operator_database_upgrades_total{namespace="ns",
