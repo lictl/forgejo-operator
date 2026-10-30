@@ -1,6 +1,6 @@
 # Development
 
-Use Go 1.26.9, Docker/Buildx, Helm and kubectl. Never run e2e against a production
+Use Go 1.26.10, Docker/Buildx, Helm and kubectl. Never run e2e against a production
 context. Unit/envtest does not contact your cluster; `make run`, `make install`,
 `make deploy` and e2e do. For e2e set a dedicated Kind cluster and kubeconfig.
 

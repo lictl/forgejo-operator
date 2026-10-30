@@ -8,7 +8,7 @@ import subprocess
 
 repo = Path(__file__).resolve().parents[1]
 # Match the project toolchain, including its standard-library license.
-go_env = {**os.environ, "GOTOOLCHAIN": "go1.26.9"}
+go_env = {**os.environ, "GOTOOLCHAIN": "go1.26.10"}
 output = repo / 'LICENSES' / 'dependencies'
 decoder = json.JSONDecoder()
 modules = {}

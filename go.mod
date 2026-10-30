@@ -4,7 +4,7 @@ go 1.26.0
 
 // Go 1.26.0's net/url rejects the multi-host Sentinel URLs of highAvailability (fixed in later
 // 1.26 releases); CI's setup-go installs this toolchain.
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/go-logr/logr v1.4.4
