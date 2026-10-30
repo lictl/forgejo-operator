@@ -99,7 +99,7 @@ func (r *ForgejoRestoreReconciler) reader() client.Reader {
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores/status,verbs=patch
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejorestores/finalizers,verbs=update
-// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
@@ -201,7 +201,25 @@ func (r *ForgejoRestoreReconciler) validate(ctx context.Context, rs *forgejov1.F
 		return ctrl.Result{}, r.fail(ctx, rs, f, "BackupDeleted", fmt.Sprintf("ForgejoBackup %q is being deleted", b.Name))
 	}
 	restoreDB, restoreData := what(rs, b)
-	return r.begin(ctx, rs, f, restoreDB, restoreData, b.Status.ForgejoImage, b.Status.PostgresImage, nil)
+	return r.begin(ctx, rs, f, origin{
+		db: restoreDB, data: restoreData, forgejoImage: b.Status.ForgejoImage, postgresImage: b.Status.PostgresImage,
+		secretKey: b.Status.SecretKeyFingerprint, takenBy: "ForgejoBackup " + b.Name, dataBytes: b.Status.DataSizeBytes,
+	})
+}
+
+// origin is what a validated restore restores, from its ForgejoBackup or the manifest of its
+// remote backup.
+type origin struct {
+	db, data bool
+	// forgejoImage ran when the backup was taken; pg_dump of postgresImage wrote its dump.
+	forgejoImage, postgresImage string
+	// secretKey is the SecretKeyFingerprint of the instance that took the backup ("" when not
+	// recorded); takenBy names the backup for messages.
+	secretKey, takenBy string
+	// dataBytes is the size of the data archive (0 when not known).
+	dataBytes int64
+	// remote describes a remote backup for status.remote.
+	remote *forgejov1.RestoreRemoteStatus
 }
 
 // remoteReadWait is how long a restore of a remote backup waits for the bucket to answer
@@ -226,22 +244,19 @@ func (r *ForgejoRestoreReconciler) validateRemote(ctx context.Context, rs *forge
 		}
 		return ctrl.Result{}, r.fail(ctx, rs, f, "RemoteBackupUnavailable", fmt.Sprintf("Cannot read the remote backup at %s: %v", where, err))
 	}
-	restoreDB := forgejo.BoolOr(rs.Spec.RestoreDatabase, true)
-	restoreData := forgejo.BoolOr(rs.Spec.RestoreData, true) && m.IncludesData
-	sec := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err == nil {
-		if have := forgejo.SecretKeyFingerprint(sec.Data); m.SecretKeyFingerprint != "" && have != "" && have != m.SecretKeyFingerprint {
-			r.eventOn(rs, corev1.EventTypeWarning, "IdentityMismatch",
-				"The backup was taken by %s/%s, whose SECRET_KEY differs from this instance's: two-factor secrets, Actions secrets and "+
-					"mirror credentials of the restored database cannot be decrypted. To recreate that instance with its identity, "+
-					"create a new Forgejo with spec.restoreFrom instead", m.Namespace, m.Forgejo)
-		}
+	from := origin{
+		db: forgejo.BoolOr(rs.Spec.RestoreDatabase, true), data: forgejo.BoolOr(rs.Spec.RestoreData, true) && m.IncludesData,
+		forgejoImage: m.ForgejoImage, postgresImage: m.PostgresImage,
+		secretKey: m.SecretKeyFingerprint, takenBy: fmt.Sprintf("The backup %s of %s/%s", m.Backup, m.Namespace, m.Forgejo),
+		remote: &forgejov1.RestoreRemoteStatus{
+			Location: where, BackupName: m.Backup, ForgejoImage: m.ForgejoImage, IncludesData: m.IncludesData,
+			KeyFingerprint: store.KeyFingerprint(), Files: m.Files,
+		},
 	}
-	remote := &forgejov1.RestoreRemoteStatus{
-		Location: where, BackupName: m.Backup, ForgejoImage: m.ForgejoImage, IncludesData: m.IncludesData,
-		KeyFingerprint: store.KeyFingerprint(), Files: m.Files,
+	if file := m.File(backup.DataArchiveFile); file != nil {
+		from.dataBytes = file.SizeBytes
 	}
-	return r.begin(ctx, rs, f, restoreDB, restoreData, m.ForgejoImage, m.PostgresImage, remote)
+	return r.begin(ctx, rs, f, from)
 }
 
 // objectStorageUnusable returns the ObjectStorageReady message when the object-storage step
@@ -259,20 +274,18 @@ func objectStorageUnusable(f *forgejov1.Forgejo) (string, bool) {
 	return c.Message, true
 }
 
-// begin starts a validated restore: it refuses a dump of a newer PostgreSQL major than the
-// server's, waits for other restores, for a PostgreSQL major upgrade, for the SSH host keys and
-// for the Secrets of spec.objectStorage, refuses a Job name taken by something else, and moves
-// to ScalingDown. dumpImage is the PostgreSQL image whose pg_dump wrote the backup's dump.
-func (r *ForgejoRestoreReconciler) begin(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo,
-	restoreDB, restoreData bool, backupImage, dumpImage string, remote *forgejov1.RestoreRemoteStatus) (ctrl.Result, error) {
-	if !restoreDB && !restoreData {
+// begin starts a validated restore: it refuses what refusal names, waits for other restores,
+// for a PostgreSQL major upgrade, for the SSH host keys and for the Secrets of
+// spec.objectStorage, refuses a Job name taken by something else, and moves to ScalingDown.
+func (r *ForgejoRestoreReconciler) begin(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo, from origin) (ctrl.Result, error) {
+	if !from.db && !from.data {
 		return ctrl.Result{}, r.fail(ctx, rs, f, "NothingToRestore",
 			"Neither the database nor data are selected (or the backup has no data archive)")
 	}
-	if restoreDB {
-		if msg := backup.DumpTooNew(f, dumpImage); msg != "" {
-			return ctrl.Result{}, r.fail(ctx, rs, f, "NewerDump", msg+"; nothing was changed")
-		}
+	if reason, msg, err := r.refusal(ctx, rs, f, from); err != nil {
+		return ctrl.Result{}, err
+	} else if reason != "" {
+		return ctrl.Result{}, r.fail(ctx, rs, f, reason, msg)
 	}
 	if u := forgejo.DatabaseUpgrade(f); forgejo.DatabaseUpgradeInFlight(f) {
 		return r.wait(ctx, rs, fmt.Sprintf("Waiting for the PostgreSQL major upgrade to %s to finish (phase %s)", u.ToImage, u.Phase))
@@ -309,31 +322,112 @@ func (r *ForgejoRestoreReconciler) begin(ctx context.Context, rs *forgejov1.Forg
 		return ctrl.Result{}, err
 	}
 
-	if from, ok := forgejo.ImageVersion(backupImage); ok {
-		if to, ok := forgejo.ImageVersion(backup.CurrentImage(f)); ok && from.Compare(to) > 0 {
-			r.eventOn(rs, corev1.EventTypeWarning, "NewerBackup",
-				"Backup was taken with %s but %s is deployed; Forgejo cannot start on a database migrated by a newer version",
-				backupImage, backup.CurrentImage(f))
-		}
-	}
-
 	orig := rs.DeepCopy()
 	now := metav1.Now()
 	rs.Status.Phase = forgejov1.RestorePhaseScalingDown
 	rs.Status.StartTime = &now
-	rs.Status.Remote = remote
+	rs.Status.Remote = from.remote
 	rs.Status.Message = "Waiting for Forgejo to scale down"
 	setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionFalse, "ScalingDown", rs.Status.Message)
 	if err := r.patchStatus(ctx, rs, orig); err != nil {
 		return ctrl.Result{}, err
 	}
 	src := backup.RestoreSource(rs)
-	r.eventOn(rs, corev1.EventTypeNormal, "RestoreStarted", "Restoring %s (database: %t, data: %t)", src, restoreDB, restoreData)
+	r.eventOn(rs, corev1.EventTypeNormal, "RestoreStarted", "Restoring %s (database: %t, data: %t)", src, from.db, from.data)
 	r.eventOn(f, corev1.EventTypeNormal, "RestoreStarted", "ForgejoRestore %s is restoring %s", rs.Name, src)
 	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 }
 
-// scaleDown waits for maintenance mode to take effect, then starts the restore Job.
+// refusal returns why the restore must not run, as a reason and a message, before anything is
+// changed: a dump of a newer PostgreSQL major than the server's, the database of a newer
+// Forgejo than the deployed one or of another identity, or a data archive that cannot fit the
+// data volume.
+func (r *ForgejoRestoreReconciler) refusal(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo, from origin) (string, string, error) {
+	if from.db {
+		if msg := backup.DumpTooNew(f, from.postgresImage); msg != "" {
+			return "NewerDump", msg + "; nothing was changed", nil
+		}
+		if msg := newerBackup(f, from.forgejoImage); msg != "" {
+			return "NewerBackup", msg, nil
+		}
+		if !rs.Spec.AllowIdentityMismatch {
+			if msg, err := r.identityMismatch(ctx, f, from); err != nil || msg != "" {
+				return "IdentityMismatch", msg, err
+			}
+		}
+	}
+	if from.data && from.dataBytes > 0 {
+		if msg, err := r.dataVolumeTooSmall(ctx, f, from.dataBytes); err != nil || msg != "" {
+			return "DataVolumeTooSmall", msg, err
+		}
+	}
+	return "", "", nil
+}
+
+// newerBackup explains why the database of a backup taken with image must not replace f's: a
+// newer Forgejo migrated it, and the deployed one does not start on it. It returns "" when
+// either version is not known.
+func newerBackup(f *forgejov1.Forgejo, image string) string {
+	deployed := backup.CurrentImage(f)
+	from, ok := forgejo.ImageVersion(image)
+	if !ok {
+		return ""
+	}
+	if to, ok := forgejo.ImageVersion(deployed); !ok || from.Compare(to) <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("The backup was taken with %s, a newer Forgejo than the deployed %s, which does not start on a database "+
+		"that version migrated. Nothing was changed: set spec.image of Forgejo %s to %s (or newer), wait for the upgrade, "+
+		"then create the restore again", image, deployed, f.Name, image)
+}
+
+// identityMismatch explains why the database of from must not replace f's: it was taken with
+// another SECRET_KEY, without which Forgejo cannot decrypt two-factor secrets, Actions secrets
+// and mirror credentials. It returns "" when either fingerprint is not known.
+func (r *ForgejoRestoreReconciler) identityMismatch(ctx context.Context, f *forgejov1.Forgejo, from origin) (string, error) {
+	if from.secretKey == "" {
+		return "", nil
+	}
+	sec := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err != nil {
+		return "", client.IgnoreNotFound(err)
+	}
+	have := forgejo.SecretKeyFingerprint(sec.Data)
+	if have == "" || have == from.secretKey {
+		return "", nil
+	}
+	next := "To restore it anyway, create a new ForgejoRestore with spec.allowIdentityMismatch: true"
+	if from.remote != nil {
+		next = "To recreate that instance with its identity, create a new Forgejo with spec.restoreFrom instead; to restore " +
+			"the database anyway, create a new ForgejoRestore with spec.allowIdentityMismatch: true"
+	}
+	return fmt.Sprintf("%s was taken with another SECRET_KEY than this instance's (fingerprint %s, not %s): Forgejo could not "+
+		"decrypt the two-factor secrets, Actions secrets and mirror credentials of the restored database. Nothing was changed. %s",
+		from.takenBy, from.secretKey, have, next), nil
+}
+
+// dataVolumeTooSmall explains why a data archive of size bytes cannot be extracted onto the
+// data volume of f: the archive alone is larger than the volume (its capacity, else its
+// request), and its files take at least as much. It returns "" when the volume is not known.
+func (r *ForgejoRestoreReconciler) dataVolumeTooSmall(ctx context.Context, f *forgejov1.Forgejo, size int64) (string, error) {
+	name := backup.DataClaimName(f)
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: name}, pvc); err != nil {
+		return "", client.IgnoreNotFound(err)
+	}
+	capacity, ok := pvc.Status.Capacity[corev1.ResourceStorage]
+	if !ok {
+		capacity, ok = pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	}
+	if !ok || capacity.Value() <= 0 || size <= capacity.Value() {
+		return "", nil
+	}
+	return fmt.Sprintf("The backup's data archive has %d bytes, more than data volume %s holds (%s), and its files take at least "+
+		"as much once extracted. Nothing was changed: grow the volume first", size, name, capacity.String()), nil
+}
+
+// scaleDown waits for maintenance mode to take effect, takes the pre-restore backup, then
+// starts the restore Job.
 func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo) (ctrl.Result, error) {
 	waitDown := func(msg string) (ctrl.Result, error) {
 		if rs.Status.StartTime != nil && time.Since(rs.Status.StartTime.Time) > scaleDownTimeout {
@@ -362,7 +456,7 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 		return ctrl.Result{}, err
 	}
 	for i := range backups {
-		if backups[i].Status.Phase == forgejov1.BackupPhaseRunning {
+		if backups[i].Name != backup.PreRestoreBackupName(rs) && backups[i].Status.Phase == forgejov1.BackupPhaseRunning {
 			return r.wait(ctx, rs, fmt.Sprintf("Waiting for ForgejoBackup %s to finish", backups[i].Name))
 		}
 	}
@@ -374,7 +468,22 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 		return waitDown("Waiting for " + busy + " to stop")
 	}
 
-	job, failReason, failMsg, err := r.restoreJob(ctx, rs, f)
+	p, failReason, failMsg, err := r.resolve(ctx, rs)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if failReason != "" {
+		return ctrl.Result{}, r.fail(ctx, rs, f, failReason, failMsg)
+	}
+	if res, done, err := r.preRestoreBackup(ctx, rs, f, p.data); err != nil || !done {
+		return res, err
+	}
+	return r.startJob(ctx, rs, f, p)
+}
+
+// startJob creates the restore Job of p and moves the restore to Restoring.
+func (r *ForgejoRestoreReconciler) startJob(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo, p plan) (ctrl.Result, error) {
+	job, failReason, failMsg, err := r.restoreJob(ctx, rs, f, p)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -404,30 +513,43 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
 }
 
-// restoreJob builds the restore Job of rs: from its ForgejoBackup, or from the remote backup
-// validated into status.remote. A problem that fails the restore is returned as reason and
-// message, with a nil Job.
-func (r *ForgejoRestoreReconciler) restoreJob(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo) (*batchv1.Job, string, string, error) {
-	var b *forgejov1.ForgejoBackup
-	var restoreDB, restoreData bool
-	backupClaim := ""
-	var err error
+// plan is what a restore restores: its ForgejoBackup (local, nil for a remote backup), and
+// whether the database and the data volume are replaced.
+type plan struct {
+	local    *forgejov1.ForgejoBackup
+	db, data bool
+}
+
+// resolve reads what rs restores: from its ForgejoBackup, or from the remote backup validated
+// into status.remote. A problem that fails the restore is returned as reason and message.
+func (r *ForgejoRestoreReconciler) resolve(ctx context.Context, rs *forgejov1.ForgejoRestore) (plan, string, string, error) {
 	if rs.Spec.Remote != nil {
 		if rs.Status.Remote == nil {
-			return nil, "RemoteBackupUnavailable", "The remote backup was not validated", nil
+			return plan{}, "RemoteBackupUnavailable", "The remote backup was not validated", nil
 		}
-		restoreDB = forgejo.BoolOr(rs.Spec.RestoreDatabase, true)
-		restoreData = forgejo.BoolOr(rs.Spec.RestoreData, true) && rs.Status.Remote.IncludesData
-	} else {
-		if b, err = r.getBackup(ctx, rs); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil, "BackupNotFound", fmt.Sprintf("ForgejoBackup %q not found", rs.Spec.BackupName), nil
-			}
-			return nil, "", "", err
-		}
-		restoreDB, restoreData = what(rs, b)
-		backupClaim = b.Status.PVCName
+		return plan{db: forgejo.BoolOr(rs.Spec.RestoreDatabase, true),
+			data: forgejo.BoolOr(rs.Spec.RestoreData, true) && rs.Status.Remote.IncludesData}, "", "", nil
 	}
+	b, err := r.getBackup(ctx, rs)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return plan{}, "BackupNotFound", fmt.Sprintf("ForgejoBackup %q not found", rs.Spec.BackupName), nil
+		}
+		return plan{}, "", "", err
+	}
+	db, data := what(rs, b)
+	return plan{local: b, db: db, data: data}, "", "", nil
+}
+
+// restoreJob builds the restore Job of p. A problem that fails the restore is returned as
+// reason and message, with a nil Job.
+func (r *ForgejoRestoreReconciler) restoreJob(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo, p plan) (*batchv1.Job, string, string, error) {
+	restoreDB, restoreData := p.db, p.data
+	backupClaim := ""
+	if p.local != nil {
+		backupClaim = p.local.Status.PVCName
+	}
+	var err error
 	in := backup.JobInput{
 		Scheme:       r.Scheme,
 		Instance:     f,
@@ -456,9 +578,117 @@ func (r *ForgejoRestoreReconciler) restoreJob(ctx context.Context, rs *forgejov1
 			Files:        rs.Status.Remote.Files,
 		}, restoreDB, restoreData)
 	} else {
-		job, err = backup.RestoreJob(in, rs, b, restoreDB, restoreData)
+		job, err = backup.RestoreJob(in, rs, p.local, restoreDB, restoreData)
 	}
 	return job, "", "", err
+}
+
+// wantsPreRestoreBackup reports whether rs backs up what it replaces first
+// (spec.preRestoreBackup). Only an instance that has run holds anything to keep; one that is
+// created from spec.restoreFrom takes no backup before it is restored. A Broken instance takes
+// none either, as for scheduled backups: what is left (an empty or half-upgraded database) is
+// not what to keep, and the restore is what repairs it.
+func wantsPreRestoreBackup(rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo) bool {
+	return forgejo.BoolOr(rs.Spec.PreRestoreBackup, true) && f.Status.Image != "" && !backup.Bootstrapping(f) && !forgejo.IsBroken(f)
+}
+
+// preRestoreBackup takes a ForgejoBackup of what rs replaces (the database, and the data
+// volume when includeData), once Forgejo has stopped so that it is consistent, and reports
+// done when it has completed or none is wanted. A backup that fails or is deleted fails the
+// restore, which has not changed anything yet. The backup does not belong to the restore: it
+// outlives it, and retention never prunes it (reason PreRestore).
+func (r *ForgejoRestoreReconciler) preRestoreBackup(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo,
+	includeData bool) (ctrl.Result, bool, error) {
+	if !wantsPreRestoreBackup(rs, f) {
+		return ctrl.Result{}, true, nil
+	}
+	name := backup.PreRestoreBackupName(rs)
+	const next = "Nothing was changed. Fix the cause and create the restore again, or create it with " +
+		"spec.preRestoreBackup: false to restore without a backup of the current state"
+	b := &forgejov1.ForgejoBackup{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: name}, b)
+	switch {
+	case apierrors.IsNotFound(err):
+		if err := r.createPreRestoreBackup(ctx, rs, f, name, includeData); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		res, err := r.backingUp(ctx, rs, name, fmt.Sprintf("Taking pre-restore backup %s", name))
+		return res, false, err
+	case err != nil:
+		return ctrl.Result{}, false, err
+	case backup.Reason(b) != forgejov1.BackupReasonPreRestore || b.Spec.ForgejoRef.Name != f.Name:
+		return ctrl.Result{}, false, r.fail(ctx, rs, f, "PreRestoreBackupFailed",
+			fmt.Sprintf("ForgejoBackup %s exists and is not the pre-restore backup of this restore. %s", name, next))
+	case !b.DeletionTimestamp.IsZero():
+		return ctrl.Result{}, false, r.fail(ctx, rs, f, "PreRestoreBackupFailed", fmt.Sprintf("Pre-restore backup %s was deleted. %s", name, next))
+	case b.Status.Phase == forgejov1.BackupPhaseFailed:
+		return ctrl.Result{}, false, r.fail(ctx, rs, f, "PreRestoreBackupFailed",
+			fmt.Sprintf("Pre-restore backup %s failed: %s. %s", name, b.Status.Message, next))
+	case b.Status.Phase == forgejov1.BackupPhaseCompleted:
+		if rs.Status.PreRestoreBackupName != name {
+			if _, err := r.backingUp(ctx, rs, name, fmt.Sprintf("Pre-restore backup %s completed", name)); err != nil {
+				return ctrl.Result{}, false, err
+			}
+		}
+		return ctrl.Result{}, true, nil
+	}
+	msg := fmt.Sprintf("Taking pre-restore backup %s", name)
+	if b.Status.Message != "" {
+		msg += ": " + b.Status.Message
+	}
+	res, err := r.backingUp(ctx, rs, name, msg)
+	return res, false, err
+}
+
+// createPreRestoreBackup creates the pre-restore backup name of rs. Like the pre-upgrade
+// backup, it belongs to the instance under retainPolicy Delete and outlives it under Retain.
+func (r *ForgejoRestoreReconciler) createPreRestoreBackup(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo,
+	name string, includeData bool) error {
+	b := &forgejov1.ForgejoBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: f.Namespace,
+			Labels: map[string]string{
+				forgejo.LabelForgejo:      f.Name,
+				forgejo.LabelBackupReason: string(forgejov1.BackupReasonPreRestore),
+			},
+		},
+		Spec: forgejov1.ForgejoBackupSpec{
+			ForgejoRef:  forgejov1.ForgejoRef{Name: f.Name},
+			Reason:      forgejov1.BackupReasonPreRestore,
+			IncludeData: &includeData,
+		},
+	}
+	if !forgejo.RetainData(f) {
+		if err := controllerutil.SetOwnerReference(f, b, r.Scheme); err != nil {
+			return err
+		}
+	}
+	if err := r.Create(ctx, b); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil // created in an earlier pass the cache does not show yet
+		}
+		return fmt.Errorf("creating pre-restore backup %s: %w", name, err)
+	}
+	r.eventOn(rs, corev1.EventTypeNormal, "PreRestoreBackup", "Created ForgejoBackup %s of the instance before restoring %s",
+		name, backup.RestoreSource(rs))
+	r.eventOn(f, corev1.EventTypeNormal, "PreRestoreBackup", "Created ForgejoBackup %s before ForgejoRestore %s changes the instance",
+		name, rs.Name)
+	return nil
+}
+
+// backingUp records the pre-restore backup name of rs and msg while the restore waits for it.
+func (r *ForgejoRestoreReconciler) backingUp(ctx context.Context, rs *forgejov1.ForgejoRestore, name, msg string) (ctrl.Result, error) {
+	if rs.Status.PreRestoreBackupName != name || rs.Status.Message != msg {
+		orig := rs.DeepCopy()
+		rs.Status.PreRestoreBackupName = name
+		rs.Status.Message = msg
+		setCondition(&rs.Status.Conditions, rs.Generation, metav1.ConditionFalse, "BackingUp", msg)
+		if err := r.patchStatus(ctx, rs, orig); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
 // restoreActivity names a restore Job or pod of the instance other than rs's own that may

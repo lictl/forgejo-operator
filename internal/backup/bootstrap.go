@@ -8,7 +8,9 @@ package backup
 //  2. restore-identity (before secrets): the operator reads identity.json of the backup with
 //     its own S3 client and creates "<name>-secrets", "<name>-admin" and
 //     "<name>-ssh-host-keys" from it, so the secrets and ssh-host-keys steps find them and
-//     generate nothing. Existing Secrets are never overwritten.
+//     generate nothing. Existing Secrets are never overwritten. A backup without an archive of
+//     the data volume is refused (DatabaseOnlyBackup), unless the Forgejo is annotated
+//     forgejo.lucas.icu/restore-from-database-only=true.
 //  3. restore-from (after storage, so the database is ready): the operator creates
 //     ForgejoRestore "<name>-restore-from" for the backup, which restores the database and the
 //     data volume like any restore, and brings Forgejo up (the first pod migrates alone). It
@@ -264,7 +266,8 @@ func targetInUse(ctx context.Context, rc *forgejo.ReconcileContext, marker strin
 
 // ReconcileRestoreIdentity restores the identity Secrets of spec.restoreFrom before the secrets
 // step would generate new ones. It stops (and with it everything that needs the secrets) while
-// the backup cannot be read or an existing Secret differs from the backup's.
+// the backup cannot be read, has no data archive (unless that is allowed) or an existing Secret
+// differs from the backup's.
 func ReconcileRestoreIdentity(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 	f := rc.Instance
 	if f.Spec.RestoreFrom == nil {
@@ -340,6 +343,15 @@ func ReconcileRestoreIdentity(ctx context.Context, rc *forgejo.ReconcileContext)
 	st.BackupName, st.ForgejoImage, st.InstanceUID = m.Backup, m.ForgejoImage, m.ForgejoUID
 	if t := m.CompletedTime(); !t.IsZero() {
 		st.BackupCompletionTime = &metav1.Time{Time: t}
+	}
+	if !m.IncludesData && f.Annotations[forgejo.AnnotationRestoreFromDatabaseOnly] != valueTrue {
+		// Refused before anything is created, like a target that is not empty (Failed).
+		res := wait("DatabaseOnlyBackup", fmt.Sprintf("spec.restoreFrom was not restored: backup %s (reason %s) at %s has no archive "+
+			"of the data volume, so the instance would start on its database with empty repositories. Pick a backup with data, or "+
+			"set the annotation %s=true on the Forgejo to restore only the database", m.Backup, m.Reason, st.Location,
+			forgejo.AnnotationRestoreFromDatabaseOnly))
+		st.Phase = forgejov1.RestoredFromFailed
+		return res, nil
 	}
 	restored, err := restoreIdentitySecrets(ctx, rc, id)
 	if err != nil {

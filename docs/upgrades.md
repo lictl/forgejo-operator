@@ -170,7 +170,8 @@ the upgrade to `RollingBack`:
 1. Forgejo is scaled to zero right away, so the failing version cannot migrate any further.
 2. `ForgejoRestore <name>-rollback-<start>` restores the pre-upgrade backup. The restore
    replaces the whole database schema, so tables a newer version created are removed too
-   (see [backup-restore.md](backup-restore.md)). Its Jobs run with the old image.
+   (see [backup-restore.md](backup-restore.md)). Its Jobs run with the old image. It takes no
+   pre-restore backup: the pre-upgrade backup holds the state before the upgrade.
 3. The old image starts again on the restored data. Once it is available the phase is
    `RolledBack`: `failedImage` is the new image, `forgejo_operator_upgrades_total{result="rolledback"}`
    is incremented, an `UpgradeRolledBack` Auto Pilot action is recorded, and `Degraded=True`

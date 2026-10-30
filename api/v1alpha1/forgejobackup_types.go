@@ -21,13 +21,16 @@ import (
 )
 
 // BackupReason records why a backup was taken.
-// +kubebuilder:validation:Enum=Manual;Scheduled;PreUpgrade
+// +kubebuilder:validation:Enum=Manual;Scheduled;PreUpgrade;PreRestore
 type BackupReason string
 
 const (
 	BackupReasonManual     BackupReason = "Manual"
 	BackupReasonScheduled  BackupReason = "Scheduled"
 	BackupReasonPreUpgrade BackupReason = "PreUpgrade"
+	// BackupReasonPreRestore: the state of an instance before a ForgejoRestore replaced it
+	// (spec.preRestoreBackup of the restore).
+	BackupReasonPreRestore BackupReason = "PreRestore"
 )
 
 // BackupPhase is the lifecycle of a backup.
@@ -91,6 +94,12 @@ type ForgejoBackupStatus struct {
 	// PostgreSQL. A restore into a server of an older major is refused.
 	// +optional
 	PostgresImage string `json:"postgresImage,omitempty"`
+	// secretKeyFingerprint identifies the SECRET_KEY of the instance when the backup was taken
+	// (forgejo.SecretKeyFingerprint, as remote manifests record it). A restore of the database
+	// into an instance with another SECRET_KEY is refused unless the ForgejoRestore sets
+	// allowIdentityMismatch; empty (backups of older operator versions) is not checked.
+	// +optional
+	SecretKeyFingerprint string `json:"secretKeyFingerprint,omitempty"`
 	// +optional
 	DatabaseSizeBytes int64 `json:"databaseSizeBytes,omitempty"`
 	// +optional

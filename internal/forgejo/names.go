@@ -62,6 +62,10 @@ const (
 	// database or data volume that existed before the instance (RestoredFromBackup=
 	// False/TargetNotEmpty otherwise).
 	AnnotationRestoreFromOverwrite = "forgejo.lucas.icu/restore-from-overwrite"
+	// AnnotationRestoreFromDatabaseOnly=true on the Forgejo lets spec.restoreFrom restore a
+	// backup without an archive of the data volume (RestoredFromBackup=
+	// False/DatabaseOnlyBackup otherwise): the instance starts with empty repositories.
+	AnnotationRestoreFromDatabaseOnly = "forgejo.lucas.icu/restore-from-database-only"
 
 	ManagedBy = "forgejo-operator"
 	AppName   = "forgejo"
