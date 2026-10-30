@@ -73,7 +73,10 @@ durations and pull policies have their ranges, forms and enums.
   instance's UID, or the UID of the instance `spec.restoreFrom` recreated, up to the restored
   backup (`status.restoredFrom.instanceUID`, `backupCompletionTime`): two instances of the same
   namespace and name writing to the same bucket (a recovery drill, the original cluster back
-  after a recovery) never prune each other's backups.
+  after a recovery) never prune each other's backups. Like local retention, it also skips
+  backups whose `secretKeyFingerprint` is another identity's, and prunes no complete scheduled
+  backup while the newest one is less than half the size of another one it holds (the size-drop
+  guard, `internal/backup/retentionguard.go`).
 - **Identity.** The backup controller builds the identity bundle (the instance's Secrets and
   sanitised spec) in Go and hands it to the upload Job in Secret `<backup>-identity`, which it
   deletes with the Job.
@@ -168,7 +171,7 @@ checks, the restore handshake or volume expansion. Around the table:
 | 21 | tls | core | – | cert-manager Certificate `<name>-tls` (Secret `<name>-tls`), ReferenceGrant `<name>-tls` for `spec.tls.gatewayNamespaces`; `TLSReady` from the Certificate's `Ready` |
 | 22 | scaling | autopilot | 15 | HPA `<name>`, PDB `<name>` |
 | 23 | monitoring | observability | – | ServiceMonitor, PrometheusRule `<name>` (alerts with `runbook_url`, SLO recording rules and burn-rate alerts), ConfigMap `<name>-dashboard`; failures become `Degraded=MonitoringFailed`, not step errors |
-| 24 | backup-schedule | backup | 2, 4 | scheduled `ForgejoBackup`s, retention (also of remote copies, see [backup-restore.md](backup-restore.md#remote-retention)), backup PVC growth, `status.backup` (with `remote`), `BackupHealthy` (also `False` while the backup key is missing, unusable or not exported) |
+| 24 | backup-schedule | backup | 2, 4 | scheduled `ForgejoBackup`s, retention (also of remote copies, see [backup-restore.md](backup-restore.md#remote-retention)) of the backups of `rc.IdentityFingerprint` only, held while the newest is less than half the size of another (`BackupSizeDropped`, see `internal/backup/retentionguard.go`), backup PVC growth, `status.backup` (with `remote`), `BackupHealthy` (also `False` while the backup key is missing, unusable or not exported) |
 | 25 | health | observability | 2 | `/api/healthz`, version and stats probes → `status.health`, `status.version`, `status.stats`, `Healthy`; one availability sample per interval (`forgejo_operator_availability_probes_total`), also while no pod is Ready, planned during maintenance (unless `rc.MaintenanceHeld`), `rc.RestoreScalingUp` and `rc.Upgrading` |
 | 26 | valkey-status | autopilot | – | with HA: the Sentinels' view of Valkey → `status.highAvailability.valkey`, `ValkeyReady`, `forgejo_operator_valkey_*`, `ValkeyFailedOver` events (not for a new replication group, recognised by its pods' UIDs); asks at most every 10 s while the pods stay the same, every minute while unreachable; no prerequisites, so it stays current while the database is down |
 | 27 | autopilot | autopilot | 18, 25 | self-healing restarts, config rollback, last-known-good bookkeeping, OOM- and usage-driven vertical sizing, `status.autoPilot` (the cron runner's pod counts like a server pod, except for the Deployment restart, which the server pods decide, and for the last known good config while it has not started a container for 5 minutes) |

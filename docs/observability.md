@@ -588,7 +588,7 @@ once sampling works again. `status.stats` keeps the last good values in the mean
 | `DatabaseReady` | core | The PostgreSQL backend is reachable/healthy |
 | `Upgrading` | upgrade | A version upgrade is being orchestrated |
 | `DatabaseUpgrading` | upgrade | A PostgreSQL major upgrade of the CNPG cluster is being orchestrated (reason = phase); otherwise its outcome, a refusal or what it waits for ([upgrades.md](upgrades.md#postgresql-major-upgrades)). Only with database type CNPG |
-| `BackupHealthy` | backup | State of scheduled backups (`UploadFailed` when the latest one was not uploaded to `spec.backup.remote`; `BackupKeyNotExported`, `BackupKeyMissing`, `BackupKeyUnusable` while the backup key is not acknowledged as copied out of the cluster, missing or unusable, see [backup-restore.md](backup-restore.md#the-key)) |
+| `BackupHealthy` | backup | State of scheduled backups (`BackupSizeDropped` while retention holds because the newest one is less than half the size of an earlier one, see [backup-restore.md](backup-restore.md#scheduled-backups-and-retention); `UploadFailed` when the latest one was not uploaded to `spec.backup.remote`; `BackupKeyNotExported`, `BackupKeyMissing`, `BackupKeyUnusable` while the backup key is not acknowledged as copied out of the cluster, missing or unusable, see [backup-restore.md](backup-restore.md#the-key)) |
 | `RestoredFromBackup` | backup | Bootstrap of `spec.restoreFrom`: `False` while the identity, database and data volume are restored (`TargetNotEmpty` when the database or data volume predates the instance), `True`/`Restored` once they are restored and recorded on `<name>-secrets` ([backup-restore.md](backup-restore.md#disaster-recovery)) |
 | `StorageHealthy` | autopilot | PVC capacity/usage |
 | `ValkeyReady` | autopilot | With HA only: Valkey has a Ready primary its Sentinels agree on. `True/Available`, `True/Degraded` (fewer than two replicas in sync, three Sentinels or three Ready pods), `False/NoMaster`, `False/NotReady`, `False/NotProvisioned`, `Unknown/UnreachableFromOperator` ([high-availability.md](high-availability.md#valkey-with-sentinel)) |
@@ -615,6 +615,8 @@ Other packages emit their own events:
   `status.autoPilot.recentActions`.
 - `ReconcileError` (Warning) names a failing reconcile step.
 - Backup, maintenance, HA and config events include `BackupScheduled`, `BackupPruned`,
+  `BackupSizeDropped` (Warning: retention holds, see
+  [backup-restore.md](backup-restore.md#scheduled-backups-and-retention)),
   `MaintenanceStarted`, `MaintenanceEnded`, `LastKnownGoodConfig`, `ConfigRetry`,
   `ValkeyFailedOver` (Warning), `WaitingForValkey`, `ValkeyReset`, `WaitingForCronRunner`,
   `CronRunnerStuck` (Warning) and `CronRunnerDeleted`.
