@@ -44,7 +44,9 @@ before-migration   forgejo   Manual   Completed   12s         40s
 `status` records `phase` (`Pending` → `Running` → `Completed`/`Failed`), `startTime`,
 `completionTime`, `jobName`, `pvcName`, `path`, `forgejoImage` (the image running when the
 backup was taken), `postgresImage` (the PostgreSQL image whose `pg_dump` wrote the dump),
-`databaseSizeBytes`, `dataSizeBytes`, `includesData`, `message`, a
+`databaseSizeBytes`, `dataSizeBytes`, `includesData`, `secretKeyFingerprint` (identifies the
+instance's `SECRET_KEY` when the backup completed, see
+[Scheduled backups and retention](#scheduled-backups-and-retention)), `message`, a
 `Ready` condition and, with `spec.backup.remote`, `remote` (see
 [Remote backups](#remote-backups)). Events are recorded on the backup and on the `Forgejo` object. Status is
 the record of a finished backup: the Job is deleted once its outcome is written there (see
@@ -246,6 +248,34 @@ spec:
   Pruning deletes the `ForgejoBackup`, and
   the finalizer then removes its files. Independently of retention, the files of every
   failed backup are removed right after it fails (see [Files](#files)); its object stays.
+* Retention counts backups, so on its own it would let `retention` "successful" backups of a
+  database or data volume that was silently replaced by an empty one, or of another instance
+  that took the name, push out every good backup. Two guards keep them, locally and in the
+  bucket ([Remote retention](#remote-retention)):
+  * **Identity.** A completed backup records the fingerprint of its instance's `SECRET_KEY`
+    (`status.secretKeyFingerprint`; the manifest of the remote copy has it as
+    `secretKeyFingerprint`). A backup of another identity, for example of an earlier instance of
+    the same name whose `ForgejoBackup`s `retainPolicy: Retain` kept while its Secrets were
+    deleted, is neither counted nor pruned; delete it yourself when you no longer need it. A
+    backup without a fingerprint (taken by an older operator) counts as the instance's.
+  * **Size drop.** When the newest completed scheduled backup's database dump or data archive
+    (`databaseSizeBytes`, `dataSizeBytes`; the data archive only when both backups have one) is
+    less than half the size of the largest of the other completed scheduled backups that
+    retention holds, no completed backup is pruned (failed ones still are), `BackupHealthy` is
+    `False/BackupSizeDropped` with both sizes, and a `BackupSizeDropped` Warning event names the
+    backups. The hold ends when a newer backup is at least half that size again, or when you
+    accept the sizes: annotate the Forgejo with the backup the condition names, and backups that
+    completed before it no longer count for the comparison:
+
+    ```console
+    $ kubectl annotate fj forgejo forgejo.lucas.icu/backup-size-accepted=forgejo-scheduled-20261030030000
+    ```
+
+    First check that the instance still has its data (an empty database or data volume is the
+    case this guard is for; restore from a backup taken before the drop if it does not). A
+    deliberate change can also halve a size: deleting large repositories, or moving files to
+    `spec.objectStorage`. Once retention has pruned the accepted backup the annotation has no
+    effect, so it can stay.
 * A tick that falls while the instance is being upgraded (or while a failed upgrade still
   holds its new image's migration, or while it is created from `spec.restoreFrom`) is deferred
   until that has settled, so a dump is
@@ -268,6 +298,10 @@ spec:
   * `True`/`BackupSucceeded`: the latest scheduled backup succeeded and it is not older
     than two scheduled runs. With `spec.backup.remote`, the message adds "uploaded to
     s3://..." or, while its upload runs, "uploading to s3://...".
+  * `False`/`BackupSizeDropped`: the newest completed scheduled backup (or, with
+    `spec.backup.remote`, its remote copy) is less than half the size of an earlier one, and
+    retention holds (see above). It takes precedence over the other reasons, except
+    `InvalidSchedule`, with which retention does not run.
   * `False`/`BackupFailed`: the latest scheduled backup failed.
   * `False`/`UploadFailed`: the latest scheduled backup succeeded on the backup PVC, but its
     upload to `spec.backup.remote` failed; the message has the reason.
@@ -458,6 +492,28 @@ A restore never changes the SSH host keys: they belong to the instance, not to t
 After losing the namespace or the cluster, use a remote backup and `spec.restoreFrom` instead
 ([Disaster recovery](#disaster-recovery)), which brings the identity back as well.
 
+### Moving to another database or volume
+
+`spec.database.type` and `spec.storage.existingClaim` cannot be changed once the `Forgejo`
+exists (the API server refuses it): Forgejo would start on another database or volume, empty
+or not the instance's, and migrate it. To move an instance:
+
+* **Another database type**: take a backup and delete the `Forgejo` with `retainPolicy: Retain`
+  (the Secrets, the data volume and the backups stay). Create it again with the same name and
+  the new `spec.database`, then restore the database from the backup with a `ForgejoRestore`
+  (`restoreData: false`). For type External, create it with `spec.replicas: 0` and scale it up
+  after the restore, so that Forgejo does not start on the empty database meanwhile. For type
+  CNPG, annotate it with `forgejo.lucas.icu/recreate-database=true`: the operator creates the
+  cluster of an instance that has run only then, and keeps Forgejo stopped until the restore
+  (see the [ForgejoBroken](runbooks/ForgejoBroken.md) runbook). A CNPG cluster `<name>-db`
+  that is no longer used stays until you delete it.
+* **Another data volume**: stop Forgejo (`spec.replicas: 0`), delete the `Forgejo` with
+  `retainPolicy: Retain`, copy the data volume to the new claim, and create the `Forgejo` again
+  with the same name and `spec.storage.existingClaim` set to it. A copied volume carries no
+  identity annotation and is adopted (see [troubleshooting.md](troubleshooting.md#broken-instances)).
+* **Either, from a remote backup**: create a new `Forgejo` with `spec.restoreFrom` and the new
+  settings ([Disaster recovery](#disaster-recovery)).
+
 ## Remote backups
 
 `spec.backup.remote` uploads every backup (scheduled, manual and pre-upgrade) to an
@@ -619,7 +675,7 @@ $ kubectl get fjb forgejo-scheduled-202610 -o jsonpath='{.status.remote}'
   not exported, missing or unusable (see [The key](#the-key)).
 * Events: `UploadStarted`, `BackupUploaded`, `UploadFailed` on the backup;
   `BackupUploaded`, `BackupUploadFailed`, `RemoteBackupPruned`, `RemoteRetentionFailed`,
-  `BackupKeyGenerated`, `BackupKeyMissing` on the `Forgejo`.
+  `BackupSizeDropped`, `BackupKeyGenerated`, `BackupKeyMissing` on the `Forgejo`.
 * Metrics: `forgejo_operator_backup_uploads_total{reason,result}` and
   `forgejo_operator_backup_last_upload_success_timestamp_seconds`.
 * Alerts: `ForgejoBackupUploadFailed` (an upload failed in the last hour) and, with scheduled
@@ -642,6 +698,14 @@ scheduled backup and at least hourly. It never deletes:
 * backups of another instance, e.g. of the same namespace and name in another cluster: a
   recovery drill and production, or the original cluster back after a recovery, each keep their
   own;
+* backups of another identity (`secretKeyFingerprint` of the manifest; one without it counts as
+  the instance's), which are not counted either;
+* any complete scheduled backup while the newest one is less than half the size of another one
+  it holds: the size-drop guard of [local retention](#scheduled-backups-and-retention) applies to
+  the sizes of `db.dump` and `data.tar.gz` in the manifests, with the same
+  `forgejo.lucas.icu/backup-size-accepted` annotation (a new value runs remote retention at
+  once). Its finding is in `status.backup.remote.message` and, unless local retention reports
+  one, in `BackupHealthy`;
 * manual and pre-upgrade backups;
 * a backup whose manifest it cannot read (e.g. encrypted with another key);
 * a backup an unfinished `ForgejoRestore` of any namespace reads, or the `spec.restoreFrom`

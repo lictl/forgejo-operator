@@ -390,11 +390,16 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 	if job.Status.CompletionTime != nil {
 		done = *job.Status.CompletionTime
 	}
+	fingerprint, err := r.secretKeyFingerprint(ctx, b)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	orig := b.DeepCopy()
 	b.Status.Phase = forgejov1.BackupPhaseCompleted
 	b.Status.CompletionTime = &done
 	b.Status.DatabaseSizeBytes = res.DatabaseSizeBytes
 	b.Status.DataSizeBytes = res.DataSizeBytes
+	b.Status.SecretKeyFingerprint = fingerprint
 	b.Status.Message = fmt.Sprintf("Backup completed (database %d bytes, data %d bytes)", res.DatabaseSizeBytes, res.DataSizeBytes)
 	if res.Warnings > 0 {
 		b.Status.Message += fmt.Sprintf("; %d file(s) changed or vanished while archiving", res.Warnings)
@@ -432,6 +437,18 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// secretKeyFingerprint identifies the SECRET_KEY of the backup's instance (Secret
+// "<name>-secrets"), which retention compares with the instance's (see backup.ofIdentity); ""
+// when the Secret is gone.
+func (r *ForgejoBackupReconciler) secretKeyFingerprint(ctx context.Context, b *forgejov1.ForgejoBackup) (string, error) {
+	ref := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Namespace: b.Namespace, Name: b.Spec.ForgejoRef.Name}}
+	sec := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: forgejo.SecretsName(ref)}, sec); err != nil {
+		return "", client.IgnoreNotFound(err)
+	}
+	return forgejo.SecretKeyFingerprint(sec.Data), nil
 }
 
 // waitForDependency keeps the backup Pending until dependencyTimeout, then fails it.

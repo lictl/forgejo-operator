@@ -97,6 +97,13 @@ type ForgejoBackupStatus struct {
 	DataSizeBytes int64 `json:"dataSizeBytes,omitempty"`
 	// +optional
 	IncludesData bool `json:"includesData,omitempty"`
+	// secretKeyFingerprint identifies the SECRET_KEY of the instance when the backup completed
+	// (16 hex digits, as in the manifest of a remote backup and the annotation
+	// forgejo.lucas.icu/identity of the data volume). Retention never prunes a backup of
+	// another identity; one without a fingerprint (taken by an older operator) counts as the
+	// instance's.
+	// +optional
+	SecretKeyFingerprint string `json:"secretKeyFingerprint,omitempty"`
 	// +optional
 	Message string `json:"message,omitempty"`
 	// remote reports the upload of the backup to spec.backup.remote of its instance.

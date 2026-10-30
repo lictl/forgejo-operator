@@ -118,6 +118,29 @@ func TestCompletedBackupDeletesItsJob(t *testing.T) {
 	if jobExists(t, c, job.Name) {
 		t.Error("backup Job kept after its outcome was recorded")
 	}
+	if got.Status.SecretKeyFingerprint != "" {
+		t.Errorf("fingerprint %q recorded without Secret fb-secrets", got.Status.SecretKeyFingerprint)
+	}
+}
+
+// A completed backup records the SECRET_KEY fingerprint of its instance, which retention
+// compares with the instance's own (it never prunes a backup of another identity).
+func TestCompletedBackupRecordsTheIdentity(t *testing.T) {
+	s := scheme(t)
+	b := runningBackup("m1")
+	job := finishedJob(t, s, b.Status.JobName, b, batchv1.JobComplete)
+	pod := jobPod(job.Name, backup.ContainerArchive, 0, `{"databaseSizeBytes":123,"dataSizeBytes":456,"warnings":0}`)
+	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fb-secrets", Namespace: ns},
+		Data: map[string][]byte{forgejo.SecretKeySecretKey: []byte("the-secret-key")}}
+	c := newFakeClient(s, instance(""), b, job, pod, secrets)
+
+	reconcileBackup(t, c, b.Name)
+
+	got := getBackup(t, c, b.Name)
+	if want := forgejo.SecretKeyFingerprint(secrets.Data); got.Status.Phase != forgejov1.BackupPhaseCompleted ||
+		got.Status.SecretKeyFingerprint != want || want == "" {
+		t.Errorf("phase %s, fingerprint %q, want %q", got.Status.Phase, got.Status.SecretKeyFingerprint, want)
+	}
 }
 
 // A failed backup keeps the failing container's output in its message and deletes its Job.

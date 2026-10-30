@@ -894,7 +894,7 @@ func TestRemoteRetentionPrunesOnlyScheduledBackups(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(append(secretObjects(FakeSecrets(remoteNS, "fj-backup-key")), restore)...).Build()
 	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
 
-	if err := runRemoteRetention(ctx, rc, nil, time.Now()); err != nil {
+	if _, err := runRemoteRetention(ctx, rc, nil, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	var left []string
@@ -951,7 +951,7 @@ func TestBackupHealthReportsUploads(t *testing.T) {
 		b.Status.Remote = &forgejov1.RemoteBackupStatus{Phase: tc.phase, Location: "s3://backups/x/", Message: "denied"}
 		f.Status.Conditions = nil
 		rc := &forgejo.ReconcileContext{Instance: f}
-		setHealth(rc, sched, []*forgejov1.ForgejoBackup{b}, time.Now(), nil, keyProblem{})
+		setHealth(rc, sched, []*forgejov1.ForgejoBackup{b}, time.Now(), nil, keyProblem{}, "")
 		c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionBackupHealthy)
 		if c == nil || c.Status != tc.status || c.Reason != tc.reason || !strings.Contains(c.Message, tc.inMsg) {
 			t.Errorf("%s: %+v", tc.phase, c)
@@ -1009,7 +1009,7 @@ func TestBackupKeyProblemsAreReported(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
 			rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
 			key := summarizeRemote(ctx, rc, nil)
-			setHealth(rc, sched, []*forgejov1.ForgejoBackup{tc.latest}, time.Now(), nil, key)
+			setHealth(rc, sched, []*forgejov1.ForgejoBackup{tc.latest}, time.Now(), nil, key, "")
 			cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionBackupHealthy)
 			if cond == nil || cond.Reason != tc.reason || !strings.Contains(cond.Message, tc.inMsg) {
 				t.Fatalf("BackupHealthy %+v", cond)
