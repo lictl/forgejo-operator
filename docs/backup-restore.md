@@ -492,6 +492,28 @@ s3://<bucket>/<prefix>/<namespace>/<name>/<backup>-<uid>/
 ├── db.dump.bin        # the files of the backup PVC, encrypted (rclone crypt appends .bin)
 ├── data.tar.gz.bin    # (when the backup has a data archive)
 ├── identity.json.bin  # the instance's identity, see below
+### Moving to another database or volume
+
+`spec.database.type` and `spec.storage.existingClaim` cannot be changed once the `Forgejo`
+exists (the API server refuses it): Forgejo would start on another database or volume, empty
+or not the instance's, and migrate it. To move an instance:
+
+* **Another database type**: take a backup and delete the `Forgejo` with `retainPolicy: Retain`
+  (the Secrets, the data volume and the backups stay). Create it again with the same name and
+  the new `spec.database`, then restore the database from the backup with a `ForgejoRestore`
+  (`restoreData: false`). For type External, create it with `spec.replicas: 0` and scale it up
+  after the restore, so that Forgejo does not start on the empty database meanwhile. For type
+  CNPG, annotate it with `forgejo.lucas.icu/recreate-database=true`: the operator creates the
+  cluster of an instance that has run only then, and keeps Forgejo stopped until the restore
+  (see the [ForgejoBroken](runbooks/ForgejoBroken.md) runbook). A CNPG cluster `<name>-db`
+  that is no longer used stays until you delete it.
+* **Another data volume**: stop Forgejo (`spec.replicas: 0`), delete the `Forgejo` with
+  `retainPolicy: Retain`, copy the data volume to the new claim, and create the `Forgejo` again
+  with the same name and `spec.storage.existingClaim` set to it. A copied volume carries no
+  identity annotation and is adopted (see [troubleshooting.md](troubleshooting.md#broken-instances)).
+* **Either, from a remote backup**: create a new `Forgejo` with `spec.restoreFrom` and the new
+  settings ([Disaster recovery](#disaster-recovery)).
+
 └── manifest.json.bin  # uploaded last: the backup is complete only when it exists
 ```
 

@@ -698,11 +698,21 @@ spec:
                     type: object
                   type:
                     default: CNPG
-                    description: DatabaseType selects the PostgreSQL provider.
+                    description: |-
+                      type of the database. It cannot be changed once the Forgejo exists: Forgejo would start on
+                      another, empty database and migrate it. See docs/backup-restore.md, "Moving to another
+                      database or volume".
                     enum:
                     - CNPG
                     - External
                     type: string
+                    x-kubernetes-validations:
+                    - message: 'database.type cannot be changed: Forgejo would start
+                        on another, empty database. To move to another database, delete
+                        the Forgejo with storage.retainPolicy Retain, create it again
+                        with the new type and restore the database from a backup (ForgejoRestore),
+                        or create a new Forgejo from a remote backup (spec.restoreFrom)'
+                      rule: self == oldSelf
                 type: object
                 x-kubernetes-validations:
                 - fieldPath: .external
@@ -3272,8 +3282,10 @@ spec:
                       type: string
                     type: array
                   existingClaim:
-                    description: existingClaim uses a pre-provisioned PVC instead
-                      of creating one.
+                    description: |-
+                      existingClaim uses a pre-provisioned PVC instead of creating one. It can only be set when
+                      the Forgejo is created: another claim would start Forgejo on another, possibly empty
+                      volume. See docs/backup-restore.md, "Moving to another database or volume".
                     type: string
                   retainPolicy:
                     default: Retain
@@ -3298,6 +3310,17 @@ spec:
                   storageClassName:
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - fieldPath: .existingClaim
+                  message: 'storage.existingClaim cannot be set, changed or removed
+                    after creation: Forgejo would start on another, possibly empty
+                    volume. To move the data, delete the Forgejo with storage.retainPolicy
+                    Retain, copy the data volume to the new claim and create the Forgejo
+                    again with it, or create a new Forgejo from a remote backup (spec.restoreFrom)'
+                  rule: (has(self.existingClaim) && size(self.existingClaim) > 0)
+                    == (has(oldSelf.existingClaim) && size(oldSelf.existingClaim)
+                    > 0) && (!has(self.existingClaim) || !has(oldSelf.existingClaim)
+                    || self.existingClaim == oldSelf.existingClaim)
               tls:
                 description: |-
                   tls says that Forgejo is served over HTTPS (ROOT_URL becomes https) and can request the
