@@ -123,23 +123,24 @@ func TestCompletedBackupDeletesItsJob(t *testing.T) {
 	}
 }
 
-// A completed backup records the SECRET_KEY fingerprint of its instance, which retention
-// compares with the instance's own (it never prunes a backup of another identity).
-func TestCompletedBackupRecordsTheIdentity(t *testing.T) {
+// A backup records the SECRET_KEY fingerprint of its instance when its Job starts (the identity
+// the dump was taken with), which restores and retention compare with the instance's own. A
+// Secret that changed while the Job ran does not change it.
+func TestCompletedBackupKeepsTheIdentityOfItsStart(t *testing.T) {
 	s := scheme(t)
 	b := runningBackup("m1")
+	started := forgejo.SecretKeyFingerprint(map[string][]byte{forgejo.SecretKeySecretKey: []byte("the-secret-key")})
+	b.Status.SecretKeyFingerprint = started
 	job := finishedJob(t, s, b.Status.JobName, b, batchv1.JobComplete)
 	pod := jobPod(job.Name, backup.ContainerArchive, 0, `{"databaseSizeBytes":123,"dataSizeBytes":456,"warnings":0}`)
-	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fb-secrets", Namespace: ns},
-		Data: map[string][]byte{forgejo.SecretKeySecretKey: []byte("the-secret-key")}}
+	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsName, Namespace: ns},
+		Data: map[string][]byte{forgejo.SecretKeySecretKey: []byte("another-secret-key")}}
 	c := newFakeClient(s, instance(""), b, job, pod, secrets)
 
 	reconcileBackup(t, c, b.Name)
 
-	got := getBackup(t, c, b.Name)
-	if want := forgejo.SecretKeyFingerprint(secrets.Data); got.Status.Phase != forgejov1.BackupPhaseCompleted ||
-		got.Status.SecretKeyFingerprint != want || want == "" {
-		t.Errorf("phase %s, fingerprint %q, want %q", got.Status.Phase, got.Status.SecretKeyFingerprint, want)
+	if got := getBackup(t, c, b.Name); got.Status.Phase != forgejov1.BackupPhaseCompleted || got.Status.SecretKeyFingerprint != started {
+		t.Errorf("phase %s, fingerprint %q, want %q", got.Status.Phase, got.Status.SecretKeyFingerprint, started)
 	}
 }
 

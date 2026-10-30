@@ -61,6 +61,24 @@ type ForgejoRestoreSpec struct {
 	// restoreData replaces the data volume with the archive (if the backup has one). Defaults to true.
 	// +optional
 	RestoreData *bool `json:"restoreData,omitempty"`
+
+	// allowIdentityMismatch restores the database of a backup that was taken with another
+	// SECRET_KEY than the instance has (of another instance, or before its identity Secret was
+	// replaced). Without it such a restore fails before anything is changed (reason
+	// IdentityMismatch): Forgejo could not decrypt the two-factor secrets, Actions secrets and
+	// mirror credentials of the restored database. A backup that records no fingerprint is
+	// restored. To recreate a lost instance with its identity, create a new Forgejo with
+	// spec.restoreFrom instead.
+	// +optional
+	AllowIdentityMismatch bool `json:"allowIdentityMismatch,omitempty"`
+
+	// preRestoreBackup takes a ForgejoBackup of what the restore replaces (reason PreRestore,
+	// never pruned), once Forgejo has stopped and before anything is changed; when that backup
+	// fails, the restore fails and Forgejo starts again unchanged. Only an instance that has run
+	// (status.image) and is not Broken or being created from spec.restoreFrom is backed up.
+	// Defaults to true.
+	// +optional
+	PreRestoreBackup *bool `json:"preRestoreBackup,omitempty"`
 }
 
 // ForgejoRestoreStatus defines the observed state of ForgejoRestore.
@@ -83,6 +101,10 @@ type ForgejoRestoreStatus struct {
 	// remote describes the remote backup of spec.remote, read from its manifest.
 	// +optional
 	Remote *RestoreRemoteStatus `json:"remote,omitempty"`
+	// preRestoreBackupName is the ForgejoBackup of the instance taken before this restore
+	// changed it (spec.preRestoreBackup).
+	// +optional
+	PreRestoreBackupName string `json:"preRestoreBackupName,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	// +optional

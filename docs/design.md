@@ -215,7 +215,12 @@ workload update.
 2. The restore controller starts Job `<restore>-restore` only after the persisted
    `status.backup.activeRestore` names it, the Deployment is at 0 (spec and status), no server
    or cron runner pod is left (nor a cron runner StatefulSet of the instance that still wants one), no backup runs, and no other restore's Job or pod is active. It gives up
-   after 15 minutes.
+   after 15 minutes. Then, for an instance that has run and is not Broken, it takes the
+   pre-restore backup `<restore>-pre-restore-<uid>` (`reason: PreRestore`, unless
+   `spec.preRestoreBackup` is false) and starts the Job once that has completed; a failed one
+   fails the restore unchanged. That backup does not wait for its restore, nor for restores
+   that have not started (they wait for that restore), like the cold backup of a PostgreSQL
+   upgrade.
 3. When the Job succeeds, the restore moves to `ScalingUp` and maintenance ends. With HA the
    `high-availability` step first empties Valkey for it (its queues and cache are from after the
    backup point), holding the workload at zero meanwhile; a database-only restore's Job removes

@@ -225,11 +225,17 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	}
 	// The cold backup of a PostgreSQL major upgrade in flight does not wait for restores that
 	// have not started (phase "" or Pending): they wait for the upgrade (see the restore
-	// controller's begin), which waits for this backup.
+	// controller's begin), which waits for this backup. Neither does the pre-restore backup of
+	// a restore, which keeps Forgejo stopped until this backup is done: they wait for that
+	// restore, and the restore itself does not count.
 	ownDatabaseUpgradeBackup := forgejo.DatabaseUpgradeInFlight(f) && forgejo.DatabaseUpgrade(f).BackupName == b.Name
+	ownRestore := backup.PreRestoreOf(b, restores)
 	for i := range restores {
 		rs := &restores[i]
-		if ownDatabaseUpgradeBackup && (rs.Status.Phase == "" || rs.Status.Phase == forgejov1.RestorePhasePending) {
+		if ownRestore != nil && rs.Name == ownRestore.Name {
+			continue
+		}
+		if (ownDatabaseUpgradeBackup || ownRestore != nil) && (rs.Status.Phase == "" || rs.Status.Phase == forgejov1.RestorePhasePending) {
 			continue
 		}
 		if backup.BlocksBackups(rs) {
@@ -277,6 +283,14 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	// pg_dump of the running server's major (the old one during a PostgreSQL major upgrade), so
 	// that the dump can be restored into a server of that major.
 	pgImage := forgejo.RunningPostgresImage(f)
+	// The SECRET_KEY the dumped database is encrypted with; restores compare it with theirs.
+	identity := ""
+	sec := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err == nil {
+		identity = forgejo.SecretKeyFingerprint(sec.Data)
+	} else if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
 	now := metav1.Now()
 	job, err := backup.BackupJob(backup.JobInput{
 		Scheme:        r.Scheme,
@@ -311,6 +325,7 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	b.Status.Path = "/" + b.Name
 	b.Status.ForgejoImage = image
 	b.Status.PostgresImage = pgImage
+	b.Status.SecretKeyFingerprint = identity
 	b.Status.IncludesData = includeData
 	b.Status.Message = fmt.Sprintf("Backup job %s is running", job.Name)
 	setCondition(&b.Status.Conditions, b.Generation, metav1.ConditionFalse, "Running", b.Status.Message)
@@ -390,16 +405,11 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 	if job.Status.CompletionTime != nil {
 		done = *job.Status.CompletionTime
 	}
-	fingerprint, err := r.secretKeyFingerprint(ctx, b)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
 	orig := b.DeepCopy()
 	b.Status.Phase = forgejov1.BackupPhaseCompleted
 	b.Status.CompletionTime = &done
 	b.Status.DatabaseSizeBytes = res.DatabaseSizeBytes
 	b.Status.DataSizeBytes = res.DataSizeBytes
-	b.Status.SecretKeyFingerprint = fingerprint
 	b.Status.Message = fmt.Sprintf("Backup completed (database %d bytes, data %d bytes)", res.DatabaseSizeBytes, res.DataSizeBytes)
 	if res.Warnings > 0 {
 		b.Status.Message += fmt.Sprintf("; %d file(s) changed or vanished while archiving", res.Warnings)
@@ -437,18 +447,6 @@ func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.Forgej
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	return ctrl.Result{}, nil
-}
-
-// secretKeyFingerprint identifies the SECRET_KEY of the backup's instance (Secret
-// "<name>-secrets"), which retention compares with the instance's (see backup.ofIdentity); ""
-// when the Secret is gone.
-func (r *ForgejoBackupReconciler) secretKeyFingerprint(ctx context.Context, b *forgejov1.ForgejoBackup) (string, error) {
-	ref := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Namespace: b.Namespace, Name: b.Spec.ForgejoRef.Name}}
-	sec := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: forgejo.SecretsName(ref)}, sec); err != nil {
-		return "", client.IgnoreNotFound(err)
-	}
-	return forgejo.SecretKeyFingerprint(sec.Data), nil
 }
 
 // waitForDependency keeps the backup Pending until dependencyTimeout, then fails it.

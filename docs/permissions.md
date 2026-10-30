@@ -49,7 +49,7 @@ whose `pg_upgrade` did not start ([upgrades.md](upgrades.md#postgresql-major-upg
 | `gateway.networking.k8s.io` | `httproutes`, `tcproutes`, `referencegrants` | get, create, update, delete | Read live, never listed or watched (see [networking.md](networking.md#permissions)) |
 | `cert-manager.io` | `certificates` | get, create, update, delete | Read live, never listed or watched (see [networking.md](networking.md#permissions)) |
 | `forgejo.lucas.icu` | `forgejos` | get, list, watch, patch | patch: removes the `retry-upgrade` annotation |
-| | `forgejobackups` | get, list, watch, create, update, patch, delete | Scheduled and pre-upgrade backups, retention (delete), the finalizer (update), owner references under `retainPolicy` (patch) |
+| | `forgejobackups` | get, list, watch, create, update, patch, delete | Scheduled, pre-upgrade and pre-restore backups, retention (delete), the finalizer (update), owner references under `retainPolicy` (patch) |
 | | `forgejorestores` | get, list, watch, create, update | Rollback restores and `spec.restoreFrom`; the finalizer |
 | | `forgejorunners` | get, list, watch, patch | The finalizer |
 | | `*/status` | patch | Status, always one merge patch with an optimistic lock |
