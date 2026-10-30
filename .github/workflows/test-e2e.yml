@@ -23,9 +23,22 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      # The checksums are those published as kind-linux-<arch>.sha256sum next to each binary of
+      # the release. Update the version and both checksums together.
+      - name: Install kind
+        env:
+          KIND_VERSION: v0.33.0
+          KIND_SHA256_AMD64: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+          KIND_SHA256_ARM64: 20022bee6cfcd5086cb7234d218e3454e6090022f2a8f55d1fa7fcf42c3867a2
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          arch="$(go env GOARCH)"
+          case "$arch" in
+            amd64) sha256="$KIND_SHA256_AMD64" ;;
+            arm64) sha256="$KIND_SHA256_ARM64" ;;
+            *) echo "No kind checksum for $arch" >&2; exit 1 ;;
+          esac
+          curl -fsSLo ./kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-${arch}"
+          echo "${sha256}  kind" | sha256sum --check --strict -
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 

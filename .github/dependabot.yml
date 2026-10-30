@@ -1,0 +1,49 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # Kubernetes libraries must move together; controller-runtime pins its k8s.io minor.
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+      # Everything else: one pull request for minor and patch updates.
+      go-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: build
+      include: scope
+    ignore:
+      # The Go toolchain is pinned in go.mod, the Dockerfile, hack/ and the docs. It is bumped in
+      # all of them at once, by hand, so a Dockerfile-only pull request would only make them differ.
+      - dependency-name: golang
