@@ -1,324 +1,129 @@
-# forgejo-operator - AI Agent Guide
-
-## Project Structure
-
-**Single-group layout (default):**
-```
-cmd/main.go                    Manager entry (registers controllers/webhooks)
-api/<version>/*_types.go       CRD schemas (+kubebuilder markers)
-api/<version>/zz_generated.*   Auto-generated (DO NOT EDIT)
-internal/controller/*          Reconciliation logic
-internal/webhook/*             Validation/defaulting (if present)
-config/crd/bases/*             Generated CRDs (DO NOT EDIT)
-config/rbac/role.yaml          Generated RBAC (DO NOT EDIT)
-config/samples/*               Example CRs (edit these)
-Makefile                       Build/test/deploy commands
-PROJECT                        Kubebuilder metadata Auto-generated (DO NOT EDIT)
-```
-
-**Multi-group layout** (for projects with multiple API groups):
-```
-api/<group>/<version>/*_types.go       CRD schemas by group
-internal/controller/<group>/*          Controllers by group
-internal/webhook/<group>/<version>/*   Webhooks by group and version (if present)
-```
-
-Multi-group layout organizes APIs by group name (e.g., `batch`, `apps`). Check the `PROJECT` file for `multigroup: true`.
-
-**To convert to multi-group layout:**
-1. Run: `kubebuilder edit --multigroup=true`
-2. Move APIs: `mkdir -p api/<group> && mv api/<version> api/<group>/`
-3. Move controllers: `mkdir -p internal/controller/<group> && mv internal/controller/*.go internal/controller/<group>/`
-4. Move webhooks (if present): `mkdir -p internal/webhook/<group> && mv internal/webhook/<version> internal/webhook/<group>/`
-5. Update import paths in all files
-6. Fix `path` in `PROJECT` file for each resource
-7. Update test suite CRD paths (add one more `..` to relative paths)
-
-## Critical Rules
-
-### Never Edit These (Auto-Generated)
-- `config/crd/bases/*.yaml` - from `make manifests`
-- `config/rbac/role.yaml` - from `make manifests`
-- `config/webhook/manifests.yaml` - from `make manifests`
-- `**/zz_generated.*.go` - from `make generate`
-- `PROJECT` - from `kubebuilder [OPTIONS]`
-
-### Never Remove Scaffold Markers
-Do NOT delete `// +kubebuilder:scaffold:*` comments. CLI injects code at these markers.
-
-### Keep Project Structure
-Do not move files around. The CLI expects files in specific locations.
-
-### Always Use CLI Commands
-Always use `kubebuilder create api` and `kubebuilder create webhook` to scaffold. Do NOT create files manually.
-
-### E2E Tests Require an Isolated Kind Cluster
-The e2e tests are designed to validate the solution in an isolated environment (similar to GitHub Actions CI).
-Ensure you run them against a dedicated [Kind](https://kind.sigs.k8s.io/) cluster (not your “real” dev/prod cluster).
-
-## After Making Changes
-
-Use the [commit message rules](docs/commits.md) for new commits. A breaking
-change needs `!` and a `BREAKING CHANGE:` footer; release notes are drafted
-from these messages and reviewed into `CHANGELOG.md` before release.
-
-**After editing `*_types.go` or markers:**
-```
-make manifests  # Regenerate CRDs/RBAC from markers
-make generate   # Regenerate DeepCopy methods
-```
-
-**After editing `*.go` files:**
-```
-make lint-fix   # Auto-fix code style
-make test       # Run unit tests
-```
-
-## CLI Commands Cheat Sheet
-
-### Create API (your own types)
-```bash
-kubebuilder create api --group <group> --version <version> --kind <Kind>
-```
-
-### Deploy Image Plugin (scaffold to deploy/manage ANY container image)
-
-Generate a controller that deploys and manages a container image (nginx, redis, memcached, your app, etc.):
-
-```bash
-# Example: deploying memcached
-kubebuilder create api --group example.com --version v1alpha1 --kind Memcached \
-  --image=memcached:alpine \
-  --plugins=deploy-image.go.kubebuilder.io/v1-alpha
-```
-
-Scaffolds good-practice code: reconciliation logic, status conditions, finalizers, RBAC. Use as a reference implementation.
-
-
-### Create Webhooks
-```bash
-# Validation + defaulting
-kubebuilder create webhook --group <group> --version <version> --kind <Kind> \
-  --defaulting --programmatic-validation
-
-# Conversion webhook (for multi-version APIs)
-kubebuilder create webhook --group <group> --version v1 --kind <Kind> \
-  --conversion --spoke v2
-```
-
-### Controller for Core Kubernetes Types
-```bash
-# Watch Pods
-kubebuilder create api --group core --version v1 --kind Pod \
-  --controller=true --resource=false
-
-# Watch Deployments
-kubebuilder create api --group apps --version v1 --kind Deployment \
-  --controller=true --resource=false
-```
-
-### Controller for External Types (e.g., from other operators)
-
-Watch resources from external APIs (cert-manager, Argo CD, Istio, etc.):
-
-```bash
-# Example: watching cert-manager Certificate resources
-kubebuilder create api \
-  --group cert-manager --version v1 --kind Certificate \
-  --controller=true --resource=false \
-  --external-api-path=github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1 \
-  --external-api-domain=io \
-  --external-api-module=github.com/cert-manager/cert-manager
-```
-
-**Note:** Use `--external-api-module=<module>@<version>` only if you need a specific version. Otherwise, omit `@<version>` to use what's in go.mod.
-
-### Webhook for External Types
-
-```bash
-# Example: validating external resources
-kubebuilder create webhook \
-  --group cert-manager --version v1 --kind Issuer \
-  --defaulting \
-  --external-api-path=github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1 \
-  --external-api-domain=io \
-  --external-api-module=github.com/cert-manager/cert-manager
-```
-
-## Testing & Development
-
-```bash
-make test              # Run unit tests (uses envtest: real K8s API + etcd)
-make run               # Run locally (uses current kubeconfig context)
-```
-
-Tests use **Ginkgo + Gomega** (BDD style). Check `suite_test.go` for setup.
-
-## Deployment Workflow
-
-```bash
-# 1. Regenerate manifests
-make manifests generate
-
-# 2. Build & deploy
-export IMG=<registry>/<project>:tag
-make docker-build docker-push IMG=$IMG  # Or: kind load docker-image $IMG --name <cluster>
-make deploy IMG=$IMG
-
-# 3. Test
-kubectl apply -k config/samples/
-
-# 4. Debug
-kubectl logs -n <project>-system deployment/<project>-controller-manager -c manager -f
-```
-
-### API Design
-
-**Key markers for** `api/<version>/*_types.go`:
-
-```go
-// +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Namespaced
-// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=".status.conditions[?(@.type=='Ready')].status"
-
-// On fields:
-// +kubebuilder:validation:Required
-// +kubebuilder:validation:Minimum=1
-// +kubebuilder:validation:MaxLength=100
-// +kubebuilder:validation:Pattern="^[a-z]+$"
-// +kubebuilder:default="value"
-```
-
-- **Use** `metav1.Condition` for status (not custom string fields)
-- **Use predefined types**: `metav1.Time` instead of `string` for dates
-- **Follow K8s API conventions**: Standard field names (`spec`, `status`, `metadata`)
-
-### Controller Design
-
-**RBAC markers in** `internal/controller/*_controller.go`:
-
-```go
-// +kubebuilder:rbac:groups=mygroup.example.com,resources=mykinds,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=mygroup.example.com,resources=mykinds/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=mygroup.example.com,resources=mykinds/finalizers,verbs=update
-// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-```
-
-**Implementation rules:**
-- **Idempotent reconciliation**: Safe to run multiple times
-- **Re-fetch before updates**: `r.Get(ctx, req.NamespacedName, obj)` before `r.Update` to avoid conflicts
-- **Structured logging**: `log := log.FromContext(ctx); log.Info("msg", "key", val)`
-- **Owner references**: Enable automatic garbage collection (`SetControllerReference`)
-- **Watch secondary resources**: Use `.Owns()` or `.Watches()`, not just `RequeueAfter`
-- **Finalizers**: Clean up external resources (buckets, VMs, DNS entries)
-
-### Logging
-
-**Follow Kubernetes logging message style guidelines:**
-
-- Start from a capital letter
-- Do not end the message with a period
-- Active voice: subject present (`"Deployment could not create Pod"`) or omitted (`"Could not create Pod"`)
-- Past tense: `"Could not delete Pod"` not `"Cannot delete Pod"`
-- Specify object type: `"Deleted Pod"` not `"Deleted"`
-- Balanced key-value pairs
-
-```go
-log.Info("Starting reconciliation")
-log.Info("Created Deployment", "name", deploy.Name)
-log.Error(err, "Failed to create Pod", "name", name)
-```
-
-**Reference:** https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md#message-style-guidelines
-
-### Webhooks
-- **Create all types together**: `--defaulting --programmatic-validation --conversion`
-- **When`--force`is used**: Backup custom logic first, then restore after scaffolding
-- **For multi-version APIs**: Use hub-and-spoke pattern (`--conversion --spoke v2`)
-  - Hub version: Usually oldest stable version (v1)
-  - Spoke versions: Newer versions that convert to/from hub (v2, v3)
-  - Example: `--group crew --version v1 --kind Captain --conversion --spoke v2` (v1 is hub, v2 is spoke)
-
-### Learning from Examples
-
-The **deploy-image plugin** scaffolds a complete controller following good practices. Use it as a reference implementation:
-
-```bash
-kubebuilder create api --group example --version v1alpha1 --kind MyApp \
-  --image=<your-image> --plugins=deploy-image.go.kubebuilder.io/v1-alpha
-```
-
-Generated code includes: status conditions (`metav1.Condition`), finalizers, owner references, events, idempotent reconciliation.
-
-## Distribution Options
-
-### Option 1: YAML Bundle (Kustomize)
-
-```bash
-# Generate dist/install.yaml from Kustomize manifests
-make build-installer IMG=<registry>/<project>:tag
-```
-
-**Key points:**
-- The `dist/install.yaml` is generated from Kustomize manifests (CRDs, RBAC, Deployment)
-- Commit this file to your repository for easy distribution
-- Users only need `kubectl` to install (no additional tools required)
-
-**Example:** Users install with a single command:
-```bash
-kubectl apply -f https://raw.githubusercontent.com/<org>/<repo>/<tag>/dist/install.yaml
-```
-
-### Option 2: Helm Chart
-
-```bash
-kubebuilder edit --plugins=helm/v2-alpha                      # Generates dist/chart/ (default)
-kubebuilder edit --plugins=helm/v2-alpha --output-dir=charts  # Generates charts/chart/
-```
-
-**For development:**
-```bash
-make helm-deploy IMG=<registry>/<project>:<tag>          # Deploy manager via Helm
-make helm-deploy IMG=$IMG HELM_EXTRA_ARGS="--set ..."    # Deploy with custom values
-make helm-status                                         # Show release status
-make helm-uninstall                                      # Remove release
-make helm-history                                        # View release history
-make helm-rollback                                       # Rollback to previous version
-```
-
-**For end users/production:**
-```bash
-helm install my-release ./<output-dir>/chart/ --namespace <ns> --create-namespace
-```
-
-**Important:** If you add webhooks or modify manifests after initial chart generation:
-1. Backup any customizations in `<output-dir>/chart/values.yaml` and `<output-dir>/chart/manager/manager.yaml`
-2. Re-run: `kubebuilder edit --plugins=helm/v2-alpha --force` (use same `--output-dir` if customized)
-3. Manually restore your custom values from the backup
-
-### Publish Container Image
-
-```bash
-export IMG=<registry>/<project>:<version>
-make docker-build docker-push IMG=$IMG
-```
-
-## References
-
-### Essential Reading
-- **Kubebuilder Book**: https://book.kubebuilder.io (comprehensive guide)
-- **controller-runtime FAQ**: https://github.com/kubernetes-sigs/controller-runtime/blob/main/FAQ.md (common patterns and questions)
-- **Good Practices**: https://book.kubebuilder.io/reference/good-practices.html (why reconciliation is idempotent, status conditions, etc.)
-- **Logging Conventions**: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md#message-style-guidelines (message style, verbosity levels)
-
-### API Design & Implementation
-- **API Conventions**: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md
-- **Operator Pattern**: https://kubernetes.io/docs/concepts/extend-kubernetes/operator/
-- **Markers Reference**: https://book.kubebuilder.io/reference/markers.html
-
-### Tools & Libraries
-- **controller-runtime**: https://github.com/kubernetes-sigs/controller-runtime
-- **controller-tools**: https://github.com/kubernetes-sigs/controller-tools
-- **Kubebuilder Repo**: https://github.com/kubernetes-sigs/kubebuilder
+# forgejo-operator: agent guide
+
+Rules that are specific to this repository. General Go, Kubebuilder and Kubernetes
+practice is assumed. [docs/design.md](docs/design.md) is the architecture contract;
+[CONTRIBUTING.md](CONTRIBUTING.md) lists what a pull request needs.
+
+## Layout
+
+| Path | Contents |
+|------|----------|
+| `api/v1alpha1` | `Forgejo`, `ForgejoBackup`, `ForgejoRestore`, `ForgejoRunner` (group `forgejo.lucas.icu`) |
+| `internal/controller` | Controllers; `forgejo_controller.go` holds the reconcile step table |
+| `internal/forgejo` | Shared helpers: names, labels, `ReconcileContext`, version table, cache scopes, metrics |
+| `internal/core` | Identity, secrets, database, storage, `app.ini`, workload, Services, routes, TLS, status |
+| `internal/backup` | Backups, restores, retention and maintenance mode |
+| `internal/upgrade` | Forgejo and PostgreSQL major upgrades, Forgejo rollback, version support |
+| `internal/autopilot` | Valkey HA, scaling, tuning, self-healing, volume growth |
+| `internal/observability` | ServiceMonitor, alert rules, dashboard, health and statistics probes |
+| `internal/runner` | Objects and Forgejo API calls of a `ForgejoRunner` |
+| `internal/rclone`, `internal/s3` | rclone crypt file format; minimal S3 bucket check |
+| `config/samples` | Example of each kind, validated by `TestSamplesAreValid` |
+| `charts/forgejo-operator` | Helm chart, maintained by hand |
+| `test/e2e/checklists` | End-to-end checklists that an agent runs against a local cluster |
+| `test/prometheus` | Rendered alert rules and their promtool unit tests |
+| `docs/runbooks` | One runbook per alert |
+
+## Generated and copied files
+
+- `config/crd/bases/*`, `config/rbac/role.yaml` and `**/zz_generated.*.go` come from
+  `make manifests generate`. `test/prometheus/rules/*` and `test/prometheus/unit-rules/*` come
+  from `make test-rules`, or without docker from
+  `go test ./internal/observability -run TestPrometheusRuleFiles -args -update-rules`.
+  `PROJECT` comes from the kubebuilder CLI. Do not edit any of them by hand.
+- `make test` runs `make manifests generate` first, and CI fails when that leaves the tree
+  dirty, so commit what it regenerates.
+- `charts/forgejo-operator/crds/` is a copy of `config/crd/bases/` (CI diffs them). Copy the
+  files again after an API change.
+- `charts/forgejo-operator/templates/rbac/manager-role.yaml` and `volume-usage.yaml` carry the
+  rules of `config/rbac/role.yaml` and `config/rbac/volume_usage_role.yaml`. Nothing checks
+  them, so update them by hand. Do not regenerate the chart with the Kubebuilder Helm plugin.
+- `make deploy` and `make deploy-local` rewrite the image in
+  `config/manager/kustomization.yaml`; do not commit that change.
+
+## Design rules
+
+Details and reasons are in [docs/design.md](docs/design.md).
+
+- A `Forgejo` is reconciled by the step table in `internal/controller/forgejo_controller.go`.
+  A step belongs to one feature package, names the steps it needs and passes outputs through
+  `ReconcileContext`. It changes the status only in memory; the pipeline patches it once at the
+  end of the pass. Keep the step table in docs/design.md in sync.
+- The operator never deletes data. Data and backup PVCs, the CNPG Cluster, scheduled and
+  pre-upgrade backups and the identity Secrets get an owner reference only with
+  `spec.storage.retainPolicy: Delete`; manual backups and `<name>-backup-key` never do.
+- Report, don't repair: when a repair could lose data or identity (identity Secrets, data
+  PVC, CNPG Cluster, a PostgreSQL upgrade that may have changed the data), set `Broken` with
+  `rc.SetBroken` and let a person act. Never generate secrets or create an empty volume or
+  database for an instance that has run (`rc.IdentityInitialized`). A step clears only its own
+  reasons (`rc.ClearBroken`); a step that backs up, prunes or grows volumes sets
+  `waitWhileBroken`.
+- Admission checks are OpenAPI markers and CEL rules in `api/v1alpha1`; there are no webhooks.
+  Each rule gets a case in `api/v1alpha1/validation_test.go`, and an API change updates
+  `config/samples`.
+- Names come from `internal/forgejo/names.go` (`internal/runner/names.go` for runners). Child
+  objects carry `forgejo.Labels` (`runner.Labels` for runners): Secrets, ConfigMaps, Pods,
+  Jobs, Deployments, StatefulSets and Services without them are invisible to the cache
+  (`forgejo.CacheScopes`). Frequent Lists select on `app.kubernetes.io/name`, or they go to
+  the API server. Read through `rc.APIReader` where a stale cache could make a step create or
+  generate something.
+- CNPG, prometheus-operator, Gateway API, cert-manager and metrics-server are optional. Check
+  `rc.HasAPI` or `rc.FirstAPI` before touching their objects, use local mirror types or
+  `unstructured.Unstructured`, and add no Go module dependency on them.
+- `forgejo.Versions` (`internal/forgejo/versions.go`) is the one table of Forgejo majors.
+  Rendering code reads `rc.Layout.Traits` and never compares major numbers. When
+  `make forgejo-versions` reports a stale table, follow
+  [docs/versions.md](docs/versions.md) and the workflow
+  `.claude/workflows/forgejo-new-version.js`.
+- The bundled CNPG database stays a single instance; replicated PostgreSQL is
+  `spec.database.type: External`.
+- Every alert needs a runbook in `docs/runbooks/` and a firing and a non-firing promtool case in
+  `test/prometheus/`.
+- An RBAC marker change also updates [docs/permissions.md](docs/permissions.md).
+  `internal/forgejo/rbac_test.go` checks the namespaced overlay and keeps `pods/exec` out of
+  the manager role.
+- Feature packages test with `testing` and the fake client; Ginkgo and envtest are used only
+  in `internal/controller`.
+- New log messages follow the
+  [Kubernetes message style](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md#message-style-guidelines).
+- A behavior change updates, in the same change, the docs that describe it: the step table in
+  docs/design.md, the feature page, docs/permissions.md, runbooks.
+
+## Checks
+
+| Change | Run |
+|--------|-----|
+| Go code | `make lint test` |
+| API or RBAC markers | `make manifests generate`, then refresh the chart copies above |
+| Alert rules | `make test-rules` (needs docker; GitHub CI does not run promtool) |
+| Chart | `helm lint --strict charts/forgejo-operator` and `helm template forgejo-operator charts/forgejo-operator --include-crds` |
+
+Unit tests and envtest touch no cluster. `make test-e2e` needs Kind and docker; it creates
+its own Kind cluster and deletes it afterwards. The checklists and every target that deploys,
+installs or uninstalls (`make run`, `install`, `deploy`, `deploy-local`, `helm-deploy` and
+their counterparts) use the current kubeconfig. Do not trust the current context: export
+`KUBECONFIG` to a file made with
+`kubectl config view --minify --flatten --context <local cluster>`, so it holds only a
+dedicated local cluster, never a real or production one.
+
+## Review every chunk
+
+When you finish implementing a chunk of work (a fix, a reconcile step, a feature slice:
+anything you would commit on its own), review it before you commit it or start the next one:
+
+1. Run the checks above.
+2. Spawn a fresh sub-agent to review the chunk: a new agent for each chunk, not a fork of your
+   conversation. Give it the base to diff against (new files included), what the change is
+   meant to do and the parts of docs/design.md it must respect, but not your own conclusions
+   about it. Tell it to report findings and not to edit files.
+3. Fix the issues it finds. When a finding is wrong, leave the code and say why in your final
+   message.
+4. Run the checks again.
+
+If you cannot spawn agents yourself (you are a sub-agent), say in your final message that the
+chunk is not reviewed yet, so that the agent that launched you has it reviewed.
+
+## Commits
+
+Follow [docs/commits.md](docs/commits.md) (Conventional Commits). Mark a breaking change with
+`!` and a `BREAKING CHANGE:` footer; release notes are drafted from these messages.
