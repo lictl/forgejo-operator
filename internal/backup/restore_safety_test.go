@@ -23,6 +23,9 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+// otherIdentity is the SECRET_KEY fingerprint of another instance.
+var otherIdentity = forgejo.SecretKeyFingerprint(map[string][]byte{forgejo.SecretKeySecretKey: []byte("another instance")})
+
 const (
 	testImageNewer = "codeberg.org/forgejo/forgejo:17"
 	// testProdPath is a remote backup of instance prod/old.
@@ -65,11 +68,11 @@ func restoreOutcome(t *testing.T, objs ...client.Object) (*forgejov1.ForgejoRest
 // A backup that records no fingerprint, and a data-only restore, are not checked.
 func TestRestoreRefusesAnotherIdentity(t *testing.T) {
 	foreign := completedBackup("b1")
-	foreign.Status.SecretKeyFingerprint = "0123456789abcdef"
+	foreign.Status.SecretKeyFingerprint = otherIdentity
 
 	got, why := restoreOutcome(t, instance(""), fbSecrets(), foreign, restoreOf("r1"))
 	if got.Status.Phase != forgejov1.RestorePhaseFailed || why != "IdentityMismatch" ||
-		!strings.Contains(got.Status.Message, "allowIdentityMismatch") || !strings.Contains(got.Status.Message, "0123456789abcdef") {
+		!strings.Contains(got.Status.Message, "allowIdentityMismatch") || !strings.Contains(got.Status.Message, otherIdentity) {
 		t.Fatalf("foreign identity: %s/%s (%s)", got.Status.Phase, why, got.Status.Message)
 	}
 	if got.Status.StartTime != nil {
@@ -103,7 +106,7 @@ func TestRestoreRefusesAnotherIdentity(t *testing.T) {
 func TestRemoteRestoreRefusesAnotherIdentity(t *testing.T) {
 	store, _, objs := remoteFixture(t)
 	store.PutBackup(t, "team/", testProdPath, backup.RemoteManifest{Backup: "b1", Namespace: "prod", Forgejo: "old",
-		Reason: forgejov1.BackupReasonManual, ForgejoImage: testImage16, SecretKeyFingerprint: "0123456789abcdef"},
+		Reason: forgejov1.BackupReasonManual, ForgejoImage: testImage16, SecretKeyFingerprint: otherIdentity},
 		map[string][]byte{backup.DBDumpFile: []byte("PGDMP"), backup.IdentityFile: backup.FakeIdentity(t, "x")}, time.Now())
 	rs := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: ns, UID: "r1-uid"}}
 	rs.Spec.ForgejoRef.Name = "fb"
