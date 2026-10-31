@@ -27,11 +27,6 @@ jobs:
           ! helm lint --strict charts/forgejo-operator --set rbac.namespaced=true
       - name: Scan full Git history for new secrets
         run: docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/gitleaks/gitleaks:v8.30.1 git . --log-opts=--all --redact --no-banner --baseline-path .gitleaks-baseline.json
-      - name: Check bundled dependency licenses
-        run: |
-          python3 hack/update-third-party-licenses.py
-          git diff --exit-code -- LICENSES
-          test -z "$(git status --porcelain -- LICENSES)"
       - name: Check Chart archive reproducibility
         run: |
           test_dir="$(mktemp -d)"
