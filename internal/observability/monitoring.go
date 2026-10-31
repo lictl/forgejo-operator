@@ -229,6 +229,14 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) (*ruleSpec, error) {
 		// No success recorded at all: only alert once a full RPO has passed without data,
 		// and only while the instance's operator metrics are scraped at all (otherwise
 		// ForgejoOperatorMetricsMissing fires).
+		add("ForgejoBackupSizeDropped", "warning", "",
+			fmt.Sprintf(`max(forgejo_operator_backup_retention_held{%s}) > 0`, op),
+			fmt.Sprintf("The newest backup of Forgejo %s is much smaller than earlier ones; retention is held", ref),
+			fmt.Sprintf("The newest scheduled backup's database dump or data archive is less than half the size of another "+
+				"backup that retention keeps (locally or in spec.backup.remote), which can mean the instance lost data. Retention "+
+				"prunes nothing until the sizes recover or the drop is accepted with the annotation "+
+				"forgejo.lucas.icu/backup-size-accepted=<backup> on the Forgejo. The BackupHealthy condition of `kubectl describe "+
+				"fj %s %s` names the backups and sizes.", f.Name, kc))
 		add("ForgejoBackupMissing", "warning", rpo.String(),
 			fmt.Sprintf(`absent(%s) and on() count(%s) > 0`, last, ready),
 			fmt.Sprintf("Forgejo %s has no successful backup", ref), desc)
@@ -277,10 +285,11 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) (*ruleSpec, error) {
 		add("ForgejoDatabaseUpgradeFailed", "warning", "",
 			recentlyIncreased(fmt.Sprintf(`forgejo_operator_database_upgrades_total{%s, result!="succeeded"}`, op), "1h"),
 			fmt.Sprintf("A PostgreSQL major upgrade of Forgejo %s failed", ref),
-			fmt.Sprintf("A PostgreSQL major upgrade of the CNPG cluster failed or was rolled back in the last hour. "+
+			fmt.Sprintf("A PostgreSQL major upgrade of the CNPG cluster failed or was reverted in the last hour. "+
 				"status.database.upgrade of `kubectl get fj %s %s -o yaml` names the failed image and the reason; it is not retried "+
-				"until spec.database.cnpg.imageName changes. With rollbackRestoreFailed Forgejo stays stopped until a backup is "+
-				"restored. See docs/upgrades.md, \"PostgreSQL major upgrades\".", f.Name, kc))
+				"until spec.database.cnpg.imageName changes or the annotation forgejo.lucas.icu/retry-database-upgrade=true is set. "+
+				"With holdsForgejo Forgejo stays stopped, and the instance is Broken, until a person acts. See docs/upgrades.md, "+
+				"\"Failures of a PostgreSQL upgrade\".", f.Name, kc))
 	}
 
 	add("ForgejoVersionUnsupported", "warning", "1h",

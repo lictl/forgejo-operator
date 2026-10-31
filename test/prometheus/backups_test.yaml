@@ -111,3 +111,20 @@ tests:
         exp_samples:
           - labels: 'forgejo_slo:availability_objective{namespace="ns", name="fj", window="28d"}'
             value: 0.999
+
+  - name: retention held by a size drop
+    interval: 1m
+    input_series:
+      - series: 'forgejo_operator_instance_ready{namespace="ns", name="fj"}'
+        values: '1x10'
+      - series: 'forgejo_operator_backup_retention_held{namespace="ns", name="fj"}'
+        values: '0x4 1x5'
+    alert_rule_test:
+      - {eval_time: 3m, alertname: ForgejoBackupSizeDropped, exp_alerts: []}
+      - eval_time: 6m
+        alertname: ForgejoBackupSizeDropped
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: ns, forgejo: fj}
+            exp_annotations:
+              summary: The newest backup of Forgejo ns/fj is much smaller than earlier ones; retention is held
+              runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupSizeDropped.md

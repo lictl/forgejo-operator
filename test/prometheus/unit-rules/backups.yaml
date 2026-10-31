@@ -92,6 +92,17 @@ groups:
       forgejo: fj
       namespace: ns
       severity: warning
+  - alert: ForgejoBackupSizeDropped
+    annotations:
+      runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupSizeDropped.md
+      summary: The newest backup of Forgejo ns/fj is much smaller than earlier ones;
+        retention is held
+    expr: max(forgejo_operator_backup_retention_held{namespace="ns", name="fj"}) >
+      0
+    labels:
+      forgejo: fj
+      namespace: ns
+      severity: warning
   - alert: ForgejoBackupMissing
     annotations:
       runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupMissing.md

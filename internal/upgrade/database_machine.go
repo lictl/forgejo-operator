@@ -416,15 +416,19 @@ func (m *dbMachine) upgrading() error {
 	if job != nil {
 		u.Message += fmt.Sprintf(", Job %s running", job.Name)
 	}
-	if elapsed > timeout && !u.PGUpgradeStarted {
+	// Like a revert, at least dbRevertTimeout: spec.upgrade.timeout is shared with Forgejo
+	// upgrades and may be short, while CloudNativePG may take minutes to pull the new image.
+	if startBy := max(timeout, dbRevertTimeout); elapsed > startBy && !u.PGUpgradeStarted {
 		why := "CloudNativePG created no upgrade Job"
 		if job != nil {
 			why = fmt.Sprintf("the container of upgrade Job %s that runs pg_upgrade did not start", job.Name)
 		}
-		m.toReverting(fmt.Sprintf("%s within spec.upgrade.timeout (%s)", why, timeout))
+		m.toReverting(fmt.Sprintf("%s within %s of writing the new image", why, startBy))
 		return nil
 	}
-	if elapsed > timeout {
+	if elapsed > timeout && !u.PGUpgradeStarted {
+		u.Message += fmt.Sprintf("; pg_upgrade has not started yet, which is reverted after %s", max(timeout, dbRevertTimeout))
+	} else if elapsed > timeout {
 		u.Message += fmt.Sprintf("; this takes longer than spec.upgrade.timeout (%s), but pg_upgrade is never interrupted", timeout)
 		if _, loaded := dbSlow.LoadOrStore(m.key()+"/"+u.StartTime.UTC().String(), true); !loaded {
 			rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeSlow", dbEventAction,
@@ -623,7 +627,7 @@ func (m *dbMachine) failHeld(reason, next string) {
 	m.finish(forgejov1.DatabaseUpgradeFailed, "failed", fmt.Sprintf(
 		"Upgrade of PostgreSQL from %s to %s failed: %s. Forgejo stays stopped; pre-upgrade backup %s (database only) holds the "+
 			"database from before the upgrade. %s", u.FromImage, u.ToImage, reason, u.BackupName, next))
-	m.rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeFailed", dbEventAction, "%s", u.Message)
+	// No event of its own: the hold reports the failure in this pass (rc.SetBroken).
 }
 
 // dbRevertTimeout is the least time a revert waits for the old data to come back: CloudNativePG

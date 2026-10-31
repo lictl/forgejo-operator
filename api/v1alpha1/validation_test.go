@@ -195,6 +195,13 @@ const errPostgresTag = "starts with the PostgreSQL major version"
 // errRunbookBase is the field path of the runbook base URL's validation errors.
 const errRunbookBase = "spec.monitoring.runbookBaseURL"
 
+// errDatabaseType and errExistingClaim are the messages of a changed database type and data
+// volume claim.
+const (
+	errDatabaseType  = "database.type cannot be changed"
+	errExistingClaim = "spec.storage.existingClaim: Invalid value: storage.existingClaim cannot be set, changed or removed"
+)
+
 func TestForgejoValidation(t *testing.T) {
 	const s3 = `endpoint: https://s3.example.com
       bucket: bucket
@@ -264,11 +271,26 @@ func TestForgejoValidation(t *testing.T) {
 		{name: "data volume lowered back", old: fj("  storage: {size: 100Gi}"), obj: fj("  storage: {size: 10Gi}")},
 		{name: "data volume removed after growth", old: fj("  storage: {size: 100Gi}"), obj: fj("  {}")},
 		{name: "database volume lowered", old: fj("  database:\n    cnpg:\n      storage: {size: 5Gi}"), obj: fj("  database:\n    cnpg:\n      storage: {size: 1Gi}")},
-		{name: "switch to External after CNPG growth", old: fj("  database:\n    cnpg:\n      storage: {size: 10Gi}"),
-			obj: fj("  database:\n    type: External\n    external: {host: pg, credentialsSecret: {name: pg}}")},
 		{name: "backup volume lowered", old: fj("  backup:\n    storage: {size: 20Gi}"), obj: fj("  backup:\n    storage: {size: 10Gi}")},
 		{name: "existing backup claim size lowered", old: fj("  backup:\n    storage: {size: 50Gi, existingClaim: backups}"), obj: fj("  backup:\n    storage: {size: 1Gi, existingClaim: backups}")},
 		{name: "small volume at creation", obj: fj("  storage: {size: 1Gi}")},
+
+		// The database type and the data volume claim are fixed at creation: another one would
+		// start Forgejo on an empty database or volume, which it then migrates.
+		{name: "database type defaulted, then explicit", old: fj("  {}"), obj: fj("  database: {type: CNPG}")},
+		{name: "External database changes its host", old: fj("  database:\n    type: External\n    external: {host: pg, credentialsSecret: {name: pg}}"),
+			obj: fj("  database:\n    type: External\n    external: {host: pg2, credentialsSecret: {name: pg}}")},
+		{name: "CNPG to External", old: fj("  database:\n    cnpg:\n      storage: {size: 10Gi}"),
+			obj: fj("  database:\n    type: External\n    external: {host: pg, credentialsSecret: {name: pg}}"), want: errDatabaseType},
+		{name: "External to CNPG by removing the type", old: fj("  database:\n    type: External\n    external: {host: pg, credentialsSecret: {name: pg}}"),
+			obj: fj("  {}"), want: errDatabaseType},
+		{name: "existing claim at creation", obj: fj("  storage: {existingClaim: data}")},
+		{name: "existing claim kept while the size changes", old: fj("  storage: {existingClaim: data}"), obj: fj("  storage: {existingClaim: data, size: 20Gi}")},
+		{name: "empty existing claim is no claim", old: fj("  {}"), obj: fj("  storage: {existingClaim: \"\"}")},
+		{name: "empty existing claim removed", old: fj("  storage: {existingClaim: \"\"}"), obj: fj("  {}")},
+		{name: "existing claim added", old: fj("  storage: {size: 10Gi}"), obj: fj("  storage: {size: 10Gi, existingClaim: data}"), want: errExistingClaim},
+		{name: "existing claim changed", old: fj("  storage: {existingClaim: data}"), obj: fj("  storage: {existingClaim: other}"), want: errExistingClaim},
+		{name: "existing claim removed", old: fj("  storage: {existingClaim: data}"), obj: fj("  {}"), want: errExistingClaim},
 
 		// Server, Services, Ingress.
 		{name: "domain with scheme", obj: fj("  server: {domain: \"https://git.example.com\"}"), want: "spec.server.domain"},

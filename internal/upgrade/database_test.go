@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -186,6 +187,9 @@ func setCluster(t *testing.T, c client.Client, u *unstructured.Unstructured) {
 func condition(f *forgejov1.Forgejo, t string) *metav1.Condition {
 	return meta.FindStatusCondition(f.Status.Conditions, t)
 }
+
+// creating is the state of a container that has not started yet.
+var creating = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}
 
 func zeroReplicas(rc *forgejo.ReconcileContext) bool {
 	return rc.ReplicasOverride != nil && *rc.ReplicasOverride == 0
@@ -619,12 +623,12 @@ func TestDatabaseUpgradePodChecks(t *testing.T) {
 	t.Run("pg_upgrade does not start within the timeout", func(t *testing.T) {
 		f := upgrading(20 * time.Minute)
 		job := upgradeJob()
-		pending := upgradePod(job.Name, ago(19*time.Minute), corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}})
+		pending := upgradePod(job.Name, ago(19*time.Minute), creating)
 		pending.Status.Phase = corev1.PodPending
 		c := dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pending)
 		rc, _ := dbPass(t, c, f)
 		if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeReverting || rc.DatabaseImage != pg17 || u.PGUpgradeStarted ||
-			!strings.Contains(u.FailureReason, "did not start within spec.upgrade.timeout") {
+			!strings.Contains(u.FailureReason, "did not start within 15m0s") {
 			t.Fatalf("phase %s, image %s: %s", u.Phase, rc.DatabaseImage, u.FailureReason)
 		}
 		// Without any Job either.
@@ -860,10 +864,16 @@ func TestDatabaseRecreateHoldsUntilARestore(t *testing.T) {
 	ctx := context.Background()
 	f := dbInstance(pg17)
 	f.Annotations = map[string]string{forgejo.AnnotationRecreateDatabase: valueTrue}
-	c := dbClient(t, f.DeepCopy(), restore("earlier", forgejov1.RestorePhaseCompleted, ago(time.Hour)))
+	running := availableDeployment(imgA, 1)
+	c := dbClient(t, f.DeepCopy(), restore("earlier", forgejov1.RestorePhaseCompleted, ago(time.Hour)), running)
 	rc, res := dbPass(t, c, f)
 	if !zeroReplicas(rc) || res.Stop || brokenReason(f) != forgejo.BrokenDatabaseRestorePending || rc.DatabaseImage != pg17 {
 		t.Fatalf("before the cluster: override %v, stop %v, Broken %q", rc.ReplicasOverride, res.Stop, brokenReason(f))
+	}
+	// Scaled down at once, also in passes whose workload step does not run.
+	dep := &appsv1.Deployment{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "fj"}, dep); err != nil || dep.Spec.Replicas == nil || *dep.Spec.Replicas != 0 {
+		t.Fatalf("Deployment replicas %v, err %v", dep.Spec.Replicas, err)
 	}
 	// The database step created it, marked; a restore from before it does not count.
 	recreated := cnpgCluster(pg17, pg17, 17, sysNew, true, time.Now().Add(-time.Minute))
@@ -1101,4 +1111,21 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 		t.Fatal(err)
 	}
 	return m.GetCounter().GetValue()
+}
+
+// A short spec.upgrade.timeout (shared with Forgejo upgrades) does not revert an upgrade whose
+// pg_upgrade has not started yet before dbRevertTimeout, and that wait is not reported as a slow
+// pg_upgrade.
+func TestDatabaseUpgradeShortTimeoutBeforePGUpgrade(t *testing.T) {
+	f := upgrading(3 * time.Minute)
+	f.Spec.Upgrade.Timeout = &metav1.Duration{Duration: 5 * time.Second}
+	job := upgradeJob()
+	pending := upgradePod(job.Name, ago(3*time.Minute), creating)
+	pending.Status.Phase = corev1.PodPending
+	rc, _ := dbPass(t, dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pending), f)
+	// Not reported as a slow pg_upgrade: it has not started.
+	if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeUpgrading || hasEvent(recorded(rc), "DatabaseUpgradeSlow") ||
+		strings.Contains(u.Message, "never interrupted") || !strings.Contains(u.Message, "has not started yet") {
+		t.Fatalf("phase %s: %s", u.Phase, u.Message)
+	}
 }

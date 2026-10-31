@@ -102,14 +102,39 @@ func RestoreJobName(r *forgejov1.ForgejoRestore) string { return childName(r.Nam
 
 // childName appends suffix to base, shortening base with a hash so the result is a valid
 // 63-character DNS label (Job names end up in pod labels).
-func childName(base, suffix string) string {
-	const maxLen = 63
+func childName(base, suffix string) string { return boundedName(base, suffix, 63) }
+
+// boundedName appends suffix to base, shortening base with a hash so that the result has at
+// most maxLen characters.
+func boundedName(base, suffix string, maxLen int) string {
 	if len(base)+len(suffix) <= maxLen {
 		return base + suffix
 	}
 	sum := sha256.Sum256([]byte(base))
 	keep := maxLen - len(suffix) - 9
 	return strings.TrimRight(base[:keep], "-.") + "-" + hex.EncodeToString(sum[:4]) + suffix
+}
+
+// PreRestoreBackupName is the ForgejoBackup a restore takes of the instance before it
+// replaces the database or the data volume (spec.preRestoreBackup):
+// "<restore>-pre-restore-<uid>", where <uid> is the first 8 characters of the restore's UID,
+// so that a restore created again under an old name takes a backup of its own.
+func PreRestoreBackupName(r *forgejov1.ForgejoRestore) string {
+	return boundedName(r.Name, RemoteBackupDirName("-pre-restore", r.UID), 253)
+}
+
+// PreRestoreOf returns the restore in restores whose pre-restore backup b is, while that
+// restore waits for it with Forgejo stopped (ScalingDown), or nil.
+func PreRestoreOf(b *forgejov1.ForgejoBackup, restores []forgejov1.ForgejoRestore) *forgejov1.ForgejoRestore {
+	if Reason(b) != forgejov1.BackupReasonPreRestore {
+		return nil
+	}
+	for i := range restores {
+		if r := &restores[i]; r.Status.Phase == forgejov1.RestorePhaseScalingDown && PreRestoreBackupName(r) == b.Name {
+			return r
+		}
+	}
+	return nil
 }
 
 // IsBackupActive reports whether a backup has not reached a terminal phase.

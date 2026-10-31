@@ -27,6 +27,7 @@ working hours). The two burn-rate alerts follow the same split.
 | [ForgejoBackupFailed](ForgejoBackupFailed.md) | warning | instance | A backup failed in the last hour |
 | [ForgejoBackupTooOld](ForgejoBackupTooOld.md) | warning | instance (RPO) | The last successful backup is older than the RPO (two schedule intervals) |
 | [ForgejoBackupMissing](ForgejoBackupMissing.md) | warning | instance (RPO) | No successful backup at all for a whole RPO |
+| [ForgejoBackupSizeDropped](ForgejoBackupSizeDropped.md) | warning | instance | The newest backup is less than half the size of one retention keeps; retention is held |
 | [ForgejoBackupUploadFailed](ForgejoBackupUploadFailed.md) | warning | instance | An upload to `spec.backup.remote` failed in the last hour |
 | [ForgejoBackupUploadTooOld](ForgejoBackupUploadTooOld.md) | warning | instance (RPO) | The last off-cluster backup is older than the RPO |
 | [ForgejoBackupUploadMissing](ForgejoBackupUploadMissing.md) | warning | instance (RPO) | No off-cluster backup at all for a whole RPO |

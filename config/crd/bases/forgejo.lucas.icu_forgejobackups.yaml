@@ -87,6 +87,7 @@ spec:
                 - Manual
                 - Scheduled
                 - PreUpgrade
+                - PreRestore
                 type: string
             required:
             - forgejoRef
@@ -389,6 +390,15 @@ spec:
                       SHA-256 matched.
                     type: boolean
                 type: object
+              secretKeyFingerprint:
+                description: |-
+                  secretKeyFingerprint identifies the SECRET_KEY of the instance when the backup was taken
+                  (forgejo.SecretKeyFingerprint, 16 hex digits, as remote manifests record it and the
+                  annotation forgejo.lucas.icu/identity of the data volume). A restore of the database into
+                  an instance with another SECRET_KEY is refused unless the ForgejoRestore sets
+                  allowIdentityMismatch, and retention never prunes a backup of another identity. Empty
+                  (backups of older operator versions) is not checked and counts as the instance's.
+                type: string
               startTime:
                 format: date-time
                 type: string
