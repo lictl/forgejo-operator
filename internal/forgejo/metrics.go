@@ -51,6 +51,12 @@ var (
 		Help: "Unix time of the last successful backup.",
 	}, []string{labelNamespace, labelName})
 
+	BackupRetentionHeld = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "forgejo_operator_backup_retention_held",
+		Help: "1 while the size-drop guard holds back retention (the newest scheduled backup is less than half the size of " +
+			"another one kept, locally or remotely; BackupHealthy=False/BackupSizeDropped), else 0.",
+	}, []string{labelNamespace, labelName})
+
 	BackupTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "forgejo_operator_backups_total",
 		Help: "Finished backups by result (succeeded/failed) and reason.",
@@ -147,8 +153,8 @@ var (
 func init() {
 	metrics.Registry.MustRegister(
 		InstanceReady, InstanceInfo, HealthCheckFailures, HealthCheckUnreachable, AvailabilityProbes,
-		BackupLastSuccess, BackupTotal, BackupDuration, BackupSize, BackupUploadTotal, BackupLastUploadSuccess, RestoreTotal,
-		UpgradeTotal, DatabaseUpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife, VersionAdvisory,
+		BackupLastSuccess, BackupRetentionHeld, BackupTotal, BackupDuration, BackupSize, BackupUploadTotal, BackupLastUploadSuccess,
+		RestoreTotal, UpgradeTotal, DatabaseUpgradeTotal, AutoPilotActions, VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife, VersionAdvisory,
 		ValkeyMasterAvailable, ValkeyReadyMembers, ValkeyFailovers, CronRunnerReady,
 	)
 }
@@ -156,7 +162,8 @@ func init() {
 // DeleteInstanceMetrics removes all series of a deleted instance.
 func DeleteInstanceMetrics(namespace, name string) {
 	l := prometheus.Labels{labelNamespace: namespace, labelName: name}
-	for _, v := range []*prometheus.GaugeVec{InstanceReady, InstanceInfo, BackupLastSuccess, BackupLastUploadSuccess, BackupDuration, BackupSize,
+	for _, v := range []*prometheus.GaugeVec{InstanceReady, InstanceInfo, BackupLastSuccess, BackupRetentionHeld, BackupLastUploadSuccess,
+		BackupDuration, BackupSize,
 		VolumeUsedRatio, Stats, VersionSupported, VersionEndOfLife, VersionAdvisory, ValkeyMasterAvailable, ValkeyReadyMembers,
 		CronRunnerReady} {
 		v.DeletePartialMatch(l)

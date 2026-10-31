@@ -188,6 +188,9 @@ func condition(f *forgejov1.Forgejo, t string) *metav1.Condition {
 	return meta.FindStatusCondition(f.Status.Conditions, t)
 }
 
+// creating is the state of a container that has not started yet.
+var creating = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}
+
 func zeroReplicas(rc *forgejo.ReconcileContext) bool {
 	return rc.ReplicasOverride != nil && *rc.ReplicasOverride == 0
 }
@@ -573,7 +576,6 @@ func TestDatabaseUpgradeJobFailureReverts(t *testing.T) {
 // grace. A running pg_upgrade is never interrupted, however long it takes.
 func TestDatabaseUpgradePodChecks(t *testing.T) {
 	waitingPull := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: waitingImagePullBackOff, Message: "not found"}}
-	creating := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}
 	t.Run("pull grace", func(t *testing.T) {
 		f := upgrading(time.Minute)
 		job := upgradeJob()
@@ -616,17 +618,6 @@ func TestDatabaseUpgradePodChecks(t *testing.T) {
 		}
 		if rc, _ = dbPass(t, c, f); hasEvent(recorded(rc), "DatabaseUpgradeSlow") {
 			t.Error("DatabaseUpgradeSlow repeated")
-		}
-	})
-	t.Run("a short spec.upgrade.timeout does not cut the start short", func(t *testing.T) {
-		f := upgrading(3 * time.Minute)
-		f.Spec.Upgrade.Timeout = &metav1.Duration{Duration: 5 * time.Second}
-		job := upgradeJob()
-		pending := upgradePod(job.Name, ago(3*time.Minute), creating)
-		pending.Status.Phase = corev1.PodPending
-		dbPass(t, dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pending), f)
-		if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeUpgrading {
-			t.Fatalf("phase %s: %s", u.Phase, u.FailureReason)
 		}
 	})
 	t.Run("pg_upgrade does not start within the timeout", func(t *testing.T) {
@@ -1120,4 +1111,21 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 		t.Fatal(err)
 	}
 	return m.GetCounter().GetValue()
+}
+
+// A short spec.upgrade.timeout (shared with Forgejo upgrades) does not revert an upgrade whose
+// pg_upgrade has not started yet before dbRevertTimeout, and that wait is not reported as a slow
+// pg_upgrade.
+func TestDatabaseUpgradeShortTimeoutBeforePGUpgrade(t *testing.T) {
+	f := upgrading(3 * time.Minute)
+	f.Spec.Upgrade.Timeout = &metav1.Duration{Duration: 5 * time.Second}
+	job := upgradeJob()
+	pending := upgradePod(job.Name, ago(3*time.Minute), creating)
+	pending.Status.Phase = corev1.PodPending
+	rc, _ := dbPass(t, dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pending), f)
+	// Not reported as a slow pg_upgrade: it has not started.
+	if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeUpgrading || hasEvent(recorded(rc), "DatabaseUpgradeSlow") ||
+		strings.Contains(u.Message, "never interrupted") || !strings.Contains(u.Message, "has not started yet") {
+		t.Fatalf("phase %s: %s", u.Phase, u.Message)
+	}
 }

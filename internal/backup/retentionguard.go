@@ -107,9 +107,14 @@ func acceptedSince(f *forgejov1.Forgejo, sizes []backupSize, backups []forgejov1
 	return time.Time{}
 }
 
+// sizeDropFloor is the least size of the larger backup for a drop to count: below it, ordinary
+// churn of a small instance (git gc packing loose objects, a few deleted test repositories)
+// halves a dump or an archive without anything being lost. A variable for tests.
+var sizeDropFloor int64 = 16 << 20
+
 // checkSizeDrop compares the newest of sizes (newest first) with the largest of the others that
 // completed no earlier than since, part by part, and describes the parts that are less than
-// half of it ("" when none is).
+// half of it ("" when none is). A part whose larger size is below sizeDropFloor is not judged.
 func checkSizeDrop(sizes []backupSize, since time.Time) string {
 	if len(sizes) < 2 {
 		return ""
@@ -129,10 +134,10 @@ func checkSizeDrop(sizes []backupSize, since time.Time) string {
 		}
 	}
 	var found []string
-	if db != nil && newest.database > 0 && 2*newest.database < db.database {
+	if db != nil && newest.database > 0 && db.database >= sizeDropFloor && 2*newest.database < db.database {
 		found = append(found, fmt.Sprintf("database dump %d bytes, %s had %d", newest.database, db.name, db.database))
 	}
-	if data != nil && newest.data > 0 && 2*newest.data < data.data {
+	if data != nil && newest.data > 0 && data.data >= sizeDropFloor && 2*newest.data < data.data {
 		found = append(found, fmt.Sprintf("data archive %d bytes, %s had %d", newest.data, data.name, data.data))
 	}
 	return strings.Join(found, "; ")

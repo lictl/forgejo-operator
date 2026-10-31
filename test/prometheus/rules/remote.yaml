@@ -133,6 +133,23 @@ groups:
       forgejo: fj
       namespace: ns
       severity: warning
+  - alert: ForgejoBackupSizeDropped
+    annotations:
+      description: The newest scheduled backup's database dump or data archive is
+        less than half the size of another backup that retention keeps (locally or
+        in spec.backup.remote), which can mean the instance lost data. Retention prunes
+        nothing until the sizes recover or the drop is accepted with the annotation
+        forgejo.lucas.icu/backup-size-accepted=<backup> on the Forgejo. The BackupHealthy
+        condition of `kubectl describe fj fj -n ns` names the backups and sizes.
+      runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoBackupSizeDropped.md
+      summary: The newest backup of Forgejo ns/fj is much smaller than earlier ones;
+        retention is held
+    expr: max(forgejo_operator_backup_retention_held{namespace="ns", name="fj"}) >
+      0
+    labels:
+      forgejo: fj
+      namespace: ns
+      severity: warning
   - alert: ForgejoBackupMissing
     annotations:
       description: Scheduled backups ("0 * * * *") must keep the last successful backup

@@ -430,10 +430,11 @@ func (r *ForgejoRestoreReconciler) dataVolumeTooSmall(ctx context.Context, f *fo
 // starts the restore Job.
 func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo) (ctrl.Result, error) {
 	waitDown := func(msg string) (ctrl.Result, error) {
-		// Only until the instance has scaled down once (the pre-restore backup is taken then): that
-		// backup may run longer than the timeout, and a check that fails briefly after it is no
-		// reason to give up a restore that has changed nothing yet.
-		if rs.Status.StartTime != nil && rs.Status.PreRestoreBackupName == "" && time.Since(rs.Status.StartTime.Time) > scaleDownTimeout {
+		since, err := r.scaleDownSince(ctx, rs)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if since != nil && time.Since(since.Time) > scaleDownTimeout {
 			return ctrl.Result{}, r.fail(ctx, rs, f, "ScaleDownTimeout", fmt.Sprintf("Timed out after %s: %s", scaleDownTimeout, msg))
 		}
 		return r.wait(ctx, rs, msg)
@@ -586,6 +587,24 @@ func (r *ForgejoRestoreReconciler) restoreJob(ctx context.Context, rs *forgejov1
 	return job, "", "", err
 }
 
+// scaleDownSince is when the scale-down timeout of rs starts: the start of the restore, or,
+// once its pre-restore backup was taken (Forgejo had scaled down for it), the completion of that
+// backup, which may run longer than the timeout. While it runs there is no timeout (nil).
+func (r *ForgejoRestoreReconciler) scaleDownSince(ctx context.Context, rs *forgejov1.ForgejoRestore) (*metav1.Time, error) {
+	name := rs.Status.PreRestoreBackupName
+	if name == "" {
+		return rs.Status.StartTime, nil
+	}
+	b := &forgejov1.ForgejoBackup{}
+	switch err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: name}, b); {
+	case apierrors.IsNotFound(err):
+		return rs.Status.StartTime, nil
+	case err != nil:
+		return nil, err
+	}
+	return b.Status.CompletionTime, nil
+}
+
 // wantsPreRestoreBackup reports whether rs backs up what it replaces first
 // (spec.preRestoreBackup). Only an instance that has run holds anything to keep; one that is
 // created from spec.restoreFrom takes no backup before it is restored. A Broken instance takes
@@ -599,18 +618,22 @@ func wantsPreRestoreBackup(rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo) b
 // volume when includeData), once Forgejo has stopped so that it is consistent, and reports
 // done when it has completed or none is wanted. A backup that fails or is deleted fails the
 // restore, which has not changed anything yet. The backup does not belong to the restore: it
-// outlives it, and retention never prunes it (reason PreRestore).
+// outlives it, and retention never prunes it (reason PreRestore). One that was started is
+// followed to its end even if none would be wanted now (the instance became Broken meanwhile):
+// the restore must not write what the backup still reads.
 func (r *ForgejoRestoreReconciler) preRestoreBackup(ctx context.Context, rs *forgejov1.ForgejoRestore, f *forgejov1.Forgejo,
 	includeData bool) (ctrl.Result, bool, error) {
-	if !wantsPreRestoreBackup(rs, f) {
-		return ctrl.Result{}, true, nil
-	}
 	name := backup.PreRestoreBackupName(rs)
 	const next = "Nothing was changed. Fix the cause and create the restore again, or create it with " +
 		"spec.preRestoreBackup: false to restore without a backup of the current state"
 	b := &forgejov1.ForgejoBackup{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: name}, b)
+	if apierrors.IsNotFound(err) && rs.Status.PreRestoreBackupName == "" && !wantsPreRestoreBackup(rs, f) {
+		return ctrl.Result{}, true, nil
+	}
 	switch {
+	case apierrors.IsNotFound(err) && rs.Status.PreRestoreBackupName == name:
+		return ctrl.Result{}, false, r.fail(ctx, rs, f, "PreRestoreBackupFailed", fmt.Sprintf("Pre-restore backup %s was deleted. %s", name, next))
 	case apierrors.IsNotFound(err):
 		if err := r.createPreRestoreBackup(ctx, rs, f, name, includeData); err != nil {
 			return ctrl.Result{}, false, err

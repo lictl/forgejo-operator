@@ -262,9 +262,12 @@ spec:
   * **Size drop.** When the newest completed scheduled backup's database dump or data archive
     (`databaseSizeBytes`, `dataSizeBytes`; the data archive only when both backups have one) is
     less than half the size of the largest of the other completed scheduled backups that
-    retention holds, no completed backup is pruned (failed ones still are), `BackupHealthy` is
-    `False/BackupSizeDropped` with both sizes, and a `BackupSizeDropped` Warning event names the
-    backups. The hold ends when a newer backup is at least half that size again, or when you
+    retention holds, and that largest one has at least 16 MiB (below that, ordinary churn of a
+    small instance halves a backup without anything being lost), no completed backup is pruned
+    (failed ones still are), `BackupHealthy` is `False/BackupSizeDropped` with both sizes, a
+    `BackupSizeDropped` Warning event names the backups, and
+    `forgejo_operator_backup_retention_held` is 1, which fires the
+    [ForgejoBackupSizeDropped](runbooks/ForgejoBackupSizeDropped.md) alert. The hold ends when a newer backup is at least half that size again, or when you
     accept the sizes: annotate the Forgejo with the backup the condition names, and backups that
     completed before it no longer count for the comparison:
 

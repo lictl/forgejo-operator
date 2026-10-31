@@ -286,3 +286,83 @@ func TestPreRestoreBackupFailureAndOptOut(t *testing.T) {
 		}
 	}
 }
+
+// A pre-restore backup that was started is followed to its end even when none would be taken
+// now (the instance became Broken while it ran): the restore Job must not write what the backup
+// still reads. A recorded one that is gone fails the restore instead of being taken again.
+func TestStartedPreRestoreBackupIsAwaited(t *testing.T) {
+	ctx := context.Background()
+	s := scheme(t)
+	f, rs := scalingDown(t)
+	c := newFakeClient(s, f, fbSecrets(), dbAppSecret("pw"), completedBackup("b1"), rs)
+	name := backup.PreRestoreBackupName(rs)
+	if got := reconcileRestore(t, c, s, rs.Name, 1); got.Status.PreRestoreBackupName != name {
+		t.Fatalf("restore: %s (%s)", got.Status.Phase, got.Status.Message)
+	}
+	live := &forgejov1.Forgejo{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(f), live); err != nil {
+		t.Fatal(err)
+	}
+	meta.SetStatusCondition(&live.Status.Conditions, metav1.Condition{Type: forgejov1.ConditionBroken, Status: metav1.ConditionTrue,
+		Reason: forgejo.BrokenDatabaseRestorePending, Message: "empty database"})
+	if err := c.Update(ctx, live); err != nil { // no status subresource for Forgejo in this fake client
+		t.Fatal(err)
+	}
+	pre := getBackup(t, c, name)
+	pre.Status.Phase = forgejov1.BackupPhaseRunning
+	if err := c.Status().Update(ctx, pre); err != nil {
+		t.Fatal(err)
+	}
+	if got := reconcileRestore(t, c, s, rs.Name, 1); got.Status.Phase != forgejov1.RestorePhaseScalingDown ||
+		jobExists(t, c, backup.RestoreJobName(rs)) || !strings.HasPrefix(got.Status.Message, "Taking pre-restore backup "+name) {
+		t.Fatalf("restore while the backup runs on a Broken instance: %s (%s)", got.Status.Phase, got.Status.Message)
+	}
+
+	if err := c.Delete(ctx, getBackup(t, c, name)); err != nil {
+		t.Fatal(err)
+	}
+	pre = &forgejov1.ForgejoBackup{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, pre); err == nil && len(pre.Finalizers) > 0 {
+		pre.Finalizers = nil
+		if err := c.Update(ctx, pre); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := reconcileRestore(t, c, s, rs.Name, 1); got.Status.Phase != forgejov1.RestorePhaseFailed ||
+		reason(got.Status.Conditions) != "PreRestoreBackupFailed" || !strings.Contains(got.Status.Message, "was deleted") {
+		t.Fatalf("recorded backup gone: %s/%s (%s)", got.Status.Phase, reason(got.Status.Conditions), got.Status.Message)
+	}
+}
+
+// After the pre-restore backup, the scale-down timeout counts from its completion: a backup that
+// outlasted the timeout does not fail the restore, a scale-down that stays stuck after it does.
+func TestScaleDownTimeoutAfterThePreRestoreBackup(t *testing.T) {
+	s := scheme(t)
+	for _, tc := range []struct {
+		name   string
+		backup func(*forgejov1.ForgejoBackup)
+		failed bool
+	}{
+		{"backup running", func(b *forgejov1.ForgejoBackup) { b.Status.Phase = forgejov1.BackupPhaseRunning }, false},
+		{"backup just completed", func(b *forgejov1.ForgejoBackup) {
+			b.Status.Phase, b.Status.CompletionTime = forgejov1.BackupPhaseCompleted, &metav1.Time{Time: time.Now().Add(-time.Minute)}
+		}, false},
+		{"stuck long after the backup", func(b *forgejov1.ForgejoBackup) {
+			b.Status.Phase, b.Status.CompletionTime = forgejov1.BackupPhaseCompleted, &metav1.Time{Time: time.Now().Add(-20 * time.Minute)}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, rs := scalingDown(t)
+			f.Status.Backup.ActiveRestore = "" // not in maintenance: the scale-down waits
+			rs.Status.StartTime = &metav1.Time{Time: time.Now().Add(-2 * time.Hour)}
+			rs.Status.PreRestoreBackupName = backup.PreRestoreBackupName(rs)
+			pre := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: rs.Status.PreRestoreBackupName, Namespace: ns}}
+			pre.Spec.ForgejoRef.Name, pre.Spec.Reason = "fb", forgejov1.BackupReasonPreRestore
+			tc.backup(pre)
+			got := reconcileRestore(t, newFakeClient(s, f, completedBackup("b1"), rs, pre), s, rs.Name, 1)
+			if failed := got.Status.Phase == forgejov1.RestorePhaseFailed && reason(got.Status.Conditions) == "ScaleDownTimeout"; failed != tc.failed {
+				t.Fatalf("%s/%s (%s)", got.Status.Phase, reason(got.Status.Conditions), got.Status.Message)
+			}
+		})
+	}
+}

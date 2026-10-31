@@ -426,7 +426,9 @@ func (m *dbMachine) upgrading() error {
 		m.toReverting(fmt.Sprintf("%s within %s of writing the new image", why, startBy))
 		return nil
 	}
-	if elapsed > timeout {
+	if elapsed > timeout && !u.PGUpgradeStarted {
+		u.Message += fmt.Sprintf("; pg_upgrade has not started yet, which is reverted after %s", max(timeout, dbRevertTimeout))
+	} else if elapsed > timeout {
 		u.Message += fmt.Sprintf("; this takes longer than spec.upgrade.timeout (%s), but pg_upgrade is never interrupted", timeout)
 		if _, loaded := dbSlow.LoadOrStore(m.key()+"/"+u.StartTime.UTC().String(), true); !loaded {
 			rc.Event(corev1.EventTypeWarning, "DatabaseUpgradeSlow", dbEventAction,

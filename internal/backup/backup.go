@@ -155,6 +155,7 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	key := summarizeRemote(ctx, rc, backups)
 
 	if !f.Spec.Backup.Enabled {
+		forgejo.BackupRetentionHeld.DeleteLabelValues(f.Namespace, f.Name)
 		forgetRemoteRetention(f.Namespace, f.Name)
 		meta.RemoveStatusCondition(&f.Status.Conditions, forgejov1.ConditionBackupHealthy)
 		if f.Status.Backup != nil {
@@ -212,6 +213,11 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	if drop == "" {
 		drop = remoteSizeDrop(f)
 	}
+	held := 0.0
+	if drop != "" {
+		held = 1
+	}
+	forgejo.BackupRetentionHeld.WithLabelValues(f.Namespace, f.Name).Set(held)
 	setHealth(rc, sched, scheduled, now, deferredSince, key, drop)
 	return forgejo.StepResult{}, nil
 }

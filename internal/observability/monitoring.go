@@ -229,6 +229,14 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) (*ruleSpec, error) {
 		// No success recorded at all: only alert once a full RPO has passed without data,
 		// and only while the instance's operator metrics are scraped at all (otherwise
 		// ForgejoOperatorMetricsMissing fires).
+		add("ForgejoBackupSizeDropped", "warning", "",
+			fmt.Sprintf(`max(forgejo_operator_backup_retention_held{%s}) > 0`, op),
+			fmt.Sprintf("The newest backup of Forgejo %s is much smaller than earlier ones; retention is held", ref),
+			fmt.Sprintf("The newest scheduled backup's database dump or data archive is less than half the size of another "+
+				"backup that retention keeps (locally or in spec.backup.remote), which can mean the instance lost data. Retention "+
+				"prunes nothing until the sizes recover or the drop is accepted with the annotation "+
+				"forgejo.lucas.icu/backup-size-accepted=<backup> on the Forgejo. The BackupHealthy condition of `kubectl describe "+
+				"fj %s %s` names the backups and sizes.", f.Name, kc))
 		add("ForgejoBackupMissing", "warning", rpo.String(),
 			fmt.Sprintf(`absent(%s) and on() count(%s) > 0`, last, ready),
 			fmt.Sprintf("Forgejo %s has no successful backup", ref), desc)

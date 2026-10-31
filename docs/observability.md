@@ -219,6 +219,7 @@ is deleted.
 | `forgejo_operator_availability_probes_total` | counter | `result` (up/down), `planned` (true/false) | The availability SLI: one sample per health-check interval of time, also while no pod is Ready (see [Service level objectives](#service-level-objectives)). All four series are exported at 0 from the first reconcile |
 | `forgejo_operator_stats` | gauge | `kind` (users, organizations, repositories, issues) | Same values as `status.stats` |
 | `forgejo_operator_backup_last_success_timestamp_seconds` | gauge | | Unix time of the last successful backup |
+| `forgejo_operator_backup_retention_held` | gauge | | 1 while the size-drop guard holds retention (`BackupHealthy=False/BackupSizeDropped`), else 0 |
 | `forgejo_operator_backups_total` | counter | `reason`, `result` | Finished backups |
 | `forgejo_operator_backup_duration_seconds` | gauge | | Duration of the last finished backup |
 | `forgejo_operator_backup_size_bytes` | gauge | `part` (database/data) | Size of the last successful backup |

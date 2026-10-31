@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/robfig/cron/v3"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +38,14 @@ func sized(name string, day int, db, data int64, fp string) *forgejov1.ForgejoBa
 	b.Status.DatabaseSizeBytes, b.Status.DataSizeBytes, b.Status.IncludesData = db, data, data > 0
 	b.Status.SecretKeyFingerprint = fp
 	return b
+}
+
+// withoutSizeFloor lets the size-drop guard judge the small sizes of a test.
+func withoutSizeFloor(t *testing.T) {
+	t.Helper()
+	floor := sizeDropFloor
+	sizeDropFloor = 0
+	t.Cleanup(func() { sizeDropFloor = floor })
 }
 
 // runPrune prunes backups (any order) of instance f with retention keep for an instance of
@@ -101,6 +110,7 @@ func TestRetentionKeepsBackupsOfAnotherIdentity(t *testing.T) {
 // When the newest completed scheduled backup is less than half the size of another one that
 // retention holds, nothing completed is pruned until the sizes recover or a person accepts them.
 func TestRetentionHoldsWhenBackupSizesDrop(t *testing.T) {
+	withoutSizeFloor(t)
 	failed := func() *forgejov1.ForgejoBackup {
 		b := sized("failed-0", 1, 0, 0, "")
 		b.CreationTimestamp = metav1.NewTime(time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC))
@@ -184,6 +194,7 @@ func TestBackupHealthReportsSizeDrop(t *testing.T) {
 
 // The scheduled backup step holds retention and reports the drop.
 func TestReconcileScheduleHoldsRetentionOnSizeDrop(t *testing.T) {
+	withoutSizeFloor(t)
 	s := testScheme(t)
 	ctx := context.Background()
 	f := ownedInstance(forgejov1.RetainPolicyRetain)
@@ -211,10 +222,15 @@ func TestReconcileScheduleHoldsRetentionOnSizeDrop(t *testing.T) {
 		!strings.Contains(c.Message, "data archive 100 bytes, fb-big had 5000") {
 		t.Errorf("BackupHealthy %+v", c)
 	}
+	held := &dto.Metric{}
+	if err := forgejo.BackupRetentionHeld.WithLabelValues(f.Namespace, f.Name).Write(held); err != nil || held.GetGauge().GetValue() != 1 {
+		t.Errorf("forgejo_operator_backup_retention_held = %v (%v), want 1", held.GetGauge().GetValue(), err)
+	}
 }
 
 // Remote retention applies both guards to the manifests in the bucket.
 func TestRemoteRetentionGuards(t *testing.T) {
+	withoutSizeFloor(t)
 	store := NewFakeS3(t)
 	s := testScheme(t)
 	ctx := context.Background()
@@ -265,5 +281,20 @@ func TestRemoteRetentionGuards(t *testing.T) {
 	}
 	if drop := remoteSizeDrop(f); drop != "" {
 		t.Errorf("finding %q after the size was accepted", drop)
+	}
+}
+
+// Drops are judged only when the larger backup reaches sizeDropFloor: a small instance halves a
+// dump or an archive through ordinary churn.
+func TestSizeDropFloor(t *testing.T) {
+	const mib = 1 << 20
+	at := func(d int) time.Time { return time.Date(2026, 10, d, 3, 0, 0, 0, time.UTC) }
+	small := []backupSize{{name: "new", at: at(3), database: 200 << 10, data: 1 * mib}, {name: "old", at: at(2), database: 900 << 10, data: 12 * mib}}
+	if found := checkSizeDrop(small, time.Time{}); found != "" {
+		t.Errorf("below the floor: %q", found)
+	}
+	large := []backupSize{{name: "new", at: at(3), database: 2 * mib, data: 7 * mib}, {name: "old", at: at(2), database: 40 * mib, data: 15 * mib}}
+	if found := checkSizeDrop(large, time.Time{}); !strings.Contains(found, "database dump") || strings.Contains(found, "data archive") {
+		t.Errorf("above the floor for the dump only: %q", found)
 	}
 }
