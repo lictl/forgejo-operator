@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -36,12 +35,6 @@ func upgradingInstance(phase forgejov1.DatabaseUpgradePhase) *forgejov1.Forgejo 
 	return f
 }
 
-// dbAppSecret is CNPG's "fb-db-app" Secret of instance "fb".
-func dbAppSecret(password string) *corev1.Secret {
-	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fb-db-app", Namespace: ns},
-		Data: map[string][]byte{"username": []byte("forgejo"), testPasswordField: []byte(password)}}
-}
-
 func TestDumpTooNew(t *testing.T) {
 	f := upgradingInstance(forgejov1.DatabaseUpgradeSucceeded)
 	if msg := backup.DumpTooNew(f, testPG18); !strings.Contains(msg, "pg_dump of PostgreSQL 18") {
@@ -63,41 +56,6 @@ func TestDumpTooNew(t *testing.T) {
 	}
 }
 
-// Restores wait while PostgreSQL is upgraded; a dump of a newer major than the server's is
-// refused.
-func TestRestoresAroundADatabaseUpgrade(t *testing.T) {
-	s := scheme(t)
-	b := completedBackup("b1")
-	b.Status.PostgresImage = testPG17
-	f := upgradingInstance(forgejov1.DatabaseUpgradeUpgrading)
-
-	rs := newRestore("r1", "")
-	rs.Spec.BackupName = "b1"
-	rs.Finalizers = []string{forgejo.FinalizerName}
-	rs.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, b, rs).WithStatusSubresource(rs).Build()
-
-	got := reconcileRestore(t, c, s, rs.Name, 1)
-	if got.Status.Phase != forgejov1.RestorePhasePending || !strings.Contains(got.Status.Message, "PostgreSQL major upgrade") {
-		t.Fatalf("phase %s (%s), want Pending, waiting for the upgrade", got.Status.Phase, got.Status.Message)
-	}
-
-	// A backup of PostgreSQL 18 into a cluster of 17.
-	newer := completedBackup("b18")
-	newer.Status.PostgresImage = testPG18
-	rs18 := newRestore("r18", "")
-	rs18.Spec.BackupName = "b18"
-	rs18.Spec.RestoreDatabase = nil // the database too
-	rs18.Finalizers = []string{forgejo.FinalizerName}
-	rs18.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
-	idle := instance("")
-	idle.Status.Database = &forgejov1.DatabaseStatus{Type: forgejov1.DatabaseTypeCNPG, Image: testPG17, MajorVersion: 17}
-	c = fake.NewClientBuilder().WithScheme(s).WithObjects(idle, newer, rs18).WithStatusSubresource(rs18).Build()
-	if got = reconcileRestore(t, c, s, rs18.Name, 1); got.Status.Phase != forgejov1.RestorePhaseFailed || reason(got.Status.Conditions) != "NewerDump" {
-		t.Fatalf("phase %s/%s (%s), want Failed/NewerDump", got.Status.Phase, reason(got.Status.Conditions), got.Status.Message)
-	}
-}
-
 // preUpgradeBackupObject is the PostgreSQL upgrade's cold backup "fb-pre-pg18-1" of instance
 // "fb", before the backup controller has seen it.
 func preUpgradeBackupObject() *forgejov1.ForgejoBackup {
@@ -113,7 +71,7 @@ func preUpgradeBackupObject() *forgejov1.ForgejoBackup {
 // started (they wait for the upgrade).
 func TestBackupsAroundADatabaseUpgrade(t *testing.T) {
 	ctx := context.Background()
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	f := upgradingInstance(forgejov1.DatabaseUpgradeBackingUp)
 	appSecret := dbAppSecret("pw")
 	manual := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: "manual", Namespace: ns,
@@ -151,7 +109,7 @@ func TestBackupsAroundADatabaseUpgrade(t *testing.T) {
 // upgrade, and the backup does not wait for it (each would otherwise wait for the other, with
 // Forgejo stopped). Both real reconcilers run.
 func TestRestoreRequestedDuringTheDatabaseUpgradeBackup(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	f := upgradingInstance(forgejov1.DatabaseUpgradeBackingUp)
 	b := completedBackup("b1")
 	b.Status.PostgresImage = testPG17

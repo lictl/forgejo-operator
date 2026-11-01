@@ -92,9 +92,6 @@ func TestRemoteNamesAndKeys(t *testing.T) {
 	if got := RemoteLocation(c, "prod/git/nightly"); got != "s3://bk/forgejo/prod/git/nightly/" {
 		t.Errorf("location %q", got)
 	}
-	if RcloneImage(f) != forgejov1.DefaultRcloneImage {
-		t.Errorf("image %q", RcloneImage(f))
-	}
 }
 
 // The upload Job completes the head the operator renders; the result is the manifest the
@@ -141,7 +138,7 @@ func TestStoreReadsAndDeletesRemoteBackups(t *testing.T) {
 	store := NewFakeS3(t)
 	f := remoteInstance(store)
 	secrets := FakeSecrets(remoteNS, "fj-backup-key")
-	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(secretObjects(secrets)...).Build()
+	c := fake.NewClientBuilder().WithScheme(FakeScheme(t)).WithObjects(secretObjects(secrets)...).Build()
 	ctx := context.Background()
 	at := time.Now().Add(-time.Hour)
 	store.PutBackup(t, "team/", "dr/fj/b1", RemoteManifest{Backup: "b1", Namespace: "dr", Forgejo: "fj", Reason: forgejov1.BackupReasonManual},
@@ -186,7 +183,7 @@ func TestStoreReadsAndDeletesRemoteBackups(t *testing.T) {
 
 	// Another key cannot decrypt the backup.
 	secrets[1].Data["key"] = []byte("some-other-long-key")
-	c2 := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(secretObjects(secrets)...).Build()
+	c2 := fake.NewClientBuilder().WithScheme(FakeScheme(t)).WithObjects(secretObjects(secrets)...).Build()
 	wrong, err := OpenStore(ctx, c2, remoteNS, &f.Spec.Backup.Remote.S3, BackupKeyRef(f))
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +225,7 @@ func TestOpenStoreReportsMissingSecretsAndBadKeys(t *testing.T) {
 				secrets[1].Data["key"] = tc.key
 				objs = secretObjects(secrets)
 			}
-			c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).Build()
+			c := fake.NewClientBuilder().WithScheme(FakeScheme(t)).WithObjects(objs...).Build()
 			_, err := OpenStore(ctx, c, remoteNS, &f.Spec.Backup.Remote.S3, BackupKeyRef(f))
 			if err == nil || !IsConfigError(err) || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("got %v, want a configuration error containing %q", err, tc.want)
@@ -247,9 +244,11 @@ func remoteJobFixture(t *testing.T) (*forgejov1.Forgejo, *forgejov1.ForgejoBacku
 	f := remoteInstance(nil)
 	f.Spec.Backup.Remote.S3.TLS = &forgejov1.S3TLSSpec{CASecret: &forgejov1.SecretKeyRef{Name: "ca"}}
 	f.Spec.Backup.Remote.S3.Prefix = "team"
-	b := completedBackup(t, "b1")
+	b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: "b1", Namespace: remoteNS}}
+	b.Spec.ForgejoRef.Name = f.Name
+	b.Status.Phase, b.Status.PVCName, b.Status.IncludesData = forgejov1.BackupPhaseCompleted, "fj-backups", true
 	target := RemoteTarget{Conn: &f.Spec.Backup.Remote.S3, Key: BackupKeyRef(f), Image: RcloneImage(f), Path: BackupRemotePath(b)}
-	in := JobInput{Scheme: testScheme(t), Instance: f, InstanceName: f.Name, ForgejoImage: f.Spec.Image, PostgresImage: forgejov1.DefaultPostgresImage,
+	in := JobInput{Scheme: FakeScheme(t), Instance: f, InstanceName: f.Name, ForgejoImage: f.Spec.Image, PostgresImage: forgejov1.DefaultPostgresImage,
 		DB: &forgejo.DBConnection{Host: "db", Port: 5432, Name: "forgejo", SecretName: "fj-db-app", UsernameKey: "username", PasswordKey: testPasswordField}}
 	return f, b, target, in
 }
@@ -285,7 +284,7 @@ func TestUploadJobKeepsSecretsOutOfThePodSpec(t *testing.T) {
 		"RCLONE_CONFIG_ENC_FILENAME_ENCRYPTION": "off",
 		"RCLONE_CONFIG_S3_ENV_AUTH":             valueTrue,
 		"RCLONE_CONFIG_S3_REGION":               "us-east-1",
-		"REMOTE_PATH":                           "regression/fb/b1",
+		"REMOTE_PATH":                           "dr/fj/b1",
 		"RCLONE_CA_CERT":                        remoteCAMount + "/ca.crt",
 	} {
 		if env[name].Value != want {
@@ -309,7 +308,7 @@ func TestUploadJobKeepsSecretsOutOfThePodSpec(t *testing.T) {
 // the usual steps; it mounts no backup PVC.
 func TestRemoteRestoreJobDownloadsFirst(t *testing.T) {
 	f, _, target, in := remoteJobFixture(t)
-	r := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: ns}}
+	r := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: remoteNS}}
 	files := []forgejov1.RemoteBackupFile{{Name: DBDumpFile, SizeBytes: 100 << 20, SHA256: "d"}, {Name: DataArchiveFile, SizeBytes: 900 << 20, SHA256: "a"}}
 	job, err := RemoteRestoreJob(in, r, RemoteSource{RemoteTarget: target, Files: files}, true, true)
 	if err != nil {
@@ -347,18 +346,6 @@ func names(cs []corev1.Container) []string {
 	return out
 }
 
-func completedBackup(t *testing.T, name string) *forgejov1.ForgejoBackup {
-	t.Helper()
-	b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
-	b.Spec.ForgejoRef.Name = "fb"
-	b.Status.Phase = forgejov1.BackupPhaseCompleted
-	b.Status.PVCName = testBackupsPVC
-	b.Status.IncludesData = true
-	return b
-}
-
-const ns = "regression"
-
 func TestBuildIdentity(t *testing.T) {
 	f := remoteInstance(nil)
 	f.Annotations = map[string]string{corev1.LastAppliedConfigAnnotation: "{...}", "team": "a"}
@@ -369,7 +356,7 @@ func TestBuildIdentity(t *testing.T) {
 			Annotations: map[string]string{forgejo.AnnotationSSHHostKeysSource: keySourceGenerated, "other": "x"}},
 			Data: map[string][]byte{testHostKeyFile: []byte("key")}},
 	}
-	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).Build()
+	c := fake.NewClientBuilder().WithScheme(FakeScheme(t)).WithObjects(objs...).Build()
 	id, err := BuildIdentity(context.Background(), c, f)
 	if err != nil {
 		t.Fatal(err)
@@ -387,7 +374,7 @@ func TestBuildIdentity(t *testing.T) {
 		t.Errorf("round trip: %v", err)
 	}
 	// The secrets are required; a missing admin Secret is an error too.
-	c = fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs[0]).Build()
+	c = fake.NewClientBuilder().WithScheme(FakeScheme(t)).WithObjects(objs[0]).Build()
 	if _, err := BuildIdentity(context.Background(), c, f); err == nil {
 		t.Error("an identity without the admin Secret was built")
 	}
@@ -417,7 +404,7 @@ func TestRestoreFromRefusesADatabaseOnlyBackup(t *testing.T) {
 	store.PutBackup(t, "team/", "dr/old/b1", RemoteManifest{Backup: "b1", Namespace: "dr", Forgejo: testOldName,
 		Reason: forgejov1.BackupReasonPreUpgrade, ForgejoImage: testImage17},
 		map[string][]byte{DBDumpFile: []byte("PGDMP"), IdentityFile: FakeIdentity(t, "old-secret-key")}, time.Now())
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := restoreFromInstance(store)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(secretObjects(FakeSecrets(remoteNS, "fj-backup-key"))...).Build()
@@ -454,11 +441,12 @@ func TestRestoreFromRefusesADatabaseOnlyBackup(t *testing.T) {
 func TestReconcileRestoreIdentity(t *testing.T) {
 	store := NewFakeS3(t)
 	putOldBackup(t, store)
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := restoreFromInstance(store)
 
-	// Without the key Secret the step waits, and the secrets step after it does not run.
+	// Without the key Secret the step waits, and the secrets step after it does not run. A
+	// failure that does not go away by itself is not backed off.
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(FakeSecrets(remoteNS, "unrelated")[0]).Build()
 	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
 	res, err := ReconcileRestoreIdentity(ctx, rc)
@@ -468,6 +456,9 @@ func TestReconcileRestoreIdentity(t *testing.T) {
 	if cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionRestoredFromBackup); cond == nil ||
 		cond.Status != metav1.ConditionFalse || !strings.Contains(cond.Message, `"fj-backup-key" not found`) {
 		t.Errorf("condition %+v", cond)
+	}
+	if _, ok := identityReadFailures.Load(types.NamespacedName{Namespace: f.Namespace, Name: f.Name}); ok {
+		t.Error("a configuration error was backed off")
 	}
 
 	c = fake.NewClientBuilder().WithScheme(s).WithObjects(secretObjects(FakeSecrets(remoteNS, "fj-backup-key"))...).Build()
@@ -506,7 +497,7 @@ func TestReconcileRestoreIdentity(t *testing.T) {
 func TestRestoreIdentityBacksOffTransientFailures(t *testing.T) {
 	store := NewFakeS3(t)
 	putOldBackup(t, store)
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := restoreFromInstance(store)
 	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
@@ -557,8 +548,6 @@ func TestRestoreIdentityBacksOffTransientFailures(t *testing.T) {
 	if _, ok := identityReadFailures.Load(key); ok {
 		t.Error("the failure is still recorded after a success")
 	}
-
-	checkConfigurationErrorIsNotBackedOff(t, store, key)
 }
 
 // expireIdentityBackoff lets the recorded identity read failure of key retry at once.
@@ -571,24 +560,10 @@ func expireIdentityBackoff(t *testing.T, key types.NamespacedName) {
 	v.(*identityReadFailure).retryAt = time.Now().Add(-time.Second)
 }
 
-// Failures that do not go away by themselves (here a missing key Secret) are not backed off.
-func checkConfigurationErrorIsNotBackedOff(t *testing.T, store *FakeS3, key types.NamespacedName) {
-	t.Helper()
-	s := testScheme(t)
-	f := restoreFromInstance(store)
-	rc := &forgejo.ReconcileContext{Client: fake.NewClientBuilder().WithScheme(s).Build(), Scheme: s, Instance: f}
-	if res, err := ReconcileRestoreIdentity(context.Background(), rc); err != nil || !res.Stop {
-		t.Fatalf("missing key: %+v %v", res, err)
-	}
-	if _, ok := identityReadFailures.Load(key); ok {
-		t.Error("a configuration error was backed off")
-	}
-}
-
 func TestRestoreIdentityNeverOverwritesSecrets(t *testing.T) {
 	store := NewFakeS3(t)
 	putOldBackup(t, store)
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := restoreFromInstance(store)
 	same := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsSecret, Namespace: remoteNS},
@@ -618,7 +593,7 @@ func TestRestoreIdentityNeverOverwritesSecrets(t *testing.T) {
 
 func TestMaintenanceHoldsUntilBootstrapRestored(t *testing.T) {
 	store := NewFakeS3(t)
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name    string
@@ -672,7 +647,7 @@ func TestMaintenanceHoldsUntilBootstrapRestored(t *testing.T) {
 
 func TestReconcileBootstrapCreatesAndFollowsTheRestore(t *testing.T) {
 	store := NewFakeS3(t)
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := restoreFromInstance(store)
 	f.Status.RestoredFrom = &forgejov1.RestoredFromStatus{Phase: forgejov1.RestoredFromRestoringData, IdentityRestoredTime: &metav1.Time{Time: time.Now()},
@@ -741,7 +716,7 @@ func TestReconcileBootstrapCreatesAndFollowsTheRestore(t *testing.T) {
 // and not into a database or data volume older than the Forgejo object.
 func TestBootstrapNeverRestoresOverLiveData(t *testing.T) {
 	store := NewFakeS3(t)
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	where := testRemoteLocation
 	created := metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second))
@@ -841,7 +816,7 @@ func TestBootstrapNeverRestoresOverLiveData(t *testing.T) {
 // prefix decide), and the spec.restoreFrom source of every bootstrapping instance in the
 // cluster, also before its ForgejoRestore exists.
 func TestProtectedRemoteDirs(t *testing.T) {
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := remoteInstance(nil) // endpoint http://garage:3900, prefix ""
 	source := func(endpoint, prefix, path string) forgejov1.RemoteBackupSource {
@@ -895,7 +870,7 @@ func TestProtectedRemoteDirs(t *testing.T) {
 
 func TestRemoteRetentionPrunesOnlyScheduledBackups(t *testing.T) {
 	store := NewFakeS3(t)
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := remoteInstance(store)
 	f.Spec.Backup.Enabled, f.Spec.Backup.Retention = true, 2
@@ -988,10 +963,7 @@ func TestBackupHealthReportsUploads(t *testing.T) {
 		{forgejov1.RemoteBackupUploading, metav1.ConditionTrue, testReasonBackupSucceeded, "uploading to s3://"},
 		{forgejov1.RemoteBackupFailed, metav1.ConditionFalse, "UploadFailed", "but its upload to s3://backups/x/ failed: denied"},
 	} {
-		b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: testScheduledBackup}}
-		b.Spec.Reason = forgejov1.BackupReasonScheduled
-		b.Status.Phase = forgejov1.BackupPhaseCompleted
-		b.Status.CompletionTime = &metav1.Time{Time: done}
+		b := scheduledBackup(testScheduledBackup, done.Add(-time.Minute), forgejov1.BackupPhaseCompleted)
 		b.Status.Remote = &forgejov1.RemoteBackupStatus{Phase: tc.phase, Location: "s3://backups/x/", Message: "denied"}
 		f.Status.Conditions = nil
 		rc := &forgejo.ReconcileContext{Instance: f}
@@ -1007,7 +979,7 @@ func TestBackupHealthReportsUploads(t *testing.T) {
 // is reported persistently: in status.backup.remote.message and as BackupHealthy=False, which
 // only a failed backup overrides.
 func TestBackupKeyProblemsAreReported(t *testing.T) {
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	sched, _ := cron.ParseStandard("0 3 * * *")
 	creds := FakeSecrets(remoteNS, "fj-backup-key")
@@ -1017,10 +989,7 @@ func TestBackupKeyProblemsAreReported(t *testing.T) {
 	exported.Annotations[forgejo.AnnotationBackupKeyExported] = valueTrue
 	own := creds[1].DeepCopy() // created by the user, e.g. restored from the offline copy
 
-	ok := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: testScheduledBackup}}
-	ok.Spec.Reason = forgejov1.BackupReasonScheduled
-	ok.Status.Phase = forgejov1.BackupPhaseCompleted
-	ok.Status.CompletionTime = &metav1.Time{Time: time.Now().Add(-time.Hour)}
+	ok := scheduledBackup(testScheduledBackup, time.Now().Add(-time.Hour), forgejov1.BackupPhaseCompleted)
 	failed := ok.DeepCopy()
 	failed.Status.Phase, failed.Status.Message = forgejov1.BackupPhaseFailed, "disk full"
 

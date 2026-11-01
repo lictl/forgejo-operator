@@ -1,8 +1,10 @@
 package backup_test
 
-// Finished backup, restore and cleanup Jobs are deleted once their outcome is in status:
-// their pods would otherwise keep a kubernetes.io/pvc-protection hold on the data and backup
-// PVCs, so deleting an instance with retainPolicy Delete left those claims Terminating.
+// Finished backup, restore and cleanup Jobs are deleted once their outcome is in status: their
+// pods would otherwise keep a kubernetes.io/pvc-protection hold on the data and backup PVCs, so
+// deleting an instance with retainPolicy Delete left those claims Terminating. A deleted backup
+// removes its files with a cleanup Job, and a restore whose Job vanished fails only once the
+// API server confirms it.
 
 import (
 	"context"
@@ -15,7 +17,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,118 +30,43 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// runningBackup is a manual backup of instance "fb" whose Job was started 5 minutes ago.
-func runningBackup(name string) *forgejov1.ForgejoBackup {
-	b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID(name + "-uid"),
-		Finalizers: []string{forgejo.FinalizerName},
-		Labels:     map[string]string{forgejo.LabelForgejo: "fb", forgejo.LabelBackupReason: string(forgejov1.BackupReasonManual)}}}
-	b.Spec.ForgejoRef.Name = "fb"
-	b.Status.Phase = forgejov1.BackupPhaseRunning
-	b.Status.StartTime = &metav1.Time{Time: time.Now().Add(-5 * time.Minute)}
-	b.Status.JobName = backup.BackupJobName(b)
-	b.Status.PVCName = testBackupsPVC
-	b.Status.Path = "/" + name
-	b.Status.IncludesData = true
-	return b
-}
-
-// finishedJob is a Job named name controlled by owner that ended with cond (Complete or
-// Failed).
-func finishedJob(t *testing.T, s *runtime.Scheme, name string, owner client.Object, cond batchv1.JobConditionType) *batchv1.Job {
-	t.Helper()
-	j := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID(name + "-uid"),
-		Labels: map[string]string{forgejo.LabelInstance: "fb"}}}
-	if err := controllerutil.SetControllerReference(owner, j, s); err != nil {
-		t.Fatal(err)
-	}
-	j.Status.Conditions = []batchv1.JobCondition{{Type: cond, Status: corev1.ConditionTrue, Reason: "Test"}}
-	now := metav1.Now()
-	if cond == batchv1.JobComplete {
-		j.Status.Succeeded, j.Status.CompletionTime = 1, &now
-	} else {
-		j.Status.Failed = 1
-	}
-	return j
-}
-
-// jobPod is a finished pod of Job job whose container name ended with exit code and message.
-func jobPod(job, container string, code int32, message string) *corev1.Pod {
-	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: job + "-x1", Namespace: ns, CreationTimestamp: metav1.Now(),
-		Labels: map[string]string{batchv1.JobNameLabel: job}}}
-	p.Status.Phase = corev1.PodSucceeded
-	if code != 0 {
-		p.Status.Phase = corev1.PodFailed
-	}
-	p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: container,
-		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code, Message: message}}}}
-	return p
-}
-
-func jobExists(t *testing.T, c client.Client, name string) bool {
-	t.Helper()
-	err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: name}, &batchv1.Job{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		t.Fatal(err)
-	}
-	return err == nil
-}
-
-func getBackup(t *testing.T, c client.Client, name string) *forgejov1.ForgejoBackup {
-	t.Helper()
-	b := &forgejov1.ForgejoBackup{}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: name}, b); err != nil {
-		t.Fatal(err)
-	}
-	return b
-}
-
-func newFakeClient(s *runtime.Scheme, objs ...client.Object) client.WithWatch {
-	return fake.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&forgejov1.ForgejoBackup{}, &forgejov1.ForgejoRestore{}, &batchv1.Job{}).
-		WithObjects(objs...).Build()
-}
-
-// A successful backup records sizes, message and times, then deletes its Job.
+// A successful backup records sizes, message and times, then deletes its Job. It keeps the
+// SECRET_KEY fingerprint of its instance recorded when its Job started (the identity the dump
+// was taken with), which restores and retention compare with the instance's own: a Secret that
+// changed while the Job ran does not change it, and none is recorded without Secret fb-secrets.
 func TestCompletedBackupDeletesItsJob(t *testing.T) {
-	s := scheme(t)
-	b := runningBackup("m1")
-	job := finishedJob(t, s, b.Status.JobName, b, batchv1.JobComplete)
-	pod := jobPod(job.Name, backup.ContainerArchive, 0, `{"databaseSizeBytes":123,"dataSizeBytes":456,"warnings":0}`)
-	c := newFakeClient(s, instance(""), b, job, pod)
-
-	reconcileBackup(t, c, b.Name)
-
-	got := getBackup(t, c, b.Name)
-	if got.Status.Phase != forgejov1.BackupPhaseCompleted || got.Status.DatabaseSizeBytes != 123 || got.Status.DataSizeBytes != 456 ||
-		got.Status.CompletionTime == nil || got.Status.StartTime == nil || got.Status.Message == "" {
-		t.Fatalf("status not recorded before the Job went: %+v", got.Status)
-	}
-	if jobExists(t, c, job.Name) {
-		t.Error("backup Job kept after its outcome was recorded")
-	}
-	if got.Status.SecretKeyFingerprint != "" {
-		t.Errorf("fingerprint %q recorded without Secret fb-secrets", got.Status.SecretKeyFingerprint)
-	}
-}
-
-// A backup records the SECRET_KEY fingerprint of its instance when its Job starts (the identity
-// the dump was taken with), which restores and retention compare with the instance's own. A
-// Secret that changed while the Job ran does not change it.
-func TestCompletedBackupKeepsTheIdentityOfItsStart(t *testing.T) {
-	s := scheme(t)
-	b := runningBackup("m1")
+	s := backup.FakeScheme(t)
 	started := forgejo.SecretKeyFingerprint(map[string][]byte{forgejo.SecretKeySecretKey: []byte("the-secret-key")})
-	b.Status.SecretKeyFingerprint = started
-	job := finishedJob(t, s, b.Status.JobName, b, batchv1.JobComplete)
-	pod := jobPod(job.Name, backup.ContainerArchive, 0, `{"databaseSizeBytes":123,"dataSizeBytes":456,"warnings":0}`)
-	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsName, Namespace: ns},
-		Data: map[string][]byte{forgejo.SecretKeySecretKey: []byte("another-secret-key")}}
-	c := newFakeClient(s, instance(""), b, job, pod, secrets)
+	for _, tc := range []struct {
+		name, started string
+		objs          []client.Object
+	}{
+		{name: "without Secret fb-secrets"},
+		{name: "Secret changed while the Job ran", started: started, objs: []client.Object{&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: testSecretsName, Namespace: ns},
+			Data:       map[string][]byte{forgejo.SecretKeySecretKey: []byte("another-secret-key")}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := runningBackup("m1")
+			b.Status.SecretKeyFingerprint = tc.started
+			job := finishedJob(t, s, b.Status.JobName, b, batchv1.JobComplete)
+			pod := jobPod(job.Name, backup.ContainerArchive, 0, `{"databaseSizeBytes":123,"dataSizeBytes":456,"warnings":0}`)
+			c := newFakeClient(s, append([]client.Object{instance(""), b, job, pod}, tc.objs...)...)
 
-	reconcileBackup(t, c, b.Name)
+			reconcileBackup(t, c, b.Name)
 
-	if got := getBackup(t, c, b.Name); got.Status.Phase != forgejov1.BackupPhaseCompleted || got.Status.SecretKeyFingerprint != started {
-		t.Errorf("phase %s, fingerprint %q, want %q", got.Status.Phase, got.Status.SecretKeyFingerprint, started)
+			got := getBackup(t, c, b.Name)
+			if got.Status.Phase != forgejov1.BackupPhaseCompleted || got.Status.DatabaseSizeBytes != 123 || got.Status.DataSizeBytes != 456 ||
+				got.Status.CompletionTime == nil || got.Status.StartTime == nil || got.Status.Message == "" {
+				t.Fatalf("status not recorded before the Job went: %+v", got.Status)
+			}
+			if jobExists(t, c, job.Name) {
+				t.Error("backup Job kept after its outcome was recorded")
+			}
+			if got.Status.SecretKeyFingerprint != tc.started {
+				t.Errorf("fingerprint %q, want %q", got.Status.SecretKeyFingerprint, tc.started)
+			}
+		})
 	}
 }
 
@@ -148,7 +74,7 @@ func TestCompletedBackupKeepsTheIdentityOfItsStart(t *testing.T) {
 // Its files are then removed by a cleanup Job, whose outcome goes into FilesRemoved before it
 // is deleted too; neither a later reconcile nor deleting the backup runs another one.
 func TestFailedBackupDeletesItsJobsAndRecordsFileRemoval(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	ctx := context.Background()
 	b := runningBackup("m2")
 	job := finishedJob(t, s, b.Status.JobName, b, batchv1.JobFailed)
@@ -206,10 +132,68 @@ func TestFailedBackupDeletesItsJobsAndRecordsFileRemoval(t *testing.T) {
 	}
 }
 
+// deletedOwnedBackup is a completed scheduled backup owned by instance f that garbage
+// collection is deleting.
+func deletedOwnedBackup(t *testing.T, f *forgejov1.Forgejo) *forgejov1.ForgejoBackup {
+	t.Helper()
+	b := completedBackup("fb-scheduled-1")
+	b.Spec.Reason = forgejov1.BackupReasonScheduled
+	b.Status.Path = "/fb-scheduled-1"
+	b.Finalizers = []string{forgejo.FinalizerName}
+	if err := controllerutil.SetOwnerReference(f, b, backup.FakeScheme(t)); err != nil {
+		t.Fatal(err)
+	}
+	b.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	return b
+}
+
+// Deleting a backup removes its files with a cleanup Job: when the user deletes it while its
+// instance lives, and when the backup volume goes with the deleted instance anyway. A backup
+// garbage-collected with its deleted instance keeps its files when the backup volume is
+// retained (retainPolicy switched to Retain after the backup was created).
+func TestBackupFinalizerRemovesFilesUnlessTheVolumeIsRetained(t *testing.T) {
+	s := backup.FakeScheme(t)
+	for _, tc := range []struct {
+		name            string
+		alive, ownedPVC bool
+		cleanup         bool
+	}{
+		{name: "explicit delete of an owned backup", alive: true, cleanup: true},
+		{name: "instance and backup volume deleted", ownedPVC: true, cleanup: true},
+		{name: "instance deleted, backup volume retained"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := instance("")
+			f.Spec.Storage.RetainPolicy = forgejov1.RetainPolicyDelete // when the backup was created: it is owned
+			b := deletedOwnedBackup(t, f)
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: testBackupsPVC, Namespace: ns}}
+			if tc.ownedPVC {
+				if err := controllerutil.SetControllerReference(f, pvc, s); err != nil {
+					t.Fatal(err)
+				}
+			}
+			objs := []client.Object{b, pvc}
+			if tc.alive {
+				objs = append(objs, f)
+			}
+			c := newFakeClient(s, objs...)
+
+			reconcileBackup(t, c, b.Name)
+
+			if exists := jobExists(t, c, backup.CleanupJobName(b)); exists != tc.cleanup {
+				t.Errorf("cleanup Job exists = %t, want %t", exists, tc.cleanup)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(b), &forgejov1.ForgejoBackup{}); !tc.cleanup && !apierrors.IsNotFound(err) {
+				t.Errorf("finalizer was not released (err %v)", err)
+			}
+		})
+	}
+}
+
 // A finished backup removes a finished Job it still has (e.g. kept by an earlier operator
 // version), but never a running Job or one it does not control.
 func TestFinishedBackupReleasesOnlyItsFinishedJob(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	for name, tc := range map[string]struct {
 		cond    batchv1.JobConditionType // "" = running
 		foreign bool
@@ -245,7 +229,7 @@ func TestFinishedBackupReleasesOnlyItsFinishedJob(t *testing.T) {
 // already recorded as Completed and its Job deleted) must not overwrite the result with
 // JobMissing, which would then remove the files of a good backup.
 func TestStaleBackupCannotOverwriteRecordedResult(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	ctx := context.Background()
 	b := runningBackup("m4")
 	live := newFakeClient(s, instance(""), b)
@@ -285,7 +269,7 @@ func TestStaleBackupCannotOverwriteRecordedResult(t *testing.T) {
 // scale-up timeout) and goes once the restore is Completed; a failed Job goes as soon as the
 // failure, with how far it got, is recorded.
 func TestRestoreDeletesItsJobOnceFinished(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	prep := func(t *testing.T, cond batchv1.JobConditionType) (client.Client, *forgejov1.ForgejoRestore, *batchv1.Job) {
 		rs := newRestore("r1", forgejov1.RestorePhaseRestoring)
 		rs.Finalizers = []string{forgejo.FinalizerName}
@@ -351,4 +335,53 @@ func TestRestoreDeletesItsJobOnceFinished(t *testing.T) {
 			t.Error("restore Job kept although the instance is being deleted")
 		}
 	})
+}
+
+// A restore Job missing from the cache is only reported as gone after a live read, and the
+// grace period counts from when the Job was created, not from when scaling down started.
+func TestRestoreJobMissingIsConfirmedLive(t *testing.T) {
+	s := backup.FakeScheme(t)
+	b := completedBackup("b1")
+	rs := newRestore("r1", forgejov1.RestorePhaseRestoring)
+	rs.Finalizers = []string{forgejo.FinalizerName}
+	rs.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
+	rs.Spec.BackupName = "b1"
+	rs.Status.StartTime = &metav1.Time{Time: time.Now().Add(-20 * time.Minute)}
+	rs.Status.JobName = backup.RestoreJobName(rs)
+
+	// Created a moment ago: within the grace period although startTime is old.
+	rs.Status.JobStartTime = &metav1.Time{Time: time.Now()}
+	cached := fake.NewClientBuilder().WithScheme(s).WithObjects(instance(rs.Name), b, rs).WithStatusSubresource(rs).Build()
+	r := &controller.ForgejoRestoreReconciler{Client: cached, APIReader: cached, Scheme: s}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: rs.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getRestore(t, cached, rs.Name); got.Status.Phase != forgejov1.RestorePhaseRestoring {
+		t.Errorf("restore failed within the grace period: %s %s", got.Status.Phase, got.Status.Message)
+	}
+
+	// Past the grace period, the cache lacks the Job but the API server has it.
+	rs.Status.JobStartTime = &metav1.Time{Time: time.Now().Add(-5 * time.Minute)}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: rs.Status.JobName, Namespace: ns, CreationTimestamp: metav1.Now()}}
+	if err := controllerutil.SetControllerReference(rs, job, s); err != nil {
+		t.Fatal(err)
+	}
+	cached = fake.NewClientBuilder().WithScheme(s).WithObjects(instance(rs.Name), b, rs).WithStatusSubresource(rs).Build()
+	live := fake.NewClientBuilder().WithScheme(s).WithObjects(job).Build()
+	r = &controller.ForgejoRestoreReconciler{Client: cached, APIReader: live, Scheme: s}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: rs.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getRestore(t, cached, rs.Name); got.Status.Phase != forgejov1.RestorePhaseRestoring {
+		t.Errorf("restore failed although the API server still has its Job: %s %s", got.Status.Phase, got.Status.Message)
+	}
+
+	// Gone from both: JobMissing.
+	r = &controller.ForgejoRestoreReconciler{Client: cached, APIReader: fake.NewClientBuilder().WithScheme(s).Build(), Scheme: s}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: rs.Name}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getRestore(t, cached, rs.Name); got.Status.Phase != forgejov1.RestorePhaseFailed || reason(got.Status.Conditions) != "JobMissing" {
+		t.Errorf("phase %s reason %s, want Failed/JobMissing", got.Status.Phase, reason(got.Status.Conditions))
+	}
 }

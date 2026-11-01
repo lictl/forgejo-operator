@@ -20,7 +20,7 @@ const testBucketName = "forgejo"
 
 // Backups carry a copy of the SSH host keys from the Secret the pods serve them from.
 func TestBackupJobCopiesSSHHostKeys(t *testing.T) {
-	s := testScheme(t)
+	s := FakeScheme(t)
 	build := func(mutate func(f *forgejov1.Forgejo)) *corev1.PodSpec {
 		t.Helper()
 		f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: "ns"}}
@@ -62,6 +62,88 @@ func TestBackupJobCopiesSSHHostKeys(t *testing.T) {
 	}
 	if got := secretOf(build(func(f *forgejov1.Forgejo) { f.Spec.Server.SSH.Enabled = ptr.To(false) })); got != "" {
 		t.Errorf("SSH disabled: %q", got)
+	}
+}
+
+func TestRestoreJobResetsAdminSyncAfterDatabaseOnlyRestore(t *testing.T) {
+	s := FakeScheme(t)
+	f := ownedInstance(forgejov1.RetainPolicyRetain)
+	b := reasonBackup("b", forgejov1.BackupReasonManual)
+	b.Status.PVCName = testBackupsPVC
+	rs := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns"}}
+	in := JobInput{Scheme: s, Instance: f, InstanceName: "fb", ForgejoImage: forgejov1.DefaultImage, PostgresImage: forgejov1.DefaultPostgresImage,
+		DB: &forgejo.DBConnection{Host: "db", Port: 5432, Name: "app", SSLMode: "verify-full", SecretName: "s", UsernameKey: "u", PasswordKey: "p"}}
+
+	job, err := RestoreJob(in, rs, b, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := job.Spec.Template.Spec.Containers[0]
+	if main.Name != ContainerResetAdminSync || len(main.VolumeMounts) != 1 || main.VolumeMounts[0].ReadOnly {
+		t.Fatalf("database-only restore ends with %s %v, want %s with the data volume read-write", main.Name, main.VolumeMounts, ContainerResetAdminSync)
+	}
+	if env := main.Env[0]; env.Name != "ADMIN_SYNC_MARKER" || env.Value != "/data/gitea/"+AdminSyncMarker {
+		t.Errorf("marker env %v", env)
+	}
+	// The LevelDB queues (without highAvailability) hold work for the replaced database.
+	if env := main.Env[1]; env.Name != "QUEUES_DIR" || env.Value != "/data/gitea/queues" {
+		t.Errorf("queues env %v", env)
+	}
+	if init := job.Spec.Template.Spec.InitContainers; len(init) != 2 || init[1].Name != ContainerRestoreDB {
+		t.Errorf("init containers %v, want verify and %s", init, ContainerRestoreDB)
+	}
+
+	job, err = RestoreJob(in, rs, b, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main := job.Spec.Template.Spec.Containers[0]; main.Name != ContainerRestoreData {
+		t.Errorf("full restore ends with %s, want %s (the archive brings its own marker)", main.Name, ContainerRestoreData)
+	}
+}
+
+func TestBackupScriptsRemovePartialFiles(t *testing.T) {
+	for name, script := range map[string]string{"dump": dumpScript, "archive": archiveScript(forgejo.LayoutForImage(forgejov1.DefaultImage))} {
+		if !strings.Contains(script, removePartials) {
+			t.Errorf("%s script does not remove its partial files on exit", name)
+		}
+	}
+	for name, script := range map[string]string{"verify": verifyScript, "restore-database": restoreDBScript, "restore-data": restoreDataScript} {
+		if strings.Contains(script, removePartials) {
+			t.Errorf("%s script must not delete files on the read-only backup volume", name)
+		}
+	}
+}
+
+// verify-ca/verify-full without a CA must not make libpq look for ~/.postgresql/root.crt.
+func TestDatabaseScriptsChooseSSLRootCert(t *testing.T) {
+	for name, script := range map[string]string{"dump": dumpScript, "restore-database": restoreDBScript} {
+		if !strings.Contains(script, pgSSLRoot) {
+			t.Errorf("%s script does not set PGSSLROOTCERT for verify-ca/verify-full", name)
+		}
+	}
+	for _, want := range []string{"/etc/ssl/certs/ca-certificates.crt", "PGSSLROOTCERT=system", "verify-ca|verify-full"} {
+		if !strings.Contains(pgSSLRoot, want) {
+			t.Errorf("pgSSLRoot lacks %q", want)
+		}
+	}
+}
+
+func TestArchiveScriptOrdersRepositories(t *testing.T) {
+	script := archiveScript(forgejo.LayoutForImage(forgejov1.DefaultImage))
+	for _, want := range []string{
+		"REPOS='./git/repositories'",
+		"--exclude './git/repositories/*/*.git/objects/pack'",
+		`echo "$r/objects/./pack"`,
+		"-T /tmp/archive.list",
+		"repositories were repacked while they were archived",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("archive script lacks %q", want)
+		}
+	}
+	if refs, objects := strings.Index(script, "for e in refs packed-refs"), strings.Index(script, `echo "$r/objects"`); refs < 0 || refs > objects {
+		t.Error("refs must be listed before objects")
 	}
 }
 
@@ -153,4 +235,40 @@ func objectStorageInstance() *forgejov1.Forgejo {
 		Subsystems: forgejov1.ObjectStorageSubsystems{ActionsArtifacts: ptr.To(false)},
 	}
 	return f
+}
+
+// The step that ends a database-only restore removes the admin sync marker and the LevelDB
+// queues, and nothing else of the data volume.
+func TestResetAdminSyncScriptRemovesQueues(t *testing.T) {
+	dir := t.TempDir()
+	marker, queues, repo := filepath.Join(dir, AdminSyncMarker), filepath.Join(dir, "queues"), filepath.Join(dir, "repo")
+	for _, d := range []string{filepath.Join(queues, "common"), repo} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{marker, filepath.Join(queues, "common", "000001.log"), filepath.Join(repo, "HEAD")} {
+		if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("sh", "-c", resetAdminSyncScript)
+	cmd.Env = append(os.Environ(), "ADMIN_SYNC_MARKER="+marker, "QUEUES_DIR="+queues)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+	for _, gone := range []string{marker, queues} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Errorf("%s still exists (%v)", gone, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(repo, "HEAD")); err != nil {
+		t.Errorf("other data removed: %v", err)
+	}
+	// Without queues (an HA instance, or a fresh volume) the script still succeeds.
+	again := exec.Command("sh", "-c", resetAdminSyncScript)
+	again.Env = cmd.Env
+	if out, err := again.CombinedOutput(); err != nil {
+		t.Fatalf("second run failed: %v\n%s", err, out)
+	}
 }

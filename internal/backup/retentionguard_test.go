@@ -53,7 +53,7 @@ func withoutSizeFloor(t *testing.T) {
 func runPrune(t *testing.T, f *forgejov1.Forgejo, keep int32, current string, backups ...*forgejov1.ForgejoBackup) (string, []string) {
 	t.Helper()
 	ctx := context.Background()
-	s := testScheme(t)
+	s := FakeScheme(t)
 	objs := make([]client.Object, 0, len(backups))
 	for _, b := range backups {
 		objs = append(objs, b)
@@ -195,7 +195,7 @@ func TestBackupHealthReportsSizeDrop(t *testing.T) {
 // The scheduled backup step holds retention and reports the drop.
 func TestReconcileScheduleHoldsRetentionOnSizeDrop(t *testing.T) {
 	withoutSizeFloor(t)
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := ownedInstance(forgejov1.RetainPolicyRetain)
 	f.Spec.Backup.Enabled, f.Spec.Backup.Schedule, f.Spec.Backup.Retention = true, "@every 1h", 1
@@ -232,7 +232,7 @@ func TestReconcileScheduleHoldsRetentionOnSizeDrop(t *testing.T) {
 func TestRemoteRetentionGuards(t *testing.T) {
 	withoutSizeFloor(t)
 	store := NewFakeS3(t)
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := remoteInstance(store)
 	f.Spec.Backup.Enabled, f.Spec.Backup.Retention = true, 1
