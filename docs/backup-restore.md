@@ -112,7 +112,11 @@ What happens:
     node satisfies both (the backup volume lives on another node or zone than the data), the
     backup or restore fails right away with reason `BackupVolumeConflict` instead of a Job
     that never starts. Recreate the backup PVC, or use a StorageClass that both nodes can
-    reach. The instance's tolerations, node selector and image pull secrets apply.
+    reach. The instance's tolerations, node selector, priority class and image pull secrets
+    apply. Backup, cleanup, upload and local/remote restore Jobs also inherit
+    `spec.podTemplate.serviceAccountName` from an available Forgejo instance: when no explicit `spec.imagePullSecrets` are
+    set, Kubernetes supplies the account's image pull secrets. The Jobs keep
+    `automountServiceAccountToken: false`; they need no Kubernetes API credentials.
   * The Job has `backoffLimit: 1` and `activeDeadlineSeconds` of 24h. If its pod cannot
     start a container within 10 minutes (unschedulable, image pull errors, rejected by
     admission), the Job is deleted and the backup fails with the reason.
