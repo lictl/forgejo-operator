@@ -17,8 +17,8 @@ editor and viewer roles of each kind) are for people, not for the operator; noth
 
 ## manager-role
 
-Every verb is used by the code (delete on CNPG Clusters only for an admission check, see the
-table); nothing is granted on `*`, and no rule uses `resourceNames`
+Every verb is used by the code (delete on PVCs and CNPG Clusters only for an admission check,
+see the table); nothing is granted on `*`, and no rule uses `resourceNames`
 (the names of an instance's objects are not known in advance). The operator never deletes data:
 the data and backup PVCs, the CNPG Cluster and the identity Secrets go only through Kubernetes'
 garbage collection under `spec.storage.retainPolicy: Delete`. Nor does a failed PostgreSQL major
@@ -31,7 +31,7 @@ stopped and the instance Broken ([upgrades.md](upgrades.md#failures-of-a-postgre
 | core | `secrets` | get, list, watch, create, update, patch, delete | The instance's generated Secrets (`<name>-secrets`, also patched with the Valkey password, `-admin`, `-ssh-host-keys`, `-backup-key`), `app.ini` (`<name>-config`, `-config-lkg`), identity Secrets of a disaster recovery, a `ForgejoRunner`'s `<name>-tokens` and `<name>-runner`, and the identity bundle `<backup>-identity` of an upload Job, deleted with the Job (the only Secret the operator deletes). Reads of Secrets the spec names (`configFrom`, `admin.existingSecret`, external database, S3 and backup keys) and CNPG's `-app` Secret. list and watch feed the cache, which holds only Secrets labelled `app.kubernetes.io/managed-by=forgejo-operator`, and the metadata-only cache of CNPG Secrets (label `cnpg.io/cluster`); RBAC cannot express that filter |
 | core | `configmaps` | get, list, watch, create, update, delete | Grafana dashboard `<name>-dashboard` |
 | core | `services` | get, list, watch, create, update, delete | `<name>-http`, `<name>-ssh`, `<name>-valkey` (headless); delete: Valkey when HA is turned off |
-| core | `persistentvolumeclaims` | get, list, watch, create, update, patch | Data and backup PVCs; owner references under `retainPolicy` and automatic expansion (patch). Never deleted |
+| core | `persistentvolumeclaims` | get, list, watch, create, update, patch, delete | Data and backup PVCs; owner references under `retainPolicy` and automatic expansion (patch); delete: never called, but the `OwnerReferencesPermissionEnforcement` admission plugin requires it to change the owner reference under `spec.storage.retainPolicy` |
 | core | `pods` | get, list, watch, delete | Server, CNPG, Job (also CNPG's major upgrade Job) and runner pods; delete: a hung pod (self-healing) or a failing pod of an upgrade's new image |
 | core | `namespaces` | get | The Pod Security label of a `ForgejoRunner`'s namespace (Docker executor) |
 | core | `nodes`, `persistentvolumes` | get, list, watch | Placing backup and restore Jobs where node-local volumes can be attached; schedulable nodes and their memory (HA warnings, vertical sizing); whether nodes carry `topology.kubernetes.io/zone` (HA spreading) |
@@ -62,7 +62,9 @@ cluster-scoped rules and `cluster_reader_role.yaml` differ.
 ### Cluster-wide write access
 
 With `config/default` the operator may create, change and delete Secrets, Deployments, Jobs,
-Services and the other kinds above **in every namespace**, and delete pods there. That is what an
+Services and the other kinds above **in every namespace**, and delete pods there. Delete on PVCs
+and CNPG Clusters is never called; without the admission plugin that needs it, update on them
+already let an owner reference hand them to garbage collection. That is what an
 operator that serves instances in any namespace needs: RBAC can restrict a rule only by
 resource name, not by label or name prefix, and the operator's objects are named after
 instances it does not know in advance. What bounds it is the code: it writes only in the

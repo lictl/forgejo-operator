@@ -135,6 +135,19 @@ func TestClusterReaderMatchesManagerRole(t *testing.T) {
 	}
 }
 
+// The operator never deletes a PVC or a CNPG Cluster, but it changes their owner references
+// under retainPolicy, which the OwnerReferencesPermissionEnforcement admission plugin allows only
+// to a caller that may delete the object. delete stays although no code calls it.
+func TestOwnerReferenceChangesKeepDelete(t *testing.T) {
+	manager := grants(t, "config/rbac/role.yaml")
+	for _, key := range []string{"/persistentvolumeclaims", "postgresql.cnpg.io/clusters"} {
+		if !slices.Contains(manager[key], "delete") {
+			t.Errorf("manager-role grants %s %v without delete, which changing its owner references needs (docs/permissions.md)",
+				key, manager[key])
+		}
+	}
+}
+
 func TestPodsExecOnlyInVolumeUsageRole(t *testing.T) {
 	if verbs, ok := grants(t, "config/rbac/role.yaml")["/pods/exec"]; ok {
 		t.Errorf("manager-role grants pods/exec %v; it belongs in config/rbac/volume_usage_role.yaml only", verbs)

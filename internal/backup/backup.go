@@ -21,7 +21,10 @@ import (
 )
 
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
+// delete on persistentvolumeclaims is never called: the OwnerReferencesPermissionEnforcement
+// admission plugin requires it to change the owner reference that setBackupPVCOwnership sets or
+// drops under retainPolicy.
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch;create;delete
 
 // ReconcileMaintenance sets rc.Maintenance while a ForgejoRestore targets this instance and
