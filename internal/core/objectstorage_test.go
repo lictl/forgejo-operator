@@ -8,6 +8,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -218,7 +219,8 @@ func TestObjectStoragePodSpecCA(t *testing.T) {
 	want := corev1.VolumeMount{Name: objectStorageCAVolume, MountPath: "/etc/forgejo-s3-ca", ReadOnly: true}
 	for _, c := range s3Containers(spec) {
 		env := envOf(c)
-		if !slices.Contains(c.VolumeMounts, want) || env["SSL_CERT_DIR"].Value != "/etc/ssl/certs:/etc/forgejo-s3-ca" ||
+		mounted := slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool { return equality.Semantic.DeepEqual(m, want) })
+		if !mounted || env["SSL_CERT_DIR"].Value != "/etc/ssl/certs:/etc/forgejo-s3-ca" ||
 			secretRefKey(env["AWS_ACCESS_KEY_ID"]) != "id" {
 			t.Fatalf("%s: mounts %v env %v", c.Name, c.VolumeMounts, env)
 		}
