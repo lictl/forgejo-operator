@@ -533,6 +533,13 @@ The objects of a `ForgejoRunner` are named in `internal/runner/names.go`, carry
 
 ## Optional integrations
 
+The Helm chart and Kustomize manifests expose authenticated HTTPS operator metrics
+using controller-runtime's self-signed certificate by default. Their ServiceMonitors
+skip certificate verification and preserve instance labels with `honorLabels: true`.
+They neither bundle cert-manager nor include cert-manager configuration for operator
+metrics; a separately managed certificate and custom monitor TLS configuration can
+provide verified TLS (see [observability.md](observability.md#scraping-the-operator)).
+
 CNPG, prometheus-operator (ServiceMonitor/PrometheusRule), metrics-server, Gateway API
 (HTTPRoute, TCPRoute, ReferenceGrant) and cert-manager (Certificate) are optional.
 Check `rc.HasAPI(gvk)` (or `rc.FirstAPI` for kinds served in several versions, such as TCPRoute

@@ -94,6 +94,18 @@ The metrics endpoint authenticates and authorizes every scrape (`TokenReview` an
 
 If the scrape is denied, the target shows `server returned HTTP status 403 Forbidden`.
 
+For Helm installations, `prometheus.enabled=true` installs the operator ServiceMonitor.
+Both the Helm and Kustomize monitors use authenticated HTTPS by default with the
+controller-runtime self-signed certificate and skip certificate verification. The
+operator does not bundle cert-manager or provide cert-manager configuration for its
+metrics endpoint. For verified TLS, mount a separately managed server certificate in
+the manager, pass `--metrics-cert-path` (with `tls.crt` and `tls.key` by default), and
+customize the ServiceMonitor's `tlsConfig` with the trusted CA, matching `serverName`,
+and `insecureSkipVerify: false`. Helm's `manager.extraVolumes`,
+`manager.extraVolumeMounts` and `manager.args` can supply the certificate; apply the
+ServiceMonitor customization with a Helm post-renderer or Kustomize overlay. Scrape
+authentication still uses the ServiceAccount token, not a client certificate.
+
 The ServiceMonitor sets **`honorLabels: true`**, and this is required. Operator metrics
 identify an instance by their own `namespace` and `name` labels. Without `honorLabels`,
 Prometheus renames `namespace` to `exported_namespace`, and the generated alerts and the
