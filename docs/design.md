@@ -36,7 +36,7 @@ and the mistakes below. The operator's runtime checks stay as a second line.
 
 | Kind | Refused |
 |------|---------|
-| `Forgejo` | a name that is not a DNS-1035 label, longer than 56 (Service `<name>-valkey`), with CNPG longer than 47 (CNPG limits Cluster `<name>-db` to 50), or with `highAvailability.enabled` longer than 45 (pod label `controller-revision-hash=<name>-valkey-<hash>`); a name ending in `-valkey` (its PDB `<name>` would be the Valkey PDB of another instance); an empty `image`, `database.cnpg.imageName` or `highAvailability.valkey.image` (it would follow the operator's default); with type CNPG, a `database.cnpg.imageName` whose tag does not start with the PostgreSQL major (CNPG reads the major from it); `replicas` > 1 or `autoscaling.horizontal.enabled` without `highAvailability.enabled` (also through the scale subresource); `minReplicas` > `maxReplicas`; type `External` without `external`, `external` without type `External`, and CNPG settings with `External` (except `imageName`, used by backup Jobs); `ingress.enabled` without a host (`ingress.host`, `server.domain`, `server.rootURL` or `gateway.hostnames`); Ingress and Gateway paths that Kubernetes or `HTTPPathMatch` refuse; `gateway.ssh` with SSH disabled; an issuer kind other than `Issuer`/`ClusterIssuer` for cert-manager's group; `nodePort` or `loadBalancerClass` on a Service type that ignores it; a `domain` or `rootURL` that is no host name or http(s) URL; an admin user name Forgejo refuses or reserves (e.g. `admin`); a `backup.schedule` that is no five-field cron expression or descriptor; `restoreFrom` set or changed after creation |
+| `Forgejo` | a name that is not a DNS-1035 label, longer than 56 (Service `<name>-valkey`), with CNPG longer than 47 (CNPG limits Cluster `<name>-db` to 50), or with `highAvailability.enabled` longer than 45 (pod label `controller-revision-hash=<name>-valkey-<hash>`); a name ending in `-valkey` (its PDB `<name>` would be the Valkey PDB of another instance); an empty `image`, `database.cnpg.imageName` or `highAvailability.valkey.image` (it would follow the operator's default); with type CNPG, a `database.cnpg.imageName` whose tag does not start with the PostgreSQL major (CNPG reads the major from it); `replicas` > 1 or `autoscaling.horizontal.enabled` without `highAvailability.enabled` (also through the scale subresource); `minReplicas` > `maxReplicas`; type `External` without `external`, `external` without type `External`, and CNPG settings with `External` (except `imageName`, used by backup Jobs); `ingress.enabled` without a host (`ingress.host`, `server.domain`, `server.rootURL` or `gateway.hostnames`); Ingress and Gateway paths that Kubernetes or `HTTPPathMatch` refuse; `gateway.ssh` with SSH disabled; an issuer kind other than `Issuer`/`ClusterIssuer` for cert-manager's group; `nodePort` or `loadBalancerClass` on a Service type that ignores it; a `domain` or `rootURL` that is no host name or http(s) URL; an admin user name Forgejo refuses or reserves (e.g. `admin`); a `backup.schedule` that is no five-field cron expression or descriptor; `restoreFrom` set or changed after creation; `database.type` changed, or `storage.existingClaim` set, changed or removed, after creation (Forgejo would start on another, empty database or volume) |
 | `ForgejoBackup` | any change of `spec` |
 | `ForgejoRestore` | any change of `spec`; neither or both of `backupName` and `remote`; `restoreDatabase` and `restoreData` both false |
 | `ForgejoRunner` | a name longer than 52 (pod label `controller-revision-hash=<name>-<hash>`), with a `.` (pod host names), or ending in `-valkey` or `-cron` (its StatefulSet `<name>` would be an HA instance's Valkey or cron runner); a missing `executor`; a changed `forgejoRef`; both `scope.organization` and `scope.repository`; labels of the other executor's form; `docker` settings with `Host` and `host.image` with `Docker` |
@@ -73,7 +73,10 @@ durations and pull policies have their ranges, forms and enums.
   instance's UID, or the UID of the instance `spec.restoreFrom` recreated, up to the restored
   backup (`status.restoredFrom.instanceUID`, `backupCompletionTime`): two instances of the same
   namespace and name writing to the same bucket (a recovery drill, the original cluster back
-  after a recovery) never prune each other's backups.
+  after a recovery) never prune each other's backups. Like local retention, it also skips
+  backups whose `secretKeyFingerprint` is another identity's, and prunes no complete scheduled
+  backup while the newest one is less than half the size of another one it holds (the size-drop
+  guard, `internal/backup/retentionguard.go`).
 - **Identity.** The backup controller builds the identity bundle (the instance's Secrets and
   sanitised spec) in Go and hands it to the upload Job in Secret `<backup>-identity`, which it
   deletes with the Job.
@@ -168,7 +171,7 @@ checks, the restore handshake or volume expansion. Around the table:
 | 21 | tls | core | – | cert-manager Certificate `<name>-tls` (Secret `<name>-tls`), ReferenceGrant `<name>-tls` for `spec.tls.gatewayNamespaces`; `TLSReady` from the Certificate's `Ready` |
 | 22 | scaling | autopilot | 15 | HPA `<name>`, PDB `<name>` |
 | 23 | monitoring | observability | – | ServiceMonitor, PrometheusRule `<name>` (alerts with `runbook_url`, SLO recording rules and burn-rate alerts), ConfigMap `<name>-dashboard`; failures become `Degraded=MonitoringFailed`, not step errors |
-| 24 | backup-schedule | backup | 2, 4 | scheduled `ForgejoBackup`s, retention (also of remote copies, see [backup-restore.md](backup-restore.md#remote-retention)), backup PVC growth, `status.backup` (with `remote`), `BackupHealthy` (also `False` while the backup key is missing, unusable or not exported) |
+| 24 | backup-schedule | backup | 2, 4 | scheduled `ForgejoBackup`s, retention (also of remote copies, see [backup-restore.md](backup-restore.md#remote-retention)) of the backups of `rc.IdentityFingerprint` only, held while the newest is less than half the size of another (`BackupSizeDropped`, see `internal/backup/retentionguard.go`), backup PVC growth, `status.backup` (with `remote`), `BackupHealthy` (also `False` while the backup key is missing, unusable or not exported) |
 | 25 | health | observability | 2 | `/api/healthz`, version and stats probes → `status.health`, `status.version`, `status.stats`, `Healthy`; one availability sample per interval (`forgejo_operator_availability_probes_total`), also while no pod is Ready, planned during maintenance (unless `rc.MaintenanceHeld`), `rc.RestoreScalingUp` and `rc.Upgrading` |
 | 26 | valkey-status | autopilot | – | with HA: the Sentinels' view of Valkey → `status.highAvailability.valkey`, `ValkeyReady`, `forgejo_operator_valkey_*`, `ValkeyFailedOver` events (not for a new replication group, recognised by its pods' UIDs); asks at most every 10 s while the pods stay the same, every minute while unreachable; no prerequisites, so it stays current while the database is down |
 | 27 | autopilot | autopilot | 18, 25 | self-healing restarts, config rollback, last-known-good bookkeeping, OOM- and usage-driven vertical sizing, `status.autoPilot` (the cron runner's pod counts like a server pod, except for the Deployment restart, which the server pods decide, and for the last known good config while it has not started a container for 5 minutes) |
@@ -212,7 +215,12 @@ workload update.
 2. The restore controller starts Job `<restore>-restore` only after the persisted
    `status.backup.activeRestore` names it, the Deployment is at 0 (spec and status), no server
    or cron runner pod is left (nor a cron runner StatefulSet of the instance that still wants one), no backup runs, and no other restore's Job or pod is active. It gives up
-   after 15 minutes.
+   after 15 minutes. Then, for an instance that has run and is not Broken, it takes the
+   pre-restore backup `<restore>-pre-restore-<uid>` (`reason: PreRestore`, unless
+   `spec.preRestoreBackup` is false) and starts the Job once that has completed; a failed one
+   fails the restore unchanged. That backup does not wait for its restore, nor for restores
+   that have not started (they wait for that restore), like the cold backup of a PostgreSQL
+   upgrade.
 3. When the Job succeeds, the restore moves to `ScalingUp` and maintenance ends. With HA the
    `high-availability` step first empties Valkey for it (its queues and cache are from after the
    backup point), holding the workload at zero meanwhile; a database-only restore's Job removes

@@ -170,7 +170,8 @@ the upgrade to `RollingBack`:
 1. Forgejo is scaled to zero right away, so the failing version cannot migrate any further.
 2. `ForgejoRestore <name>-rollback-<start>` restores the pre-upgrade backup. The restore
    replaces the whole database schema, so tables a newer version created are removed too
-   (see [backup-restore.md](backup-restore.md)). Its Jobs run with the old image.
+   (see [backup-restore.md](backup-restore.md)). Its Jobs run with the old image. It takes no
+   pre-restore backup: the pre-upgrade backup holds the state before the upgrade.
 3. The old image starts again on the restored data. Once it is available the phase is
    `RolledBack`: `failedImage` is the new image, `forgejo_operator_upgrades_total{result="rolledback"}`
    is incremented, an `UpgradeRolledBack` Auto Pilot action is recorded, and `Degraded=True`
@@ -341,7 +342,7 @@ spec:
     cnpg:
       imageName: ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie   # the default
   upgrade:
-    timeout: 15m         # default; pg_upgrade must have started, and Forgejo on the new major come up, within it
+    timeout: 15m         # default; Forgejo on the new major must come up within it (pg_upgrade must start, and a revert end, within at least 15m)
 ```
 
 External databases (`spec.database.type: External`) are never upgraded by the operator: their
@@ -459,7 +460,7 @@ small database took about 75 s, the `pg_upgrade` Job 40 s of it.
 |-----------|---------|
 | The pre-upgrade backup fails, Forgejo's pods do not stop within 15 minutes, or the Cluster does not show the new image 2 minutes after it was written (e.g. refused by CloudNativePG) | `Failed` before anything changed: the old major keeps running, Forgejo starts again |
 | CloudNativePG's upgrade Job fails (`BackoffLimitExceeded`), or its pod cannot pull an image for 2 minutes | `Reverting`: the old image is written back. `RolledBack` once the primary serves the old major with the **same system ID**: nothing was restored, nothing lost |
-| `pg_upgrade` has not started within `spec.upgrade.timeout` of writing the new image (the Job's pod stays `Pending`, or CloudNativePG creates no Job) | `Reverting`, as above: the old data is untouched |
+| `pg_upgrade` has not started within `spec.upgrade.timeout`, and at least 15 minutes, of writing the new image (the Job's pod stays `Pending`, or CloudNativePG creates no Job) | `Reverting`, as above: the old data is untouched |
 | The Job runs longer than `spec.upgrade.timeout` after `pg_upgrade` started | Only reported (`DatabaseUpgradeSlow` event, message): aborting `pg_upgrade --link` can leave the old data unusable |
 | The old data does not come back within `spec.upgrade.timeout`, and at least 15 minutes, although `pg_upgrade` never started (`pgUpgradeStarted: false`) | `Failed`, nothing changed: the old data is untouched, and Forgejo starts once the cluster serves again (`DatabaseUpgradeRevertFailed` event). Check the cluster's pods |
 | The old data does not come back within that time after `pg_upgrade` had started (a `pg_upgrade --link` that failed after it started linking can leave the old data directory unusable) | `Failed` with `holdsForgejo: true` |

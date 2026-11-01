@@ -10,7 +10,7 @@ export DOCKER_CONFIG="$tmp/docker"
 export HELM_REGISTRY_CONFIG="$tmp/helm.json"
 mkdir -p "$DOCKER_CONFIG"
 if ! command -v crane >/dev/null; then
-  GOBIN="$tmp" GOTOOLCHAIN=go1.26.9 go install github.com/google/go-containerregistry/cmd/crane@v0.20.6
+  GOBIN="$tmp" GOTOOLCHAIN=go1.26.10 go install github.com/google/go-containerregistry/cmd/crane@v0.20.6
   export PATH="$tmp:$PATH"
 fi
 github_image="ghcr.io/lictl/forgejo-operator:$TAG"

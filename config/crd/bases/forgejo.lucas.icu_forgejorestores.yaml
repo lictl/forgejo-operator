@@ -59,6 +59,16 @@ spec:
           spec:
             description: spec defines the desired state of ForgejoRestore
             properties:
+              allowIdentityMismatch:
+                description: |-
+                  allowIdentityMismatch restores the database of a backup that was taken with another
+                  SECRET_KEY than the instance has (of another instance, or before its identity Secret was
+                  replaced). Without it such a restore fails before anything is changed (reason
+                  IdentityMismatch): Forgejo could not decrypt the two-factor secrets, Actions secrets and
+                  mirror credentials of the restored database. A backup that records no fingerprint is
+                  restored. To recreate a lost instance with its identity, create a new Forgejo with
+                  spec.restoreFrom instead.
+                type: boolean
               backupName:
                 description: backupName is a completed ForgejoBackup in the same namespace.
                 maxLength: 253
@@ -76,6 +86,14 @@ spec:
                 required:
                 - name
                 type: object
+              preRestoreBackup:
+                description: |-
+                  preRestoreBackup takes a ForgejoBackup of what the restore replaces (reason PreRestore,
+                  never pruned), once Forgejo has stopped and before anything is changed; when that backup
+                  fails, the restore fails and Forgejo starts again unchanged. Only an instance that has run
+                  (status.image) and is not Broken or being created from spec.restoreFrom is backed up.
+                  Defaults to true.
+                type: boolean
               remote:
                 description: |-
                   remote restores a backup from object storage by its location; no ForgejoBackup object is
@@ -329,6 +347,11 @@ spec:
                 - ScalingUp
                 - Completed
                 - Failed
+                type: string
+              preRestoreBackupName:
+                description: |-
+                  preRestoreBackupName is the ForgejoBackup of the instance taken before this restore
+                  changed it (spec.preRestoreBackup).
                 type: string
               remote:
                 description: remote describes the remote backup of spec.remote, read

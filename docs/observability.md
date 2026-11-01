@@ -219,6 +219,7 @@ is deleted.
 | `forgejo_operator_availability_probes_total` | counter | `result` (up/down), `planned` (true/false) | The availability SLI: one sample per health-check interval of time, also while no pod is Ready (see [Service level objectives](#service-level-objectives)). All four series are exported at 0 from the first reconcile |
 | `forgejo_operator_stats` | gauge | `kind` (users, organizations, repositories, issues) | Same values as `status.stats` |
 | `forgejo_operator_backup_last_success_timestamp_seconds` | gauge | | Unix time of the last successful backup |
+| `forgejo_operator_backup_retention_held` | gauge | | 1 while the size-drop guard holds retention (`BackupHealthy=False/BackupSizeDropped`), else 0 |
 | `forgejo_operator_backups_total` | counter | `reason`, `result` | Finished backups |
 | `forgejo_operator_backup_duration_seconds` | gauge | | Duration of the last finished backup |
 | `forgejo_operator_backup_size_bytes` | gauge | `part` (database/data) | Size of the last successful backup |
@@ -588,7 +589,7 @@ once sampling works again. `status.stats` keeps the last good values in the mean
 | `DatabaseReady` | core | The PostgreSQL backend is reachable/healthy |
 | `Upgrading` | upgrade | A version upgrade is being orchestrated |
 | `DatabaseUpgrading` | upgrade | A PostgreSQL major upgrade of the CNPG cluster is being orchestrated (reason = phase); otherwise its outcome, a refusal or what it waits for ([upgrades.md](upgrades.md#postgresql-major-upgrades)). Only with database type CNPG |
-| `BackupHealthy` | backup | State of scheduled backups (`UploadFailed` when the latest one was not uploaded to `spec.backup.remote`; `BackupKeyNotExported`, `BackupKeyMissing`, `BackupKeyUnusable` while the backup key is not acknowledged as copied out of the cluster, missing or unusable, see [backup-restore.md](backup-restore.md#the-key)) |
+| `BackupHealthy` | backup | State of scheduled backups (`BackupSizeDropped` while retention holds because the newest one is less than half the size of an earlier one, see [backup-restore.md](backup-restore.md#scheduled-backups-and-retention); `UploadFailed` when the latest one was not uploaded to `spec.backup.remote`; `BackupKeyNotExported`, `BackupKeyMissing`, `BackupKeyUnusable` while the backup key is not acknowledged as copied out of the cluster, missing or unusable, see [backup-restore.md](backup-restore.md#the-key)) |
 | `RestoredFromBackup` | backup | Bootstrap of `spec.restoreFrom`: `False` while the identity, database and data volume are restored (`TargetNotEmpty` when the database or data volume predates the instance), `True`/`Restored` once they are restored and recorded on `<name>-secrets` ([backup-restore.md](backup-restore.md#disaster-recovery)) |
 | `StorageHealthy` | autopilot | PVC capacity/usage |
 | `ValkeyReady` | autopilot | With HA only: Valkey has a Ready primary its Sentinels agree on. `True/Available`, `True/Degraded` (fewer than two replicas in sync, three Sentinels or three Ready pods), `False/NoMaster`, `False/NotReady`, `False/NotProvisioned`, `Unknown/UnreachableFromOperator` ([high-availability.md](high-availability.md#valkey-with-sentinel)) |
@@ -615,6 +616,8 @@ Other packages emit their own events:
   `status.autoPilot.recentActions`.
 - `ReconcileError` (Warning) names a failing reconcile step.
 - Backup, maintenance, HA and config events include `BackupScheduled`, `BackupPruned`,
+  `BackupSizeDropped` (Warning: retention holds, see
+  [backup-restore.md](backup-restore.md#scheduled-backups-and-retention)),
   `MaintenanceStarted`, `MaintenanceEnded`, `LastKnownGoodConfig`, `ConfigRetry`,
   `ValkeyFailedOver` (Warning), `WaitingForValkey`, `ValkeyReset`, `WaitingForCronRunner`,
   `CronRunnerStuck` (Warning) and `CronRunnerDeleted`.

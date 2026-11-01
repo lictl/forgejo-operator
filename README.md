@@ -267,5 +267,5 @@ backed by `internal/runner`). See [docs/design.md](docs/design.md).
 ## License
 
 The project is MIT licensed except files with their own license notices, including
-Kubebuilder scaffold files under Apache License 2.0. See [LICENSE](LICENSE) and
-[third-party notices](THIRD_PARTY_NOTICES.md).
+Kubebuilder scaffold files under Apache License 2.0. See [LICENSE](LICENSE). Go
+module dependencies keep their own licenses.

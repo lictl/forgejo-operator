@@ -24,7 +24,7 @@ curl -fsSL https://get.helm.sh/helm-v4.2.4-linux-amd64.tar.gz -o "$tmp/helm.tar.
 echo "c306b46f719b0a4da32d0f78ee21bf90ce8d602f15b22ab753f0674d1670a7f3  $tmp/helm.tar.gz" | sha256sum -c -
 tar -xzf "$tmp/helm.tar.gz" -C "$tmp" linux-amd64/helm
 export PATH="$tmp/linux-amd64:$tmp:$PATH"
-export GOTOOLCHAIN=go1.26.9
+export GOTOOLCHAIN=go1.26.10
 GOBIN="$tmp" go install github.com/google/go-containerregistry/cmd/crane@v0.20.6
 test "$(helm show chart charts/forgejo-operator | sed -n 's/^version: //p')" = "$version"
 test "$(helm show chart charts/forgejo-operator | sed -n 's/^appVersion: //p' | tr -d '\042')" = "$TAG"

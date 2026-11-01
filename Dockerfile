@@ -1,5 +1,5 @@
 # Build the manager binary
-FROM --platform=$BUILDPLATFORM golang:1.26.9@sha256:37cfcca63222ec499bec5e8ad7aad52dbf7529db36d5812b8eae2f0621aa92d6 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -35,8 +35,6 @@ LABEL org.opencontainers.image.source="https://github.com/lictl/forgejo-operator
 WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY LICENSE /licenses/LICENSE
-COPY LICENSES /licenses/LICENSES
-COPY THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

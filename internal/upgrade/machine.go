@@ -550,6 +550,9 @@ func (m *machine) createRestore() error {
 		Spec: forgejov1.ForgejoRestoreSpec{
 			ForgejoRef: forgejov1.ForgejoRef{Name: f.Name},
 			BackupName: m.u.BackupName,
+			// What the rollback replaces is the failed upgrade's state; the pre-upgrade backup
+			// already holds the instance's, and a backup that failed would fail the rollback.
+			PreRestoreBackup: ptr.To(false),
 		},
 	}
 	if err := controllerutil.SetOwnerReference(f, rs, rc.Scheme); err != nil {

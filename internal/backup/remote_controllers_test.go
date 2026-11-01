@@ -37,7 +37,7 @@ func remoteFixture(t *testing.T) (*backup.FakeS3, *forgejov1.Forgejo, []client.O
 	fakeSecrets := backup.FakeSecrets(ns, fbKey)
 	objs := make([]client.Object, 0, 3+len(fakeSecrets))
 	objs = append(objs, f,
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fb-secrets", Namespace: ns}, Data: map[string][]byte{"secret-key": []byte("sk")}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsName, Namespace: ns}, Data: map[string][]byte{"secret-key": []byte("sk")}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fb-admin", Namespace: ns}, Data: map[string][]byte{testPasswordField: []byte("pw")}},
 	)
 	for _, s := range fakeSecrets {

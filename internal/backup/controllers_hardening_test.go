@@ -28,7 +28,10 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-const testBackupsPVC = "fb-backups"
+const (
+	testBackupsPVC  = "fb-backups"
+	testSecretsName = "fb-secrets"
+)
 
 // deletedOwnedBackup is a completed scheduled backup owned by instance f that garbage
 // collection is deleting.

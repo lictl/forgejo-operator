@@ -51,9 +51,10 @@ func TestReconcileOwnershipFollowsRetainPolicy(t *testing.T) {
 	s := testScheme(t)
 	ctx := context.Background()
 	reasons := map[string]forgejov1.BackupReason{
-		"sched":  forgejov1.BackupReasonScheduled,
-		"pre":    forgejov1.BackupReasonPreUpgrade,
-		"manual": forgejov1.BackupReasonManual,
+		"sched":       forgejov1.BackupReasonScheduled,
+		"pre":         forgejov1.BackupReasonPreUpgrade,
+		"pre-restore": forgejov1.BackupReasonPreRestore,
+		"manual":      forgejov1.BackupReasonManual,
 	}
 
 	// Created under Delete: scheduled and pre-upgrade backups and the PVC are owned.

@@ -155,6 +155,7 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	key := summarizeRemote(ctx, rc, backups)
 
 	if !f.Spec.Backup.Enabled {
+		forgejo.BackupRetentionHeld.DeleteLabelValues(f.Namespace, f.Name)
 		forgetRemoteRetention(f.Namespace, f.Name)
 		meta.RemoveStatusCondition(&f.Status.Conditions, forgejov1.ConditionBackupHealthy)
 		if f.Status.Backup != nil {
@@ -204,11 +205,20 @@ func ReconcileSchedule(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	rc.Requeue(time.Until(due) + time.Second)
 
 	scheduled := scheduledBackups(backups)
-	if err := prune(ctx, rc, scheduled, now); err != nil {
+	drop, err := prune(ctx, rc, scheduled, backups, now)
+	if err != nil {
 		return forgejo.StepResult{}, err
 	}
 	pruneRemote(ctx, rc, backups, now)
-	setHealth(rc, sched, scheduled, now, deferredSince, key)
+	if drop == "" {
+		drop = remoteSizeDrop(f)
+	}
+	held := 0.0
+	if drop != "" {
+		held = 1
+	}
+	forgejo.BackupRetentionHeld.WithLabelValues(f.Namespace, f.Name).Set(held)
+	setHealth(rc, sched, scheduled, now, deferredSince, key, drop)
 	return forgejo.StepResult{}, nil
 }
 
@@ -330,26 +340,42 @@ func scheduledBackups(backups []forgejov1.ForgejoBackup) []*forgejov1.ForgejoBac
 	return out
 }
 
-// prune removes the scheduled backups that pruneCandidates selects. Manual and pre-upgrade
-// backups are never pruned. Deleting a ForgejoBackup removes its files (finalizer).
-func prune(ctx context.Context, rc *forgejo.ReconcileContext, scheduled []*forgejov1.ForgejoBackup, now time.Time) error {
-	keep := int(rc.Instance.Spec.Backup.Retention)
+// prune removes the scheduled backups that pruneCandidates selects among those of the
+// instance's identity (see retentionguard.go). Manual and pre-upgrade backups are never pruned.
+// While the size-drop guard holds (the returned message), no completed backup is pruned;
+// failed ones, which hold no files, still are. Deleting a ForgejoBackup removes its files
+// (finalizer).
+func prune(ctx context.Context, rc *forgejo.ReconcileContext, scheduled []*forgejov1.ForgejoBackup, backups []forgejov1.ForgejoBackup,
+	now time.Time) (string, error) {
+	f := rc.Instance
+	keep := int(f.Spec.Backup.Retention)
 	if keep < 1 {
 		keep = 7
 	}
-	for _, b := range pruneCandidates(scheduled, keep, now) {
+	own := ofInstanceIdentity(scheduled, rc.IdentityFingerprint)
+	sizes := localSizes(own)
+	drop := ""
+	if found := checkSizeDrop(sizes, acceptedSince(f, sizes, backups)); found != "" {
+		drop = fmt.Sprintf("Scheduled backup %s is less than half the size of an earlier one (%s): the instance may have lost data. "+
+			"Retention keeps every completed scheduled backup until the sizes recover; if the drop is expected (e.g. repositories "+
+			"were deleted), annotate the Forgejo with %s=%s", sizes[0].name, found, AnnotationBackupSizeAccepted, sizes[0].name)
+	}
+	for _, b := range pruneCandidates(own, keep, now) {
+		if drop != "" && b.Status.Phase == forgejov1.BackupPhaseCompleted {
+			continue
+		}
 		if inUse, err := RestoreUsing(ctx, rc.Client, b); err != nil || inUse != "" {
 			if err != nil {
-				return err
+				return "", err
 			}
 			continue
 		}
 		if err := rc.Client.Delete(ctx, b); client.IgnoreNotFound(err) != nil {
-			return fmt.Errorf("pruning backup %s: %w", b.Name, err)
+			return "", fmt.Errorf("pruning backup %s: %w", b.Name, err)
 		}
 		rc.Event(corev1.EventTypeNormal, "BackupPruned", "Backup", "Deleted %s scheduled backup %s (retention %d)", b.Status.Phase, b.Name, keep)
 	}
-	return nil
+	return drop, nil
 }
 
 // pruneCandidates selects from scheduled (newest first) the completed backups beyond the
@@ -412,8 +438,18 @@ func finishedAt(b *forgejov1.ForgejoBackup) time.Time {
 // setHealth reports BackupHealthy from the newest finished scheduled backup. A successful
 // backup turns stale once two further scheduled runs have passed without a newer success.
 // While a due run is deferred (deferredSince), staleness is judged as of the time the run was
-// due, so the deferral itself never makes the backups stale.
-func setHealth(rc *forgejo.ReconcileContext, sched cron.Schedule, scheduled []*forgejov1.ForgejoBackup, now time.Time, deferredSince *time.Time, key keyProblem) {
+// due, so the deferral itself never makes the backups stale. A finding of the size-drop guard
+// (drop) comes first, with a Warning event when its message is new: it holds retention until
+// the sizes recover or a person accepts them.
+func setHealth(rc *forgejo.ReconcileContext, sched cron.Schedule, scheduled []*forgejov1.ForgejoBackup, now time.Time, deferredSince *time.Time,
+	key keyProblem, drop string) {
+	if drop != "" {
+		if c := meta.FindStatusCondition(rc.Instance.Status.Conditions, forgejov1.ConditionBackupHealthy); c == nil || c.Message != drop {
+			rc.Event(corev1.EventTypeWarning, reasonBackupSizeDropped, "Backup", "%s", drop)
+		}
+		rc.SetCondition(forgejov1.ConditionBackupHealthy, metav1.ConditionFalse, reasonBackupSizeDropped, drop)
+		return
+	}
 	var latest *forgejov1.ForgejoBackup
 	running := false
 	for _, b := range scheduled {

@@ -36,6 +36,7 @@ import (
 	"sync"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -572,6 +573,12 @@ func holdForDatabaseRestore(ctx context.Context, rc *forgejo.ReconcileContext, c
 
 	zero := int32(0)
 	rc.ReplicasOverride = &zero
+	// Also while this step stops the pipeline (the workload step that applies the override is
+	// skipped then, for example while a deleted cluster's pods and volumes go): Forgejo's open
+	// connections would keep the old PostgreSQL pod terminating, and nothing may write meanwhile.
+	if err := stopForgejo(ctx, rc); err != nil {
+		return err
+	}
 	if held {
 		msg := fmt.Sprintf("%s Forgejo is kept stopped until a ForgejoRestore has restored the database from a backup (for example %s, "+
 			"database only); a restore of the data volume alone does not end this.", u.Message, u.BackupName)
@@ -597,6 +604,31 @@ func holdForDatabaseRestore(ctx context.Context, rc *forgejo.ReconcileContext, c
 	rc.SetBroken(forgejo.BrokenDatabaseRestorePending, fmt.Sprintf(
 		"%s (annotation %s). Forgejo stays stopped until a ForgejoRestore of the database created after it has restored a backup into "+
 			"it; the annotation is removed then", state, forgejo.AnnotationRecreateDatabase))
+	return nil
+}
+
+// stopForgejo scales the server Deployment and the cron runner of rc.Instance to zero if they
+// run (the workload step keeps them there through rc.ReplicasOverride whenever it runs).
+func stopForgejo(ctx context.Context, rc *forgejo.ReconcileContext) error {
+	f := rc.Instance
+	patch := []byte(`{"spec":{"replicas":0}}`)
+	dep := &appsv1.Deployment{}
+	err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep)
+	switch {
+	case err == nil && (dep.Spec.Replicas == nil || *dep.Spec.Replicas != 0):
+		if err := rc.Client.Patch(ctx, dep, client.RawPatch(types.MergePatchType, patch)); err != nil {
+			return fmt.Errorf("scaling Deployment %s to zero: %w", dep.Name, err)
+		}
+	case err != nil && !apierrors.IsNotFound(err):
+		return err
+	}
+	cron, err := forgejo.CronRunner(ctx, rc.Client, f)
+	if err != nil || cron == nil || (cron.Spec.Replicas != nil && *cron.Spec.Replicas == 0) {
+		return err
+	}
+	if err := rc.Client.Patch(ctx, cron, client.RawPatch(types.MergePatchType, patch)); err != nil {
+		return fmt.Errorf("scaling StatefulSet %s to zero: %w", cron.Name, err)
+	}
 	return nil
 }
 

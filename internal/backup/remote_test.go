@@ -11,6 +11,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -400,11 +401,54 @@ func restoreFromInstance(store *FakeS3) *forgejov1.Forgejo {
 	return f
 }
 
+// putOldBackup uploads backup "b1" of instance "old" (database and data) to "dr/old/b1".
 func putOldBackup(t *testing.T, store *FakeS3) {
 	t.Helper()
 	store.PutBackup(t, "team/", "dr/old/b1", RemoteManifest{Backup: "b1", Namespace: "dr", Forgejo: testOldName, Reason: forgejov1.BackupReasonScheduled,
-		ForgejoImage: testImage17},
+		ForgejoImage: testImage17, IncludesData: true},
+		map[string][]byte{DBDumpFile: []byte("PGDMP"), DataArchiveFile: []byte("tar"), IdentityFile: FakeIdentity(t, "old-secret-key")}, time.Now())
+}
+
+// spec.restoreFrom of a backup without a data archive (a PostgreSQL pre-upgrade backup, say)
+// is refused before anything is created, unless the Forgejo allows it by annotation: the
+// instance would start with the backup's database and empty repositories.
+func TestRestoreFromRefusesADatabaseOnlyBackup(t *testing.T) {
+	store := NewFakeS3(t)
+	store.PutBackup(t, "team/", "dr/old/b1", RemoteManifest{Backup: "b1", Namespace: "dr", Forgejo: testOldName,
+		Reason: forgejov1.BackupReasonPreUpgrade, ForgejoImage: testImage17},
 		map[string][]byte{DBDumpFile: []byte("PGDMP"), IdentityFile: FakeIdentity(t, "old-secret-key")}, time.Now())
+	s := testScheme(t)
+	ctx := context.Background()
+	f := restoreFromInstance(store)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(secretObjects(FakeSecrets(remoteNS, "fj-backup-key"))...).Build()
+	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
+
+	if res, err := ReconcileRestoreIdentity(ctx, rc); err != nil || !res.Stop {
+		t.Fatalf("database-only backup: %+v %v", res, err)
+	}
+	cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionRestoredFromBackup)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "DatabaseOnlyBackup" ||
+		!strings.Contains(cond.Message, forgejo.AnnotationRestoreFromDatabaseOnly) {
+		t.Fatalf("condition %+v", cond)
+	}
+	if st := f.Status.RestoredFrom; st.Phase != forgejov1.RestoredFromFailed || st.IdentityRestoredTime != nil {
+		t.Errorf("status %+v", st)
+	}
+	// A failed bootstrap: Forgejo is held, and only a person ends that.
+	if reason, failed := bootstrapHold(f, nil); !failed || !strings.Contains(reason, "no archive of the data volume") {
+		t.Errorf("hold %q, failed %t", reason, failed)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: remoteNS, Name: testSecretsSecret}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Errorf("identity restored for a refused backup: %v", err)
+	}
+
+	f.Annotations = map[string]string{forgejo.AnnotationRestoreFromDatabaseOnly: valueTrue}
+	if res, err := ReconcileRestoreIdentity(ctx, rc); err != nil || res.Stop {
+		t.Fatalf("allowed: %+v %v", res, err)
+	}
+	if st := f.Status.RestoredFrom; st.Phase != forgejov1.RestoredFromRestoringData || st.IdentityRestoredTime == nil {
+		t.Errorf("allowed: status %+v", st)
+	}
 }
 
 func TestReconcileRestoreIdentity(t *testing.T) {
@@ -894,7 +938,7 @@ func TestRemoteRetentionPrunesOnlyScheduledBackups(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(append(secretObjects(FakeSecrets(remoteNS, "fj-backup-key")), restore)...).Build()
 	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
 
-	if err := runRemoteRetention(ctx, rc, nil, time.Now()); err != nil {
+	if _, err := runRemoteRetention(ctx, rc, nil, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	var left []string
@@ -951,7 +995,7 @@ func TestBackupHealthReportsUploads(t *testing.T) {
 		b.Status.Remote = &forgejov1.RemoteBackupStatus{Phase: tc.phase, Location: "s3://backups/x/", Message: "denied"}
 		f.Status.Conditions = nil
 		rc := &forgejo.ReconcileContext{Instance: f}
-		setHealth(rc, sched, []*forgejov1.ForgejoBackup{b}, time.Now(), nil, keyProblem{})
+		setHealth(rc, sched, []*forgejov1.ForgejoBackup{b}, time.Now(), nil, keyProblem{}, "")
 		c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionBackupHealthy)
 		if c == nil || c.Status != tc.status || c.Reason != tc.reason || !strings.Contains(c.Message, tc.inMsg) {
 			t.Errorf("%s: %+v", tc.phase, c)
@@ -1009,7 +1053,7 @@ func TestBackupKeyProblemsAreReported(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
 			rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
 			key := summarizeRemote(ctx, rc, nil)
-			setHealth(rc, sched, []*forgejov1.ForgejoBackup{tc.latest}, time.Now(), nil, key)
+			setHealth(rc, sched, []*forgejov1.ForgejoBackup{tc.latest}, time.Now(), nil, key, "")
 			cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionBackupHealthy)
 			if cond == nil || cond.Reason != tc.reason || !strings.Contains(cond.Message, tc.inMsg) {
 				t.Fatalf("BackupHealthy %+v", cond)

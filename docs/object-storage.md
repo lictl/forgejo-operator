@@ -33,7 +33,11 @@ $ kubectl get fj git -o jsonpath='{.status.conditions[?(@.type=="ObjectStorageRe
 
 Object storage is meant for new instances. Turning it on for an instance that already has files
 does not move them: Forgejo then looks for them in the bucket. Copy them first with Forgejo's
-`forgejo migrate-storage` (or `rclone`), or keep those subsystems on the volume.
+`forgejo migrate-storage` (or `rclone`), or keep those subsystems on the volume. Once the files
+are gone from the volume, the data archive of the next scheduled backup may be less than half
+the size of the earlier ones, and retention keeps every backup until you accept the new size
+(`BackupHealthy=False/BackupSizeDropped`, see
+[backup-restore.md](backup-restore.md#scheduled-backups-and-retention)).
 
 ## What goes where
 

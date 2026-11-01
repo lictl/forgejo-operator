@@ -34,9 +34,21 @@ const (
 // remoteRetentionRun is the last run of remote retention for an instance.
 type remoteRetentionRun struct {
 	at time.Time
-	// trigger is the newest uploaded scheduled backup when it ran: a new upload runs it again.
+	// trigger is the newest uploaded scheduled backup when it ran, and the value of
+	// AnnotationBackupSizeAccepted: a new upload, or a newly accepted size, runs it again.
 	trigger string
 	err     error
+	// drop is the finding of the size-drop guard: the run pruned no complete scheduled backup.
+	drop string
+}
+
+// remoteSizeDrop is the finding of the size-drop guard in the last run of remote retention of f
+// ("" when it found none).
+func remoteSizeDrop(f *forgejov1.Forgejo) string {
+	if v, ok := remoteRetentionRuns.Load(types.NamespacedName{Namespace: f.Namespace, Name: f.Name}); ok {
+		return v.(*remoteRetentionRun).drop
+	}
+	return ""
 }
 
 // remoteRetentionRuns maps types.NamespacedName to *remoteRetentionRun.
@@ -97,8 +109,8 @@ func summarizeRemote(ctx context.Context, rc *forgejo.ReconcileContext, backups 
 	if key.message != "" {
 		problems = append(problems, key.message)
 	}
-	if run, ok := remoteRetentionRuns.Load(types.NamespacedName{Namespace: f.Namespace, Name: f.Name}); ok && run.(*remoteRetentionRun).err != nil {
-		problems = append(problems, "Remote retention failed: "+run.(*remoteRetentionRun).err.Error())
+	if v, ok := remoteRetentionRuns.Load(types.NamespacedName{Namespace: f.Namespace, Name: f.Name}); ok {
+		problems = append(problems, v.(*remoteRetentionRun).problems()...)
 	}
 	r.Message = strings.Join(problems, "; ")
 
@@ -183,7 +195,7 @@ func pruneRemote(ctx context.Context, rc *forgejo.ReconcileContext, backups []fo
 		return
 	}
 	key := types.NamespacedName{Namespace: f.Namespace, Name: f.Name}
-	trigger := newestUploadedScheduled(backups)
+	trigger := newestUploadedScheduled(backups) + "|" + f.Annotations[AnnotationBackupSizeAccepted]
 	if v, ok := remoteRetentionRuns.Load(key); ok {
 		last := v.(*remoteRetentionRun)
 		if last.trigger == trigger && now.Sub(last.at) < remoteRetentionInterval {
@@ -192,12 +204,13 @@ func pruneRemote(ctx context.Context, rc *forgejo.ReconcileContext, backups []fo
 	}
 	cctx, cancel := context.WithTimeout(ctx, remoteRetentionTimeout)
 	defer cancel()
-	err := runRemoteRetention(cctx, rc, backups, now)
+	drop, err := runRemoteRetention(cctx, rc, backups, now)
 	var previous error
 	if v, ok := remoteRetentionRuns.Load(key); ok {
 		previous = v.(*remoteRetentionRun).err
 	}
-	remoteRetentionRuns.Store(key, &remoteRetentionRun{at: now, trigger: trigger, err: err})
+	run := &remoteRetentionRun{at: now, trigger: trigger, err: err, drop: drop}
+	remoteRetentionRuns.Store(key, run)
 	st := summary(f)
 	if st.Remote == nil {
 		st.Remote = &forgejov1.RemoteBackupSummary{}
@@ -208,40 +221,57 @@ func pruneRemote(ctx context.Context, rc *forgejo.ReconcileContext, backups []fo
 		if previous == nil || previous.Error() != err.Error() {
 			rc.Event(corev1.EventTypeWarning, "RemoteRetentionFailed", "Backup", "Remote retention of %s failed: %v", st.Remote.Location, err)
 		}
-		msg := "Remote retention failed: " + err.Error()
+	}
+	for _, msg := range run.problems() {
 		if !strings.Contains(st.Remote.Message, msg) {
 			st.Remote.Message = strings.TrimPrefix(st.Remote.Message+"; "+msg, "; ")
 		}
 	}
 }
 
+// problems are the messages of run for status.backup.remote.message.
+func (run *remoteRetentionRun) problems() []string {
+	var out []string
+	if run.err != nil {
+		out = append(out, "Remote retention failed: "+run.err.Error())
+	}
+	if run.drop != "" {
+		out = append(out, run.drop)
+	}
+	return out
+}
+
 // runRemoteRetention keeps the newest spec.backup.retention complete scheduled backups of the
 // instance in the bucket and deletes the older ones. Only this instance's backups count (the
 // UID in the manifest), and those its spec.restoreFrom took over (see ownsRemoteBackup): an
 // instance of the same namespace and name in another cluster, e.g. a disaster recovery drill,
-// keeps its own. Manual and pre-upgrade backups are never deleted, and neither is a backup
-// whose manifest cannot be read (e.g. one encrypted with another key). Directories without a
-// manifest (failed uploads) are deleted once they are older than any upload can run.
-func runRemoteRetention(ctx context.Context, rc *forgejo.ReconcileContext, backups []forgejov1.ForgejoBackup, now time.Time) error {
+// keeps its own. A backup of another identity (the SECRET_KEY fingerprint in the manifest)
+// neither counts nor is deleted, and while the size-drop guard holds (the returned message, see
+// retentionguard.go) no complete scheduled backup is deleted. Manual and pre-upgrade backups
+// are never deleted, and neither is a backup whose manifest cannot be read (e.g. one encrypted
+// with another key). Directories without a manifest (failed uploads) are deleted once they are
+// older than any upload can run.
+func runRemoteRetention(ctx context.Context, rc *forgejo.ReconcileContext, backups []forgejov1.ForgejoBackup, now time.Time) (string, error) {
 	f := rc.Instance
 	conn := &f.Spec.Backup.Remote.S3
 	store, err := OpenStore(ctx, rc.Client, f.Namespace, conn, BackupKeyRef(f))
 	if err != nil {
-		return err
+		return "", err
 	}
 	base := InstanceRemotePath(f.Namespace, f.Name)
 	dirs, err := store.ListDirs(ctx, base)
 	if err != nil {
-		return fmt.Errorf("listing %s: %w", store.Location(base), err)
+		return "", fmt.Errorf("listing %s: %w", store.Location(base), err)
 	}
 	protected, err := protectedRemoteDirs(ctx, rc, backups)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	type candidate struct {
 		name string
 		at   time.Time
+		size backupSize
 	}
 	var scheduled []candidate
 	var errs []error
@@ -267,14 +297,15 @@ func runRemoteRetention(ctx context.Context, rc *forgejo.ReconcileContext, backu
 			continue
 		}
 		if m.Reason != forgejov1.BackupReasonScheduled || m.Namespace != f.Namespace || m.Forgejo != f.Name ||
-			RemoteBackupDirName(m.Backup, types.UID(m.BackupUID)) != name || !ownsRemoteBackup(f, m) {
+			RemoteBackupDirName(m.Backup, types.UID(m.BackupUID)) != name || !ownsRemoteBackup(f, m) ||
+			!ofIdentity(m.SecretKeyFingerprint, rc.IdentityFingerprint) {
 			continue
 		}
 		at := m.CompletedTime()
 		if at.IsZero() {
 			at = d.LastModified
 		}
-		scheduled = append(scheduled, candidate{name: name, at: at})
+		scheduled = append(scheduled, candidate{name: name, at: at, size: remoteSize(m, at)})
 	}
 	slices.SortFunc(scheduled, func(a, b candidate) int {
 		if c := b.at.Compare(a.at); c != 0 {
@@ -282,6 +313,16 @@ func runRemoteRetention(ctx context.Context, rc *forgejo.ReconcileContext, backu
 		}
 		return strings.Compare(b.name, a.name)
 	})
+	sizes := make([]backupSize, 0, len(scheduled))
+	for _, c := range scheduled {
+		sizes = append(sizes, c.size)
+	}
+	if found := checkSizeDrop(sizes, acceptedSince(f, sizes, backups)); found != "" {
+		return fmt.Sprintf("The remote copy of scheduled backup %s at %s is less than half the size of an earlier one (%s): the "+
+			"instance may have lost data. Remote retention keeps every complete scheduled backup until the sizes recover; if the "+
+			"drop is expected, annotate the Forgejo with %s=%s", sizes[0].name, store.Location(base+"/"+scheduled[0].name), found,
+			AnnotationBackupSizeAccepted, sizes[0].name), errors.Join(errs...)
+	}
 	keep := int(f.Spec.Backup.Retention)
 	if keep < 1 {
 		keep = 7
@@ -296,7 +337,7 @@ func runRemoteRetention(ctx context.Context, rc *forgejo.ReconcileContext, backu
 		rc.Event(corev1.EventTypeNormal, "RemoteBackupPruned", "Backup", "Deleted the remote copy of scheduled backup %s at %s (retention %d)",
 			scheduled[i].name, store.Location(path), keep)
 	}
-	return errors.Join(errs...)
+	return "", errors.Join(errs...)
 }
 
 // ownsRemoteBackup reports whether remote retention of f may prune the backup of m: f took it,

@@ -20,8 +20,8 @@ import (
 )
 
 // Ownership of backups follows spec.storage.retainPolicy, which may change at any time:
-//   - Delete: scheduled and pre-upgrade ForgejoBackups and the operator-managed backup PVC are
-//     owned by the instance and garbage-collected with it.
+//   - Delete: scheduled, pre-upgrade and pre-restore ForgejoBackups and the operator-managed
+//     backup PVC are owned by the instance and garbage-collected with it.
 //   - Retain: no ForgejoBackup and no backup PVC carries a reference to the instance, so
 //     deleting the instance keeps every backup.
 //
@@ -71,7 +71,7 @@ func SyncBackupOwnership(ctx context.Context, c client.Client, scheme *runtime.S
 	switch r := Reason(b); {
 	case forgejo.RetainData(f):
 		b.OwnerReferences = withoutInstanceRefs(b.OwnerReferences, f)
-	case r == forgejov1.BackupReasonScheduled || r == forgejov1.BackupReasonPreUpgrade:
+	case r == forgejov1.BackupReasonScheduled || r == forgejov1.BackupReasonPreUpgrade || r == forgejov1.BackupReasonPreRestore:
 		if !hasRefTo(b.OwnerReferences, f.UID) {
 			if err := controllerutil.SetOwnerReference(f, b, scheme); err != nil {
 				return false, err

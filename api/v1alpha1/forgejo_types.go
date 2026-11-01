@@ -637,7 +637,11 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.type) || self.type != 'External' || !has(self.cnpg) || (!has(self.cnpg.parameters) && (!has(self.cnpg.storage) || !has(self.cnpg.storage.storageClassName)) && (!has(self.cnpg.enablePodMonitor) || !self.cnpg.enablePodMonitor) && (!has(self.cnpg.resources) || (!has(self.cnpg.resources.requests) && !has(self.cnpg.resources.limits))))",message="cnpg settings apply to type CNPG only; with type External only cnpg.imageName (the image of backup and restore Jobs) is used",fieldPath=".cnpg",reason="FieldValueForbidden"
 // +kubebuilder:validation:XValidation:rule="(has(self.type) && self.type == 'External') || !has(self.cnpg) || !has(self.cnpg.imageName) || self.cnpg.imageName.matches('^([^@]*/)?[^/:@]+:[0-9][^/:@]*(@[^@/]+)?$')",message="cnpg.imageName needs a tag that starts with the PostgreSQL major version, e.g. ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie (a digest may follow it): CloudNativePG reads the major version from the tag, and refuses a digest alone or 'latest'",fieldPath=".cnpg.imageName",reason="FieldValueInvalid"
 type DatabaseSpec struct {
+	// type of the database. It cannot be changed once the Forgejo exists: Forgejo would start on
+	// another, empty database and migrate it. See docs/backup-restore.md, "Moving to another
+	// database or volume".
 	// +kubebuilder:default=CNPG
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="database.type cannot be changed: Forgejo would start on another, empty database. To move to another database, delete the Forgejo with storage.retainPolicy Retain, create it again with the new type and restore the database from a backup (ForgejoRestore), or create a new Forgejo from a remote backup (spec.restoreFrom)"
 	// +optional
 	Type DatabaseType `json:"type,omitempty"`
 
@@ -750,6 +754,7 @@ const (
 )
 
 // StorageSpec configures the Forgejo data volume.
+// +kubebuilder:validation:XValidation:rule="(has(self.existingClaim) && size(self.existingClaim) > 0) == (has(oldSelf.existingClaim) && size(oldSelf.existingClaim) > 0) && (!has(self.existingClaim) || !has(oldSelf.existingClaim) || self.existingClaim == oldSelf.existingClaim)",message="storage.existingClaim cannot be set, changed or removed after creation: Forgejo would start on another, possibly empty volume. To move the data, delete the Forgejo with storage.retainPolicy Retain, copy the data volume to the new claim and create the Forgejo again with it, or create a new Forgejo from a remote backup (spec.restoreFrom)",fieldPath=".existingClaim"
 type StorageSpec struct {
 	// size of the data volume. The operator only grows the claim (when its StorageClass
 	// allows expansion): a lower size, or one below what autopilot already grew, is ignored.
@@ -765,7 +770,9 @@ type StorageSpec struct {
 	// +optional
 	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
 
-	// existingClaim uses a pre-provisioned PVC instead of creating one.
+	// existingClaim uses a pre-provisioned PVC instead of creating one. It can only be set when
+	// the Forgejo is created: another claim would start Forgejo on another, possibly empty
+	// volume. See docs/backup-restore.md, "Moving to another database or volume".
 	// +optional
 	ExistingClaim string `json:"existingClaim,omitempty"`
 
