@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -21,6 +23,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
@@ -118,11 +121,16 @@ func dbClient(t *testing.T, objs ...client.Object) client.Client {
 }
 
 // dbPass runs the database-upgrade step once, as the pipeline does (prepare sets what earlier
-// steps decided), and returns its context and result.
+// steps decided), and returns its context and result. The step may only use what manager-role
+// grants (rbacGuard); the test's own reads and writes on c are not checked.
 func dbPass(t *testing.T, c client.Client, f *forgejov1.Forgejo, prepare ...func(*forgejo.ReconcileContext)) (*forgejo.ReconcileContext, forgejo.StepResult) {
 	t.Helper()
-	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image,
-		RESTMapper: dbMapper(), Recorder: events.NewFakeRecorder(100)}
+	live, ok := c.(client.WithWatch)
+	if !ok {
+		t.Fatalf("client %T", c)
+	}
+	rc := &forgejo.ReconcileContext{Client: rbacGuard(t, live, true), APIReader: rbacGuard(t, live, false), Scheme: c.Scheme(),
+		Instance: f, TargetImage: f.Status.Image, RESTMapper: dbMapper(), Recorder: events.NewFakeRecorder(100)}
 	for _, p := range prepare {
 		p(rc)
 	}
@@ -897,6 +905,53 @@ func TestDatabaseRecreateHoldsUntilARestore(t *testing.T) {
 	// Applied again (a GitOps tool), it has no effect on the cluster that is no longer marked.
 	if rc, _ = dbPass(t, c, f); rc.ReplicasOverride != nil || brokenReason(f) != "" {
 		t.Fatalf("annotation applied again: override %v, Broken %q", rc.ReplicasOverride, brokenReason(f))
+	}
+}
+
+// A hold stops the server and the cron runner of an HA instance at once (stopForgejo patches
+// both, which manager-role must grant; dbPass checks that).
+func TestDatabaseHoldStopsTheCronRunner(t *testing.T) {
+	ctx := context.Background()
+	f := dbInstance(pg17)
+	f.Spec.HighAvailability.Enabled = true
+	f.Annotations = map[string]string{forgejo.AnnotationRecreateDatabase: valueTrue}
+	cron := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: forgejo.CronRunnerName(f), Namespace: f.Namespace, OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: forgejov1.GroupVersion.String(), Kind: "Forgejo", Name: f.Name, UID: f.UID, Controller: ptr.To(true)}}},
+		Spec: appsv1.StatefulSetSpec{Replicas: ptr.To[int32](1)},
+	}
+	c := dbClient(t, f.DeepCopy(), availableDeployment(imgA, 1), cron)
+	if rc, _ := dbPass(t, c, f); !zeroReplicas(rc) || brokenReason(f) != forgejo.BrokenDatabaseRestorePending {
+		t.Fatalf("override %v, Broken %q", rc.ReplicasOverride, brokenReason(f))
+	}
+	dep, sts := &appsv1.Deployment{}, &appsv1.StatefulSet{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "fj"}, dep); err != nil || ptr.Deref(dep.Spec.Replicas, 1) != 0 {
+		t.Fatalf("Deployment replicas %v, err %v", dep.Spec.Replicas, err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: cron.Name}, sts); err != nil || ptr.Deref(sts.Spec.Replicas, 1) != 0 {
+		t.Fatalf("cron runner replicas %v, err %v", sts.Spec.Replicas, err)
+	}
+}
+
+// A refused scale-down (an admission policy, say) does not hide the hold: the step fails, and
+// Broken still names what waits.
+func TestDatabaseHoldRecordedWhenStoppingFails(t *testing.T) {
+	f := dbInstance(pg17)
+	f.Annotations = map[string]string{forgejo.AnnotationRecreateDatabase: valueTrue}
+	live, _ := dbClient(t, f.DeepCopy(), availableDeployment(imgA, 1)).(client.WithWatch)
+	refused := interceptor.NewClient(live, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*appsv1.Deployment); ok {
+				return apierrors.NewForbidden(appsv1.Resource("deployments"), obj.GetName(), errors.New("denied by policy"))
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	rc := &forgejo.ReconcileContext{Client: refused, APIReader: refused, Scheme: live.Scheme(), Instance: f, TargetImage: f.Status.Image,
+		RESTMapper: dbMapper(), Recorder: events.NewFakeRecorder(100)}
+	if _, err := ReconcileDatabase(context.Background(), rc); !apierrors.IsForbidden(err) || !zeroReplicas(rc) ||
+		brokenReason(f) != forgejo.BrokenDatabaseRestorePending {
+		t.Fatalf("err %v, override %v, Broken %q", err, rc.ReplicasOverride, brokenReason(f))
 	}
 }
 
