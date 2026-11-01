@@ -2,9 +2,9 @@ package observability
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -24,8 +24,6 @@ import (
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
-
-const testSeverityWarning = "warning"
 
 func monitoringRC(t *testing.T, f *forgejov1.Forgejo, funcs interceptor.Funcs) (*forgejo.ReconcileContext, *events.FakeRecorder) {
 	t.Helper()
@@ -257,9 +255,10 @@ func TestMonitoringKeepsOtherDegradedReasons(t *testing.T) {
 	}
 }
 
-func ruleSpecOf(t *testing.T, f *forgejov1.Forgejo, scraped bool) *ruleSpec {
+// ruleSpecOf renders the PrometheusRule of an instance whose ServiceMonitor exists.
+func ruleSpecOf(t *testing.T, f *forgejov1.Forgejo) *ruleSpec {
 	t.Helper()
-	spec, err := prometheusRuleSpec(f, scraped)
+	spec, err := prometheusRuleSpec(f, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,158 +277,56 @@ func findRule(spec *ruleSpec, alert string) *rule {
 	return nil
 }
 
-func TestNotReadyAlertFollowsDesiredReplicas(t *testing.T) {
-	hpa := func(f *forgejov1.Forgejo) {
-		f.Spec.HighAvailability.Enabled = true
-		f.Spec.Autoscaling.Horizontal = &forgejov1.HorizontalAutoscalingSpec{Enabled: true, MinReplicas: 0, MaxReplicas: 3}
+// Alerts are rendered for what the spec has: ForgejoDown and ForgejoNotReady while replicas
+// are desired (an HPA keeps at least one), the backup alerts with scheduled backups,
+// the upload alerts with spec.backup.remote (their staleness alerts also need scheduled
+// backups), the Valkey and cron runner alerts with highAvailability, the PostgreSQL upgrade
+// alert with the bundled CNPG database. The test/prometheus rule files pin the expressions.
+func TestRenderedAlertsFollowTheSpec(t *testing.T) {
+	readiness := []string{"ForgejoDown", "ForgejoNotReady"}
+	backups := []string{"ForgejoBackupTooOld", "ForgejoBackupSizeDropped", "ForgejoBackupMissing"}
+	uploads := []string{"ForgejoBackupUploadFailed", "ForgejoBackupUploadTooOld", "ForgejoBackupUploadMissing"}
+	ha := []string{"ForgejoValkeyNoMaster", "ForgejoValkeyFailedOver", "ForgejoValkeyDegraded", "ForgejoCronRunnerDown"}
+	cnpg := []string{"ForgejoDatabaseUpgradeFailed"}
+	scheduled := func(f *forgejov1.Forgejo) {
+		f.Spec.Backup.Enabled = true
+		f.Spec.Backup.Schedule = testDailySchedule
 	}
 	for _, tt := range []struct {
-		name     string
-		replicas *int32
-		hpa      bool
-		want     bool
+		name   string
+		mutate func(*forgejov1.Forgejo)
+		want   []string // the conditional alerts that are rendered
 	}{
-		{name: "default replicas", want: true},
-		{name: "two replicas", replicas: new(int32(2)), want: true},
-		{name: "scaled to zero", replicas: new(int32(0)), want: false},
-		{name: "zero replicas with HPA", replicas: new(int32(0)), hpa: true, want: true},
+		{"defaults", func(*forgejov1.Forgejo) {}, slices.Concat(readiness, cnpg)},
+		{"scaled to zero", func(f *forgejov1.Forgejo) { f.Spec.Replicas = new(int32(0)) }, cnpg},
+		{"zero replicas with HPA", func(f *forgejov1.Forgejo) {
+			f.Spec.Replicas = new(int32(0))
+			f.Spec.HighAvailability.Enabled = true
+			f.Spec.Autoscaling.Horizontal = &forgejov1.HorizontalAutoscalingSpec{Enabled: true, MinReplicas: 0, MaxReplicas: 3}
+		}, slices.Concat(readiness, ha, cnpg)},
+		{"scheduled backups", scheduled, slices.Concat(readiness, backups, cnpg)},
+		{"remote without scheduled backups", func(f *forgejov1.Forgejo) { f.Spec.Backup.Remote = &forgejov1.RemoteBackupSpec{} },
+			slices.Concat(readiness, []string{"ForgejoBackupUploadFailed"}, cnpg)},
+		{"remote with scheduled backups", func(f *forgejov1.Forgejo) {
+			scheduled(f)
+			f.Spec.Backup.Remote = &forgejov1.RemoteBackupSpec{}
+		}, slices.Concat(readiness, backups, uploads, cnpg)},
+		{"highAvailability", func(f *forgejov1.Forgejo) { f.Spec.HighAvailability.Enabled = true }, slices.Concat(readiness, ha, cnpg)},
+		{"external database", func(f *forgejov1.Forgejo) { f.Spec.Database.Type = forgejov1.DatabaseTypeExternal }, readiness},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			f := testInstance("replicas")
-			f.Spec.Replicas = tt.replicas
-			if tt.hpa {
-				hpa(f)
+			f := testInstance("cond")
+			tt.mutate(f)
+			spec := ruleSpecOf(t, f)
+			for _, alert := range slices.Concat(readiness, backups, uploads, ha, cnpg) {
+				if got, want := findRule(spec, alert) != nil, slices.Contains(tt.want, alert); got != want {
+					t.Errorf("%s rendered=%v, want %v", alert, got, want)
+				}
 			}
-			spec := ruleSpecOf(t, f, true)
-			if got := findRule(spec, "ForgejoNotReady") != nil; got != tt.want {
-				t.Fatalf("ForgejoNotReady rendered=%v, want %v", got, tt.want)
-			}
-			if got := findRule(spec, "ForgejoDown") != nil; got != tt.want {
-				t.Fatalf("ForgejoDown rendered=%v, want %v", got, tt.want)
-			}
-			// The guard and the unreachable alert do not depend on the replica count.
+			// The guard and the unreachable alert are rendered for every spec.
 			if findRule(spec, "ForgejoOperatorMetricsMissing") == nil || findRule(spec, "ForgejoHealthProbeUnreachable") == nil {
-				t.Fatal("ForgejoOperatorMetricsMissing/ForgejoHealthProbeUnreachable missing")
+				t.Error("ForgejoOperatorMetricsMissing/ForgejoHealthProbeUnreachable missing")
 			}
 		})
-	}
-}
-
-func TestOperatorMetricsGuard(t *testing.T) {
-	f := testInstance("guard")
-	f.Spec.Backup.Enabled = true
-	f.Spec.Backup.Schedule = testDailySchedule
-	spec := ruleSpecOf(t, f, false)
-
-	guard := findRule(spec, "ForgejoOperatorMetricsMissing")
-	if guard == nil || guard.Expr != `absent(forgejo_operator_instance_ready{namespace="ns", name="guard"})` || guard.For != "15m" {
-		t.Fatalf("guard %+v", guard)
-	}
-	if !strings.Contains(guard.Annotations["description"], "honorLabels") {
-		t.Fatalf("guard description %q", guard.Annotations["description"])
-	}
-	// A missing backup is only reported while the instance's operator metrics are scraped.
-	missing := findRule(spec, "ForgejoBackupMissing")
-	want := `absent(forgejo_operator_backup_last_success_timestamp_seconds{namespace="ns", name="guard"}) and on() ` +
-		`count(forgejo_operator_instance_ready{namespace="ns", name="guard"}) > 0`
-	if missing == nil || missing.Expr != want || missing.For != "2d" {
-		t.Fatalf("ForgejoBackupMissing %+v", missing)
-	}
-
-	unreachable := findRule(spec, "ForgejoHealthProbeUnreachable")
-	if unreachable == nil || unreachable.For != "15m" || unreachable.Expr !=
-		`increase(forgejo_operator_health_check_unreachable_total{namespace="ns", name="guard"}[5m]) > 0` {
-		t.Fatalf("ForgejoHealthProbeUnreachable %+v", unreachable)
-	}
-	if d := unreachable.Annotations["description"]; !strings.Contains(d, "guard-http port 3000") {
-		t.Fatalf("ForgejoHealthProbeUnreachable description %q", d)
-	}
-	// A slow probe interval widens the window so that it always contains a probe.
-	f.Spec.AutoPilot.SelfHealing.HealthCheckInterval = &metav1.Duration{Duration: 10 * time.Minute}
-	if r := findRule(ruleSpecOf(t, f, false), "ForgejoHealthProbeUnreachable"); !strings.Contains(r.Expr, "[20m]") {
-		t.Fatalf("expr %q", r.Expr)
-	}
-}
-
-func TestVersionUnsupportedAlert(t *testing.T) {
-	r := findRule(ruleSpecOf(t, testInstance("ver"), false), "ForgejoVersionUnsupported")
-	want := `max by (namespace, name, major, support) (forgejo_operator_version_supported{namespace="ns", name="ver"}) == 0`
-	if r == nil || r.Expr != want || r.For != "1h" || r.Labels["severity"] != testSeverityWarning {
-		t.Fatalf("ForgejoVersionUnsupported %+v", r)
-	}
-	if d := r.Annotations["description"]; !strings.Contains(d, "VersionSupported") || !strings.Contains(d, "docs/versions.md") {
-		t.Fatalf("description %q", d)
-	}
-	r = findRule(ruleSpecOf(t, testInstance("ver"), false), "ForgejoVersionAdvisory")
-	want = `max by (namespace, name, major) (forgejo_operator_version_advisory{namespace="ns", name="ver"}) == 1`
-	if r == nil || r.Expr != want || r.For != "1h" || r.Labels["severity"] != testSeverityWarning {
-		t.Fatalf("ForgejoVersionAdvisory %+v", r)
-	}
-}
-
-// Upload alerts exist only with spec.backup.remote; staleness ones only with scheduled backups.
-func TestBackupUploadAlerts(t *testing.T) {
-	f := testInstance("up")
-	for _, name := range []string{"ForgejoBackupUploadFailed", "ForgejoBackupUploadTooOld", "ForgejoBackupUploadMissing"} {
-		if findRule(ruleSpecOf(t, f, false), name) != nil {
-			t.Errorf("%s without spec.backup.remote", name)
-		}
-	}
-	f.Spec.Backup.Remote = &forgejov1.RemoteBackupSpec{}
-	r := findRule(ruleSpecOf(t, f, false), "ForgejoBackupUploadFailed")
-	if r == nil || !strings.Contains(r.Expr, `forgejo_operator_backup_uploads_total{namespace="ns", name="up", result="failed"}`) {
-		t.Fatalf("upload failed rule %+v", r)
-	}
-	if findRule(ruleSpecOf(t, f, false), "ForgejoBackupUploadTooOld") != nil {
-		t.Error("staleness alert without scheduled backups")
-	}
-	f.Spec.Backup.Enabled = true
-	f.Spec.Backup.Schedule = testDailySchedule
-	if r := findRule(ruleSpecOf(t, f, false), "ForgejoBackupUploadTooOld"); r == nil ||
-		!strings.Contains(r.Expr, "forgejo_operator_backup_last_upload_success_timestamp_seconds") {
-		t.Errorf("too old rule %+v", r)
-	}
-	if r := findRule(ruleSpecOf(t, f, false), "ForgejoBackupUploadMissing"); r == nil || !strings.Contains(r.Expr, "absent(") {
-		t.Errorf("missing rule %+v", r)
-	}
-}
-
-func TestRunnersOfflineAlert(t *testing.T) {
-	r := findRule(ruleSpecOf(t, testInstance("run"), false), "ForgejoRunnersOffline")
-	want := `max by (namespace, name, runner) (forgejo_operator_runner_jobs_waiting{namespace="ns", name="run"}) > 0 ` +
-		`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_online{namespace="ns", name="run"}) == 0 ` +
-		`and on (namespace, name, runner) max by (namespace, name, runner) (forgejo_operator_runners_desired{namespace="ns", name="run"}) > 0`
-	if r == nil || r.Expr != want || r.For != "10m" || r.Labels["severity"] != testSeverityWarning {
-		t.Fatalf("ForgejoRunnersOffline %+v", r)
-	}
-	if d := r.Annotations["description"]; !strings.Contains(d, "kubectl -n ns describe forgejorunner {{ $labels.runner }}") ||
-		!strings.Contains(d, `{{ $value | printf "%.0f" }}`) {
-		t.Fatalf("description %q", d)
-	}
-}
-
-// With highAvailability: alerts for a Valkey without a usable primary, a failover, a
-// degraded group and a cron runner that is down; none without it.
-func TestHighAvailabilityAlerts(t *testing.T) {
-	names := []string{"ForgejoValkeyNoMaster", "ForgejoValkeyFailedOver", "ForgejoValkeyDegraded", "ForgejoCronRunnerDown"}
-	f := testInstance("ha")
-	for _, n := range names {
-		if findRule(ruleSpecOf(t, f, false), n) != nil {
-			t.Fatalf("%s without highAvailability", n)
-		}
-	}
-	f.Spec.HighAvailability.Enabled = true
-	spec := ruleSpecOf(t, f, false)
-	for _, n := range names {
-		if findRule(spec, n) == nil {
-			t.Fatalf("no %s", n)
-		}
-	}
-	if r := findRule(spec, "ForgejoValkeyNoMaster"); r.Labels["severity"] != "critical" ||
-		!strings.Contains(r.Expr, `forgejo_operator_valkey_master_available{namespace="ns", name="ha"}`) {
-		t.Fatalf("ForgejoValkeyNoMaster: %+v", r)
-	}
-	if r := findRule(spec, "ForgejoCronRunnerDown"); !strings.Contains(r.Expr, "forgejo_operator_cron_runner_ready") || r.For == "" {
-		t.Fatalf("ForgejoCronRunnerDown: %+v", r)
 	}
 }
