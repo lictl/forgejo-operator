@@ -151,6 +151,12 @@ and in `RollingOut` the new image migrates the restored database.
 
 ## Failure detection
 
+Before evaluating failures, the operator reads the Deployment directly from the API
+server. If the target image has fully rolled out and every replica is available, the
+upgrade succeeds even after the timeout or when cached pod status still shows crashes.
+A failed live read postpones the decision until a later reconcile; stale cached state
+cannot select an automatic rollback of a verified rollout.
+
 The upgrade fails when the new image's pods show any of:
 
 - the image cannot be pulled (`ErrImagePull`/`ImagePullBackOff`) for more than 2 minutes, or

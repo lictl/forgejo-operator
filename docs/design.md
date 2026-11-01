@@ -161,7 +161,7 @@ checks, the restore handshake or volume expansion. Around the table:
 | 11 | restore-from | backup | 10 | with `spec.restoreFrom`: `ForgejoRestore <name>-restore-from` of the backup once the database is ready, unless the database or data volume predates the instance (`TargetNotEmpty`); `status.restoredFrom` follows it; at `ScalingUp` the annotation `restored-from` on `<name>-secrets`, then `Completed` |
 | 12 | ssh-host-keys | core | 5 | Secret `<name>-ssh-host-keys` (generated once); `rc.SSHHostKeys`, `rc.SSHHostKeysUnavailable`, `status.ssh` (see [SSH host keys](#ssh-host-keys)) |
 | 13 | object-storage | core | – | with `spec.objectStorage`: reads its Secrets, `rc.ObjectStorage` (digest of the credentials and CA), `rc.ObjectStorageUnavailable` (any failed answer of the endpoint, not `UnreachableFromOperator`), `ObjectStorageReady` from the operator's check of the bucket (see [object-storage.md](object-storage.md)). Stops only while the Secrets are unusable; a bucket the operator cannot reach is only reported |
-| 14 | upgrade | upgrade | 10, 13 | `rc.TargetImage`, `rc.Layout`, `rc.Upgrading`, `rc.ReplicasOverride`, `status.upgrade`, `Upgrading`; pre-upgrade `ForgejoBackup`, rollback `ForgejoRestore` |
+| 14 | upgrade | upgrade | 10, 13 | `rc.TargetImage`, `rc.Layout`, `rc.Upgrading`, `rc.ReplicasOverride`, `status.upgrade`, `Upgrading`; pre-upgrade `ForgejoBackup`, rollback `ForgejoRestore`; verifies the Deployment with `APIReader` before judging rollout failure or timeout |
 | 15 | tuning | autopilot | 14 | `rc.Tuning`, `rc.TuningEnv`, `rc.ResourcesOverride`, `rc.HPAManaged`, `status.autoPilot.tuning` |
 | 16 | config | core | 12, 15 | Secret `<name>-config` (`app.ini`, including `SSH_SERVER_HOST_KEYS`, and with HA `app-web.ini`, the same without cron tasks; one hash covers both); `rc.ConfigSecretName`, `rc.ConfigHash`, `rc.DesiredConfigHash` |
 | 17 | config-guard | autopilot | 16 | may switch `rc.ConfigSecretName`/`rc.ConfigHash` to `<name>-config-lkg` |
@@ -238,6 +238,12 @@ workload update.
    minutes of a restore failing, it double-checks with a live read.
 
 ## Upgrade and migration holds
+
+An upgrade verifies the Deployment directly with `APIReader` before evaluating cached
+pod failures or the rollout timeout. An available target image succeeds even when the
+informer still reports an unavailable Deployment; a failed live read returns an error
+without selecting a rollback or stopping the workload. This protects writes accepted
+while the operator or its cache was behind.
 
 `forgejo migrate` (run by the `bootstrap` init container) takes no lock, so it must never
 run in two pods at once. Three signals hold the workload at one pod with the `Recreate`
