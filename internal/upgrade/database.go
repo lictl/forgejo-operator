@@ -431,10 +431,11 @@ func refuseVersion(rc *forgejo.ReconcileContext, current, desired string, ref fo
 // databaseUpgradeBlocked names what a PostgreSQL major upgrade waits for before it starts, as the
 // reason and message of the DatabaseUpgrading condition, or returns "" when it may start. It
 // never starts while a failed upgrade holds Forgejo (holdsForgejo, until a restore or the retry
-// annotation has lifted that hold) or the instance is Broken, and never together with a restore, a bootstrap of spec.restoreFrom or a Forgejo upgrade, and it
-// waits for what the verification of the new major needs: Forgejo running, a healthy cluster,
-// the SSH host keys and the bucket of spec.objectStorage (their steps run later in the pass,
-// so their last reports in status are used).
+// annotation has lifted that hold) or the instance is Broken, and never together with a
+// restore, a bootstrap of spec.restoreFrom or a Forgejo upgrade, and it waits for what the
+// verification of the new major needs: Forgejo running, a healthy cluster, the SSH host keys and
+// the bucket of spec.objectStorage (their steps run later in the pass, so their last reports in
+// status are used).
 func databaseUpgradeBlocked(ctx context.Context, rc *forgejo.ReconcileContext, c *forgejo.CNPGCluster, desired string) (string, string, error) {
 	f := rc.Instance
 	to := fmt.Sprintf("The upgrade to %s", desired)

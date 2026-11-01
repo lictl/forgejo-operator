@@ -523,7 +523,7 @@ backup/restore Job pods reach them in the instance's namespace.
 All names come from `internal/forgejo/names.go`. Every child resource carries
 `forgejo.Labels(instance, component)`, and Deployments and Services select with
 `forgejo.SelectorLabels`. Data-bearing resources (data PVC, backup PVC, CNPG cluster,
-scheduled and pre-upgrade backups) and the identity Secrets (`<name>-secrets`, `<name>-admin`,
+scheduled, pre-upgrade and pre-restore backups) and the identity Secrets (`<name>-secrets`, `<name>-admin`,
 `<name>-ssh-host-keys`) get an owner reference only with `spec.storage.retainPolicy: Delete`.
 Manual backups never do, and neither does the backup encryption key `<name>-backup-key`.
 The objects of a `ForgejoRunner` are named in `internal/runner/names.go`, carry

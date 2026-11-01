@@ -432,8 +432,9 @@ spec.database ─────────────► Pending ─► BackingU
 | `Cancelled` | `spec.database.cnpg.imageName` changed before the new image was written | usual | old |
 
 The state is persisted in `status.database.upgrade`, so an operator restart resumes it; the
-backup has a name derived from `startTime` and is created only once `BackingUp` is saved. While it is in flight, `DatabaseUpgrading=True` (reason = phase),
-`status.phase` is `Upgrading` and `Progressing=True`. On a local cluster a 17 → 18 upgrade of a
+backup has a name derived from `startTime` and is created only once `BackingUp` is saved. While
+it is in flight, `DatabaseUpgrading=True` (reason = phase), `status.phase` is `Upgrading` and
+`Progressing=True`. On a local cluster a 17 → 18 upgrade of a
 small database took about 75 s, the `pg_upgrade` Job 40 s of it.
 
 **One upgrade at a time.** While a PostgreSQL upgrade is in flight:
