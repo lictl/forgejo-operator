@@ -135,6 +135,24 @@ func TestClusterReaderMatchesManagerRole(t *testing.T) {
 	}
 }
 
+// The operator changes owner references on update: of PVCs, CNPG Clusters, Secrets and
+// ForgejoBackups under retainPolicy, and of a Deployment it adopts. The
+// OwnerReferencesPermissionEnforcement admission plugin allows that only to a caller that may
+// delete the object, so delete stays on them although no code deletes a PVC, Cluster or
+// Deployment.
+func TestOwnerReferenceChangesKeepDelete(t *testing.T) {
+	manager := grants(t, "config/rbac/role.yaml")
+	for _, key := range []string{
+		"/persistentvolumeclaims", "/secrets", "apps/deployments", "forgejo.lucas.icu/forgejobackups",
+		"postgresql.cnpg.io/clusters",
+	} {
+		if !slices.Contains(manager[key], "delete") {
+			t.Errorf("manager-role grants %s %v without delete, which changing its owner references needs (docs/permissions.md)",
+				key, manager[key])
+		}
+	}
+}
+
 func TestPodsExecOnlyInVolumeUsageRole(t *testing.T) {
 	if verbs, ok := grants(t, "config/rbac/role.yaml")["/pods/exec"]; ok {
 		t.Errorf("manager-role grants pods/exec %v; it belongs in config/rbac/volume_usage_role.yaml only", verbs)

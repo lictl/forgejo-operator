@@ -12,21 +12,21 @@ package upgrade
 // of the old major exists. The state machine is persisted in status.database.upgrade:
 //
 //	Pending → BackingUp → Upgrading ──────────────────► Verifying → Succeeded
-//	   │          │           │ Job failed or               │ Forgejo not available
-//	   ▼          ▼           ▼ image not pulled             ▼ on the new major
-//	Cancelled   Failed     Reverting ──────────────────► RollingBack → RolledBack
-//	          (nothing        │ old data back  (not back,     │ backup unusable: Failed (Cluster kept)
-//	           changed)       ▼ (same system  pg_upgrade had  │ restore failed: Failed (Forgejo stays
-//	                       RolledBack  ID)    started)        ▼ stopped)
-//	                       (not back, pg_upgrade never started: Failed, Cluster kept)
+//	   │          │           │ Job failed, image not       │ Forgejo fails on the new
+//	   ▼          ▼           ▼ pulled, or no pg_upgrade    ▼ major, Cluster gone
+//	Cancelled   Failed     Reverting ──────────────────► Failed, Forgejo held (Broken)
+//	          (nothing        │ old data back  (not back,
+//	           changed)       ▼ (same system  pg_upgrade had started)
+//	                       RolledBack  ID)
+//	                       (not back, pg_upgrade never started: Failed, Forgejo not held)
 //
 // Reverting writes the old image back, which CNPG answers by deleting the upgrade Job and
 // starting the untouched old data. Nothing interrupts a running pg_upgrade: a Job that runs
-// longer than spec.upgrade.timeout is only reported. RollingBack, for an old data directory that
-// does not come back after pg_upgrade had started and for a new major Forgejo does not run on,
-// deletes the Cluster (only while the pre-upgrade backup, read again right before, can restore
-// it), lets the database step create it again on the old image, and restores the pre-upgrade
-// backup into it.
+// longer than spec.upgrade.timeout is only reported. The operator restores no backup and deletes
+// nothing: old data that does not come back after pg_upgrade had started, a new major on which
+// Forgejo does not become available, and a lost Cluster end Failed with
+// status.database.upgrade.holdsForgejo, which keeps Forgejo stopped and the instance Broken
+// until a person acts (failHeld, holdForDatabaseRestore).
 
 import (
 	"context"
@@ -50,7 +50,7 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods;persistentvolumeclaims;secrets,verbs=get;list;watch
 
@@ -430,11 +430,12 @@ func refuseVersion(rc *forgejo.ReconcileContext, current, desired string, ref fo
 
 // databaseUpgradeBlocked names what a PostgreSQL major upgrade waits for before it starts, as the
 // reason and message of the DatabaseUpgrading condition, or returns "" when it may start. It
-// never starts after a rollback whose restore failed (until a restore has lifted that hold), and
-// never together with a restore, a bootstrap of spec.restoreFrom or a Forgejo upgrade, and it
-// waits for what the verification of the new major needs: Forgejo running, a healthy cluster,
-// the SSH host keys and the bucket of spec.objectStorage (their steps run later in the pass,
-// so their last reports in status are used).
+// never starts while a failed upgrade holds Forgejo (holdsForgejo, until a restore or the retry
+// annotation has lifted that hold) or the instance is Broken, and never together with a
+// restore, a bootstrap of spec.restoreFrom or a Forgejo upgrade, and it waits for what the
+// verification of the new major needs: Forgejo running, a healthy cluster, the SSH host keys and
+// the bucket of spec.objectStorage (their steps run later in the pass, so their last reports in
+// status are used).
 func databaseUpgradeBlocked(ctx context.Context, rc *forgejo.ReconcileContext, c *forgejo.CNPGCluster, desired string) (string, string, error) {
 	f := rc.Instance
 	to := fmt.Sprintf("The upgrade to %s", desired)

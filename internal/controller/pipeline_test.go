@@ -405,9 +405,10 @@ func TestPipelineBlockedByNamesRootCause(t *testing.T) {
 	}
 }
 
-// While a PostgreSQL upgrade's rollback deletes the Cluster, the database-upgrade step stops:
-// the database step (and the chain) is skipped, the independent steps run, and the upgrade in
-// flight is visible to the backup schedule. So it is when the step fails.
+// While the Cluster of a PostgreSQL upgrade in flight is being deleted, the database-upgrade
+// step stops: the database step (and the chain) is skipped, the independent steps run, and the
+// upgrade in flight is visible to the backup schedule. The same holds when the step fails. (A
+// Cluster that is gone ends the upgrade with failHeld, which also stops the step.)
 func TestPipelineDatabaseUpgradeStopsTheDatabaseStep(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		var upgradingAtSchedule, dbUpgradingAtSchedule bool

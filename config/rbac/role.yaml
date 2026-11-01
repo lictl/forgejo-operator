@@ -35,8 +35,10 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  - secrets
   verbs:
   - create
+  - delete
   - get
   - list
   - patch
@@ -50,18 +52,6 @@ rules:
   - delete
   - get
   - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - apps
