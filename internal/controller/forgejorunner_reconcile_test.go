@@ -31,8 +31,6 @@ import (
 	"github.com/lictl/forgejo-operator/internal/runner"
 )
 
-const testRegisterJob = "ci-register"
-
 const runnerTestNS = "runner-test"
 
 // fakeRunnerAPI is Forgejo's runner API in memory. Registration Jobs are simulated by
@@ -225,6 +223,19 @@ func (fx *runnerFixture) tokens(name string) map[string][]byte {
 	return sec.Data
 }
 
+func (fx *runnerFixture) configKeys(name string) []string {
+	fx.t.Helper()
+	sec := &corev1.Secret{}
+	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: name + "-runner"}, sec); err != nil {
+		fx.t.Fatal(err)
+	}
+	keys := make([]string, 0, len(sec.Data))
+	for k := range sec.Data {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func (fx *runnerFixture) statefulSet(name string) *appsv1.StatefulSet {
 	fx.t.Helper()
 	sts := &appsv1.StatefulSet{}
@@ -238,14 +249,24 @@ func (fx *runnerFixture) statefulSet(name string) *appsv1.StatefulSet {
 // in the fake Forgejo (online), and the Job is marked Complete.
 func (fx *runnerFixture) completeRegistration(name string) {
 	fx.t.Helper()
-	job := &batchv1.Job{}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: name + "-register"}, job); err != nil {
-		fx.t.Fatalf("registration job: %v", err)
-	}
+	job := fx.registerJob(name)
 	for i, uuid := range runner.ParseRegistrationAnnotation(job.Annotations[runner.AnnotationRegistrationRunners]) {
 		fx.api.register(uuid, runner.RunnerName(fx.runner(name), i), "idle")
 	}
 	job.Status.Conditions = append(job.Status.Conditions, batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue})
+	if err := fx.c.Status().Update(context.Background(), job); err != nil {
+		fx.t.Fatal(err)
+	}
+}
+
+// failRegistration marks the registration Job Failed at the fixture's clock.
+func (fx *runnerFixture) failRegistration(name string) {
+	fx.t.Helper()
+	job := fx.registerJob(name)
+	job.Status.Conditions = append(job.Status.Conditions, batchv1.JobCondition{
+		Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded",
+		LastTransitionTime: metav1.NewTime(fx.clock),
+	})
 	if err := fx.c.Status().Update(context.Background(), job); err != nil {
 		fx.t.Fatal(err)
 	}
@@ -271,6 +292,15 @@ func (fx *runnerFixture) scale(name string, replicas int32) {
 	if err := fx.c.Update(context.Background(), fr); err != nil {
 		fx.t.Fatal(err)
 	}
+}
+
+func (fx *runnerFixture) registerJob(name string) *batchv1.Job {
+	fx.t.Helper()
+	job := &batchv1.Job{}
+	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: name + "-register"}, job); err != nil {
+		fx.t.Fatalf("registration job: %v", err)
+	}
+	return job
 }
 
 func (fx *runnerFixture) registerJobExists(name string) bool {
@@ -301,16 +331,34 @@ func (fx *runnerFixture) deletePod(name string, i int32) {
 	}
 }
 
-func drainEvents(rec *events.FakeRecorder) []string {
+// drainEvents empties rec and returns the events that contain every one of substrs.
+func drainEvents(rec *events.FakeRecorder, substrs ...string) []string {
 	var out []string
 	for {
 		select {
 		case e := <-rec.Events:
-			out = append(out, e)
+			match := true
+			for _, s := range substrs {
+				match = match && strings.Contains(e, s)
+			}
+			if match {
+				out = append(out, e)
+			}
 		default:
 			return out
 		}
 	}
+}
+
+// listedNames are the names of the runners Forgejo lists.
+func (fx *runnerFixture) listedNames() []string {
+	fx.t.Helper()
+	list, _ := fx.api.ListRunners(context.Background())
+	names := make([]string, 0, len(list))
+	for _, r := range list {
+		names = append(names, r.Name)
+	}
+	return names
 }
 
 // startRunners takes a ForgejoRunner from creation to running, registered runners.
@@ -334,11 +382,7 @@ func TestRunnerRegistersBeforeStartingPods(t *testing.T) {
 	if sts := fx.statefulSet("ci"); *sts.Spec.Replicas != 0 {
 		t.Fatalf("pods started before their runners were registered: replicas %d", *sts.Spec.Replicas)
 	}
-	job := &batchv1.Job{}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, job); err != nil {
-		t.Fatalf("no registration job: %v", err)
-	}
-	if c := job.Spec.Template.Spec.Containers[0]; c.Image != "codeberg.org/forgejo/forgejo:17" {
+	if c := fx.registerJob("ci").Spec.Template.Spec.Containers[0]; c.Image != "codeberg.org/forgejo/forgejo:17" {
 		t.Errorf("registration image %s", c.Image)
 	}
 	if c := fx.condition("ci", forgejov1.ConditionRunnerRegistered); c == nil || c.Reason != reasonRegistering {
@@ -352,8 +396,8 @@ func TestRunnerRegistersBeforeStartingPods(t *testing.T) {
 		fr.Status.Runners[1].UUID != runner.UUIDOf(string(tokens["token-1"])) || fr.Status.Runners[0].ID == 0 {
 		t.Fatalf("records %+v", fr.Status.Runners)
 	}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
-		t.Errorf("the finished registration Job was kept: %v", err)
+	if fx.registerJobExists("ci") {
+		t.Error("the finished registration Job was kept")
 	}
 	if sts := fx.statefulSet("ci"); *sts.Spec.Replicas != 2 {
 		t.Fatalf("replicas %d after registration", *sts.Spec.Replicas)
@@ -374,8 +418,8 @@ func TestRunnerRegistersBeforeStartingPods(t *testing.T) {
 	}
 	// A further pass registers nothing again.
 	fx.reconcile("ci")
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
-		t.Errorf("registered again: %v", err)
+	if fx.registerJobExists("ci") {
+		t.Error("registered again")
 	}
 }
 
@@ -384,8 +428,8 @@ func TestRunnerWaitsForForgejo(t *testing.T) {
 	f.Status.Phase = forgejov1.PhaseUpgrading
 	fx := newRunnerFixture(t, f, testForgejoRunner("ci", 1))
 	fx.reconcile("ci")
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("registered with an upgrading instance: %v", err)
+	if fx.registerJobExists("ci") {
+		t.Fatal("registered with an upgrading instance")
 	}
 	if c := fx.condition("ci", forgejov1.ConditionRunnerRegistered); c == nil || c.Reason != reasonWaitingForForgejo || !strings.Contains(c.Message, "upgrading") {
 		t.Fatalf("Registered %+v", c)
@@ -432,15 +476,10 @@ func TestRunnerScaleDownUnregistersOnceThePodIsGone(t *testing.T) {
 	if tokens := fx.tokens("ci"); len(tokens) != 1 || tokens["token-0"] == nil {
 		t.Fatalf("tokens after scale-down %v", tokens)
 	}
-	list, _ := fx.api.ListRunners(context.Background())
-	if len(list) != 1 {
-		t.Fatalf("Forgejo has %d runners, want 1", len(list))
+	if names := fx.listedNames(); len(names) != 1 {
+		t.Fatalf("Forgejo has %v, want 1 runner", names)
 	}
-	var unregistered bool
-	for _, e := range drainEvents(fx.rec) {
-		unregistered = unregistered || strings.Contains(e, "Unregistered runners ci-1")
-	}
-	if !unregistered {
+	if len(drainEvents(fx.rec, "Unregistered runners ci-1")) == 0 {
 		t.Error("no Unregistered event")
 	}
 }
@@ -495,20 +534,12 @@ func TestRunnerMissingInForgejoIsRegisteredAgain(t *testing.T) {
 	if sts := fx.statefulSet("ci"); *sts.Spec.Replicas != 2 {
 		t.Fatalf("replicas %d while ci-0 is registered again: the healthy runners were stopped", *sts.Spec.Replicas)
 	}
-	var missingEvent bool
-	for _, e := range drainEvents(fx.rec) {
-		missingEvent = missingEvent || strings.Contains(e, "RunnerMissing") && strings.Contains(e, "ci-0")
-	}
-	if !missingEvent {
+	if len(drainEvents(fx.rec, "RunnerMissing", "ci-0")) == 0 {
 		t.Error("no RunnerMissing event")
 	}
 
 	// The Job has registered the runner but has not finished: Forgejo lists it again, and it
 	// is recorded (with its event) when the Job is collected.
-	job := &batchv1.Job{}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, job); err != nil {
-		t.Fatal(err)
-	}
 	fx.api.register(ci0.UUID, "ci-0", "idle")
 	fx.reconcile("ci")
 	if rec := fx.runner("ci").Status.Runners[0]; !rec.Missing {
@@ -520,11 +551,7 @@ func TestRunnerMissingInForgejoIsRegisteredAgain(t *testing.T) {
 	if rec.Missing || rec.UUID != ci0.UUID || rec.ID == 0 || rec.ID == ci0.ID {
 		t.Fatalf("record after registering again %+v (old id %d)", rec, ci0.ID)
 	}
-	var registeredEvent bool
-	for _, e := range drainEvents(fx.rec) {
-		registeredEvent = registeredEvent || strings.Contains(e, "Registered runners ci-0 with")
-	}
-	if !registeredEvent {
+	if len(drainEvents(fx.rec, "Registered runners ci-0 with")) == 0 {
 		t.Error("no Registered event for the runner registered again")
 	}
 	if c := fx.condition("ci", forgejov1.ConditionRunnerRegistered); c == nil || c.Status != metav1.ConditionTrue {
@@ -653,12 +680,183 @@ func TestRunnerRegistrationJobOutlivesAFailedStatusWrite(t *testing.T) {
 	if recs := fx.runner("late").Status.Runners; len(recs) != 1 || recs[0].Name != "late-0" {
 		t.Fatalf("records %+v", recs)
 	}
-	list, _ := fx.api.ListRunners(context.Background())
-	if len(list) != 1 || list[0].Name != "late-0" {
-		t.Fatalf("Forgejo has %+v, want only ci-0", list)
+	if names := fx.listedNames(); len(names) != 1 || names[0] != "late-0" {
+		t.Fatalf("Forgejo has %v, want only late-0", names)
 	}
 	if sts := fx.statefulSet("late"); *sts.Spec.Replicas != 1 {
 		t.Fatalf("replicas %d", *sts.Spec.Replicas)
+	}
+}
+
+// A registration Job that registered ci-1 and then failed leaves ci-1 in Forgejo without a
+// record. Scaled back meanwhile, the secrets of the failed Job's runners are kept (and get no
+// configuration) while the Job is kept for registrationRetry and while Forgejo's API cannot be
+// read. Once it can, ci-1 is deleted in Forgejo before its secret is dropped, so no offline
+// ghost stays behind.
+func TestRunnerFailedRegistrationLeavesNoGhost(t *testing.T) {
+	fx := newRunnerFixture(t, readyForgejo(), testForgejoRunner("ci", 1))
+	fx.clock = time.Now()
+	fx.startRunners("ci")
+	fx.addPod("ci", 0)
+	fx.scale("ci", 3)
+	fx.reconcile("ci")
+	regs := runner.ParseRegistrationAnnotation(fx.registerJob("ci").Annotations[runner.AnnotationRegistrationRunners])
+	if len(regs) != 2 || regs[1] == "" || regs[2] == "" {
+		t.Fatalf("registration Job registers %v, want ci-1 and ci-2", regs)
+	}
+	fx.api.register(regs[1], "ci-1", "offline")
+	ci1 := fx.api.runners[regs[1]].ID
+	fx.failRegistration("ci")
+	fx.scale("ci", 1)
+	fx.reconcile("ci")
+	if !fx.registerJobExists("ci") {
+		t.Fatal("the failed registration Job was not kept for registrationRetry")
+	}
+	if tokens := fx.tokens("ci"); len(tokens) != 3 {
+		t.Fatalf("the secrets of the failed Job's runners were dropped while it exists: %d left", len(tokens))
+	}
+
+	fx.clock = fx.clock.Add(registrationRetry + time.Second)
+	fx.api.err = errors.New("connection refused")
+	fx.reconcile("ci") // the failed Job goes
+	fx.reconcile("ci")
+	if fx.registerJobExists("ci") {
+		t.Fatal("the failed registration Job was kept after registrationRetry")
+	}
+	if tokens := fx.tokens("ci"); len(tokens) != 3 {
+		t.Fatalf("secrets dropped while Forgejo's API cannot be read: %d left", len(tokens))
+	}
+	if keys := fx.configKeys("ci"); len(keys) != 1 || keys[0] != "config-0.yaml" {
+		t.Fatalf("configuration files %v: a secret kept for pruning got one", keys)
+	}
+	if c := fx.condition("ci", forgejov1.ConditionDegraded); c == nil || c.Reason != reasonAPIUnavailable {
+		t.Fatalf("Degraded %+v", c)
+	}
+
+	drainEvents(fx.rec)
+	fx.api.err = nil
+	fx.reconcile("ci")
+	if len(fx.api.deleted) != 1 || fx.api.deleted[0] != ci1 {
+		t.Fatalf("deleted %v in Forgejo, want ci-1 (id %d)", fx.api.deleted, ci1)
+	}
+	if names := fx.listedNames(); len(names) != 1 || names[0] != "ci-0" {
+		t.Fatalf("Forgejo has %v, want only ci-0", names)
+	}
+	if tokens := fx.tokens("ci"); len(tokens) != 1 || tokens["token-0"] == nil {
+		t.Fatalf("tokens %v, want only token-0", tokens)
+	}
+	if len(drainEvents(fx.rec, "Unregistered runners ci-1 (id")) == 0 {
+		t.Error("no Unregistered event for ci-1")
+	}
+	fx.reconcile("ci")
+	if keys := fx.configKeys("ci"); len(keys) != 1 || keys[0] != "config-0.yaml" {
+		t.Fatalf("configuration files %v", keys)
+	}
+	if c := fx.condition("ci", forgejov1.ConditionDegraded); c == nil || c.Status != metav1.ConditionFalse {
+		t.Fatalf("Degraded %+v", c)
+	}
+}
+
+// A runner registered again for another scope keeps the version Forgejo lists for it: the
+// registration writes the version, and the pods are not restarted to declare it again.
+func TestRunnerScopeChangeKeepsTheVersion(t *testing.T) {
+	fx := newRunnerFixture(t, readyForgejo(), testForgejoRunner("ci", 2))
+	fx.startRunners("ci")
+	versions := map[string]string{"ci-0": "13.2.0", "ci-1": "12.7.0"}
+	for u, r := range fx.api.runners {
+		r.Version = versions[r.Name]
+		fx.api.runners[u] = r
+	}
+	fr := fx.runner("ci")
+	fr.Spec.Scope.Organization = "acme"
+	if err := fx.c.Update(context.Background(), fr); err != nil {
+		t.Fatal(err)
+	}
+	fx.reconcile("ci")
+	job := fx.registerJob("ci")
+	var env string
+	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "RUNNERS" {
+			env = e.Value
+		}
+	}
+	if env != "0:13.2.0:ci-0 1:12.7.0:ci-1" {
+		t.Fatalf("RUNNERS %q, want the listed versions", env)
+	}
+	if sts := fx.statefulSet("ci"); *sts.Spec.Replicas != 2 {
+		t.Fatalf("replicas %d during a scope change", *sts.Spec.Replicas)
+	}
+}
+
+// A scaled-away pod stuck Terminating (a lost node) holds its runner's unregistration only
+// until podStopMargin after its deletionTimestamp (which includes its grace period).
+func TestRunnerStuckTerminatingPodIsUnregistered(t *testing.T) {
+	fx := newRunnerFixture(t, readyForgejo(), testForgejoRunner("ci", 2))
+	fx.clock = time.Now()
+	fx.startRunners("ci")
+	fx.addPod("ci", 0)
+	fr := fx.runner("ci")
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: runner.RunnerName(fr, 1), Namespace: runnerTestNS, Labels: runner.Labels(fr, forgejo.ComponentRunner),
+			Finalizers: []string{"example.com/lost-node"},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-b"},
+	}
+	if err := fx.c.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	ci1 := fx.runner("ci").Status.Runners[1]
+	fx.scale("ci", 1)
+	fx.reconcile("ci")
+	if err := fx.c.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := fx.c.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil || pod.DeletionTimestamp.IsZero() {
+		t.Fatalf("pod not terminating: %v", err)
+	}
+	stopBy := pod.DeletionTimestamp.Add(podStopMargin)
+
+	fx.clock = stopBy.Add(-time.Second)
+	res := fx.reconcile("ci")
+	if len(fx.api.deleted) != 0 || len(fx.runner("ci").Status.Runners) != 2 {
+		t.Fatalf("unregistered within the margin: deleted %v", fx.api.deleted)
+	}
+	if res.RequeueAfter <= 0 || res.RequeueAfter > time.Second {
+		t.Errorf("requeued after %s, want at the end of the margin (1s)", res.RequeueAfter)
+	}
+
+	drainEvents(fx.rec)
+	fx.clock = stopBy.Add(time.Second)
+	fx.reconcile("ci")
+	if len(fx.api.deleted) != 1 || fx.api.deleted[0] != ci1.ID {
+		t.Fatalf("deleted %v, want ci-1 (id %d)", fx.api.deleted, ci1.ID)
+	}
+	if recs := fx.runner("ci").Status.Runners; len(recs) != 1 || recs[0].Index != 0 {
+		t.Fatalf("records %+v", recs)
+	}
+	if stuck := drainEvents(fx.rec, "RunnerPodStuck", "ci-1", "node-b"); len(stuck) != 1 {
+		t.Errorf("RunnerPodStuck events %q, want 1", stuck)
+	}
+	fx.reconcile("ci")
+	if tokens := fx.tokens("ci"); tokens["token-1"] == nil {
+		t.Fatal("the secret of a runner whose pod still exists was dropped (scaling back up reuses it)")
+	}
+	if len(drainEvents(fx.rec)) != 0 {
+		t.Error("events repeated on the next pass")
+	}
+
+	// The pod goes (force-deleted): its secret goes too.
+	pod.Finalizers = nil
+	if err := fx.c.Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	fx.reconcile("ci")
+	if tokens := fx.tokens("ci"); len(tokens) != 1 || tokens["token-0"] == nil {
+		t.Fatalf("tokens %v after the stuck pod went", tokens)
+	}
+	if len(fx.api.deleted) != 1 {
+		t.Fatalf("deleted %v", fx.api.deleted)
 	}
 }
 
@@ -673,41 +871,17 @@ func TestRunnerFinalizerUnregistersAll(t *testing.T) {
 	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "ci"}, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
 		t.Errorf("StatefulSet not deleted: %v", err)
 	}
-	list, _ := fx.api.ListRunners(context.Background())
-	if len(list) != 1 || list[0].Name != "someone-else" {
-		t.Fatalf("Forgejo still has %+v", list)
+	if names := fx.listedNames(); len(names) != 1 || names[0] != "someone-else" {
+		t.Fatalf("Forgejo still has %v", names)
 	}
 	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "ci"}, &forgejov1.ForgejoRunner{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("finalizer kept: %v", err)
 	}
 }
 
+// The finalizer waits for the runner pods, then tries to unregister for unregisterGiveUp after
+// its first failure, also when the pods took longer than that to stop.
 func TestRunnerFinalizerWaitsForPodsThenGivesUp(t *testing.T) {
-	fx := newRunnerFixture(t, readyForgejo(), testForgejoRunner("ci", 1))
-	fx.startRunners("ci")
-	fx.addPod("ci", 0)
-	if err := fx.c.Delete(context.Background(), fx.runner("ci")); err != nil {
-		t.Fatal(err)
-	}
-	if res := fx.reconcile("ci"); res.RequeueAfter == 0 {
-		t.Fatal("did not wait for the runner pod")
-	}
-	if len(fx.api.deleted) != 0 {
-		t.Fatal("unregistered while the pod runs")
-	}
-	fx.deletePod("ci", 0)
-	fx.api.err = errors.New("connection refused")
-	if res := fx.reconcile("ci"); res.RequeueAfter == 0 {
-		t.Fatal("gave up at once")
-	}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "ci"}, &forgejov1.ForgejoRunner{}); err != nil {
-		t.Fatalf("released before giving up: %v", err)
-	}
-}
-
-// The finalizer tries to unregister for unregisterGiveUp after its first failure, also when
-// the pods took longer than that to stop.
-func TestRunnerFinalizerBudgetStartsAfterThePods(t *testing.T) {
 	fx := newRunnerFixture(t, readyForgejo(), testForgejoRunner("slow", 1))
 	fx.startRunners("slow")
 	fx.addPod("slow", 0)
@@ -715,10 +889,11 @@ func TestRunnerFinalizerBudgetStartsAfterThePods(t *testing.T) {
 	if err := fx.c.Delete(context.Background(), fx.runner("slow")); err != nil {
 		t.Fatal(err)
 	}
-	fx.reconcile("slow")
-	fx.clock = fx.clock.Add(7 * time.Minute) // the runner finishes a 7-minute job
-	if res := fx.reconcile("slow"); res.RequeueAfter == 0 {
-		t.Fatal("did not wait for the runner pod")
+	for _, d := range []time.Duration{0, 7 * time.Minute} { // the runner finishes a 7-minute job
+		fx.clock = fx.clock.Add(d)
+		if res := fx.reconcile("slow"); res.RequeueAfter == 0 || len(fx.api.deleted) != 0 {
+			t.Fatalf("after %s: did not wait for the runner pod (unregistered %v)", d, fx.api.deleted)
+		}
 	}
 	fx.deletePod("slow", 0)
 	fx.api.err = errors.New("connection refused") // Forgejo restarts
@@ -726,8 +901,7 @@ func TestRunnerFinalizerBudgetStartsAfterThePods(t *testing.T) {
 		err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: "slow"}, &forgejov1.ForgejoRunner{})
 		return err == nil
 	}
-	fx.reconcile("slow")
-	if !exists() {
+	if res := fx.reconcile("slow"); res.RequeueAfter == 0 || !exists() {
 		t.Fatal("gave up at the first failed attempt")
 	}
 	fx.clock = fx.clock.Add(4 * time.Minute)
@@ -740,11 +914,7 @@ func TestRunnerFinalizerBudgetStartsAfterThePods(t *testing.T) {
 	if exists() {
 		t.Fatal("did not give up 6 minutes after the first failed attempt")
 	}
-	var gaveUp bool
-	for _, e := range drainEvents(fx.rec) {
-		gaveUp = gaveUp || strings.Contains(e, reasonUnregisterFailed) && strings.Contains(e, "slow-0")
-	}
-	if !gaveUp {
+	if len(drainEvents(fx.rec, reasonUnregisterFailed, "slow-0")) == 0 {
 		t.Error("no UnregisterFailed event")
 	}
 }
@@ -795,11 +965,7 @@ func TestRunnerActionsDisabled(t *testing.T) {
 func TestRunnerSecretsStayInTheTokensSecret(t *testing.T) {
 	fx := newRunnerFixture(t, readyForgejo(), testForgejoRunner("ci", 2))
 	fx.reconcile("ci")
-	job := &batchv1.Job{}
-	if err := fx.c.Get(context.Background(), types.NamespacedName{Namespace: runnerTestNS, Name: testRegisterJob}, job); err != nil {
-		t.Fatal(err)
-	}
-	jobJSON, _ := json.Marshal(job)
+	jobJSON, _ := json.Marshal(fx.registerJob("ci"))
 	fx.completeRegistration("ci")
 	fx.reconcile("ci")
 	fx.setReady("ci")
