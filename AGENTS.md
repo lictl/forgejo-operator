@@ -96,7 +96,7 @@ Details and reasons are in [docs/design.md](docs/design.md).
 |--------|-----|
 | Go code | `make lint test` |
 | API or RBAC markers | `make manifests generate`, then refresh the chart copies above |
-| Alert rules | `make test-rules` (needs docker; GitHub CI does not run promtool) |
+| Alert rules | `make test-rules` (needs docker; CI runs it too) |
 | Chart | `helm lint --strict charts/forgejo-operator` and `helm template forgejo-operator charts/forgejo-operator --include-crds` |
 
 Unit tests and envtest touch no cluster. `make test-e2e` needs Kind and docker; it creates
