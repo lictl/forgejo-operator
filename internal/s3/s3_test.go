@@ -152,7 +152,6 @@ func TestCheckBucketTLS(t *testing.T) {
 // fakeStore is a minimal S3 server for one bucket, path style, that checks every request is
 // signed with the expected key.
 type fakeStore struct {
-	t       *testing.T
 	objects map[string][]byte
 	pages   int
 }
@@ -210,7 +209,7 @@ func (f *fakeStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func TestObjects(t *testing.T) {
-	store := &fakeStore{t: t, objects: map[string][]byte{
+	store := &fakeStore{objects: map[string][]byte{
 		"team/ns/fj/b1/db.dump.bin":       []byte("dump"),
 		"team/ns/fj/b1/manifest.json.bin": []byte("manifest"),
 		"team/ns/fj/b2/db.dump.bin":       []byte("dump2"),

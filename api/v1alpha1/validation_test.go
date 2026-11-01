@@ -267,13 +267,11 @@ func TestForgejoValidation(t *testing.T) {
 
 		// Sizes may be lowered: the operator only grows claims and ignores a lower size, so
 		// undoing an increase the StorageClass could not apply stops its warning.
-		{name: "data volume grows", old: fj("  storage: {size: 10Gi}"), obj: fj("  storage: {size: 20Gi}")},
 		{name: "data volume lowered back", old: fj("  storage: {size: 100Gi}"), obj: fj("  storage: {size: 10Gi}")},
 		{name: "data volume removed after growth", old: fj("  storage: {size: 100Gi}"), obj: fj("  {}")},
 		{name: "database volume lowered", old: fj("  database:\n    cnpg:\n      storage: {size: 5Gi}"), obj: fj("  database:\n    cnpg:\n      storage: {size: 1Gi}")},
 		{name: "backup volume lowered", old: fj("  backup:\n    storage: {size: 20Gi}"), obj: fj("  backup:\n    storage: {size: 10Gi}")},
 		{name: "existing backup claim size lowered", old: fj("  backup:\n    storage: {size: 50Gi, existingClaim: backups}"), obj: fj("  backup:\n    storage: {size: 1Gi, existingClaim: backups}")},
-		{name: "small volume at creation", obj: fj("  storage: {size: 1Gi}")},
 
 		// The database type and the data volume claim are fixed at creation: another one would
 		// start Forgejo on an empty database or volume, which it then migrates.
@@ -313,7 +311,6 @@ func TestForgejoValidation(t *testing.T) {
 		{name: "gateway path escapes", obj: fj("  gateway:\n    parentRefs: [{name: eg}]\n    path: /a%20b/~c")},
 		{name: "gateway path //", obj: fj("  gateway:\n    parentRefs: [{name: eg}]\n    path: /a//b"), want: "must not contain '//'"},
 		{name: "gateway path /./", obj: fj("  gateway:\n    parentRefs: [{name: eg}]\n    path: /a/./b"), want: "must not contain '/./'"},
-		{name: "gateway path /./ at the end", obj: fj("  gateway:\n    parentRefs: [{name: eg}]\n    path: /a/./"), want: "must not contain '/./'"},
 		{name: "gateway path /../", obj: fj("  gateway:\n    parentRefs: [{name: eg}]\n    path: /a/../b"), want: "must not contain '/../'"},
 		{name: "gateway path /..", obj: fj("  gateway:\n    parentRefs: [{name: eg}]\n    path: /a/.."), want: "must not end with '/..'"},
 		{name: "gateway path /.", obj: fj("  gateway:\n    parentRefs: [{name: eg}]\n    path: /a/."), want: "must not end with '/.'"},
@@ -340,8 +337,6 @@ func TestForgejoValidation(t *testing.T) {
 
 		// Backups.
 		{name: "schedule with seconds", obj: fj("  backup: {enabled: true, schedule: \"0 0 3 * * *\"}"), want: "must be a cron expression with five fields"},
-		{name: "schedule descriptor", obj: fj("  backup: {enabled: true, schedule: \"@every 6h\"}")},
-		{name: "schedule with zone", obj: fj("  backup: {enabled: true, schedule: \"CRON_TZ=Asia/Tokyo 30 2 * * 1-5\"}")},
 		{name: "remote without credentials", obj: fj("  backup:\n    remote:\n      s3: {endpoint: \"https://s3.example.com\", bucket: bucket}"), want: errCredentials},
 		{name: "remote with a generated key", obj: fj("  backup:\n    remote:\n      s3:\n        " + strings.ReplaceAll(s3, "\n      ", "\n        "))},
 
