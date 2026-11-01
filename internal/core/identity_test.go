@@ -7,9 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
@@ -29,26 +27,7 @@ func dataPVC(f *forgejov1.Forgejo, annotations map[string]string) *corev1.Persis
 		Name: forgejo.DataPVCName(f), Namespace: f.Namespace, Annotations: annotations}}
 }
 
-func cnpgCluster(f *forgejov1.Forgejo, annotations map[string]string) *unstructured.Unstructured {
-	c := &unstructured.Unstructured{}
-	c.SetGroupVersionKind(forgejo.CNPGClusterGVK)
-	c.SetName(forgejo.DatabaseClusterName(f))
-	c.SetNamespace(f.Namespace)
-	c.SetAnnotations(annotations)
-	return c
-}
-
 func identityOf(sec *corev1.Secret) string { return forgejo.SecretKeyFingerprint(sec.Data) }
-
-// identityContext is a ReconcileContext whose client serves the CNPG API.
-func identityContext(t *testing.T, f *forgejov1.Forgejo, objs ...client.Object) *forgejo.ReconcileContext {
-	t.Helper()
-	s := testScheme(t)
-	mapper := meta.NewDefaultRESTMapper(nil)
-	mapper.Add(forgejo.CNPGClusterGVK, meta.RESTScopeNamespace)
-	c := fake.NewClientBuilder().WithScheme(s).WithRESTMapper(mapper).WithObjects(objs...).Build()
-	return &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: s, RESTMapper: mapper, Instance: f, TargetImage: f.Status.Image}
-}
 
 func reconcileIdentity(t *testing.T, rc *forgejo.ReconcileContext) forgejo.StepResult {
 	t.Helper()
@@ -68,14 +47,14 @@ func brokenReason(f *forgejov1.Forgejo) string {
 
 func TestIdentityNewInstanceIsNotBroken(t *testing.T) {
 	f := testInstance()
-	rc := identityContext(t, f)
+	rc := cnpgContext(t, f)
 	if res := reconcileIdentity(t, rc); res.Stop || brokenReason(f) != "" || rc.IdentityInitialized {
 		t.Fatalf("stop %v, broken %q, initialized %v", res.Stop, brokenReason(f), rc.IdentityInitialized)
 	}
 
 	// A first install interrupted after the secrets step: the volume and the cluster are created later.
 	sec := identitySecret(f, "k1")
-	rc = identityContext(t, f, sec, cnpgCluster(f, map[string]string{forgejo.AnnotationIdentity: identityOf(sec)}))
+	rc = cnpgContext(t, f, sec, cnpgCluster(f, map[string]string{forgejo.AnnotationIdentity: identityOf(sec)}))
 	if res := reconcileIdentity(t, rc); res.Stop || brokenReason(f) != "" || rc.IdentityFingerprint != identityOf(sec) {
 		t.Fatalf("stop %v, broken %q, fingerprint %q", res.Stop, brokenReason(f), rc.IdentityFingerprint)
 	}
@@ -109,7 +88,7 @@ func TestIdentityReportsMissingObjectsOfAnInstanceThatRan(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := ran()
-			rc := identityContext(t, f, tc.objs(f)...)
+			rc := cnpgContext(t, f, tc.objs(f)...)
 			if res := reconcileIdentity(t, rc); !res.Stop || brokenReason(f) != tc.reason {
 				t.Fatalf("stop %v, broken %q", res.Stop, brokenReason(f))
 			}
@@ -118,7 +97,7 @@ func TestIdentityReportsMissingObjectsOfAnInstanceThatRan(t *testing.T) {
 
 	// Status is gone too: the running-image annotation on the volume shows that it ran.
 	f := testInstance()
-	rc := identityContext(t, f, dataPVC(f, map[string]string{forgejo.AnnotationRunningImage: img16}))
+	rc := cnpgContext(t, f, dataPVC(f, map[string]string{forgejo.AnnotationRunningImage: img16}))
 	if res := reconcileIdentity(t, rc); !res.Stop || brokenReason(f) != forgejo.BrokenSecretsMissing {
 		t.Fatalf("stop %v, broken %q", res.Stop, brokenReason(f))
 	}
@@ -129,7 +108,7 @@ func TestIdentityMismatch(t *testing.T) {
 	f.Status.Image = img16
 	sec := identitySecret(f, "new")
 	old := identitySecret(f, "old")
-	rc := identityContext(t, f, sec, dataPVC(f, map[string]string{forgejo.AnnotationIdentity: identityOf(old)}), cnpgCluster(f, nil))
+	rc := cnpgContext(t, f, sec, dataPVC(f, map[string]string{forgejo.AnnotationIdentity: identityOf(old)}), cnpgCluster(f, nil))
 	if res := reconcileIdentity(t, rc); !res.Stop || brokenReason(f) != forgejo.BrokenIdentityMismatch {
 		t.Fatalf("other identity: stop %v, broken %q", res.Stop, brokenReason(f))
 	}
@@ -139,7 +118,7 @@ func TestIdentityMismatch(t *testing.T) {
 	// for an instance that has run).
 	f = testInstance()
 	f.Status.Image = img16
-	rc = identityContext(t, f, sec, dataPVC(f, map[string]string{forgejo.AnnotationIdentity: identityOf(sec)}), cnpgCluster(f, nil))
+	rc = cnpgContext(t, f, sec, dataPVC(f, map[string]string{forgejo.AnnotationIdentity: identityOf(sec)}), cnpgCluster(f, nil))
 	if res := reconcileIdentity(t, rc); res.Stop || brokenReason(f) != "" {
 		t.Fatalf("unstamped cluster: stop %v, broken %q", res.Stop, brokenReason(f))
 	}
@@ -156,7 +135,7 @@ func TestIdentityLeavesALostClusterToAnInFlightDatabaseUpgrade(t *testing.T) {
 	f.Status.Image = img16
 	f.Status.Database = &forgejov1.DatabaseStatus{Upgrade: &forgejov1.DatabaseUpgradeStatus{Phase: forgejov1.DatabaseUpgradeUpgrading}}
 	sec := identitySecret(f, "k1")
-	rc := identityContext(t, f, sec, dataPVC(f, map[string]string{forgejo.AnnotationIdentity: identityOf(sec)}))
+	rc := cnpgContext(t, f, sec, dataPVC(f, map[string]string{forgejo.AnnotationIdentity: identityOf(sec)}))
 	if res := reconcileIdentity(t, rc); res.Stop || brokenReason(f) != "" {
 		t.Fatalf("stop %v, broken %q", res.Stop, brokenReason(f))
 	}
@@ -167,7 +146,7 @@ func TestIdentityAdoptsAndRecoversStatusImage(t *testing.T) {
 	f := testInstance()
 	f.Status.Image = img16
 	sec := identitySecret(f, "k1")
-	rc := identityContext(t, f, sec, dataPVC(f, nil), cnpgCluster(f, nil))
+	rc := cnpgContext(t, f, sec, dataPVC(f, nil), cnpgCluster(f, nil))
 	if res := reconcileIdentity(t, rc); res.Stop || brokenReason(f) != "" {
 		t.Fatalf("adoption: stop %v, broken %q", res.Stop, brokenReason(f))
 	}
@@ -203,7 +182,7 @@ func TestIdentityClearsBrokenOnceRestored(t *testing.T) {
 	f.Status.Image = img16
 	sec := identitySecret(f, "k1")
 	stamp := map[string]string{forgejo.AnnotationIdentity: identityOf(sec)}
-	rc := identityContext(t, f, dataPVC(f, stamp), cnpgCluster(f, stamp))
+	rc := cnpgContext(t, f, dataPVC(f, stamp), cnpgCluster(f, stamp))
 	if reconcileIdentity(t, rc); brokenReason(f) != forgejo.BrokenSecretsMissing {
 		t.Fatalf("broken %q", brokenReason(f))
 	}
@@ -226,7 +205,7 @@ func TestIdentityLeavesRestoreFromToTheBootstrap(t *testing.T) {
 	f.Spec.RestoreFrom = &forgejov1.RestoreFromSpec{}
 	sec := identitySecret(f, "from-backup")
 	leftover := identitySecret(f, "leftover")
-	rc := identityContext(t, f, sec, dataPVC(f, map[string]string{
+	rc := cnpgContext(t, f, sec, dataPVC(f, map[string]string{
 		forgejo.AnnotationIdentity: identityOf(leftover), forgejo.AnnotationRunningImage: img16}))
 	if res := reconcileIdentity(t, rc); res.Stop || brokenReason(f) != "" || rc.IdentityInitialized {
 		t.Fatalf("stop %v, broken %q, initialized %v", res.Stop, brokenReason(f), rc.IdentityInitialized)
@@ -236,7 +215,7 @@ func TestIdentityLeavesRestoreFromToTheBootstrap(t *testing.T) {
 func TestCreationGuardsForAnInstanceThatRan(t *testing.T) {
 	ctx := context.Background()
 	f := testInstance()
-	rc := identityContext(t, f, identitySecret(f, "k1"))
+	rc := cnpgContext(t, f, identitySecret(f, "k1"))
 	rc.IdentityInitialized = true
 	if _, err := ReconcileStorage(ctx, rc); err == nil {
 		t.Fatal("storage step created a data PVC for an instance that ran")
@@ -244,7 +223,7 @@ func TestCreationGuardsForAnInstanceThatRan(t *testing.T) {
 
 	partial := identitySecret(f, "k1")
 	delete(partial.Data, forgejo.SecretKeySecretKey)
-	rc = identityContext(t, f, partial)
+	rc = cnpgContext(t, f, partial)
 	rc.IdentityInitialized = true
 	if _, err := ReconcileSecrets(ctx, rc); err == nil {
 		t.Fatal("secrets step generated SECRET_KEY for an instance that ran")
@@ -252,7 +231,7 @@ func TestCreationGuardsForAnInstanceThatRan(t *testing.T) {
 
 	// A new instance's volume carries its identity.
 	f = testInstance()
-	rc = identityContext(t, f)
+	rc = cnpgContext(t, f)
 	rc.IdentityFingerprint = "fingerprint-1"
 	if _, err := ReconcileStorage(ctx, rc); err != nil {
 		t.Fatal(err)
@@ -271,14 +250,11 @@ func TestIdentityRecreateDatabaseAnnotation(t *testing.T) {
 	f.Status.Image = img16
 	f.Annotations = map[string]string{forgejo.AnnotationRecreateDatabase: valueTrue}
 	sec := identitySecret(f, "k1")
-	rc := identityContext(t, f, sec, dataPVC(f, map[string]string{forgejo.AnnotationIdentity: identityOf(sec)}))
+	rc := cnpgContext(t, f, sec, dataPVC(f, map[string]string{forgejo.AnnotationIdentity: identityOf(sec)}))
 	if res := reconcileIdentity(t, rc); res.Stop || brokenReason(f) != "" || !rc.DatabaseRecreate {
 		t.Fatalf("stop %v, broken %q, recreate %v", res.Stop, brokenReason(f), rc.DatabaseRecreate)
 	}
-	// CNPG's "-app" Secret has the same keys as the admin Secret.
-	appSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.CNPGAppSecretName(f), Namespace: f.Namespace},
-		Data: map[string][]byte{adminUsernameKey: []byte("forgejo"), adminPasswordKey: []byte("pw")}}
-	if err := rc.Client.Create(ctx, appSecret); err != nil {
+	if err := rc.Client.Create(ctx, cnpgAppSecret(f)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ReconcileDatabase(ctx, rc); err != nil {

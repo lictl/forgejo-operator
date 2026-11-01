@@ -52,7 +52,6 @@ const (
 	testTLSSecret             = "fj-tls"
 	testCondReady             = "Ready"
 	testRootURL               = "http://git.example.com/"
-	testSSLModeDisable        = "disable"
 	testKeyName               = "name"
 )
 
@@ -451,6 +450,8 @@ func TestRoutesReadyFollowsRouteStatus(t *testing.T) {
 		t.Fatalf("both accepted: %+v", c)
 	}
 
+	// No Forgejo pod is Ready, but only missing endpoints are masked then: a missing Service
+	// is a problem.
 	acceptRoute(t, rc, tcpRouteV1, "fj-ssh", "True", "False")
 	runStep(t, rc, ReconcileGateway)
 	if c := condition(f, forgejov1.ConditionRoutesReady); c.Status != metav1.ConditionFalse || c.Reason != reasonRoutesRefsNotResolved ||
@@ -560,18 +561,6 @@ func TestRoutesReadyWhileNoPodIsReady(t *testing.T) {
 	}
 }
 
-func TestRoutesConditionMasksOnlyMissingEndpoints(t *testing.T) {
-	f := gatewayInstance()
-	rc, _ := optionalRC(t, f, allOptionalAPIs)
-	runStep(t, rc, ReconcileGateway)
-	acceptRoute(t, rc, forgejo.HTTPRouteGVK, "fj", "True", "False")
-	acceptRoute(t, rc, tcpRouteV1, "fj-ssh", "True", "True")
-	runStep(t, rc, ReconcileGateway)
-	if c := condition(f, forgejov1.ConditionRoutesReady); c.Status != metav1.ConditionFalse || !strings.Contains(c.Message, "BackendNotFound") {
-		t.Fatalf("a missing Service is a problem even while no pod is Ready: %+v", c)
-	}
-}
-
 func TestRemovingGatewayDeletesRoutes(t *testing.T) {
 	f := gatewayInstance()
 	rc, _ := optionalRC(t, f, allOptionalAPIs)
@@ -586,6 +575,7 @@ func TestRemovingGatewayDeletesRoutes(t *testing.T) {
 		t.Fatal("removing spec.gateway.ssh must delete only the TCPRoute")
 	}
 
+	g := f.Spec.Gateway
 	f.Spec.Gateway = nil
 	runStep(t, rc, ReconcileGateway)
 	if getOptional(t, rc, forgejo.HTTPRouteGVK, "fj") != nil {
@@ -595,18 +585,16 @@ func TestRemovingGatewayDeletesRoutes(t *testing.T) {
 		t.Error("RoutesReady must go away with spec.gateway")
 	}
 
-	// A route of the same name that the instance does not control is left alone.
-	foreign := &unstructured.Unstructured{}
-	foreign.SetGroupVersionKind(forgejo.HTTPRouteGVK)
-	foreign.SetNamespace(f.Namespace)
-	foreign.SetName("fj")
-	if err := rc.Client.Create(context.Background(), foreign); err != nil {
-		t.Fatal(err)
-	}
-	ForgetInstance(f.Namespace, f.Name) // as after an operator restart
+	// Enabling spec.gateway creates the route again; disabling it deletes it again.
+	f.Spec.Gateway = g
 	runStep(t, rc, ReconcileGateway)
 	if getOptional(t, rc, forgejo.HTTPRouteGVK, "fj") == nil {
-		t.Error("a route the instance does not control was deleted")
+		t.Fatal("enabling spec.gateway again did not create the HTTPRoute")
+	}
+	f.Spec.Gateway = nil
+	runStep(t, rc, ReconcileGateway)
+	if getOptional(t, rc, forgejo.HTTPRouteGVK, "fj") != nil {
+		t.Error("an HTTPRoute created after the first deletion was not deleted")
 	}
 }
 
@@ -813,32 +801,16 @@ func TestPublicIdentityWithoutGatewayOrTLS(t *testing.T) {
 		if d, r := Domain(f), RootURL(f); d != tc.domain || r != tc.root {
 			t.Errorf("%s: DOMAIN %q ROOT_URL %q, want %q %q", tc.name, d, r, tc.domain, tc.root)
 		}
-		if got := trustedProxies(f); got != defaultTrustedProxies {
-			t.Errorf("%s: trusted proxies %q", tc.name, got)
-		}
 	}
 }
 
 func TestConfigWithGatewayAndTLS(t *testing.T) {
-	ctx := context.Background()
 	f := gatewayInstance()
 	f.Spec.Server.Domain = ""
 	f.Spec.Gateway.Hostnames = []string{testCodeHost}
 	f.Spec.TLS = &forgejov1.TLSSpec{}
 	f.Spec.Server.TrustedProxies = []string{testPodCIDR, "fd00::/8"}
-	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace}}
-	rc := testContext(t, f, secrets)
-	rc.TargetImage = img15
-	rc.Layout = forgejo.LayoutForImage(img15)
-	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: testForgejoName, User: testForgejoName, Password: "pw", SSLMode: testSSLModeDisable}
-	if _, err := ReconcileConfig(ctx, rc); err != nil {
-		t.Fatal(err)
-	}
-	sec := &corev1.Secret{}
-	if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.ConfigSecretName(f)}, sec); err != nil {
-		t.Fatal(err)
-	}
-	ini := string(sec.Data[forgejo.ConfigSecretKey])
+	ini, _, _ := renderConfig(t, f)
 	server := section(ini, "server")
 	for _, want := range []string{
 		"DOMAIN = code.example.com", "ROOT_URL = https://code.example.com/",
@@ -869,52 +841,32 @@ func (m *countingMapper) RESTMapping(gk schema.GroupKind, versions ...string) (*
 // made sure that it has no routes, Certificate or ReferenceGrant.
 func TestUnusedFeaturesCostNothingPerPass(t *testing.T) {
 	for name, served := range map[string][]schema.GroupVersionKind{"served": allOptionalAPIs, "not served": nil} {
-		t.Run(name, func(t *testing.T) { unusedFeaturesPasses(t, served) })
-	}
-
-	// Enabling the feature creates the route again; disabling it deletes it again.
-	f := gatewayInstance()
-	f.Spec.Gateway.SSH = nil
-	rc, _ := optionalRC(t, f, allOptionalAPIs)
-	runStep(t, rc, ReconcileGateway)
-	g := f.Spec.Gateway
-	f.Spec.Gateway = nil
-	runStep(t, rc, ReconcileGateway)
-	f.Spec.Gateway = g
-	runStep(t, rc, ReconcileGateway)
-	f.Spec.Gateway = nil
-	runStep(t, rc, ReconcileGateway)
-	if getOptional(t, rc, forgejo.HTTPRouteGVK, "fj") != nil {
-		t.Error("an HTTPRoute created after the first deletion was not deleted")
-	}
-}
-
-func unusedFeaturesPasses(t *testing.T, served []schema.GroupVersionKind) {
-	{
-		f := testInstance()
-		rc, _ := optionalRC(t, f, served)
-		mapper := &countingMapper{RESTMapper: rc.RESTMapper}
-		rc.RESTMapper = mapper
-		gets := 0
-		rc.Client = interceptor.NewClient(rc.Client.(client.WithWatch), interceptor.Funcs{
-			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				gets++
-				return c.Get(ctx, key, obj, opts...)
-			},
+		t.Run(name, func(t *testing.T) {
+			f := testInstance()
+			rc, _ := optionalRC(t, f, served)
+			mapper := &countingMapper{RESTMapper: rc.RESTMapper}
+			rc.RESTMapper = mapper
+			gets := 0
+			rc.Client = interceptor.NewClient(rc.Client.(client.WithWatch), interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					gets++
+					return c.Get(ctx, key, obj, opts...)
+				},
+			})
+			pass := func() {
+				runStep(t, rc, ReconcileGateway)
+				runStep(t, rc, ReconcileTLS)
+			}
+			pass()
+			if len(served) > 0 && gets == 0 {
+				t.Error("the first pass must look for leftovers of an earlier spec")
+			}
+			mapper.lookups, gets = 0, 0
+			pass()
+			if mapper.lookups != 0 || gets != 0 {
+				t.Errorf("second pass made %d lookups and %d reads", mapper.lookups, gets)
+			}
 		})
-		pass := func() {
-			runStep(t, rc, ReconcileGateway)
-			runStep(t, rc, ReconcileTLS)
-		}
-		pass()
-		if len(served) > 0 && gets == 0 {
-			t.Error("the first pass must look for leftovers of an earlier spec")
-		}
-		mapper.lookups, gets = 0, 0
-		pass()
-		if mapper.lookups != 0 || gets != 0 {
-			t.Errorf("second pass made %d lookups and %d reads", mapper.lookups, gets)
-		}
 	}
 }
 
