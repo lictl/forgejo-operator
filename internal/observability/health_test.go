@@ -13,9 +13,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
@@ -153,7 +155,7 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 
 func newHealthRC(name string) (*forgejo.ReconcileContext, *events.FakeRecorder) {
 	rec := events.NewFakeRecorder(20)
-	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name}}
+	f := testInstance(name)
 	f.Status.Health = &forgejov1.HealthStatus{}
 	return &forgejo.ReconcileContext{Instance: f, Recorder: rec}, rec
 }
@@ -242,8 +244,8 @@ func TestUnreachableDoesNotFeedSelfHealing(t *testing.T) {
 // With a floating tag, nodes that hold different patch releases make the reported version
 // alternate: VersionDetected is emitted once per version and status.image.
 func TestVersionDetectedOncePerImageAndVersion(t *testing.T) {
-	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "detect", UID: "u1"},
-		Status: forgejov1.ForgejoStatus{Image: "codeberg.org/forgejo/forgejo:17"}}
+	f := testInstance("detect")
+	f.Status.Image = "codeberg.org/forgejo/forgejo:17"
 	t.Cleanup(func() { ForgetInstance("ns", "detect") })
 	reports := []string{testVersion170, "17.0.1", testVersion170, "17.0.1", testVersion170}
 	got := make([]bool, 0, len(reports))
@@ -258,12 +260,43 @@ func TestVersionDetectedOncePerImageAndVersion(t *testing.T) {
 	if !newVersionFor(f, "17.0.1") || newVersionFor(f, "17.0.1") {
 		t.Fatal("new image")
 	}
-	f.UID = "u2"
+	f.UID = "uid-detect-2"
 	if !newVersionFor(f, "17.0.1") {
 		t.Fatal("re-created instance")
 	}
 	ForgetInstance("ns", "detect")
 	if !newVersionFor(f, "17.0.1") {
 		t.Fatal("ForgetInstance kept the versions")
+	}
+}
+
+func TestServingPodsWaitsForEndpoints(t *testing.T) {
+	ctx := context.Background()
+	f := testInstance("settle")
+	rc, _ := monitoringRC(t, f, interceptor.Funcs{})
+	now := time.Now()
+	pod := func(name string, readySince time.Time) {
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: f.Namespace, Name: name, Labels: forgejo.SelectorLabels(f)}}
+		p.Status.Conditions = []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(readySince),
+		}}
+		if err := rc.Client.Create(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pod("fresh", now.Add(-2*time.Second))
+	ready, settling, err := servingPods(ctx, rc, now)
+	if err != nil || ready != 0 || settling <= 0 || settling > endpointSettle {
+		t.Fatalf("ready=%d settling=%s err=%v, want 0 and a short wait", ready, settling, err)
+	}
+	// Probed once the pod has settled.
+	if ready, settling, _ = servingPods(ctx, rc, now.Add(endpointSettle)); ready != 1 || settling != 0 {
+		t.Fatalf("ready=%d settling=%s after settling", ready, settling)
+	}
+	// An established pod is probed right away, also while another one settles.
+	pod("old", now.Add(-time.Hour))
+	if ready, _, _ = servingPods(ctx, rc, now); ready != 1 {
+		t.Fatalf("ready=%d, want 1", ready)
 	}
 }

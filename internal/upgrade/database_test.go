@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -16,9 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -97,18 +93,6 @@ func running17() *unstructured.Unstructured {
 	return cnpgCluster(pg17, pg17, 17, sysOld, true, time.Now().Add(-48*time.Hour))
 }
 
-func dbScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
-	s := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	if err := forgejov1.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	return s
-}
-
 func dbMapper() meta.RESTMapper {
 	m := meta.NewDefaultRESTMapper(nil)
 	m.Add(forgejo.CNPGClusterGVK, meta.RESTScopeNamespace)
@@ -117,7 +101,7 @@ func dbMapper() meta.RESTMapper {
 
 func dbClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
-	return fake.NewClientBuilder().WithScheme(dbScheme(t)).WithRESTMapper(dbMapper()).WithObjects(objs...).Build()
+	return fake.NewClientBuilder().WithScheme(testScheme(t)).WithRESTMapper(dbMapper()).WithObjects(objs...).Build()
 }
 
 // dbPass runs the database-upgrade step once, as the pipeline does (prepare sets what earlier
@@ -297,13 +281,23 @@ func TestDatabaseNewCluster(t *testing.T) {
 	}
 }
 
-// An external database is never orchestrated.
+// An external database is never orchestrated, not even the CNPG Cluster the instance used
+// before, and a failed upgrade of the bundled cluster no longer holds Forgejo once the instance
+// uses one.
 func TestDatabaseUpgradeIgnoresExternal(t *testing.T) {
-	f := dbInstance(pg18)
+	g := dbInstance(pg18)
+	g.Spec.Database.Type = forgejov1.DatabaseTypeExternal
+	if rc, res := dbPass(t, dbClient(t, running17()), g); res.Stop || rc.Upgrading || forgejo.DatabaseUpgrade(g) != nil {
+		t.Fatalf("leftover cluster orchestrated: %+v", g.Status.Database)
+	}
+
+	f, c := heldFailure(t)
 	f.Spec.Database.Type = forgejov1.DatabaseTypeExternal
-	rc, res := dbPass(t, dbClient(t, running17()), f)
-	if res.Stop || rc.Upgrading || forgejo.DatabaseUpgrade(f) != nil || condition(f, forgejov1.ConditionDatabaseUpgrading) != nil {
-		t.Fatalf("external database orchestrated: %+v", f.Status.Database)
+	rc, res := dbPass(t, c, f)
+	u := forgejo.DatabaseUpgrade(f)
+	if res.Stop || rc.Upgrading || u.Phase != forgejov1.DatabaseUpgradeFailed || u.HoldsForgejo || rc.ReplicasOverride != nil ||
+		brokenReason(f) != "" || condition(f, forgejov1.ConditionDatabaseUpgrading) != nil {
+		t.Fatalf("stop %v, upgrade %+v, override %v, Broken %q", res.Stop, u, rc.ReplicasOverride, brokenReason(f))
 	}
 }
 
@@ -382,12 +376,6 @@ func pendingUpgrade(t *testing.T, objs ...client.Object) (*forgejov1.Forgejo, cl
 	}
 	u.StartTime = ago(0) // as persisted (second precision)
 	return f, c
-}
-
-func serverPodRunning(f *forgejov1.Forgejo, name string) *corev1.Pod {
-	p := serverPod(f, name, imgA, ago(time.Hour), corev1.ContainerState{}, 0)
-	p.Status.Phase = corev1.PodRunning
-	return p
 }
 
 func backupObject(t *testing.T, c client.Client, name string) *forgejov1.ForgejoBackup {
@@ -479,13 +467,13 @@ func TestDatabaseUpgradeSucceeds(t *testing.T) {
 	rc, _ = dbPass(t, c, f)
 	expectPass(t, rc, u, forgejov1.DatabaseUpgradeVerifying, pg18, false)
 
-	before := counterValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", resultSucceeded))
-	if err := c.Create(ctx, deployment(imgA, true)); err != nil {
+	before := metricValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", resultSucceeded))
+	if err := c.Create(ctx, deployment(imgA, 1, 1)); err != nil {
 		t.Fatal(err)
 	}
 	rc, _ = dbPass(t, c, f)
 	expectPass(t, rc, u, forgejov1.DatabaseUpgradeSucceeded, pg18, false)
-	if rc.Upgrading || u.FailedImage != "" || counterValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", resultSucceeded)) != before+1 {
+	if rc.Upgrading || u.FailedImage != "" || metricValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", resultSucceeded)) != before+1 {
 		t.Fatalf("upgrading %v, failed image %q", rc.Upgrading, u.FailedImage)
 	}
 	// Idle afterwards.
@@ -556,7 +544,7 @@ func TestDatabaseUpgradeJobFailureReverts(t *testing.T) {
 	if !u.PGUpgradeStarted {
 		t.Fatal("a failed Job whose pods are gone does not count as a pg_upgrade that may have run")
 	}
-	before := counterValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", resultRolledBack))
+	before := metricValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", resultRolledBack))
 	setCluster(t, c, running17())
 	if err := c.Create(ctx, primaryPod(true)); err != nil {
 		t.Fatal(err)
@@ -565,7 +553,7 @@ func TestDatabaseUpgradeJobFailureReverts(t *testing.T) {
 	d := condition(f, forgejov1.ConditionDegraded)
 	if u.Phase != forgejov1.DatabaseUpgradeRolledBack || u.FailedImage != pg18 || rc.DatabaseImage != pg17 ||
 		rc.Upgrading || rc.ReplicasOverride != nil || d == nil || d.Reason != ReasonPostgresUpgradeRolledBack ||
-		counterValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", resultRolledBack)) != before+1 {
+		metricValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", resultRolledBack)) != before+1 {
 		t.Fatalf("phase %s, image %s, degraded %+v: %s", u.Phase, rc.DatabaseImage, d, u.Message)
 	}
 	// Held: the failed image is not tried again.
@@ -580,10 +568,13 @@ func TestDatabaseUpgradeJobFailureReverts(t *testing.T) {
 	}
 }
 
-// An upgrade pod that cannot pull its image never ran pg_upgrade: reverted after the pull
-// grace. A running pg_upgrade is never interrupted, however long it takes.
-func TestDatabaseUpgradePodChecks(t *testing.T) {
-	waitingPull := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: waitingImagePullBackOff, Message: "not found"}}
+// waitingPull is the state of a container whose image cannot be pulled.
+var waitingPull = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: waitingImagePullBackOff, Message: "not found"}}
+
+// Phase Upgrading waits for an upgrade pod to pull its image (the pull grace), for pg_upgrade to
+// start (at least dbRevertTimeout) and for a running pg_upgrade, which is never interrupted,
+// however long it takes. A change of the image asked for waits for it too.
+func TestDatabaseUpgradingKeepsWaiting(t *testing.T) {
 	t.Run("pull grace", func(t *testing.T) {
 		f := upgrading(time.Minute)
 		job := upgradeJob()
@@ -592,6 +583,52 @@ func TestDatabaseUpgradePodChecks(t *testing.T) {
 			t.Fatalf("reverted within the pull grace: %s", forgejo.DatabaseUpgrade(f).Phase)
 		}
 	})
+	t.Run("long pg_upgrade", func(t *testing.T) {
+		f := upgrading(time.Hour)
+		job := upgradeJob()
+		pod := upgradePod(job.Name, ago(59*time.Minute), corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})
+		c := dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pod)
+		rc, _ := dbPass(t, c, f)
+		u := forgejo.DatabaseUpgrade(f)
+		if u.Phase != forgejov1.DatabaseUpgradeUpgrading || rc.DatabaseImage != pg18 || !strings.Contains(u.Message, "never interrupted") ||
+			!hasEvent(recorded(rc), "DatabaseUpgradeSlow") {
+			t.Fatalf("phase %s: %s", u.Phase, u.Message)
+		}
+		if rc, _ = dbPass(t, c, f); hasEvent(recorded(rc), "DatabaseUpgradeSlow") {
+			t.Error("DatabaseUpgradeSlow repeated")
+		}
+	})
+	// spec.upgrade.timeout is shared with Forgejo upgrades and may be short: the wait for
+	// pg_upgrade to start is not reported as a slow pg_upgrade.
+	t.Run("short spec.upgrade.timeout before pg_upgrade starts", func(t *testing.T) {
+		f := upgrading(3 * time.Minute)
+		f.Spec.Upgrade.Timeout = &metav1.Duration{Duration: 5 * time.Second}
+		job := upgradeJob()
+		pending := upgradePod(job.Name, ago(3*time.Minute), creating)
+		pending.Status.Phase = corev1.PodPending
+		rc, _ := dbPass(t, dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pending), f)
+		if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeUpgrading || hasEvent(recorded(rc), "DatabaseUpgradeSlow") ||
+			strings.Contains(u.Message, "never interrupted") || !strings.Contains(u.Message, "has not started yet") {
+			t.Fatalf("phase %s: %s", u.Phase, u.Message)
+		}
+	})
+	t.Run("spec change is queued", func(t *testing.T) {
+		f := upgrading(time.Minute)
+		f.Spec.Database.CNPG.ImageName = pg17
+		c := dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()))
+		rc, _ := dbPass(t, c, f)
+		cond := condition(f, forgejov1.ConditionDatabaseUpgrading)
+		if forgejo.DatabaseUpgrade(f).Phase != forgejov1.DatabaseUpgradeUpgrading || rc.DatabaseImage != pg18 ||
+			!strings.Contains(cond.Message, "handled once this upgrade has finished") || !hasEvent(recorded(rc), "DatabaseUpgradeQueued") {
+			t.Fatalf("phase %s, image %s: %s", forgejo.DatabaseUpgrade(f).Phase, rc.DatabaseImage, cond.Message)
+		}
+	})
+}
+
+// Phase Upgrading writes the old image back when pg_upgrade cannot have run to the end (an upgrade
+// pod that cannot pull its image, a pg_upgrade that does not start), and fails when the new image
+// never reached the cluster or the cluster is lost.
+func TestDatabaseUpgradingGivesUp(t *testing.T) {
 	t.Run("image not pulled", func(t *testing.T) {
 		f := upgrading(5 * time.Minute)
 		job := upgradeJob()
@@ -611,21 +648,6 @@ func TestDatabaseUpgradePodChecks(t *testing.T) {
 		dbPass(t, c, f)
 		if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeReverting || !u.PGUpgradeStarted {
 			t.Fatalf("phase %s, pg_upgrade started %v", u.Phase, u.PGUpgradeStarted)
-		}
-	})
-	t.Run("long pg_upgrade", func(t *testing.T) {
-		f := upgrading(time.Hour)
-		job := upgradeJob()
-		pod := upgradePod(job.Name, ago(59*time.Minute), corev1.ContainerState{Running: &corev1.ContainerStateRunning{}})
-		c := dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pod)
-		rc, _ := dbPass(t, c, f)
-		u := forgejo.DatabaseUpgrade(f)
-		if u.Phase != forgejov1.DatabaseUpgradeUpgrading || rc.DatabaseImage != pg18 || !strings.Contains(u.Message, "never interrupted") ||
-			!hasEvent(recorded(rc), "DatabaseUpgradeSlow") {
-			t.Fatalf("phase %s: %s", u.Phase, u.Message)
-		}
-		if rc, _ = dbPass(t, c, f); hasEvent(recorded(rc), "DatabaseUpgradeSlow") {
-			t.Error("DatabaseUpgradeSlow repeated")
 		}
 	})
 	t.Run("pg_upgrade does not start within the timeout", func(t *testing.T) {
@@ -655,15 +677,15 @@ func TestDatabaseUpgradePodChecks(t *testing.T) {
 			t.Fatalf("phase %s, image %s: %s", u.Phase, rc.DatabaseImage, u.Message)
 		}
 	})
-	t.Run("spec change is queued", func(t *testing.T) {
+	// A cluster that disappears is not recreated: Forgejo stays stopped, Broken. The step stops,
+	// so that the database step does not create a cluster in this pass: only the idle path waits
+	// for what the deleted one left.
+	t.Run("cluster lost", func(t *testing.T) {
 		f := upgrading(time.Minute)
-		f.Spec.Database.CNPG.ImageName = pg17
-		c := dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()))
-		rc, _ := dbPass(t, c, f)
-		cond := condition(f, forgejov1.ConditionDatabaseUpgrading)
-		if forgejo.DatabaseUpgrade(f).Phase != forgejov1.DatabaseUpgradeUpgrading || rc.DatabaseImage != pg18 ||
-			!strings.Contains(cond.Message, "handled once this upgrade has finished") || !hasEvent(recorded(rc), "DatabaseUpgradeQueued") {
-			t.Fatalf("phase %s, image %s: %s", forgejo.DatabaseUpgrade(f).Phase, rc.DatabaseImage, cond.Message)
+		rc, res := dbPass(t, dbClient(t), f)
+		if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeFailed || !u.HoldsForgejo || !zeroReplicas(rc) ||
+			brokenReason(f) != forgejo.BrokenDatabaseUpgradeFailed || !res.Stop {
+			t.Fatalf("phase %s, holds %v, Broken %q, stop %v", u.Phase, u.HoldsForgejo, brokenReason(f), res.Stop)
 		}
 	})
 }
@@ -735,7 +757,7 @@ func TestDatabaseUpgradePausedByMaintenance(t *testing.T) {
 	f, c := pendingUpgrade(t)
 	dbPass(t, c, f) // BackingUp
 	inMaintenance := func(rc *forgejo.ReconcileContext) {
-		rc.Maintenance, rc.MaintenanceReason = true, "ForgejoRestore manual is restoring backup b"
+		rc.Maintenance, rc.MaintenanceReason = true, maintenanceReason
 	}
 	rc, _ := dbPass(t, c, f, inMaintenance)
 	u := forgejo.DatabaseUpgrade(f)
@@ -775,13 +797,13 @@ func TestDatabaseVerifyFailureHoldsForgejo(t *testing.T) {
 	c := dbClient(t, cnpgCluster(pg18, pg18, 18, sysNew, true, time.Now().Add(-48*time.Hour)), serverPodRunning(f, "fj-1"), pre, prePVC,
 		f.DeepCopy())
 	u := forgejo.DatabaseUpgrade(f)
-	before := counterValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", "failed"))
+	before := metricValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", "failed"))
 	rc, res := dbPass(t, c, f)
 	if u.Phase != forgejov1.DatabaseUpgradeFailed || !u.HoldsForgejo || !zeroReplicas(rc) || res.Stop || rc.DatabaseImage != pg18 ||
 		u.FailedImage != pg18 || getCluster(t, c) == nil || restores(t, c) != 0 || brokenReason(f) != forgejo.BrokenDatabaseUpgradeFailed ||
 		!strings.Contains(u.FailureReason, "did not become available") || !strings.Contains(u.Message, testPreBackup) ||
 		!hasEvent(recorded(rc), "DatabaseUpgradeFailed") ||
-		counterValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", "failed")) != before+1 {
+		metricValue(t, forgejo.DatabaseUpgradeTotal.WithLabelValues("ns", "fj", "failed")) != before+1 {
 		t.Fatalf("phase %s, holds %v, override %v, image %s, Broken %q: %s", u.Phase, u.HoldsForgejo, rc.ReplicasOverride,
 			rc.DatabaseImage, brokenReason(f), u.Message)
 	}
@@ -871,17 +893,27 @@ func TestDatabaseHoldNeedsADatabaseRestore(t *testing.T) {
 func TestDatabaseRecreateHoldsUntilARestore(t *testing.T) {
 	ctx := context.Background()
 	f := dbInstance(pg17)
+	f.Spec.HighAvailability.Enabled = true
 	f.Annotations = map[string]string{forgejo.AnnotationRecreateDatabase: valueTrue}
-	running := availableDeployment(imgA, 1)
-	c := dbClient(t, f.DeepCopy(), restore("earlier", forgejov1.RestorePhaseCompleted, ago(time.Hour)), running)
+	cron := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: forgejo.CronRunnerName(f), Namespace: f.Namespace, OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: forgejov1.GroupVersion.String(), Kind: "Forgejo", Name: f.Name, UID: f.UID, Controller: ptr.To(true)}}},
+		Spec: appsv1.StatefulSetSpec{Replicas: ptr.To[int32](1)},
+	}
+	c := dbClient(t, f.DeepCopy(), restore("earlier", forgejov1.RestorePhaseCompleted, ago(time.Hour)), deployment(imgA, 1, 1), cron)
 	rc, res := dbPass(t, c, f)
 	if !zeroReplicas(rc) || res.Stop || brokenReason(f) != forgejo.BrokenDatabaseRestorePending || rc.DatabaseImage != pg17 {
 		t.Fatalf("before the cluster: override %v, stop %v, Broken %q", rc.ReplicasOverride, res.Stop, brokenReason(f))
 	}
-	// Scaled down at once, also in passes whose workload step does not run.
-	dep := &appsv1.Deployment{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "fj"}, dep); err != nil || dep.Spec.Replicas == nil || *dep.Spec.Replicas != 0 {
+	// The server and the cron runner of an HA instance are scaled down at once, also in passes
+	// whose workload step does not run (stopForgejo patches both, which manager-role must grant;
+	// dbPass checks that).
+	dep, sts := &appsv1.Deployment{}, &appsv1.StatefulSet{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "fj"}, dep); err != nil || ptr.Deref(dep.Spec.Replicas, 1) != 0 {
 		t.Fatalf("Deployment replicas %v, err %v", dep.Spec.Replicas, err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: cron.Name}, sts); err != nil || ptr.Deref(sts.Spec.Replicas, 1) != 0 {
+		t.Fatalf("cron runner replicas %v, err %v", sts.Spec.Replicas, err)
 	}
 	// The database step created it, marked; a restore from before it does not count.
 	recreated := cnpgCluster(pg17, pg17, 17, sysNew, true, time.Now().Add(-time.Minute))
@@ -908,37 +940,12 @@ func TestDatabaseRecreateHoldsUntilARestore(t *testing.T) {
 	}
 }
 
-// A hold stops the server and the cron runner of an HA instance at once (stopForgejo patches
-// both, which manager-role must grant; dbPass checks that).
-func TestDatabaseHoldStopsTheCronRunner(t *testing.T) {
-	ctx := context.Background()
-	f := dbInstance(pg17)
-	f.Spec.HighAvailability.Enabled = true
-	f.Annotations = map[string]string{forgejo.AnnotationRecreateDatabase: valueTrue}
-	cron := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: forgejo.CronRunnerName(f), Namespace: f.Namespace, OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: forgejov1.GroupVersion.String(), Kind: "Forgejo", Name: f.Name, UID: f.UID, Controller: ptr.To(true)}}},
-		Spec: appsv1.StatefulSetSpec{Replicas: ptr.To[int32](1)},
-	}
-	c := dbClient(t, f.DeepCopy(), availableDeployment(imgA, 1), cron)
-	if rc, _ := dbPass(t, c, f); !zeroReplicas(rc) || brokenReason(f) != forgejo.BrokenDatabaseRestorePending {
-		t.Fatalf("override %v, Broken %q", rc.ReplicasOverride, brokenReason(f))
-	}
-	dep, sts := &appsv1.Deployment{}, &appsv1.StatefulSet{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "fj"}, dep); err != nil || ptr.Deref(dep.Spec.Replicas, 1) != 0 {
-		t.Fatalf("Deployment replicas %v, err %v", dep.Spec.Replicas, err)
-	}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: cron.Name}, sts); err != nil || ptr.Deref(sts.Spec.Replicas, 1) != 0 {
-		t.Fatalf("cron runner replicas %v, err %v", sts.Spec.Replicas, err)
-	}
-}
-
 // A refused scale-down (an admission policy, say) does not hide the hold: the step fails, and
 // Broken still names what waits.
 func TestDatabaseHoldRecordedWhenStoppingFails(t *testing.T) {
 	f := dbInstance(pg17)
 	f.Annotations = map[string]string{forgejo.AnnotationRecreateDatabase: valueTrue}
-	live, _ := dbClient(t, f.DeepCopy(), availableDeployment(imgA, 1)).(client.WithWatch)
+	live, _ := dbClient(t, f.DeepCopy(), deployment(imgA, 1, 1)).(client.WithWatch)
 	refused := interceptor.NewClient(live, interceptor.Funcs{
 		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 			if _, ok := obj.(*appsv1.Deployment); ok {
@@ -952,31 +959,6 @@ func TestDatabaseHoldRecordedWhenStoppingFails(t *testing.T) {
 	if _, err := ReconcileDatabase(context.Background(), rc); !apierrors.IsForbidden(err) || !zeroReplicas(rc) ||
 		brokenReason(f) != forgejo.BrokenDatabaseRestorePending {
 		t.Fatalf("err %v, override %v, Broken %q", err, rc.ReplicasOverride, brokenReason(f))
-	}
-}
-
-// A Forgejo upgrade does not start while the instance is Broken: its pre-upgrade backup would
-// back up an empty, recreated database, and its rollback restore would release the hold.
-func TestForgejoUpgradeWaitsWhileBroken(t *testing.T) {
-	f := fixture(nil) // spec.image imgB, running imgA
-	c := newClient(t)
-	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image}
-	rc.SetBroken(forgejo.BrokenDatabaseRestorePending, "recreated")
-	if _, err := Reconcile(context.Background(), rc); err != nil {
-		t.Fatal(err)
-	}
-	if cond := condition(f, forgejov1.ConditionUpgrading); f.Status.Upgrade != nil || rc.TargetImage != imgA || cond.Reason != "WaitingForBroken" {
-		t.Fatalf("upgrade %+v, target %s, condition %+v", f.Status.Upgrade, rc.TargetImage, cond)
-	}
-}
-
-// Switching to an external database ends a failed upgrade's hold of the bundled cluster.
-func TestDatabaseHoldEndsWithAnExternalDatabase(t *testing.T) {
-	f, c := heldFailure(t)
-	f.Spec.Database.Type = forgejov1.DatabaseTypeExternal
-	rc, _ := dbPass(t, c, f)
-	if forgejo.DatabaseUpgrade(f).HoldsForgejo || rc.ReplicasOverride != nil || brokenReason(f) != "" {
-		t.Fatalf("holds %v, override %v, Broken %q", forgejo.DatabaseUpgrade(f).HoldsForgejo, rc.ReplicasOverride, brokenReason(f))
 	}
 }
 
@@ -1070,24 +1052,6 @@ func TestDatabaseVerifyIgnoresLeftoverPods(t *testing.T) {
 	}
 }
 
-// A Forgejo upgrade does not start while PostgreSQL is upgraded; the retry annotation waits.
-func TestForgejoUpgradeWaitsForDatabaseUpgrade(t *testing.T) {
-	f := fixture(nil) // spec.image imgB, running imgA
-	c := newClient(t)
-	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image,
-		DatabaseUpgrading: true, Upgrading: true}
-	if _, err := Reconcile(context.Background(), rc); err != nil {
-		t.Fatal(err)
-	}
-	cond := condition(f, forgejov1.ConditionUpgrading)
-	if f.Status.Upgrade != nil || rc.TargetImage != imgA || cond == nil || cond.Reason != "WaitingForDatabaseUpgrade" {
-		t.Fatalf("upgrade %+v, target %s, condition %+v", f.Status.Upgrade, rc.TargetImage, cond)
-	}
-	if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade == nil || !inFlight(f.Status.Upgrade.Phase) {
-		t.Fatalf("after the database upgrade the Forgejo upgrade starts: %+v", f.Status.Upgrade)
-	}
-}
-
 // A Cluster deleted while no upgrade is in flight (the manual rollback of docs/upgrades.md, with
 // the annotation recreate-database) is created again only once it and its pods, volumes, Secrets
 // and Services are gone: a new cluster of that name would take them over. The step stops
@@ -1143,44 +1107,5 @@ func TestDatabaseRecreatesADeletedClusterOnceItsObjectsAreGone(t *testing.T) {
 	if cond := condition(f, forgejov1.ConditionDatabaseUpgrading); res.Stop || rc.DatabaseImage != pg17 || cond.Reason != reasonDatabaseUpToDate ||
 		!strings.Contains(cond.Message, "Creating CNPG cluster fj-db") || !zeroReplicas(rc) || brokenReason(f) != forgejo.BrokenDatabaseRestorePending {
 		t.Fatalf("stop %v, image %s, DatabaseUpgrading %+v", res.Stop, rc.DatabaseImage, cond)
-	}
-}
-
-// A cluster that disappears during the upgrade is not recreated: Forgejo stays stopped, Broken.
-func TestDatabaseUpgradeClusterLost(t *testing.T) {
-	f := upgrading(time.Minute)
-	rc, res := dbPass(t, dbClient(t), f)
-	// Stopped, so that the database step does not create a cluster in this pass: only the idle
-	// path waits for what the deleted one left.
-	if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeFailed || !u.HoldsForgejo || !zeroReplicas(rc) ||
-		brokenReason(f) != forgejo.BrokenDatabaseUpgradeFailed || !res.Stop {
-		t.Fatalf("phase %s, holds %v, Broken %q, stop %v", u.Phase, u.HoldsForgejo, brokenReason(f), res.Stop)
-	}
-}
-
-// counterValue reads a counter.
-func counterValue(t *testing.T, c prometheus.Counter) float64 {
-	t.Helper()
-	m := &dto.Metric{}
-	if err := c.Write(m); err != nil {
-		t.Fatal(err)
-	}
-	return m.GetCounter().GetValue()
-}
-
-// A short spec.upgrade.timeout (shared with Forgejo upgrades) does not revert an upgrade whose
-// pg_upgrade has not started yet before dbRevertTimeout, and that wait is not reported as a slow
-// pg_upgrade.
-func TestDatabaseUpgradeShortTimeoutBeforePGUpgrade(t *testing.T) {
-	f := upgrading(3 * time.Minute)
-	f.Spec.Upgrade.Timeout = &metav1.Duration{Duration: 5 * time.Second}
-	job := upgradeJob()
-	pending := upgradePod(job.Name, ago(3*time.Minute), creating)
-	pending.Status.Phase = corev1.PodPending
-	rc, _ := dbPass(t, dbClient(t, cnpgCluster(pg18, pg17, 17, "", false, time.Now()), job, pending), f)
-	// Not reported as a slow pg_upgrade: it has not started.
-	if u := forgejo.DatabaseUpgrade(f); u.Phase != forgejov1.DatabaseUpgradeUpgrading || hasEvent(recorded(rc), "DatabaseUpgradeSlow") ||
-		strings.Contains(u.Message, "never interrupted") || !strings.Contains(u.Message, "has not started yet") {
-		t.Fatalf("phase %s: %s", u.Phase, u.Message)
 	}
 }

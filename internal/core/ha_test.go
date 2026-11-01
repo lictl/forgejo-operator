@@ -29,28 +29,6 @@ const (
 const testValkeyURL = "redis+sentinel://:pw@fj-valkey-0.fj-valkey.ns.svc.cluster.local:26379,fj-valkey-1.fj-valkey.ns.svc.cluster.local:26379" +
 	"?mastername=forgejo&sentinelpassword=pw"
 
-// renderHAConfig runs the config step for f with Valkey and returns "<name>-config".
-func renderHAConfig(t *testing.T, f *forgejov1.Forgejo, valkeyURL string) *corev1.Secret {
-	t.Helper()
-	ctx := context.Background()
-	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace},
-		Data: map[string][]byte{forgejo.SecretKeyInternalToken: []byte("tok")}}
-	rc := testContext(t, f, secrets)
-	rc.Recorder = events.NewFakeRecorder(10)
-	rc.TargetImage = forgejo.Image(f)
-	rc.Layout = forgejo.LayoutForImage(rc.TargetImage)
-	rc.ValkeyURL = valkeyURL
-	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: testForgejoName, User: testForgejoName, Password: "pw", SSLMode: testSSLModeDisable}
-	if _, err := ReconcileConfig(ctx, rc); err != nil {
-		t.Fatal(err)
-	}
-	sec := &corev1.Secret{}
-	if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.ConfigSecretName(f)}, sec); err != nil {
-		t.Fatal(err)
-	}
-	return sec
-}
-
 // With highAvailability, the server pods' app-web.ini has every cron task off, including
 // ones spec.config enables explicitly, while app.ini (the cron runner's) keeps them.
 func TestHAConfigServerVariantWithoutCron(t *testing.T) {
@@ -61,15 +39,13 @@ func TestHAConfigServerVariantWithoutCron(t *testing.T) {
 		"cron":                 {testCronEnabled: valueTrue},
 		"Cron.Archive_Cleanup": {testCronEnabled: valueTrue, "run_at_start": valueTrue, "SCHEDULE": "@every 1m"},
 	}
-	sec := renderHAConfig(t, f, testValkeyURL)
-	full, web := string(sec.Data[forgejo.ConfigSecretKey]), string(sec.Data[forgejo.ConfigSecretKeyWeb])
+	full, sec, _ := renderConfig(t, f)
+	web := string(sec.Data[forgejo.ConfigSecretKeyWeb])
 	if web == "" {
 		t.Fatalf("no %s in %v", forgejo.ConfigSecretKeyWeb, sec.Data)
 	}
-	for _, want := range []string{"ENABLED = false\nRUN_AT_START = false\n"} {
-		if got := section(web, "cron"); got != want {
-			t.Errorf("app-web.ini [cron] = %q, want %q", got, want)
-		}
+	if got := section(web, "cron"); got != "ENABLED = false\nRUN_AT_START = false\n" {
+		t.Errorf("app-web.ini [cron] = %q", got)
 	}
 	if got := section(web, "cron.archive_cleanup"); got != "ENABLED = false\nRUN_AT_START = false\nSCHEDULE = @every 1m\n" {
 		t.Errorf("app-web.ini [cron.archive_cleanup] = %q", got)
@@ -118,12 +94,11 @@ func TestHAConfigServerVariantWithoutCron(t *testing.T) {
 
 // Without highAvailability the single pod runs the cron tasks: one app.ini, unchanged.
 func TestConfigWithoutHAHasNoServerVariant(t *testing.T) {
-	f := testInstance()
-	sec := renderHAConfig(t, f, "")
+	ini, sec, _ := renderConfig(t, testInstance())
 	if _, ok := sec.Data[forgejo.ConfigSecretKeyWeb]; ok || len(sec.Data) != 1 {
 		t.Fatalf("keys = %v, want only app.ini", sec.Data)
 	}
-	if got := section(string(sec.Data[forgejo.ConfigSecretKey]), "cron"); got != "" {
+	if got := section(ini, "cron"); got != "" {
 		t.Fatalf("[cron] = %q, want none", got)
 	}
 }
@@ -132,9 +107,9 @@ func TestConfigWithoutHAHasNoServerVariant(t *testing.T) {
 func TestConfigHashCoversServerVariant(t *testing.T) {
 	f := testInstance()
 	f.Spec.HighAvailability.Enabled = true
-	a := renderHAConfig(t, f, testValkeyURL)
+	_, a, _ := renderConfig(t, f)
 	f.Spec.Config = map[string]map[string]string{"cron.git_gc_repos": {testCronEnabled: valueTrue}}
-	b := renderHAConfig(t, f, testValkeyURL)
+	_, b, _ := renderConfig(t, f)
 	if a.Annotations[forgejo.AnnotationConfigHash] == b.Annotations[forgejo.AnnotationConfigHash] {
 		t.Fatal("hash unchanged by a cron setting")
 	}
@@ -195,14 +170,15 @@ func haWorkloadContext(t *testing.T, f *forgejov1.Forgejo, objs ...client.Object
 	return rc
 }
 
-func configVol(t *testing.T, d *appsv1.Deployment) *corev1.SecretVolumeSource {
+// configVol is the app.ini volume of a pod.
+func configVol(t *testing.T, spec corev1.PodTemplateSpec) *corev1.SecretVolumeSource {
 	t.Helper()
-	for _, v := range d.Spec.Template.Spec.Volumes {
+	for _, v := range spec.Spec.Volumes {
 		if v.Name == configVolume {
 			return v.Secret
 		}
 	}
-	t.Fatalf("%s: no config volume", d.Name)
+	t.Fatal("no config volume")
 	return nil
 }
 
@@ -218,31 +194,9 @@ func getCronRunner(t *testing.T, rc *forgejo.ReconcileContext) *appsv1.StatefulS
 	return s
 }
 
-func configVolOf(t *testing.T, name string, spec corev1.PodSpec) *corev1.SecretVolumeSource {
-	t.Helper()
-	for _, v := range spec.Volumes {
-		if v.Name == configVolume {
-			return v.Secret
-		}
-	}
-	t.Fatalf("%s: no config volume", name)
-	return nil
-}
-
-func getDeployment(t *testing.T, rc *forgejo.ReconcileContext, name string) *appsv1.Deployment {
-	t.Helper()
-	d := &appsv1.Deployment{}
-	if err := rc.Client.Get(context.Background(), types.NamespacedName{Namespace: rc.Instance.Namespace, Name: name}, d); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		t.Fatal(err)
-	}
-	return d
-}
-
 // With highAvailability the workload step runs StatefulSet "<name>-cron": one pod with the
-// full app.ini, not selected by the Services; the server pods mount app-web.ini.
+// full app.ini, not selected by the Services; the server pods mount app-web.ini. An unchanged
+// spec changes nothing.
 func TestReconcileWorkloadCronRunner(t *testing.T) {
 	ctx := context.Background()
 	f := withHA(testInstance())
@@ -253,9 +207,9 @@ func TestReconcileWorkloadCronRunner(t *testing.T) {
 	if _, err := ReconcileWorkload(ctx, rc); err != nil {
 		t.Fatal(err)
 	}
-	web, cron := getDeployment(t, rc, forgejo.DeploymentName(f)), getCronRunner(t, rc)
-	if web == nil || cron == nil {
-		t.Fatalf("web %v, cron %v", web != nil, cron != nil)
+	web, cron := getDeployment(t, rc), getCronRunner(t, rc)
+	if cron == nil {
+		t.Fatal("no cron runner")
 	}
 	if *web.Spec.Replicas != 3 || *cron.Spec.Replicas != 1 || cron.Spec.PodManagementPolicy != appsv1.ParallelPodManagement ||
 		cron.Spec.UpdateStrategy.Type != appsv1.RollingUpdateStatefulSetStrategyType || !metav1.IsControlledBy(cron, f) {
@@ -269,10 +223,10 @@ func TestReconcileWorkloadCronRunner(t *testing.T) {
 	if cron.Spec.Template.Annotations[forgejo.AnnotationConfigHash] != testHAHash {
 		t.Fatalf("cron template annotations %v", cron.Spec.Template.Annotations)
 	}
-	if items := configVol(t, web).Items; len(items) != 1 || items[0].Key != forgejo.ConfigSecretKeyWeb || items[0].Path != "app.ini" {
+	if items := configVol(t, web.Spec.Template).Items; len(items) != 1 || items[0].Key != forgejo.ConfigSecretKeyWeb || items[0].Path != "app.ini" {
 		t.Fatalf("server config items = %v", items)
 	}
-	if items := configVolOf(t, cron.Name, cron.Spec.Template.Spec).Items; len(items) != 0 {
+	if items := configVol(t, cron.Spec.Template).Items; len(items) != 0 {
 		t.Fatalf("cron config items = %v, want the whole Secret", items)
 	}
 	wc, cc := web.Spec.Template.Spec.Containers[0], cron.Spec.Template.Spec.Containers[0]
@@ -293,26 +247,10 @@ func TestReconcileWorkloadCronRunner(t *testing.T) {
 		spread[0].LabelSelector.MatchLabels[forgejo.LabelComponent] != forgejo.ComponentServer {
 		t.Fatalf("server spread = %+v", spread)
 	}
-}
-
-// On a ReadWriteMany volume the cron runner is spread away from the server pods, and an
-// unchanged spec changes nothing.
-func TestReconcileWorkloadCronRunnerSpreadOnReadWriteMany(t *testing.T) {
-	ctx := context.Background()
-	f := withHA(testInstance())
-	f.Spec.Replicas = ptr.To[int32](3)
-	f.Status.Image = img17
-	rc := haWorkloadContext(t, f)
-	rc.DataVolumeShared = true
-	if _, err := ReconcileWorkload(ctx, rc); err != nil {
-		t.Fatal(err)
-	}
-	cron := getCronRunner(t, rc)
+	// The cron runner gets the cron component's placement: on this ReadWriteMany volume, a
+	// spread away from the server pods (TestCronRunnerPlacement).
 	if s := cron.Spec.Template.Spec.TopologySpreadConstraints; len(s) != 1 || len(s[0].LabelSelector.MatchExpressions) != 1 {
 		t.Fatalf("cron spread = %+v", s)
-	}
-	if a := cron.Spec.Template.Spec.Affinity; a != nil {
-		t.Fatalf("cron affinity on a ReadWriteMany volume = %+v", a)
 	}
 	rv := cron.ResourceVersion
 	if _, err := ReconcileWorkload(ctx, rc); err != nil {
@@ -324,8 +262,9 @@ func TestReconcileWorkloadCronRunnerSpreadOnReadWriteMany(t *testing.T) {
 }
 
 // On a volume that is not ReadWriteMany, only pods on the node it is attached to can mount
-// it: the cron runner requires a node with a server pod, next to the user's own affinity.
-func TestCronRunnerSharesAServerNodeOnReadWriteOnce(t *testing.T) {
+// it: the cron runner requires a node with a server pod, next to the user's own affinity. On
+// a ReadWriteMany volume it is spread away from the server pods instead.
+func TestCronRunnerPlacement(t *testing.T) {
 	f := withHA(testInstance())
 	f.Spec.PodTemplate.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
 		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
@@ -352,6 +291,9 @@ func TestCronRunnerSharesAServerNodeOnReadWriteOnce(t *testing.T) {
 	rc.DataVolumeShared = true
 	if a := affinity(rc, forgejo.ComponentCron); a != f.Spec.PodTemplate.Affinity {
 		t.Fatalf("cron affinity on ReadWriteMany = %+v", a)
+	}
+	if s := topologySpread(rc, forgejo.ComponentCron); len(s) != 1 || len(s[0].LabelSelector.MatchExpressions) != 1 {
+		t.Fatalf("cron spread on ReadWriteMany = %+v", s)
 	}
 }
 
@@ -385,8 +327,8 @@ func TestReconcileWorkloadCronRunnerFollowsHoldsAndHA(t *testing.T) {
 	if getCronRunner(t, rc) != nil {
 		t.Fatal("cron runner kept without highAvailability")
 	}
-	web := getDeployment(t, rc, forgejo.DeploymentName(f))
-	if items := configVol(t, web).Items; len(items) != 0 || web.Spec.Template.Spec.Containers[0].Lifecycle != nil ||
+	web := getDeployment(t, rc)
+	if items := configVol(t, web.Spec.Template).Items; len(items) != 0 || web.Spec.Template.Spec.Containers[0].Lifecycle != nil ||
 		len(web.Spec.Template.Spec.TopologySpreadConstraints) != 0 {
 		t.Fatalf("non-HA pod: items %v, lifecycle %+v, spread %v", items, web.Spec.Template.Spec.Containers[0].Lifecycle,
 			web.Spec.Template.Spec.TopologySpreadConstraints)
@@ -433,7 +375,7 @@ func TestReconcileWorkloadWaitsForCronRunnerBeforeNewImage(t *testing.T) {
 	if err != nil || !res.Stop || res.RequeueAfter == 0 {
 		t.Fatalf("res = %+v, err = %v; want a wait", res, err)
 	}
-	if web := getDeployment(t, rc, forgejo.DeploymentName(f)); deployedImage(web) != img16 {
+	if web := getDeployment(t, rc); deployedImage(web) != img16 {
 		t.Fatalf("server image %s rolled out while the cron runner runs", deployedImage(web))
 	}
 	if cron := getCronRunner(t, rc); *cron.Spec.Replicas != 0 {
@@ -446,7 +388,7 @@ func TestReconcileWorkloadWaitsForCronRunnerBeforeNewImage(t *testing.T) {
 	if res, err := ReconcileWorkload(ctx, rc); err != nil || res.Stop {
 		t.Fatalf("res = %+v, err = %v", res, err)
 	}
-	if web := getDeployment(t, rc, forgejo.DeploymentName(f)); deployedImage(web) != img17 || *web.Spec.Replicas != 1 {
+	if web := getDeployment(t, rc); deployedImage(web) != img17 || *web.Spec.Replicas != 1 {
 		t.Fatalf("server: image %s, replicas %d", deployedImage(web), *web.Spec.Replicas)
 	}
 }
@@ -507,14 +449,9 @@ func TestReportCronRunnerWarnsAboutStuckPod(t *testing.T) {
 	if ha := f.Status.HighAvailability; ha.CronRunner != "" || ha.CronRunnerReady {
 		t.Fatalf("status = %+v, a terminating pod is not the runner", ha)
 	}
-	select {
-	case ev := <-rec.Events:
-		if !strings.Contains(ev, "CronRunnerStuck") || !strings.Contains(ev, "node-b") ||
-			!strings.Contains(ev, "delete pod fj-cron-0 --force --grace-period=0") {
-			t.Fatalf("event = %q", ev)
-		}
-	default:
-		t.Fatal("no CronRunnerStuck event")
+	if evs := drainEvents(rec); len(evs) != 1 || !strings.Contains(evs[0], "CronRunnerStuck") || !strings.Contains(evs[0], "node-b") ||
+		!strings.Contains(evs[0], "delete pod fj-cron-0 --force --grace-period=0") {
+		t.Fatalf("want one CronRunnerStuck event, got %q", evs)
 	}
 }
 
@@ -536,7 +473,7 @@ func TestCronRunnerOfAnotherOwnerIsIgnored(t *testing.T) {
 	if res, err := ReconcileWorkload(ctx, rc); err != nil || res.Stop {
 		t.Fatalf("res = %+v, err = %v; want the rollout to go ahead", res, err)
 	}
-	if web := getDeployment(t, rc, forgejo.DeploymentName(f)); deployedImage(web) != img17 {
+	if web := getDeployment(t, rc); deployedImage(web) != img17 {
 		t.Fatalf("server image %s", deployedImage(web))
 	}
 	got := getCronRunner(t, rc)

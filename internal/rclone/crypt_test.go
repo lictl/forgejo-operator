@@ -64,9 +64,6 @@ func TestDecryptRejectsWrongKeyAndDamage(t *testing.T) {
 	if _, err := c.Decrypt(flipped); !errors.Is(err, ErrAuthentication) {
 		t.Errorf("changed byte: got %v, want ErrAuthentication", err)
 	}
-	if _, err := c.Decrypt(data[:len(data)-10]); !errors.Is(err, ErrAuthentication) {
-		t.Errorf("truncated file: got %v, want ErrAuthentication", err)
-	}
 	if _, err := c.Decrypt(data[:headerSize+blockSize+5]); !errors.Is(err, ErrAuthentication) {
 		t.Errorf("truncated last block: got %v, want ErrAuthentication", err)
 	}

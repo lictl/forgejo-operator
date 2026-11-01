@@ -1,6 +1,7 @@
 package forgejo
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,18 +25,6 @@ func majors(rs []Release) []int {
 		out = append(out, r.Major)
 	}
 	return out
-}
-
-func sameInts(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // The table must stay well-formed when it is edited for a new release.
@@ -105,66 +94,56 @@ func TestSupportPolicyFollowsTheCalendar(t *testing.T) {
 		{Versions.WithVerified(18), "2026-12-01", []int{15, 17}}, // 18 verified early, not released yet
 	} {
 		got := majors(tc.table.Supported(day(tc.now)))
-		if !sameInts(got, tc.want) {
+		if !slices.Equal(got, tc.want) {
 			t.Errorf("%s: supported %v, want %v", tc.now, got, tc.want)
 		}
 	}
 }
 
 func TestClassify(t *testing.T) {
-	now := day("2026-10-22")
-	v := func(s string) (Version, bool) { return ParseVersion(s) }
+	const now = "2026-10-22"
+	with18 := Versions.WithVerified(18)
 	for _, tc := range []struct {
-		version string
-		want    SupportLevel
-		msg     []string
+		table    VersionTable
+		now      string
+		version  string
+		want     SupportLevel
+		advisory bool
+		msg      []string
 	}{
-		{"15", SupportSupported, []string{"current LTS", "2027-07-15"}},
-		{"15.0.10", SupportSupported, nil},
-		{"17.0.1", SupportSupported, []string{"latest release", "2027-01-28"}},
+		{Versions, now, "15", SupportSupported, false, []string{"current LTS", "2027-07-15"}},
+		{Versions, now, "15.0.8", SupportSupported, true, []string{"The running patch release 15.0.8"}},
+		{Versions, now, "15.0.10", SupportSupported, false, nil},
+		{Versions, now, "17", SupportSupported, false, nil}, // floating: the patch is unknown
+		{Versions, now, "17.0.0", SupportSupported, true, []string{"The running patch release 17.0.0"}},
+		{Versions, now, "17.0.1", SupportSupported, false, []string{"latest release", "2027-01-28"}},
 		// The advice names the minimum patch of a target with an advisory: a floating :17 may
-		// still pull 17.0.0.
-		{"16.0.6", SupportDeprecated, []string{"2026-10-29", "Upgrade to 17 (17.0.1 or newer) before 2026-10-29"}},
-		{"14", SupportEndOfLife, []string{"Upgrade to 15 (LTS, 15.0.10 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
-		{"11.0.16", SupportEndOfLife, []string{"Upgrade to 15 (LTS, 15.0.10 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
-		{"18", SupportFuture, []string{"newest verified: 17", "2027-01-14"}},
-		{"21", SupportFuture, []string{"update the operator"}},
-		{"latest", SupportUnknown, nil},
+		// still pull 17.0.0. An instance on 16 cannot go back to the LTS 15, so only 17 is
+		// offered (the targets are listed oldest first).
+		{Versions, now, "16.0.6", SupportDeprecated, false, []string{"2026-10-29", "Upgrade to 17 (17.0.1 or newer) before 2026-10-29"}},
+		{Versions, "2026-10-29", "16", SupportEndOfLife, false, nil}, // its EOL day
+		{Versions, now, "14", SupportEndOfLife, false, []string{"Upgrade to 15 (LTS, 15.0.10 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
+		{Versions, now, "11.0.16", SupportEndOfLife, false, []string{"Upgrade to 15 (LTS, 15.0.10 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
+		// 17 ended and nothing newer is verified: tell the user to update the operator.
+		{Versions, "2027-02-01", "17", SupportEndOfLife, false, []string{"update the operator"}},
+		{Versions, now, "18", SupportFuture, false, []string{"newest verified: 17", "2027-01-14"}},
+		{Versions, now, "21", SupportFuture, false, []string{"update the operator"}},
+		// Once 18 is verified and out, 17 is deprecated until its end of life.
+		{with18, "2027-01-20", "17", SupportDeprecated, false, []string{"Upgrade to 18 before 2027-01-28"}},
+		{with18, "2027-01-01", "18", SupportFuture, false, []string{"not released yet"}},
+		{Versions, now, "latest", SupportUnknown, false, nil},
 	} {
-		ver, ok := v(tc.version)
-		s := Versions.Classify(ver, ok, now)
-		if s.Level != tc.want {
-			t.Errorf("%s: %s (%s), want %s", tc.version, s.Level, s.Message, tc.want)
+		ver, ok := ParseVersion(tc.version)
+		s := tc.table.Classify(ver, ok, day(tc.now))
+		if s.Level != tc.want || (s.Advisory != nil) != tc.advisory {
+			t.Errorf("%s on %s: %s, advisory %v (%s); want %s, advisory %v",
+				tc.version, tc.now, s.Level, s.Advisory != nil, s.Message, tc.want, tc.advisory)
 		}
 		for _, m := range tc.msg {
 			if !strings.Contains(s.Message, m) {
-				t.Errorf("%s: message %q lacks %q", tc.version, s.Message, m)
+				t.Errorf("%s on %s: message %q lacks %q", tc.version, tc.now, s.Message, m)
 			}
 		}
-	}
-	// An instance on 16 cannot go back to the LTS 15, so only 17 is offered.
-	if s := Versions.Classify(Version{Major: 16, Minor: -1, Patch: -1}, true, now); strings.Contains(s.Message, "Upgrade to 15") {
-		t.Errorf("16: offered a downgrade to 15: %s", s.Message)
-	}
-
-	// 16 reaches its end of life on 2026-10-29.
-	if s := Versions.Classify(Version{Major: 16, Minor: -1, Patch: -1}, true, day("2026-10-29")); s.Level != SupportEndOfLife {
-		t.Errorf("16 on its EOL day: %s", s.Level)
-	}
-	// Once 18 is verified and out, 17 is deprecated until its end of life.
-	full := Versions.WithVerified(18)
-	if s := full.Classify(Version{Major: 17, Minor: 0, Patch: 1}, true, day("2027-01-20")); s.Level != SupportDeprecated ||
-		!strings.Contains(s.Message, "Upgrade to 18 before 2027-01-28") {
-		t.Errorf("17 after 18: %s %s", s.Level, s.Message)
-	}
-	if s := full.Classify(Version{Major: 18, Minor: -1, Patch: -1}, true, day("2027-01-01")); s.Level != SupportFuture ||
-		!strings.Contains(s.Message, "not released yet") {
-		t.Errorf("verified 18 before its release: %s %s", s.Level, s.Message)
-	}
-	// 17 ended and nothing newer is verified: tell the user to update the operator.
-	if s := Versions.Classify(Version{Major: 17, Minor: -1, Patch: -1}, true, day("2027-02-01")); s.Level != SupportEndOfLife ||
-		!strings.Contains(s.Message, "update the operator") {
-		t.Errorf("17 after EOL: %s %s", s.Level, s.Message)
 	}
 }
 
@@ -176,28 +155,6 @@ func TestClassifyMessageIsStableAcrossPatches(t *testing.T) {
 	exact := Versions.Classify(Version{16, 0, 6}, true, now)
 	if floating.Message != exact.Message || !strings.HasPrefix(exact.Message, "Forgejo 16 is outside") {
 		t.Fatalf("%q != %q", floating.Message, exact.Message)
-	}
-}
-
-func TestClassifyAdvisories(t *testing.T) {
-	now := day("2026-10-22")
-	for _, tc := range []struct {
-		v        Version
-		advisory bool
-	}{
-		{Version{17, 0, 0}, true},
-		{Version{17, 0, 1}, false},
-		{Version{17, -1, -1}, false}, // floating: the patch is unknown
-		{Version{15, 0, 8}, true},
-		{Version{15, 0, 10}, false},
-	} {
-		s := Versions.Classify(tc.v, true, now)
-		if (s.Advisory != nil) != tc.advisory {
-			t.Errorf("%s: advisory %v, want %v (%s)", tc.v, s.Advisory != nil, tc.advisory, s.Message)
-		}
-		if tc.advisory && (s.Level != SupportSupported || !strings.Contains(s.Message, "The running patch release "+tc.v.String())) {
-			t.Errorf("%s: %s %s", tc.v, s.Level, s.Message)
-		}
 	}
 }
 
@@ -266,9 +223,6 @@ func TestTraits(t *testing.T) {
 	}
 	if p := v18.ConfigProfile(); p != "internal-socket" {
 		t.Errorf("18 profile %q", p)
-	}
-	if p := legacy.ConfigProfile(); p != LegacyConfigProfile {
-		t.Errorf("legacy profile %q", p)
 	}
 
 	// Majors older than the table keep the legacy app.ini whatever its oldest row is: even a

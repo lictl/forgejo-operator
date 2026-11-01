@@ -53,7 +53,7 @@ func noEvents(t *testing.T, rec *events.FakeRecorder) {
 // released at once: the backup volume goes with the namespace. Before, the finalizer held
 // the namespace for cleanupTimeout (10 minutes).
 func TestBackupFinalizerReleasedInTerminatingNamespace(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	newBackup := func() *forgejov1.ForgejoBackup {
 		b := completedBackup("manual")
 		b.Status.Path = "/manual"
@@ -95,7 +95,7 @@ func TestBackupFinalizerReleasedInTerminatingNamespace(t *testing.T) {
 // A new backup in a terminating namespace neither waits for its storage (and then fails
 // with a Warning event) nor returns an error that would be retried with backoff.
 func TestBackupStartInTerminatingNamespace(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	for name, refused := range map[string]client.Object{
 		"backup PVC": &corev1.PersistentVolumeClaim{},
 		"backup Job": &batchv1.Job{},
@@ -131,7 +131,7 @@ func TestBackupStartInTerminatingNamespace(t *testing.T) {
 // A restore whose Job cannot be created in a terminating namespace stays as it is, without
 // an error, a retry or an event.
 func TestRestoreStartInTerminatingNamespace(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	b := completedBackup("b1")
 	rs := newRestore("r1", forgejov1.RestorePhaseScalingDown)
 	rs.Spec.BackupName = b.Name
@@ -147,7 +147,7 @@ func TestRestoreStartInTerminatingNamespace(t *testing.T) {
 			t.Fatalf("pass %d: Reconcile = %+v, %v; want no error and no requeue", i, res, err)
 		}
 	}
-	got := reconcileRestore(t, c, s, rs.Name, 0)
+	got := getRestore(t, c, rs.Name)
 	if got.Status.Phase != forgejov1.RestorePhaseScalingDown || got.Status.JobName != "" {
 		t.Errorf("phase %s job %q (%s), want ScalingDown without a Job", got.Status.Phase, got.Status.JobName, got.Status.Message)
 	}

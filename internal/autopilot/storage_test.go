@@ -2,17 +2,22 @@ package autopilot
 
 import (
 	"context"
-	"strconv"
+	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -22,7 +27,267 @@ import (
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
-// --- F09: storage is its own step ---
+func dataPVC(f *forgejov1.Forgejo, request, capacity string) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: forgejo.DataPVCName(f), Namespace: f.Namespace},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: ptr.To("standard"),
+			Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(request)}},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound, Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(capacity)}},
+	}
+}
+
+func mountingPod(f *forgejov1.Forgejo) *corev1.Pod {
+	p := readyPod(f, "fj-data", testHash, time.Hour)
+	p.Spec.Volumes = []corev1.Volume{{Name: volData, VolumeSource: corev1.VolumeSource{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: forgejo.DataPVCName(f)}}}}
+	p.Spec.Containers = []corev1.Container{{Name: serverContainerName, VolumeMounts: []corev1.VolumeMount{{Name: volData, MountPath: "/data"}}}}
+	return p
+}
+
+func storageInstance() *forgejov1.Forgejo {
+	f := testInstance()
+	f.Spec.Database.Type = forgejov1.DatabaseTypeExternal
+	f.Spec.AutoPilot.StorageAutoExpand.ThresholdPercent = 80
+	return f
+}
+
+type fakeExec struct {
+	mu    sync.Mutex
+	calls map[string]int
+	df    func() (string, error)
+	du    func() (string, error)
+}
+
+func (e *fakeExec) install(t *testing.T) {
+	t.Helper()
+	e.calls = map[string]int{}
+	old, oldWait := execFn, measureWait
+	measureWait = 2 * time.Second
+	execFn = func(_ context.Context, _, _, _ string, cmd []string) (string, error) {
+		e.mu.Lock()
+		e.calls[cmd[0]]++
+		e.mu.Unlock()
+		if cmd[0] == "df" {
+			return e.df()
+		}
+		return e.du()
+	}
+	t.Cleanup(func() { execFn, measureWait = old, oldWait })
+}
+
+func (e *fakeExec) count(cmd string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls[cmd]
+}
+
+// df of a 1 GiB volume 90% and 10% full, and of a larger file system the claim is a
+// directory of (which du measures).
+const (
+	df90     = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdb 1048576 943718 104858 90% /data\n"
+	df10     = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdb 1048576 104858 943718 10% /data\n"
+	nodeFSDF = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n/dev/vda1 409600000 100000000 309600000  25% /data\n"
+)
+
+// installDF answers every df with out.
+func installDF(t *testing.T, out string) *fakeExec {
+	t.Helper()
+	fx := &fakeExec{df: func() (string, error) { return out, nil }}
+	fx.install(t)
+	return fx
+}
+
+// With auto-expansion off, usage is still measured and reported; nothing is expanded.
+func TestStorageMeasuredWithAutoExpandDisabled(t *testing.T) {
+	f := storageInstance()
+	f.Spec.AutoPilot.StorageAutoExpand.Enabled = ptr.To(false)
+	pvc := dataPVC(f, "1Gi", "1Gi")
+	env := newTestEnv(t, f, pvc, mountingPod(f))
+	installDF(t, df90)
+	if err := reconcileStorage(context.Background(), env.rc, stateFor(f), nil); err != nil {
+		t.Fatal(err)
+	}
+	if f.Status.Storage == nil || len(f.Status.Storage.Volumes) != 1 || f.Status.Storage.Volumes[0].UsedPercent != 89 {
+		t.Fatalf("status.storage = %+v", f.Status.Storage)
+	}
+	var m dto.Metric
+	if err := forgejo.VolumeUsedRatio.WithLabelValues(f.Namespace, f.Name, pvc.Name).Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	if v := m.GetGauge().GetValue(); v < 0.89 || v > 0.91 {
+		t.Fatalf("volume_used_ratio = %v", v)
+	}
+	c := condition(f, forgejov1.ConditionStorageHealthy)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != ReasonAutoExpandDisabled {
+		t.Fatalf("StorageHealthy = %+v", c)
+	}
+	got := &corev1.PersistentVolumeClaim{}
+	_ = env.rc.Client.Get(context.Background(), client.ObjectKeyFromObject(pvc), got)
+	if !got.Spec.Resources.Requests.Storage().Equal(resource.MustParse("1Gi")) {
+		t.Fatal("PVC expanded with auto-expansion disabled")
+	}
+}
+
+// A slow du never holds the reconcile; its result is reported by a later one. Failures are
+// backed off instead of retried on every check.
+func TestDuRunsInBackgroundAndBacksOff(t *testing.T) {
+	f := storageInstance()
+	env := newTestEnv(t, f, dataPVC(f, "1Gi", "1Gi"), mountingPod(f))
+	release := make(chan struct{})
+	var fail atomic.Bool
+	fx := &fakeExec{
+		df: func() (string, error) { return nodeFSDF, nil },
+		du: func() (string, error) {
+			<-release
+			if fail.Load() {
+				return "", errors.New("command terminated with exit code 137")
+			}
+			return "524288\t/data\n", nil
+		},
+	}
+	fx.install(t)
+	st := stateFor(f)
+	ctx := context.Background()
+
+	start := time.Now()
+	if err := reconcileStorage(ctx, env.rc, st, nil); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > measureWait+time.Second {
+		t.Fatalf("reconcile waited %s for du", d)
+	}
+	if c := condition(f, forgejov1.ConditionStorageHealthy); c == nil || c.Reason != "MeasurementUnavailable" {
+		t.Fatalf("StorageHealthy = %+v", c)
+	}
+	if env.rc.RequeueAfter == 0 {
+		t.Fatal("no requeue while du runs")
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for st.measure.anyRunning() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := reconcileStorage(ctx, env.rc, st, nil); err != nil {
+		t.Fatal(err)
+	}
+	if v := f.Status.Storage.Volumes[0]; v.UsedBytes != 512<<20 || v.UsedPercent != 50 {
+		t.Fatalf("du result not reported: %+v", v)
+	}
+
+	// du fails: the next attempts back off.
+	fail.Store(true)
+	st.measure.mu.Lock()
+	c := st.measure.claims[forgejo.DataPVCName(f)]
+	c.attempt, c.duAttempt = time.Time{}, time.Time{}
+	st.measure.mu.Unlock()
+	st.lastStorageCheck = time.Time{}
+	if err := reconcileStorage(ctx, env.rc, st, nil); err != nil {
+		t.Fatal(err)
+	}
+	for st.measure.anyRunning() && time.Now().Before(deadline.Add(5*time.Second)) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	calls := fx.count("sh")
+	st.lastStorageCheck = time.Time{}
+	st.measure.mu.Lock()
+	c.attempt = time.Now().Add(-storageCheckInterval - time.Second) // the plain interval has passed
+	st.measure.mu.Unlock()
+	if err := reconcileStorage(ctx, env.rc, st, nil); err != nil {
+		t.Fatal(err)
+	}
+	if fx.count("sh") != calls {
+		t.Fatal("du retried right after a failure")
+	}
+	if v := f.Status.Storage.Volumes[0]; v.UsedBytes != 512<<20 {
+		t.Fatalf("last good measurement not kept after a failure: %+v", v)
+	}
+}
+
+func TestStalledResizeIsReportedAndFSResizeRestarts(t *testing.T) {
+	f := storageInstance()
+	pvc := dataPVC(f, "2Gi", "1Gi")
+	long := metav1.NewTime(time.Now().Add(-40 * time.Minute))
+	pvc.Status.Conditions = []corev1.PersistentVolumeClaimCondition{{
+		Type: corev1.PersistentVolumeClaimFileSystemResizePending, Status: corev1.ConditionTrue, LastTransitionTime: long,
+		Message: "Waiting for user to (re-)start a pod to finish file system resize of volume on node.",
+	}}
+	dep := testDeployment(f, 1)
+	env := newTestEnv(t, f, pvc, mountingPod(f), dep)
+	installDF(t, df90)
+	st := stateFor(f)
+	if err := reconcileStorage(context.Background(), env.rc, st, dep); err != nil {
+		t.Fatal(err)
+	}
+	c := condition(f, forgejov1.ConditionStorageHealthy)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != ReasonExpansionStalled || !strings.Contains(c.Message, "FileSystemResizePending") {
+		t.Fatalf("StorageHealthy = %+v", c)
+	}
+	got := &appsv1.Deployment{}
+	_ = env.rc.Client.Get(context.Background(), client.ObjectKeyFromObject(dep), got)
+	if _, ok := got.Spec.Template.Annotations[forgejo.AnnotationRestartedAt]; !ok || lastAction(f, ActionPodRestarted).IsZero() {
+		t.Fatal("no restart for a pending file system resize")
+	}
+	// Once per pending resize.
+	f.Status.AutoPilot.RecentActions = nil
+	st.lastStorageCheck = time.Time{}
+	if err := reconcileStorage(context.Background(), env.rc, st, got); err != nil {
+		t.Fatal(err)
+	}
+	if !lastAction(f, ActionPodRestarted).IsZero() {
+		t.Fatal("restarted twice for the same resize")
+	}
+}
+
+func TestParseDF(t *testing.T) {
+	used, size, err := parseDF("Filesystem     1024-blocks    Used Available Capacity Mounted on\nserver:/export with space 2048 1024 1024 50% /data\n")
+	if err != nil || used != 1024*1024 || size != 2048*1024 {
+		t.Fatalf("used=%d size=%d err=%v", used, size, err)
+	}
+	if _, _, err := parseDF("df: /data: No such file or directory\n"); err == nil {
+		t.Fatal("garbage parsed")
+	}
+}
+
+// Without ClusterRole volume-usage bound (pods/exec), nothing is measured or expanded:
+// StorageHealthy is Unknown/MeasurementUnavailable and names the ClusterRole, and du is not
+// tried after a refused df.
+func TestStorageWithoutPodsExec(t *testing.T) {
+	f := storageInstance()
+	pvc := dataPVC(f, "1Gi", "1Gi")
+	env := newTestEnv(t, f, pvc, mountingPod(f))
+	forbidden := apierrors.NewForbidden(schema.GroupResource{Resource: "pods/exec"}, "pod",
+		errors.New(`User "system:serviceaccount:forgejo-operator-system:forgejo-operator-controller-manager" cannot create resource "pods/exec"`))
+	fx := &fakeExec{
+		df: func() (string, error) { return "", forbidden },
+		du: func() (string, error) { return "", forbidden },
+	}
+	fx.install(t)
+	if err := reconcileStorage(context.Background(), env.rc, stateFor(f), nil); err != nil {
+		t.Fatal(err)
+	}
+	c := condition(f, forgejov1.ConditionStorageHealthy)
+	if c == nil || c.Status != metav1.ConditionUnknown || c.Reason != "MeasurementUnavailable" ||
+		!strings.Contains(c.Message, "forgejo-operator-volume-usage") {
+		t.Fatalf("StorageHealthy = %+v", c)
+	}
+	if n := fx.count("df"); n != 1 {
+		t.Fatalf("df ran %d times", n)
+	}
+	if n := fx.count("sh"); n != 0 {
+		t.Fatalf("du ran %d times after a refused df", n)
+	}
+	got := &corev1.PersistentVolumeClaim{}
+	if err := env.rc.Client.Get(context.Background(), client.ObjectKeyFromObject(pvc), got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Spec.Resources.Requests.Storage().Equal(resource.MustParse("1Gi")) {
+		t.Fatal("PVC changed without a measurement")
+	}
+}
+
+// --- storage is its own step ---
 
 // cnpgTestEnv is newTestEnv with the CNPG Cluster kind known to the fake client and the
 // database not resolved, as when the database step stopped.
@@ -165,7 +430,7 @@ func TestStorageStepToleratesMissingCluster(t *testing.T) {
 	f, claim := fullDBInstance()
 	env := cnpgTestEnv(t, f, dbPVC(f, "1Gi"), expandableClass(), crashingPostgres(f, claim))
 	env.rc.Maintenance = true
-	(&fakeExec{df: func() (string, error) { return "", nil }}).install(t)
+	installDF(t, "")
 
 	if _, err := ReconcileStorage(context.Background(), env.rc); err != nil {
 		t.Fatal(err)
@@ -190,10 +455,7 @@ func TestStoragePassRunsOnlyInItsStep(t *testing.T) {
 	ctx := context.Background()
 	f := storageInstance()
 	env := newTestEnv(t, f, dataPVC(f, "1Gi", "1Gi"), mountingPod(f), testDeployment(f, 1), expandableClass())
-	fx := &fakeExec{df: func() (string, error) {
-		return "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdb 1048576 104858 943718 10% /data\n", nil
-	}}
-	fx.install(t)
+	fx := installDF(t, df10)
 
 	if _, err := Reconcile(ctx, env.rc); err != nil {
 		t.Fatal(err)
@@ -243,9 +505,7 @@ func TestFilesystemResizeRestartHonoursStatusHolds(t *testing.T) {
 			dep := testDeployment(f, 1)
 			mutate(f, dep)
 			env := newTestEnv(t, f, pvc, mountingPod(f), dep)
-			(&fakeExec{df: func() (string, error) {
-				return "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdb 1048576 104858 943718 10% /data\n", nil
-			}}).install(t)
+			installDF(t, df10)
 			if _, err := ReconcileStorage(ctx, env.rc); err != nil {
 				t.Fatal(err)
 			}
@@ -276,103 +536,5 @@ func TestMeasurementPredatesResize(t *testing.T) {
 	}
 	if (measurement{capacity: 1}).predatesResize(&corev1.PersistentVolumeClaim{}) {
 		t.Error("a PVC without a reported capacity counts as resized")
-	}
-}
-
-// --- F57: rc.ValkeyURL is deterministic; maintenance does not wait for Valkey ---
-
-func haInstance() *forgejov1.Forgejo {
-	f := testInstance()
-	f.Spec.HighAvailability.Enabled = true
-	return f
-}
-
-// valkeyDBURL is how core renders a database of rc.ValkeyURL (for test fixtures).
-func valkeyDBURL(u string, db int) string {
-	base, query, _ := strings.Cut(u, "?")
-	return base + "/" + strconv.Itoa(db) + "?" + query
-}
-
-func secretsWithValkeyPassword(f *forgejov1.Forgejo, pw string) *corev1.Secret {
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace},
-		Data:       map[string][]byte{valkeyPasswordKey: []byte(pw)},
-	}
-}
-
-func TestReconcileHASetsValkeyURLWhileValkeyNotReady(t *testing.T) {
-	for _, maintenance := range []bool{false, true} {
-		f := haInstance()
-		env := newTestEnv(t, f, secretsWithValkeyPassword(f, "pw"))
-		env.rc.Maintenance = maintenance
-		res, err := ReconcileHA(context.Background(), env.rc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if res.Stop == maintenance {
-			t.Fatalf("maintenance=%v: Stop = %v", maintenance, res.Stop)
-		}
-		if res.RequeueAfter == 0 {
-			t.Fatalf("maintenance=%v: no requeue while Valkey is not ready", maintenance)
-		}
-		if want := valkeyURL(f, "pw"); env.rc.ValkeyURL != want {
-			t.Fatalf("maintenance=%v: ValkeyURL = %q, want %q", maintenance, env.rc.ValkeyURL, want)
-		}
-	}
-}
-
-func TestReconcileHAValkeyURLSameWhenReady(t *testing.T) {
-	ctx := context.Background()
-	f := haInstance()
-	env := newTestEnv(t, f, secretsWithValkeyPassword(f, "pw"))
-	if _, err := ReconcileHA(ctx, env.rc); err != nil {
-		t.Fatal(err)
-	}
-	notReady := env.rc.ValkeyURL
-	sts := &appsv1.StatefulSet{}
-	if err := env.rc.Client.Get(ctx, client.ObjectKey{Namespace: f.Namespace, Name: forgejo.ValkeyName(f)}, sts); err != nil {
-		t.Fatal(err)
-	}
-	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation, Replicas: 3, ReadyReplicas: 1, AvailableReplicas: 1}
-	if err := env.rc.Client.Status().Update(ctx, sts); err != nil {
-		t.Fatal(err)
-	}
-	env.rc.ValkeyURL = ""
-	res, err := ReconcileHA(ctx, env.rc)
-	if err != nil || res.Stop {
-		t.Fatalf("ready Valkey: res=%+v err=%v", res, err)
-	}
-	if env.rc.ValkeyURL == "" || env.rc.ValkeyURL != notReady {
-		t.Fatalf("ValkeyURL changed with readiness: %q vs %q", env.rc.ValkeyURL, notReady)
-	}
-}
-
-// The secrets step just created "<name>-secrets" and the cache has not seen it yet.
-func TestReconcileHAReadsPasswordLiveWhenCacheLags(t *testing.T) {
-	f := haInstance()
-	env := newTestEnv(t, f)
-	env.rc.APIReader = fake.NewClientBuilder().WithScheme(env.rc.Scheme).WithObjects(secretsWithValkeyPassword(f, "live")).Build()
-	res, err := ReconcileHA(context.Background(), env.rc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := valkeyURL(f, "live"); env.rc.ValkeyURL != want {
-		t.Fatalf("ValkeyURL = %q, want %q (res %+v)", env.rc.ValkeyURL, want, res)
-	}
-}
-
-// Without the Secret anywhere the step waits, except in maintenance.
-func TestReconcileHAMissingSecretStopsOnlyOutsideMaintenance(t *testing.T) {
-	for _, maintenance := range []bool{false, true} {
-		f := haInstance()
-		env := newTestEnv(t, f)
-		env.rc.Maintenance = maintenance
-		res, err := ReconcileHA(context.Background(), env.rc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if res.Stop == maintenance || res.RequeueAfter == 0 {
-			t.Fatalf("maintenance=%v: res = %+v", maintenance, res)
-		}
 	}
 }

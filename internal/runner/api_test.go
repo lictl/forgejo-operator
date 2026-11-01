@@ -111,61 +111,37 @@ func (f *fakeForgejo) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func TestAPIListsEveryPage(t *testing.T) {
-	f := &fakeForgejo{maxItems: 20}
-	for i := 1; i <= 45; i++ {
-		f.runners = append(f.runners, APIRunner{ID: int64(i), UUID: fmt.Sprintf("u%d", i), Status: statusIdle})
-	}
-	srv := httptest.NewServer(f)
-	defer srv.Close()
-	got, err := NewAPI(srv.URL, "admin", "pw").ListRunners(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 45 {
-		t.Fatalf("listed %d runners, want 45 (pages capped at 20)", len(got))
-	}
-	for _, v := range f.visible {
-		if v != "true" {
-			t.Fatalf("listed without visible=true: organization and repository runners are missed")
-		}
-	}
-}
-
-func TestAPIDelete(t *testing.T) {
-	f := &fakeForgejo{maxItems: 50, runners: []APIRunner{{ID: 7, UUID: "u"}}}
+// GetRunner and DeleteRunner of a runner that exists and of one that is gone, which is not an
+// error.
+func TestAPIGetAndDeleteRunner(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeForgejo{maxItems: 50, runners: []APIRunner{{ID: 7, UUID: "u", Status: statusIdle}}}
 	srv := httptest.NewServer(f)
 	defer srv.Close()
 	api := NewAPI(srv.URL+"/", "admin", "pw")
-	if deleted, err := api.DeleteRunner(context.Background(), 7); err != nil || !deleted {
+	if got, err := api.GetRunner(ctx, 7); err != nil || got == nil || got.UUID != "u" || !got.Online() {
+		t.Fatalf("GetRunner(7) = %+v, %v", got, err)
+	}
+	if deleted, err := api.DeleteRunner(ctx, 7); err != nil || !deleted {
 		t.Fatalf("deleted %v, %v", deleted, err)
 	}
-	if deleted, err := api.DeleteRunner(context.Background(), 7); err != nil || deleted {
+	if deleted, err := api.DeleteRunner(ctx, 7); err != nil || deleted {
 		t.Fatalf("deleting a runner that is gone: %v, %v", deleted, err)
 	}
 	if len(f.deleted) != 1 || f.deleted[0] != 7 {
 		t.Fatalf("deleted %v", f.deleted)
 	}
-}
-
-func TestAPIGetRunner(t *testing.T) {
-	f := &fakeForgejo{maxItems: 50, runners: []APIRunner{{ID: 7, UUID: "u", Status: statusIdle}}}
-	srv := httptest.NewServer(f)
-	defer srv.Close()
-	api := NewAPI(srv.URL, "admin", "pw")
-	got, err := api.GetRunner(context.Background(), 7)
-	if err != nil || got == nil || got.UUID != "u" || !got.Online() {
-		t.Fatalf("GetRunner(7) = %+v, %v", got, err)
-	}
-	if got, err := api.GetRunner(context.Background(), 8); err != nil || got != nil {
+	if got, err := api.GetRunner(ctx, 7); err != nil || got != nil {
 		t.Fatalf("GetRunner of a deleted runner = %+v, %v; want nil, nil", got, err)
 	}
 }
 
-// Forgejo orders runners by last_online, newest first, so a runner that polls while the pages
-// are read moves to page 1: the read sees another runner twice and misses it. The list is
-// read again until its pages add up, and a list of several pages is read twice and merged.
-func TestAPIListSurvivesRunnersMovingBetweenPages(t *testing.T) {
+// ListRunners reads every page: Forgejo caps them at MAX_RESPONSE_ITEMS, here below the page
+// size the operator asks for. Forgejo orders runners by last_online, newest first, so a runner
+// that polls while the pages are read moves to page 1: the read sees another runner twice and
+// misses it. The list is read again until its pages add up, and a list of several pages is
+// read twice and merged.
+func TestAPIListRunners(t *testing.T) {
 	f := &fakeForgejo{maxItems: 2}
 	for i := 1; i <= 5; i++ {
 		f.runners = append(f.runners, APIRunner{ID: int64(i), UUID: fmt.Sprintf("u%d", i), Status: statusIdle})
@@ -193,6 +169,11 @@ func TestAPIListSurvivesRunnersMovingBetweenPages(t *testing.T) {
 	if f.listed != 3+3+3 {
 		t.Errorf("served %d pages, want 9 (an inconsistent read, then two full reads)", f.listed)
 	}
+	for _, v := range f.visible {
+		if v != "true" {
+			t.Fatalf("listed without visible=true: organization and repository runners are missed")
+		}
+	}
 
 	// Pages that never add up are an error, not a short list.
 	f.afterPage = func(f *fakeForgejo, page int) {
@@ -215,42 +196,22 @@ func TestAPIUnauthorized(t *testing.T) {
 	}
 }
 
-func TestAPIWaitingJobsByScope(t *testing.T) {
-	waiting := []map[string]any{{testKeyStatus: statusWaiting}, {testKeyStatus: "running"}, {testKeyStatus: statusWaiting}}
-	f := &fakeForgejo{maxItems: 50, jobs: map[string][]map[string]any{
-		"/api/v1/admin/actions/runners/jobs":            waiting,
-		"/api/v1/orgs/acme/actions/runners/jobs":        waiting[:1],
-		"/api/v1/repos/acme/app/actions/runners/jobs":   waiting[1:2],
-		"/api/v1/repos/acme/other/actions/runners/jobs": nil,
-	}}
-	srv := httptest.NewServer(f)
-	defer srv.Close()
-	api := NewAPI(srv.URL, "admin", "pw")
-	for scope, want := range map[string]int{"": 2, testOrg: 1, testRepo: 0} {
-		got, err := api.WaitingJobs(context.Background(), scope, []string{testLabelDocker, testLabelHost})
-		if err != nil || got != want {
-			t.Errorf("scope %q: %d, %v; want %d", scope, got, err, want)
-		}
-	}
-	if _, err := api.WaitingJobs(context.Background(), "nobody", []string{testLabelDocker, testLabelHost}); err == nil {
-		t.Error("a 404 counted as no waiting jobs")
-	}
-}
-
-// A user scope: /orgs/{user}/actions/runners/jobs answers 404 (Forgejo 15 and 17), so the
-// instance's waiting jobs are counted for the user's id.
-func TestAPIWaitingJobsOfAUser(t *testing.T) {
+// WaitingJobs of each scope counts the waiting jobs, not the running ones. A user scope:
+// /orgs/{user}/actions/runners/jobs answers 404 (Forgejo 15 and 17), so the instance's waiting
+// jobs are counted for the user's id; an owner that is neither is an error, not zero jobs.
+func TestAPIWaitingJobs(t *testing.T) {
 	f := &fakeForgejo{maxItems: 50, users: map[string]int64{"alice": 2, testOrg: 3}, jobs: map[string][]map[string]any{
 		"/api/v1/admin/actions/runners/jobs": {
 			{testKeyStatus: statusWaiting, testKeyOwnerID: 2}, {testKeyStatus: "running", testKeyOwnerID: 2},
 			{testKeyStatus: statusWaiting, testKeyOwnerID: 2}, {testKeyStatus: statusWaiting, testKeyOwnerID: 3},
 		},
-		"/api/v1/orgs/acme/actions/runners/jobs": {{testKeyStatus: statusWaiting, testKeyOwnerID: 3}},
+		"/api/v1/orgs/acme/actions/runners/jobs":      {{testKeyStatus: statusWaiting, testKeyOwnerID: 3}},
+		"/api/v1/repos/acme/app/actions/runners/jobs": {{testKeyStatus: "running", testKeyOwnerID: 3}},
 	}}
 	srv := httptest.NewServer(f)
 	defer srv.Close()
 	api := NewAPI(srv.URL, "admin", "pw")
-	for scope, want := range map[string]int{"alice": 2, testOrg: 1, "": 3} {
+	for scope, want := range map[string]int{"": 3, testOrg: 1, testRepo: 0, "alice": 2} {
 		got, err := api.WaitingJobs(context.Background(), scope, []string{testLabelDocker, testLabelHost})
 		if err != nil || got != want {
 			t.Errorf("scope %q: %d, %v; want %d", scope, got, err, want)

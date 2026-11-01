@@ -212,7 +212,7 @@ Clusters without the Gateway API or cert-manager CRDs, TCPRoute `v1alpha2`-only 
 1. **E7.1 unit tests**: in the repository root run
    `go test ./internal/core/ -count=1 -v -run 'TestNoRoutesOrCertificatesWithoutCRDs|TestTCPRouteVersionDiscovery|TestGatewayRendersRoutes|TestGatewayRouteOptions|TestRoutesReadyFollowsRouteStatus|TestRoutesConditionIgnoresStaleStatus|TestRemovingGatewayDeletesRoutes|TestCertManagerCertificate|TestCertificateNeedsDNSNames|TestPublicIdentityWithoutGatewayOrTLS|TestConfigWithGatewayAndTLS|TestNewInstanceGeneratesHostKeys|TestHostKeysSecretFollowsRetainPolicy|TestExistingHostKeysSecretIsReused|TestMissingHostKeysSecretIsNeverRegenerated|TestExistingSecretHostKeys|TestUnmanagedHostKeys|TestParseHostKeys|TestHostKeysScript|TestRouteHostnamesFromPublicHosts|TestNoHTTPRouteWithoutHostnames|TestTrustedProxiesForDirectServices' 2>&1 | grep -E '^(=== RUN|--- |ok|FAIL|PASS)'`.
    Expect every listed test (and the subtests of `TestTCPRouteVersionDiscovery`: `v1_and_v1alpha2`, `v1alpha2_only`, `standard_channel_without_TCPRoute`) `--- PASS` and the package `ok`. Record the `--- PASS` lines.
-2. **E7.2 holds while the host keys are unavailable**: `go test ./internal/upgrade/ ./internal/backup/ ./internal/autopilot/ -count=1 -v -run 'TestUpgradeWaitsForSSHHostKeys|TestRestoreWaitsForSSHHostKeys|TestAnsweredFailuresRestart' 2>&1 | grep -E '^(--- |ok|FAIL)'` → three `--- PASS` lines and three packages `ok`.
+2. **E7.2 holds while the host keys are unavailable**: `go test ./internal/upgrade/ ./internal/backup/ ./internal/autopilot/ -count=1 -v -run 'TestUpgradeWaits|TestRestoreWaitsBeforeScalingDown|TestRestartUnhealthy' 2>&1 | grep -E '^(--- |ok|FAIL)'` → three `--- PASS` lines and three packages `ok`.
 
 ## E8 — Cleanup
 

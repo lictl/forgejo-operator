@@ -230,34 +230,3 @@ func TestStatsSamplingWaitsForSlowMetrics(t *testing.T) {
 		t.Fatalf("stats %+v", st)
 	}
 }
-
-func TestServingPodsWaitsForEndpoints(t *testing.T) {
-	ctx := context.Background()
-	f := testInstance("settle")
-	rc, _ := monitoringRC(t, f, interceptor.Funcs{})
-	now := time.Now()
-	pod := func(name string, readySince time.Time) {
-		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: f.Namespace, Name: name, Labels: forgejo.SelectorLabels(f)}}
-		p.Status.Conditions = []corev1.PodCondition{{
-			Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(readySince),
-		}}
-		if err := rc.Client.Create(ctx, p); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	pod("fresh", now.Add(-2*time.Second))
-	ready, settling, err := servingPods(ctx, rc, now)
-	if err != nil || ready != 0 || settling <= 0 || settling > endpointSettle {
-		t.Fatalf("ready=%d settling=%s err=%v, want 0 and a short wait", ready, settling, err)
-	}
-	// Probed once the pod has settled.
-	if ready, settling, _ = servingPods(ctx, rc, now.Add(endpointSettle)); ready != 1 || settling != 0 {
-		t.Fatalf("ready=%d settling=%s after settling", ready, settling)
-	}
-	// An established pod is probed right away, also while another one settles.
-	pod("old", now.Add(-time.Hour))
-	if ready, _, _ = servingPods(ctx, rc, now); ready != 1 {
-		t.Fatalf("ready=%d, want 1", ready)
-	}
-}

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -14,9 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -33,18 +33,22 @@ const (
 	testClassFixed      = "fixed"
 	testSize200Gi       = "200Gi"
 	testSize50Gi        = "50Gi"
+
+	testForgejoUID            = "forgejo-uid"
+	testReasonBackupSucceeded = "BackupSucceeded"
 )
 
-func testScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
-	s := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	if err := forgejov1.AddToScheme(s); err != nil {
-		t.Fatal(err)
-	}
-	return s
+func ownedInstance(policy forgejov1.RetainPolicy) *forgejov1.Forgejo {
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: "ns", UID: testForgejoUID}}
+	f.Spec.Storage.RetainPolicy = policy
+	return f
+}
+
+func reasonBackup(name string, reason forgejov1.BackupReason) *forgejov1.ForgejoBackup {
+	b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"}}
+	b.Spec.ForgejoRef.Name = "fb"
+	b.Spec.Reason = reason
+	return b
 }
 
 func TestJobNamesNeverCollideAcrossKinds(t *testing.T) {
@@ -67,7 +71,7 @@ func TestJobNamesNeverCollideAcrossKinds(t *testing.T) {
 }
 
 func TestCreateJobRefusesJobsOfOtherObjects(t *testing.T) {
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	bk := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns", UID: "backup-uid"}}
 	rs := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "ns", UID: "restore-uid"}}
@@ -251,6 +255,50 @@ func TestMaintenanceRestore(t *testing.T) {
 	}
 }
 
+// A running restore is planned maintenance; a failed one that changed the instance holds it
+// until a person acts (rc.MaintenanceHeld: phase Degraded, unplanned downtime). A restore that
+// replaced the database and waits for Forgejo (ScalingUp) migrates it. Every restore in
+// ScalingUp, also a data-only one, is handed to the HA step, which empties Valkey for it.
+func TestReconcileMaintenanceFlags(t *testing.T) {
+	s := FakeScheme(t)
+	ctx := context.Background()
+	f := ownedInstance(forgejov1.RetainPolicyRetain)
+	for _, tc := range []struct {
+		name                         string
+		phase                        forgejov1.RestorePhase
+		restoreDB                    bool
+		mod                          Modification
+		maintenance, held, migrating bool
+	}{
+		{name: "running", phase: forgejov1.RestorePhaseRestoring, restoreDB: true, maintenance: true},
+		{name: "failed after changing data", phase: forgejov1.RestorePhaseFailed, restoreDB: true, mod: Modified, maintenance: true, held: true},
+		{name: "failed without changes", phase: forgejov1.RestorePhaseFailed, restoreDB: true},
+		{name: "database restored, scaling up", phase: forgejov1.RestorePhaseScalingUp, restoreDB: true, migrating: true},
+		{name: "data-only, scaling up", phase: forgejov1.RestorePhaseScalingUp},
+		{name: "completed", phase: forgejov1.RestorePhaseCompleted, restoreDB: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := restore("r1", time.Now(), tc.phase, tc.mod)
+			r.Namespace = "ns"
+			r.Spec.ForgejoRef.Name = "fb"
+			r.Spec.RestoreDatabase = ptr.To(tc.restoreDB)
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(&r).Build()
+			rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f.DeepCopy()}
+			if _, err := ReconcileMaintenance(ctx, rc); err != nil {
+				t.Fatal(err)
+			}
+			if rc.Maintenance != tc.maintenance || rc.MaintenanceHeld != tc.held || rc.RestoreMigrating != tc.migrating {
+				t.Errorf("Maintenance=%v MaintenanceHeld=%v RestoreMigrating=%v, want %v %v %v", rc.Maintenance, rc.MaintenanceHeld,
+					rc.RestoreMigrating, tc.maintenance, tc.held, tc.migrating)
+			}
+			scalingUp := tc.phase == forgejov1.RestorePhaseScalingUp
+			if got := rc.ScalingUpRestore; (got != nil) != scalingUp || (got != nil && got.Name != r.Name) || rc.RestoreScalingUp != scalingUp {
+				t.Errorf("ScalingUpRestore=%v RestoreScalingUp=%v, want ScalingUp %v", got, rc.RestoreScalingUp, scalingUp)
+			}
+		})
+	}
+}
+
 func scheduledBackup(name string, created time.Time, phase forgejov1.BackupPhase) *forgejov1.ForgejoBackup {
 	b := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: name, CreationTimestamp: metav1.NewTime(created)}}
 	b.Spec.Reason = forgejov1.BackupReasonScheduled
@@ -355,8 +403,106 @@ func TestPruneCandidates(t *testing.T) {
 	}
 }
 
+func gaugeValue(t *testing.T, ns string) float64 {
+	t.Helper()
+	m := &dto.Metric{}
+	g, err := forgejo.BackupLastSuccess.GetMetricWithLabelValues(ns, "fb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.(prometheus.Metric).Write(m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetGauge().GetValue()
+}
+
+func TestLastSuccessGaugeIsExportedFromStatus(t *testing.T) {
+	t1 := metav1.NewTime(time.Unix(1_700_000_000, 0))
+	t2 := metav1.NewTime(t1.Add(time.Hour))
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: "gauge"}}
+	withSuccess := func(at *metav1.Time) *forgejov1.Forgejo {
+		g := f.DeepCopy()
+		g.Status.Backup = &forgejov1.BackupStatusSummary{LastSuccessfulBackupTime: at}
+		return g
+	}
+	ExportLastSuccess(withSuccess(&t2))
+	if v := gaugeValue(t, "gauge"); v != float64(t2.Unix()) {
+		t.Errorf("gauge = %v, want %v", v, t2.Unix())
+	}
+	// A summary from a lagging cache never moves the gauge back.
+	ExportLastSuccess(withSuccess(&t1))
+	if v := gaugeValue(t, "gauge"); v != float64(t2.Unix()) {
+		t.Errorf("gauge went back to %v", v)
+	}
+	// Called on every reconcile: an instance without a recorded success (status not written
+	// yet, or the step that writes it skipped) does not remove the series.
+	ExportLastSuccess(f)
+	ExportLastSuccess(withSuccess(nil))
+	if v := gaugeValue(t, "gauge"); v != float64(t2.Unix()) {
+		t.Errorf("gauge = %v after exporting an empty status, want %v", v, t2.Unix())
+	}
+	// No successful backup left: the series is removed, and a later success starts afresh.
+	ForgetLastSuccess("gauge", "fb")
+	if forgejo.BackupLastSuccess.DeleteLabelValues("gauge", "fb") {
+		t.Error("series still exported without a successful backup")
+	}
+	ExportLastSuccess(withSuccess(&t1))
+	if v := gaugeValue(t, "gauge"); v != float64(t1.Unix()) {
+		t.Errorf("gauge = %v after forgetting, want %v", v, t1.Unix())
+	}
+	ForgetLastSuccess("gauge", "fb")
+}
+
+func TestReconcileScheduleExportsLastSuccessAndDefersDuringUpgrade(t *testing.T) {
+	s := FakeScheme(t)
+	ctx := context.Background()
+	f := ownedInstance(forgejov1.RetainPolicyRetain)
+	ForgetLastSuccess(f.Namespace, f.Name) // the gauge never goes down: drop what other tests left
+	f.Spec.Backup.Enabled = true
+	f.Spec.Backup.Schedule = "@every 1h"
+	done := metav1.NewTime(time.Now().Add(-30 * time.Hour).Truncate(time.Second))
+	f.Status.Backup = &forgejov1.BackupStatusSummary{LastScheduleTime: &metav1.Time{Time: done.Add(-time.Minute)}}
+
+	last := reasonBackup("fb-scheduled-old", forgejov1.BackupReasonScheduled)
+	last.CreationTimestamp = metav1.NewTime(done.Add(-time.Minute))
+	last.Status.Phase = forgejov1.BackupPhaseCompleted
+	last.Status.CompletionTime = &done
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, last).WithStatusSubresource(&forgejov1.ForgejoBackup{}).Build()
+
+	rc := &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f, Upgrading: true}
+	if _, err := ReconcileSchedule(ctx, rc); err != nil {
+		t.Fatal(err)
+	}
+	if v := gaugeValue(t, "ns"); v != float64(done.Unix()) {
+		t.Errorf("last-success gauge = %v, want %v", v, done.Unix())
+	}
+	list := &forgejov1.ForgejoBackupList{}
+	if err := c.List(ctx, list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 1 {
+		t.Errorf("a scheduled backup was started during an upgrade: %d backups", len(list.Items))
+	}
+	// The run became due 29h ago, when the last backup was 1h old: not stale.
+	if c := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionBackupHealthy); c == nil || c.Reason != testReasonBackupSucceeded {
+		t.Errorf("BackupHealthy = %+v, want BackupSucceeded while deferred", c)
+	}
+
+	// After the upgrade the deferred run starts.
+	rc = &forgejo.ReconcileContext{Client: c, Scheme: s, Instance: f}
+	if _, err := ReconcileSchedule(ctx, rc); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.List(ctx, list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 2 {
+		t.Errorf("the deferred scheduled backup did not start: %d backups", len(list.Items))
+	}
+}
+
 func TestBackupPVCGrowsButNeverShrinks(t *testing.T) {
-	s := testScheme(t)
+	s := FakeScheme(t)
 	ctx := context.Background()
 	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: "ns"}}
 	claim := func(size, class string) *corev1.PersistentVolumeClaim {
@@ -410,16 +556,33 @@ func TestBackupPVCGrowsButNeverShrinks(t *testing.T) {
 	}
 }
 
-func TestBackupScriptsRemovePartialFiles(t *testing.T) {
-	for name, script := range map[string]string{"dump": dumpScript, "archive": archiveScript(forgejo.LayoutForImage(forgejov1.DefaultImage))} {
-		if !strings.Contains(script, removePartials) {
-			t.Errorf("%s script does not remove its partial files on exit", name)
+func TestResizeWarningIsRateLimited(t *testing.T) {
+	s := FakeScheme(t)
+	ctx := context.Background()
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fb", Namespace: "ratelimit"}}
+	f.Spec.Backup.Storage.Size = resource.MustParse("50Gi")
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupsPVC, Namespace: "ratelimit"},
+		Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: ptr.To("fixed"),
+			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("20Gi")}}},
+	}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(pvc, &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: testClassFixed}}).Build()
+	warnings := 0
+	warn := func(string, string) { warnings++ }
+	for range 3 {
+		if _, err := GrowBackupPVC(ctx, c, f, warn); err != nil {
+			t.Fatal(err)
 		}
 	}
-	for name, script := range map[string]string{"verify": verifyScript, "restore-database": restoreDBScript, "restore-data": restoreDataScript} {
-		if strings.Contains(script, removePartials) {
-			t.Errorf("%s script must not delete files on the read-only backup volume", name)
-		}
+	if warnings != 1 {
+		t.Errorf("%d warnings for the same unresizable claim, want 1", warnings)
+	}
+	f.Spec.Backup.Storage.Size = resource.MustParse("60Gi") // a new request is reported right away
+	if _, err := GrowBackupPVC(ctx, c, f, warn); err != nil {
+		t.Fatal(err)
+	}
+	if warnings != 2 {
+		t.Errorf("a new size was not reported (%d warnings)", warnings)
 	}
 }
 
@@ -436,7 +599,7 @@ func TestServerPodsRunningCountsCronRunner(t *testing.T) {
 	cronOf := func(owner *forgejov1.Forgejo) *appsv1.StatefulSet {
 		s := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: forgejo.CronRunnerName(f), Namespace: f.Namespace},
 			Spec: appsv1.StatefulSetSpec{Replicas: ptr.To[int32](1)}}
-		if err := controllerutil.SetControllerReference(owner, s, testScheme(t)); err != nil {
+		if err := controllerutil.SetControllerReference(owner, s, FakeScheme(t)); err != nil {
 			t.Fatal(err)
 		}
 		return s
@@ -464,7 +627,7 @@ func TestServerPodsRunningCountsCronRunner(t *testing.T) {
 		{"not the instance's StatefulSet", []client.Object{foreign}, 0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(tt.objs...).Build()
+			c := fake.NewClientBuilder().WithScheme(FakeScheme(t)).WithObjects(tt.objs...).Build()
 			n, err := ServerPodsRunning(ctx, c, f)
 			if err != nil || n != tt.want {
 				t.Fatalf("ServerPodsRunning = %d, %v; want %d", n, err, tt.want)

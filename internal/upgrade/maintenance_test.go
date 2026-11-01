@@ -6,41 +6,27 @@ import (
 	"testing"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
+// maintenanceReason is what the maintenance step reports for a restore that is not an upgrade's.
+const maintenanceReason = "ForgejoRestore manual is restoring backup b"
+
 // reconcileInMaintenance reconciles f as the pipeline does while the maintenance step reports
 // a restore (rc.Maintenance).
 func reconcileInMaintenance(t *testing.T, c client.Client, f *forgejov1.Forgejo) *forgejo.ReconcileContext {
 	t.Helper()
 	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image,
-		Maintenance: true, MaintenanceReason: "ForgejoRestore manual is restoring backup b"}
+		Maintenance: true, MaintenanceReason: maintenanceReason}
 	if _, err := Reconcile(context.Background(), rc); err != nil {
 		t.Fatal(err)
 	}
 	return rc
-}
-
-// deployment is core's Deployment with one replica of image, available or not.
-func deployment(image string, available bool) *appsv1.Deployment {
-	d := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: "ns"},
-		Spec: appsv1.DeploymentSpec{Replicas: ptr.To[int32](1), Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: serverContainer, Image: image}}}}},
-		Status: appsv1.DeploymentStatus{Replicas: 1, UpdatedReplicas: 1},
-	}
-	if available {
-		d.Status.AvailableReplicas, d.Status.ReadyReplicas = 1, 1
-	}
-	return d
 }
 
 func replace(t *testing.T, c client.Client, obj client.Object) {
@@ -51,41 +37,6 @@ func replace(t *testing.T, c client.Client, obj client.Object) {
 	obj.SetResourceVersion("")
 	if err := c.Create(context.Background(), obj); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestSucceedsOnlyOnceDeploymentRolledOut(t *testing.T) {
-	f := fixture(&forgejov1.UpgradeStatus{
-		Phase: forgejov1.UpgradePhaseVerifying, FromImage: imgA, ToImage: imgB,
-		StartTime: ago(10 * time.Minute), RolloutStartTime: ago(5 * time.Minute),
-	})
-	f.Status.Image = imgB
-
-	// status.image alone is not enough: no Deployment yet.
-	_, c := reconcile(t, f)
-	if p := f.Status.Upgrade.Phase; p != forgejov1.UpgradePhaseVerifying {
-		t.Fatalf("without a Deployment: phase %s", p)
-	}
-	for _, d := range []*appsv1.Deployment{deployment(imgB, false), deployment(imgA, true)} {
-		replace(t, c, d)
-		if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseVerifying {
-			t.Fatalf("Deployment %s (available %d): phase %s", deploymentImage(d), d.Status.AvailableReplicas, f.Status.Upgrade.Phase)
-		}
-	}
-	stale := deployment(imgB, true)
-	stale.Generation, stale.Status.ObservedGeneration = 2, 1
-	replace(t, c, stale)
-	if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseVerifying {
-		t.Fatalf("unobserved generation: phase %s", f.Status.Upgrade.Phase)
-	}
-
-	// The rolled-out Deployment decides, also while status.image still names the old image
-	// (core had no pass to record it), and status.image follows.
-	replace(t, c, deployment(imgB, true))
-	f.Status.Image = imgA
-	rc := reconcileWith(t, c, c.Scheme(), f)
-	if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseSucceeded || rc.TargetImage != imgB || rc.Upgrading || f.Status.Image != imgB {
-		t.Fatalf("phase %s, target %s, upgrading %v, status.image %s", u.Phase, rc.TargetImage, rc.Upgrading, f.Status.Image)
 	}
 }
 
@@ -100,7 +51,7 @@ func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 		if u.Phase != forgejov1.UpgradePhasePending || rc.TargetImage != imgA || !rc.Upgrading || !strings.HasPrefix(u.Message, "Paused") {
 			t.Fatalf("phase %s, target %s, upgrading %v, message %q", u.Phase, rc.TargetImage, rc.Upgrading, u.Message)
 		}
-		if reconcileWith(t, c, c.Scheme(), f); u.Phase != forgejov1.UpgradePhaseBackingUp {
+		if reconcileWith(t, c, f); u.Phase != forgejov1.UpgradePhaseBackingUp {
 			t.Fatalf("after maintenance: phase %s", u.Phase)
 		}
 	})
@@ -114,7 +65,7 @@ func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 		if rc.ReplicasOverride == nil || *rc.ReplicasOverride != 0 || rc.TargetImage != imgA || backups(t, c) != 0 {
 			t.Fatalf("override %v, target %s, backups %d", rc.ReplicasOverride, rc.TargetImage, backups(t, c))
 		}
-		if reconcileWith(t, c, c.Scheme(), f); backups(t, c) != 1 || f.Status.Upgrade.Phase != forgejov1.UpgradePhaseBackingUp {
+		if reconcileWith(t, c, f); backups(t, c) != 1 || f.Status.Upgrade.Phase != forgejov1.UpgradePhaseBackingUp {
 			t.Fatalf("after maintenance: backups %d, phase %s", backups(t, c), f.Status.Upgrade.Phase)
 		}
 	})
@@ -123,9 +74,7 @@ func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 		f := fixture(&forgejov1.UpgradeStatus{
 			Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(16 * time.Minute),
 		})
-		stuck := serverPod(f, "stuck", imgA, ago(time.Hour), corev1.ContainerState{}, 0)
-		stuck.Status.Phase = corev1.PodRunning
-		reconcileInMaintenance(t, newClient(t, stuck), f)
+		reconcileInMaintenance(t, newClient(t, serverPodRunning(f, "stuck")), f)
 		if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseBackingUp || u.FailureReason != "" {
 			t.Fatalf("phase %s: %s", u.Phase, u.FailureReason)
 		}
@@ -144,7 +93,7 @@ func TestMaintenancePausesPendingAndBackingUp(t *testing.T) {
 		if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseBackingUp || u.RolloutStartTime != nil || rc.TargetImage != imgA {
 			t.Fatalf("phase %s, rolloutStartTime %v, target %s", u.Phase, u.RolloutStartTime, rc.TargetImage)
 		}
-		rc = reconcileWith(t, c, c.Scheme(), f)
+		rc = reconcileWith(t, c, f)
 		if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseRollingOut || u.RolloutStartTime == nil || rc.TargetImage != imgB {
 			t.Fatalf("after maintenance: phase %s, target %s", u.Phase, rc.TargetImage)
 		}
@@ -180,11 +129,11 @@ func TestMaintenancePausesRolloutTimeout(t *testing.T) {
 
 	// Maintenance has ended: the timeout counts from there.
 	u.RolloutStartTime = ago(time.Minute)
-	if reconcileWith(t, c, c.Scheme(), f); u.Phase != forgejov1.UpgradePhaseRollingOut || u.FailureReason != "" {
+	if reconcileWith(t, c, f); u.Phase != forgejov1.UpgradePhaseRollingOut || u.FailureReason != "" {
 		t.Fatalf("after maintenance: phase %s (%s)", u.Phase, u.FailureReason)
 	}
 	u.RolloutStartTime = ago(16 * time.Minute)
-	if reconcileWith(t, c, c.Scheme(), f); u.Phase != forgejov1.UpgradePhaseRollingBack {
+	if reconcileWith(t, c, f); u.Phase != forgejov1.UpgradePhaseRollingBack {
 		t.Fatalf("timeout after maintenance: phase %s", u.Phase)
 	}
 }
@@ -207,7 +156,7 @@ func TestMaintenancePausesRollback(t *testing.T) {
 			t.Fatalf("restores %d, phase %s", n, f.Status.Upgrade.Phase)
 		}
 		f.Status.Backup.ActiveRestore = ""
-		reconcileWith(t, c, c.Scheme(), f)
+		reconcileWith(t, c, f)
 		if n := restores(t, c); n != 1 {
 			t.Fatalf("after maintenance: restores %d", n)
 		}
@@ -217,17 +166,17 @@ func TestMaintenancePausesRollback(t *testing.T) {
 		f := rollingBack()
 		done := restore("rollback", forgejov1.RestorePhaseCompleted, ago(40*time.Minute))
 		done.Status.CompletionTime = ago(20 * time.Minute)
-		c := newClient(t, done, deployment(imgA, false))
+		c := newClient(t, done, deployment(imgA, 1, 0))
 		reconcileInMaintenance(t, c, f)
 		if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseRollingBack {
 			t.Fatalf("phase %s: %s", u.Phase, u.Message)
 		}
 		f.Status.Backup.ActiveRestore = ""
-		if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseRollingBack {
+		if reconcileWith(t, c, f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseRollingBack {
 			t.Fatalf("after maintenance: phase %s: %s", f.Status.Upgrade.Phase, f.Status.Upgrade.Message)
 		}
-		replace(t, c, deployment(imgA, true))
-		if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseRolledBack {
+		replace(t, c, deployment(imgA, 1, 1))
+		if reconcileWith(t, c, f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseRolledBack {
 			t.Fatalf("old image available: phase %s", f.Status.Upgrade.Phase)
 		}
 	})
@@ -261,40 +210,44 @@ func restores(t *testing.T, c client.Client) int {
 	return len(l.Items)
 }
 
-// An upgrade does not start while the Secret of SSH host keys the pods serve is unusable: the
-// new image's pods could not start, and the cold backup would stop Forgejo for nothing.
-func TestUpgradeWaitsForSSHHostKeys(t *testing.T) {
-	f := fixture(nil)
-	c := newClient(t)
-	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image,
-		SSHHostKeysUnavailable: true}
-	if _, err := Reconcile(context.Background(), rc); err != nil {
-		t.Fatal(err)
-	}
-	cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionUpgrading)
-	if f.Status.Upgrade != nil || rc.Upgrading || rc.TargetImage != imgA || cond == nil || cond.Reason != reasonWaitingForSSHHostKeys {
-		t.Fatalf("upgrade %+v, upgrading %v, target %s, condition %+v", f.Status.Upgrade, rc.Upgrading, rc.TargetImage, cond)
-	}
-	if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade == nil || !inFlight(f.Status.Upgrade.Phase) {
-		t.Fatalf("once the keys are back the upgrade starts: %+v", f.Status.Upgrade)
-	}
-}
-
-// An upgrade does not start while the bucket of spec.objectStorage is unusable: the new
-// version could not start, and its rollback would restore the database for nothing.
-func TestUpgradeWaitsForObjectStorage(t *testing.T) {
-	f := fixture(nil)
-	c := newClient(t)
-	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image,
-		ObjectStorageUnavailable: true}
-	if _, err := Reconcile(context.Background(), rc); err != nil {
-		t.Fatal(err)
-	}
-	cond := meta.FindStatusCondition(f.Status.Conditions, forgejov1.ConditionUpgrading)
-	if f.Status.Upgrade != nil || rc.Upgrading || rc.TargetImage != imgA || cond == nil || cond.Reason != "WaitingForObjectStorage" {
-		t.Fatalf("upgrade %+v, upgrading %v, target %s, condition %+v", f.Status.Upgrade, rc.Upgrading, rc.TargetImage, cond)
-	}
-	if reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade == nil || !inFlight(f.Status.Upgrade.Phase) {
-		t.Fatalf("once the bucket is usable the upgrade starts: %+v", f.Status.Upgrade)
+// An idle instance does not start an upgrade while something it needs is missing, and starts it
+// once that is back.
+func TestUpgradeWaits(t *testing.T) {
+	for _, tt := range []struct {
+		name, reason string
+		prepare      func(*forgejo.ReconcileContext)
+	}{
+		// Its pre-upgrade backup would back up an empty, recreated database, and its rollback
+		// restore would release the hold.
+		{"Broken", "WaitingForBroken", func(rc *forgejo.ReconcileContext) {
+			rc.SetBroken(forgejo.BrokenDatabaseRestorePending, "recreated")
+		}},
+		// One upgrade at a time.
+		{"PostgreSQL upgrade", "WaitingForDatabaseUpgrade", func(rc *forgejo.ReconcileContext) { rc.DatabaseUpgrading = true }},
+		{"restore", reasonWaitingForRestore, func(rc *forgejo.ReconcileContext) {
+			rc.Maintenance, rc.MaintenanceReason = true, maintenanceReason
+		}},
+		// The new image's pods could not start, and the cold backup would stop Forgejo for nothing.
+		{"SSH host keys", reasonWaitingForSSHHostKeys, func(rc *forgejo.ReconcileContext) { rc.SSHHostKeysUnavailable = true }},
+		// The new version could not start, and its rollback would restore the database for nothing.
+		{"object storage", "WaitingForObjectStorage", func(rc *forgejo.ReconcileContext) { rc.ObjectStorageUnavailable = true }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := fixture(nil) // spec.image imgB, running imgA
+			c := newClient(t)
+			rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image}
+			tt.prepare(rc)
+			if _, err := Reconcile(context.Background(), rc); err != nil {
+				t.Fatal(err)
+			}
+			cond := condition(f, forgejov1.ConditionUpgrading)
+			if f.Status.Upgrade != nil || rc.Upgrading || rc.TargetImage != imgA || cond == nil || cond.Reason != tt.reason {
+				t.Fatalf("upgrade %+v, upgrading %v, target %s, condition %+v", f.Status.Upgrade, rc.Upgrading, rc.TargetImage, cond)
+			}
+			meta.RemoveStatusCondition(&f.Status.Conditions, forgejov1.ConditionBroken) // the cause of "Broken" is repaired
+			if reconcileWith(t, c, f); f.Status.Upgrade == nil || !inFlight(f.Status.Upgrade.Phase) {
+				t.Fatalf("once it is back the upgrade starts: %+v", f.Status.Upgrade)
+			}
+		})
 	}
 }

@@ -35,8 +35,6 @@ const (
 	testExistingKeysSecret = "my-keys"
 )
 
-const hostKeysImage = "codeberg.org/forgejo/forgejo:15"
-
 func init() {
 	// RSA 3072 takes long to generate; the size does not matter for the tests.
 	rsaHostKeyBits = 2048
@@ -54,7 +52,7 @@ type hostKeysEnv struct {
 func newHostKeysEnv(t *testing.T, mutate func(f *forgejov1.Forgejo), objs ...client.Object) *hostKeysEnv {
 	t.Helper()
 	f := testInstance()
-	f.Spec.Image = hostKeysImage
+	f.Spec.Image = img15
 	f.UID = types.UID(t.Name())
 	if mutate != nil {
 		mutate(f)
@@ -67,7 +65,7 @@ func newHostKeysEnv(t *testing.T, mutate func(f *forgejov1.Forgejo), objs ...cli
 	rc.TargetImage = forgejo.Image(f)
 	rc.Layout = forgejo.LayoutForImage(rc.TargetImage)
 	rc.ConfigSecretName = forgejo.ConfigSecretName(f)
-	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: "fjdb", User: "fjuser", Password: "pw", SSLMode: testSSLModeDisable}
+	rc.DB = testDB()
 	return &hostKeysEnv{t: t, ctx: context.Background(), rc: rc, f: f}
 }
 
@@ -86,16 +84,7 @@ func (e *hostKeysEnv) pass() (*appsv1.Deployment, string) {
 	if _, err := ReconcileWorkload(e.ctx, e.rc); err != nil {
 		e.t.Fatalf("workload: %v", err)
 	}
-	return e.deployment(), e.appINI()
-}
-
-func (e *hostKeysEnv) deployment() *appsv1.Deployment {
-	e.t.Helper()
-	d := &appsv1.Deployment{}
-	if err := e.rc.Client.Get(e.ctx, types.NamespacedName{Namespace: e.f.Namespace, Name: forgejo.DeploymentName(e.f)}, d); err != nil {
-		e.t.Fatal(err)
-	}
-	return d
+	return getDeployment(e.t, e.rc), e.appINI()
 }
 
 func (e *hostKeysEnv) appINI() string {
@@ -223,12 +212,8 @@ func checkHostKeysPodLayout(t *testing.T, d *appsv1.Deployment, digest string) {
 		im[sshHostKeysCopyVolume].ReadOnly || im[sshHostKeysCopyVolume].MountPath != "/etc/forgejo-ssh" {
 		t.Fatalf("first init container %s mounts: %+v", init.Name, im)
 	}
-	env := map[string]string{}
-	for _, e := range init.Env {
-		env[e.Name] = e.Value
-	}
-	if env["SSH_HOST_KEYS_DIGEST"] != digest || d.Spec.Template.Annotations[forgejo.AnnotationSSHHostKeys] != digest {
-		t.Fatalf("digest: env %q, annotation %q, want %q", env["SSH_HOST_KEYS_DIGEST"], d.Spec.Template.Annotations[forgejo.AnnotationSSHHostKeys], digest)
+	if env := envOf(init)["SSH_HOST_KEYS_DIGEST"].Value; env != digest || d.Spec.Template.Annotations[forgejo.AnnotationSSHHostKeys] != digest {
+		t.Fatalf("digest: env %q, annotation %q, want %q", env, d.Spec.Template.Annotations[forgejo.AnnotationSSHHostKeys], digest)
 	}
 	if sc := init.SecurityContext; sc == nil || !ptr.Deref(sc.RunAsNonRoot, false) || !ptr.Deref(sc.ReadOnlyRootFilesystem, false) {
 		t.Fatalf("init container security context: %+v", sc)
@@ -259,14 +244,18 @@ func TestHostKeysSecretFollowsRetainPolicy(t *testing.T) {
 	}
 }
 
-// rsaKey is an RSA key, as other tools write them in PKCS#1 PEM.
-func rsaKey(t *testing.T) *rsa.PrivateKey {
+// ed25519HostKey is a new ed25519 key and its PEM, as the Secret of host keys holds it.
+func ed25519HostKey(t *testing.T) (ed25519.PrivateKey, []byte) {
 	t.Helper()
-	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return k
+	pemBytes, err := marshalHostKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key, pemBytes
 }
 
 // A Secret that outlived its Forgejo (retainPolicy Retain) or that the user created before the
@@ -290,11 +279,7 @@ func TestExistingHostKeysSecretIsReused(t *testing.T) {
 	checkGeneratedStatus(t, e.f)
 
 	// Created by the user (no source annotation): labelled, and reported as ExistingSecret.
-	_, ed, _ := ed25519.GenerateKey(rand.Reader)
-	pemBytes, err := marshalHostKey(ed)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ed, pemBytes := ed25519HostKey(t)
 	own := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSSHHostKeysSecret, Namespace: "ns"}, Data: map[string][]byte{HostKeyEd25519: pemBytes}}
 	e = newHostKeysEnv(t, nil, own)
 	e.pass()
@@ -414,11 +399,7 @@ func TestHostKeysScript(t *testing.T) {
 }
 
 func TestExistingSecretHostKeys(t *testing.T) {
-	_, ed, _ := ed25519.GenerateKey(rand.Reader)
-	pemBytes, err := marshalHostKey(ed)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ed, pemBytes := ed25519HostKey(t)
 	own := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testExistingKeysSecret, Namespace: "ns"}, Data: map[string][]byte{HostKeyEd25519: pemBytes, "other": []byte("x")}}
 	e := newHostKeysEnv(t, func(f *forgejov1.Forgejo) {
 		f.Spec.Server.SSH.HostKeys = &forgejov1.SSHHostKeysSpec{ExistingSecret: testExistingKeysSecret}
@@ -459,24 +440,39 @@ func TestExistingSecretHostKeys(t *testing.T) {
 	}
 }
 
+// With SSH disabled, or SSH_SERVER_HOST_KEYS in spec.config or configFrom, the user manages the
+// host keys: no Secret, no mount, no status.ssh, and app.ini keeps the user's value.
 func TestUnmanagedHostKeys(t *testing.T) {
-	for name, mutate := range map[string]func(f *forgejov1.Forgejo){
-		"ssh disabled": func(f *forgejov1.Forgejo) { f.Spec.Server.SSH.Enabled = ptr.To(false) },
-		"spec.config": func(f *forgejov1.Forgejo) {
+	userKeys := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "my-ssh", Namespace: "ns"},
+		Data: map[string][]byte{"paths": []byte("/data/ssh/key1,/data/ssh/key2")}}
+	for _, tc := range []struct {
+		name     string
+		mutate   func(f *forgejov1.Forgejo)
+		hostKeys string // [server] SSH_SERVER_HOST_KEYS, "" for none
+	}{
+		{"ssh disabled", func(f *forgejov1.Forgejo) { f.Spec.Server.SSH.Enabled = ptr.To(false) }, ""},
+		{"spec.config", func(f *forgejov1.Forgejo) {
 			f.Spec.Config = map[string]map[string]string{"SERVER": {"SSH_SERVER_HOST_KEYS": "/x"}}
-		},
+		}, "/x"},
+		{"configFrom", func(f *forgejov1.Forgejo) {
+			f.Spec.ConfigFrom = []forgejov1.ConfigValueFromSecret{{Section: "Server", Key: "SSH_SERVER_HOST_KEYS",
+				SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "my-ssh"}, Key: "paths"}}}
+		}, "/data/ssh/key1,/data/ssh/key2"},
 	} {
-		t.Run(name, func(t *testing.T) {
-			e := newHostKeysEnv(t, mutate)
+		t.Run(tc.name, func(t *testing.T) {
+			e := newHostKeysEnv(t, tc.mutate, userKeys.DeepCopy())
+			e.f.Status.SSH = &forgejov1.SSHStatus{HostKeysSecretName: "stale"}
 			d, ini := e.pass()
 			if _, err := e.secret(forgejo.SSHHostKeysSecretName(e.f)); !apierrors.IsNotFound(err) {
 				t.Fatal("no Secret for unmanaged host keys")
 			}
-			if mountsHostKeys(d) || e.f.Status.SSH != nil {
-				t.Fatal("unmanaged host keys must be left alone")
+			if mountsHostKeys(d) || e.f.Status.SSH != nil || e.rc.SSHHostKeys != nil {
+				t.Fatalf("unmanaged host keys must be left alone: status %+v", e.f.Status.SSH)
 			}
-			if strings.Contains(ini, "/etc/forgejo-ssh") {
-				t.Fatalf("app.ini:\n%s", ini)
+			if got := section(ini, "server"); strings.Contains(ini, "/etc/forgejo-ssh") ||
+				tc.hostKeys == "" && strings.Contains(got, "SSH_SERVER_HOST_KEYS") ||
+				tc.hostKeys != "" && !strings.Contains(got, "SSH_SERVER_HOST_KEYS = "+tc.hostKeys+"\n") {
+				t.Fatalf("app.ini, want SSH_SERVER_HOST_KEYS %q:\n%s", tc.hostKeys, ini)
 			}
 		})
 	}
@@ -505,8 +501,11 @@ func TestParseHostKeys(t *testing.T) {
 	if _, err := parseHostKeys(map[string][]byte{"unrelated": []byte("x")}); err == nil {
 		t.Fatal("no keys must be an error")
 	}
-	// PEM formats as written by other tools are accepted too.
-	rk := rsaKey(t)
+	// PEM formats as written by other tools are accepted too: an RSA key in PKCS#1.
+	rk, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pkcs1 := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rk)})
 	if keys, err := parseHostKeys(map[string][]byte{HostKeyRSA: pkcs1}); err != nil || ssh.FingerprintSHA256(keys[0].pub) != fingerprintOf(t, rk) {
 		t.Fatalf("PKCS#1: %v", err)
@@ -518,11 +517,7 @@ func TestParseHostKeys(t *testing.T) {
 // but never adopted: with retainPolicy Delete a controller reference would be refused
 // (AlreadyOwnedError) and block config and workload on every pass.
 func TestHostKeysSecretControlledByAnotherController(t *testing.T) {
-	_, ed, _ := ed25519.GenerateKey(rand.Reader)
-	pemBytes, err := marshalHostKey(ed)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ed, pemBytes := ed25519HostKey(t)
 	sealed := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: testSSHHostKeysSecret, Namespace: "ns",
 			Labels: map[string]string{"sealedsecrets.bitnami.com/managed": valueTrue},
@@ -552,27 +547,5 @@ func TestHostKeysSecretControlledByAnotherController(t *testing.T) {
 	e.pass()
 	if again, _ := e.secret(sealed.Name); again.ResourceVersion != before.ResourceVersion {
 		t.Fatal("the Secret was changed on the second pass")
-	}
-}
-
-// SSH_SERVER_HOST_KEYS from configFrom means the user manages the host keys, as in
-// spec.config: no Secret, no mount, no status.ssh, and app.ini keeps the user's value.
-func TestHostKeysOverriddenThroughConfigFrom(t *testing.T) {
-	userKeys := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "my-ssh", Namespace: "ns"},
-		Data: map[string][]byte{"paths": []byte("/data/ssh/key1,/data/ssh/key2")}}
-	e := newHostKeysEnv(t, func(f *forgejov1.Forgejo) {
-		f.Spec.ConfigFrom = []forgejov1.ConfigValueFromSecret{{Section: "Server", Key: "SSH_SERVER_HOST_KEYS",
-			SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "my-ssh"}, Key: "paths"}}}
-	}, userKeys)
-	e.f.Status.SSH = &forgejov1.SSHStatus{HostKeysSecretName: "stale"}
-	d, ini := e.pass()
-	if _, err := e.secret(forgejo.SSHHostKeysSecretName(e.f)); !apierrors.IsNotFound(err) {
-		t.Fatal("generated host keys although configFrom sets SSH_SERVER_HOST_KEYS")
-	}
-	if mountsHostKeys(d) || e.f.Status.SSH != nil || e.rc.SSHHostKeys != nil {
-		t.Fatalf("unmanaged host keys must be left alone: status %+v", e.f.Status.SSH)
-	}
-	if !strings.Contains(section(ini, "server"), "SSH_SERVER_HOST_KEYS = /data/ssh/key1,/data/ssh/key2\n") {
-		t.Fatalf("app.ini lost the configFrom value:\n%s", ini)
 	}
 }

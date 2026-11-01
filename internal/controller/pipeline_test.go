@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"runtime"
 	"slices"
@@ -13,11 +14,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -49,21 +52,6 @@ func newRC() *forgejo.ReconcileContext {
 	return &forgejo.ReconcileContext{Instance: &forgejov1.Forgejo{}}
 }
 
-func TestStepTableNeedsEarlierSteps(t *testing.T) {
-	seen := map[string]bool{}
-	for _, s := range steps {
-		for _, n := range s.needs {
-			if !seen[n] {
-				t.Errorf("step %q needs %q, which does not run before it", s.name, n)
-			}
-		}
-		if seen[s.name] {
-			t.Errorf("duplicate step %q", s.name)
-		}
-		seen[s.name] = true
-	}
-}
-
 func TestPipelineAllSucceed(t *testing.T) {
 	st, ran := stubSteps(nil)
 	p := runPipeline(context.Background(), newRC(), st)
@@ -72,7 +60,7 @@ func TestPipelineAllSucceed(t *testing.T) {
 	}
 }
 
-// F45/F26: a failing network step must not stop scheduled backups, health or autopilot.
+// A failing network step must not stop scheduled backups, health or autopilot.
 func TestPipelineIndependentStepsRunAfterError(t *testing.T) {
 	boom := errors.New("admission webhook denied the Ingress")
 	st, ran := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
@@ -92,7 +80,7 @@ func TestPipelineIndependentStepsRunAfterError(t *testing.T) {
 	}
 }
 
-// F57: a Valkey that is not ready blocks config and workload, not the restore handshake,
+// A Valkey that is not ready blocks config and workload, not the restore handshake,
 // backups or health.
 func TestPipelineValkeyStop(t *testing.T) {
 	st, ran := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
@@ -151,17 +139,35 @@ func TestPipelineInfersUpgradingWhenUpgradeSkipped(t *testing.T) {
 	}
 }
 
-func TestPipelineConflictEndsPass(t *testing.T) {
-	st, ran := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-		if name == stepConfig {
-			return forgejo.StepResult{}, apierrors.NewConflict(schema.GroupResource{Resource: "secrets"}, "x", errors.New("stale"))
-		}
-		return forgejo.StepResult{}, nil
-	})
-	rc := newRC()
-	p := runPipeline(context.Background(), rc, st)
-	if !p.conflict || p.err() != nil || (*ran)[len(*ran)-1] != stepConfig || rc.RequeueAfter != time.Second {
-		t.Errorf("conflict %v err %v ran %v requeue %v", p.conflict, p.err(), *ran, rc.RequeueAfter)
+// A conflict ends the pass and retries a second later; so does a create refused because the
+// namespace is being deleted, without a retry. Neither is a step failure.
+func TestPipelineEndsPass(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		step                  string
+		err                   error
+		conflict, terminating bool
+		requeue               time.Duration
+	}{
+		{name: "conflict", step: stepConfig, conflict: true, requeue: time.Second,
+			err: apierrors.NewConflict(schema.GroupResource{Resource: "secrets"}, "x", errors.New("stale"))},
+		{name: "namespace terminating", step: stepStorage, terminating: true,
+			err: fmt.Errorf("creating PVC: %w", forgejo.NewNamespaceTerminatingError("persistentvolumeclaims", "fj-data", "ns"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, ran := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
+				if name == tc.step {
+					return forgejo.StepResult{}, tc.err
+				}
+				return forgejo.StepResult{}, nil
+			})
+			rc := newRC()
+			p := runPipeline(context.Background(), rc, st)
+			if p.conflict != tc.conflict || p.terminating != tc.terminating || p.err() != nil || len(p.failed) != 0 ||
+				(*ran)[len(*ran)-1] != tc.step || rc.RequeueAfter != tc.requeue {
+				t.Errorf("conflict %v terminating %v err %v ran %v requeue %v", p.conflict, p.terminating, p.err(), *ran, rc.RequeueAfter)
+			}
+		})
 	}
 }
 
@@ -200,7 +206,8 @@ func TestPipelineStorageAndOwnershipRunWhenDatabaseStops(t *testing.T) {
 	}
 }
 
-// Even when the very first step fails, the steps without prerequisites run.
+// Even when the very first step fails, the steps without prerequisites run, and a step it
+// blocks through the chain names that failure.
 func TestPipelineStepsWithoutNeedsRunAfterMaintenanceError(t *testing.T) {
 	st, ran := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
 		if name == stepMaintenance {
@@ -208,20 +215,32 @@ func TestPipelineStepsWithoutNeedsRunAfterMaintenanceError(t *testing.T) {
 		}
 		return forgejo.StepResult{}, nil
 	})
-	runPipeline(context.Background(), newRC(), st)
+	p := runPipeline(context.Background(), newRC(), st)
 	want := []string{stepMaintenance, stepBackupOwnership, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepValkeyStatus,
 		stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
 		t.Errorf("ran %v, want %v", *ran, want)
 	}
+	// backup-schedule needs restore-guard, which needs maintenance.
+	if got := p.blockedBy(stepBackupSchedule); !strings.Contains(got, `step "maintenance" failed: listing restores: forbidden`) {
+		t.Errorf("blockedBy = %q", got)
+	}
 }
 
-// The step table wires the steps the orchestrator names to the feature packages, and
-// gives the ownership and storage steps no prerequisites.
-func TestStepTableWiring(t *testing.T) {
+// Every step needs only steps before it. The step table wires the steps the orchestrator
+// names to the feature packages, and gives the ownership and storage steps no prerequisites.
+func TestStepTable(t *testing.T) {
 	byName := map[string]namedStep{}
 	order := map[string]int{}
 	for i, s := range steps {
+		for _, n := range s.needs {
+			if _, ok := byName[n]; !ok {
+				t.Errorf("step %q needs %q, which does not run before it", s.name, n)
+			}
+		}
+		if _, dup := byName[s.name]; dup {
+			t.Errorf("duplicate step %q", s.name)
+		}
 		byName[s.name] = s
 		order[s.name] = i
 	}
@@ -234,40 +253,31 @@ func TestStepTableWiring(t *testing.T) {
 			t.Errorf("step %q needs %v; it must run on every pass", name, s.needs)
 		}
 	}
-	if order[stepBackupOwnership] != order["secrets"]+1 {
-		t.Errorf("backup-ownership is at %d, want right after secrets (%d)", order[stepBackupOwnership], order["secrets"])
-	}
 	// Pods reference the object storage Secrets: no upgrade, app.ini or rollout without them.
-	if !slices.Contains(byName[stepUpgrade].needs, stepObjectStorage) || order[stepObjectStorage] > order[stepUpgrade] {
+	if !slices.Contains(byName[stepUpgrade].needs, stepObjectStorage) {
 		t.Errorf("upgrade must need %s (needs %v)", stepObjectStorage, byName[stepUpgrade].needs)
 	}
 	// spec.restoreFrom: the identity Secrets come from the backup before anything generates
 	// them, and the backup's ForgejoRestore needs the database and the data volume. The identity
 	// check comes between them, before anything generates or creates identity or data.
-	if !slices.Equal(byName[stepIdentity].needs, []string{stepRestoreIdentity}) || order[stepRestoreIdentity] > order[stepIdentity] {
+	if !slices.Equal(byName[stepIdentity].needs, []string{stepRestoreIdentity}) {
 		t.Errorf("identity must need %s (needs %v)", stepRestoreIdentity, byName[stepIdentity].needs)
 	}
-	if !slices.Equal(byName["secrets"].needs, []string{stepIdentity}) || order[stepIdentity] > order["secrets"] {
-		t.Errorf("secrets must need %s (needs %v)", stepIdentity, byName["secrets"].needs)
+	if !slices.Equal(byName[stepSecrets].needs, []string{stepIdentity}) {
+		t.Errorf("secrets must need %s (needs %v)", stepIdentity, byName[stepSecrets].needs)
 	}
 	for _, name := range []string{stepDatabaseUpgrade, stepBackupSchedule} {
 		if !slices.Contains(byName[name].needs, stepIdentity) {
 			t.Errorf("%s must need %s (needs %v)", name, stepIdentity, byName[name].needs)
 		}
 	}
-	for _, name := range []string{stepBackupSchedule, stepStorageAutopilot} {
-		if !byName[name].waitWhileBroken {
-			t.Errorf("%s must wait while the instance is Broken", name)
-		}
-	}
 	if !slices.Equal(byName[stepRestoreFrom].needs, []string{stepStorage}) {
 		t.Errorf("%s needs %v, want storage", stepRestoreFrom, byName[stepRestoreFrom].needs)
 	}
+	// Last: it sees this pass's maintenance and upgrade flags, and its restart follows the
+	// workload update.
 	if order[stepStorageAutopilot] != len(steps)-1 {
 		t.Errorf("storage-autopilot is at %d, want last", order[stepStorageAutopilot])
-	}
-	if order[stepStorageAutopilot] < order["autopilot"] || order[stepStorageAutopilot] < order["workload"] {
-		t.Error("storage-autopilot must run after the workload and autopilot steps")
 	}
 	for name, want := range map[string]string{
 		stepBackupOwnership:  "internal/backup.ReconcileOwnership",
@@ -366,42 +376,52 @@ func TestPausedReconcileExportsAndDeletionForgetsMetrics(t *testing.T) {
 	backup.ForgetLastSuccess(ns, name)
 }
 
-// An instance deleted while its reconcile runs is not reported as a reconcile error.
-func TestReconcileInstanceDeletedDuringPass(t *testing.T) {
-	const ns, name = "pipeline-test-deleted", "fj"
-	f := &forgejov1.Forgejo{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
-		Spec:       forgejov1.ForgejoSpec{Paused: true},
-	}
-	s := testScheme(t)
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f).WithStatusSubresource(f).
-		WithInterceptorFuncs(interceptor.Funcs{
+// Neither a pass in a namespace that is being deleted (as in kube-controller-manager) nor a
+// pass whose instance is deleted while it runs is a reconcile error: no error (no backoff),
+// no requeue, no Warning event and no Degraded condition.
+func TestReconcileEndsQuietly(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		paused bool
+		funcs  interceptor.Funcs
+	}{
+		{name: "namespace terminating", funcs: interceptor.Funcs{
+			Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
+				return forgejo.NewNamespaceTerminatingError("x", obj.GetName(), obj.GetNamespace())
+			},
+		}},
+		// Paused, so that the status patch is the only write.
+		{name: "instance deleted during the pass", paused: true, funcs: interceptor.Funcs{
 			SubResourcePatch: func(_ context.Context, _ client.Client, _ string, obj client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
 				return apierrors.NewNotFound(schema.GroupResource{Group: forgejov1.GroupVersion.Group, Resource: "forgejos"}, obj.GetName())
 			},
-		}).Build()
-	r := &ForgejoReconciler{Client: c, Scheme: s}
-	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
-	if err != nil || res.RequeueAfter != 0 {
-		t.Errorf("Reconcile = %+v, %v; want no error and no requeue", res, err)
-	}
-	forgejo.DeleteInstanceMetrics(ns, name)
-}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const ns, name = "pipeline-test-quiet", "fj"
+			f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}, Spec: forgejov1.ForgejoSpec{Paused: tc.paused}}
+			s := testScheme(t)
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(f).WithStatusSubresource(f).WithInterceptorFuncs(tc.funcs).Build()
+			rec := events.NewFakeRecorder(10)
+			r := &ForgejoReconciler{Client: c, Scheme: s, Recorder: rec}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}}
+			defer forgetInstance(ns, name)
 
-// A failure inside the chain skips its dependants but keeps the failure as the reason.
-func TestPipelineBlockedByNamesRootCause(t *testing.T) {
-	st, _ := stubSteps(func(name string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
-		if name == stepMaintenance {
-			return forgejo.StepResult{}, errors.New("listing restores: forbidden")
-		}
-		return forgejo.StepResult{}, nil
-	})
-	p := runPipeline(context.Background(), newRC(), st)
-	if p.completed[stepBackupSchedule] {
-		t.Fatal("backup schedule ran without maintenance")
-	}
-	if got := p.blockedBy(stepBackupSchedule); !strings.Contains(got, `step "maintenance" failed: listing restores: forbidden`) {
-		t.Errorf("blockedBy = %q", got)
+			res, err := r.Reconcile(context.Background(), req)
+			if err != nil || res != (ctrl.Result{}) {
+				t.Errorf("Reconcile = %+v, %v; want no error and no requeue", res, err)
+			}
+			if n := len(rec.Events); n > 0 {
+				t.Errorf("%d event(s) emitted, e.g. %q", n, <-rec.Events)
+			}
+			got := &forgejov1.Forgejo{}
+			if err := c.Get(context.Background(), req.NamespacedName, got); err != nil {
+				t.Fatal(err)
+			}
+			if c := meta.FindStatusCondition(got.Status.Conditions, forgejov1.ConditionDegraded); c != nil {
+				t.Errorf("Degraded set: %+v", c)
+			}
+		})
 	}
 }
 

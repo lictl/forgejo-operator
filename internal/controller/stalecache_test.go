@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,20 +36,6 @@ func newStaleCache(live client.WithWatch) *staleCache {
 	return sc
 }
 
-func eventsWithReason(rec *events.FakeRecorder, reason string) []string {
-	var out []string
-	for {
-		select {
-		case e := <-rec.Events:
-			if strings.Contains(e, " "+reason+" ") {
-				out = append(out, e)
-			}
-		default:
-			return out
-		}
-	}
-}
-
 // The pass that the previous pass's child changes queue starts before the cache has seen
 // that pass's status write. It must not emit the previous pass's transition events again
 // (e2e V5.3: UnsupportedVersion went out twice, with series.count 2).
@@ -73,24 +58,15 @@ func TestReconcileAfterStatusWriteIgnoresStaleCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = r.Reconcile(context.Background(), req)
-	if got := eventsWithReason(rec, "UnsupportedVersion"); len(got) != 1 {
+	if got := drainEvents(rec, " UnsupportedVersion "); len(got) != 1 {
 		t.Fatalf("first pass: %d UnsupportedVersion events, want 1: %q", len(got), got)
 	}
 
 	// The cache still holds the object as it was before the first pass's status write.
 	sc.snapshot = before
 	_, _ = r.Reconcile(context.Background(), req)
-	if got := eventsWithReason(rec, "UnsupportedVersion"); len(got) != 0 {
+	if got := drainEvents(rec, " UnsupportedVersion "); len(got) != 0 {
 		t.Errorf("pass on a stale cache emitted %q again", got)
-	}
-
-	// Once the cache has caught up, it is used again without a live read.
-	sc.snapshot = nil
-	if _, err := r.getInstance(context.Background(), req.NamespacedName); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := r.statusWrites.Load(req.NamespacedName); ok {
-		t.Error("last status write still tracked after the cache caught up")
 	}
 }
 

@@ -1,22 +1,28 @@
 package backup_test
 
-// Restores that would lose data or identity are refused before anything is changed, and an
-// in-place restore backs up what it replaces first. Driven through the real reconcilers
+// Restores that would lose data or identity are refused before anything is changed, a restore
+// waits while it could leave Forgejo unable to start again or another restore may still write,
+// and an in-place restore backs up what it replaces first. Driven through the real reconcilers
 // against fake clients.
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/backup"
@@ -32,144 +38,227 @@ const (
 	testProdPath = "prod/old/b1"
 )
 
-// fbSecrets is the identity Secret of instance "fb".
-func fbSecrets() *corev1.Secret {
-	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsName, Namespace: ns},
-		Data: map[string][]byte{"secret-key": []byte("sk")}}
-}
-
-// restoreOf is a restore of backup b1 that has not started, the database too.
-func restoreOf(name string) *forgejov1.ForgejoRestore {
-	rs := newRestore(name, "")
-	rs.UID = types.UID("3f2a9c1e-0000-4000-8000-" + strings.Repeat("0", 12-len(name)) + name)
+// unstartedRestore is restore r1 of backup b1 that has not started, the database too.
+func unstartedRestore() *forgejov1.ForgejoRestore {
+	rs := newRestore("r1", "")
+	rs.UID = "3f2a9c1e-0000-4000-8000-0000000000r1"
 	rs.Spec.BackupName = "b1"
 	rs.Spec.RestoreDatabase = nil
 	rs.Status.StartTime = nil
 	return rs
 }
 
-// restoreOutcome reconciles a restore that has not started (finalizer, then validation) and
-// returns its phase and the reason of its Ready condition.
+// restoreOutcome reconciles a restore that has not started (finalizer, then validation) in a
+// fake client holding copies of objs, and returns it and the reason of its Ready condition.
 func restoreOutcome(t *testing.T, objs ...client.Object) (*forgejov1.ForgejoRestore, string) {
 	t.Helper()
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	var name string
+	copies := make([]client.Object, 0, len(objs))
 	for _, o := range objs {
 		if rs, ok := o.(*forgejov1.ForgejoRestore); ok {
 			name = rs.Name
 		}
+		copies = append(copies, o.DeepCopyObject().(client.Object))
 	}
-	got := reconcileRestore(t, newFakeClient(s, objs...), s, name, 2)
+	got := reconcileRestore(t, newFakeClient(s, copies...), s, name, 2)
 	return got, reason(got.Status.Conditions)
 }
 
-// The database of a backup taken with another SECRET_KEY is not restored unless the restore
-// allows it: its two-factor secrets, Actions secrets and mirror credentials would not decrypt.
-// A backup that records no fingerprint, and a data-only restore, are not checked.
-func TestRestoreRefusesAnotherIdentity(t *testing.T) {
+// A restore that would lose data or identity fails before maintenance mode starts:
+//   - the database of a backup taken with another SECRET_KEY, unless the restore allows it: its
+//     two-factor secrets, Actions secrets and mirror credentials would not decrypt. A backup
+//     that records no fingerprint, and a data-only restore, are not checked. A remote backup's
+//     manifest records the fingerprint; the message points at spec.restoreFrom, which recreates
+//     that instance with its identity;
+//   - the database of a backup of a newer Forgejo: the deployed version would not start on it.
+//     The message says to upgrade first. The data volume alone does not depend on the version;
+//   - a dump of a newer PostgreSQL major than the server's;
+//   - a data archive larger than the data volume, which cannot be extracted onto it: the
+//     restore fails before it empties the volume.
+func TestRestoreRefusesToLoseDataOrIdentity(t *testing.T) {
 	foreign := completedBackup("b1")
 	foreign.Status.SecretKeyFingerprint = otherIdentity
-
-	got, why := restoreOutcome(t, instance(""), fbSecrets(), foreign, restoreOf("r1"))
-	if got.Status.Phase != forgejov1.RestorePhaseFailed || why != "IdentityMismatch" ||
-		!strings.Contains(got.Status.Message, "allowIdentityMismatch") || !strings.Contains(got.Status.Message, otherIdentity) {
-		t.Fatalf("foreign identity: %s/%s (%s)", got.Status.Phase, why, got.Status.Message)
-	}
-	if got.Status.StartTime != nil {
-		t.Errorf("maintenance started for a refused restore")
-	}
-
-	allowed := restoreOf("r2")
-	allowed.Spec.AllowIdentityMismatch = true
-	dataOnly := restoreOf("r3")
-	dataOnly.Spec.RestoreDatabase = ptr.To(false)
 	own := completedBackup("b1")
 	own.Status.SecretKeyFingerprint = forgejo.SecretKeyFingerprint(fbSecrets().Data)
-	for _, tc := range []struct {
-		name   string
-		backup *forgejov1.ForgejoBackup
-		rs     *forgejov1.ForgejoRestore
-	}{
-		{"allowed", foreign, allowed},
-		{"data only", foreign, dataOnly},
-		{"same identity", own, restoreOf("r4")},
-		{"not recorded", completedBackup("b1"), restoreOf("r5")},
-	} {
-		if got, why := restoreOutcome(t, instance(""), fbSecrets(), tc.backup.DeepCopy(), tc.rs); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
-			t.Errorf("%s: %s/%s (%s), want ScalingDown", tc.name, got.Status.Phase, why, got.Status.Message)
-		}
-	}
-}
+	newer := completedBackup("b1")
+	newer.Status.ForgejoImage = testImageNewer
+	upgraded := instance("")
+	upgraded.Status.Image = testImageNewer
+	pg17 := instance("")
+	pg17.Status.Database = &forgejov1.DatabaseStatus{Type: forgejov1.DatabaseTypeCNPG, Image: testPG17, MajorVersion: 17}
+	pg18Dump := completedBackup("b1")
+	pg18Dump.Status.PostgresImage = testPG18
+	dataPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "fb-data", Namespace: ns}}
+	dataPVC.Spec.Resources.Requests = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("4Gi")}
+	dataPVC.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}
+	big := completedBackup("b1")
+	big.Status.DataSizeBytes = 2 << 30
+	fits := completedBackup("b1")
+	fits.Status.DataSizeBytes = 512 << 20
+	allowed := unstartedRestore()
+	allowed.Spec.AllowIdentityMismatch = true
+	dataOnly := unstartedRestore()
+	dataOnly.Spec.RestoreDatabase = ptr.To(false)
+	dbOnly := unstartedRestore()
+	dbOnly.Spec.RestoreData = ptr.To(false)
 
-// The same holds for a remote backup, whose manifest records the fingerprint; the message
-// points at spec.restoreFrom, which recreates that instance with its identity.
-func TestRemoteRestoreRefusesAnotherIdentity(t *testing.T) {
-	store, _, objs := remoteFixture(t)
+	store, _, remote := remoteFixture(t)
 	store.PutBackup(t, "team/", testProdPath, backup.RemoteManifest{Backup: "b1", Namespace: "prod", Forgejo: "old",
 		Reason: forgejov1.BackupReasonManual, ForgejoImage: testImage16, SecretKeyFingerprint: otherIdentity},
 		map[string][]byte{backup.DBDumpFile: []byte("PGDMP"), backup.IdentityFile: backup.FakeIdentity(t, "x")}, time.Now())
-	rs := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: ns, UID: "r1-uid"}}
-	rs.Spec.ForgejoRef.Name = "fb"
-	rs.Spec.Remote = &forgejov1.RemoteBackupSource{S3: store.FakeConnection("team"), Path: testProdPath}
+	fromRemote := &forgejov1.ForgejoRestore{ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: ns, UID: "r1-uid"}}
+	fromRemote.Spec.ForgejoRef.Name = "fb"
+	fromRemote.Spec.Remote = &forgejov1.RemoteBackupSource{S3: store.FakeConnection("team"), Path: testProdPath}
+	fromRemoteAllowed := fromRemote.DeepCopy()
+	fromRemoteAllowed.Spec.AllowIdentityMismatch = true
 
-	got, why := restoreOutcome(t, append(objs, rs)...)
-	if got.Status.Phase != forgejov1.RestorePhaseFailed || why != "IdentityMismatch" ||
-		!strings.Contains(got.Status.Message, "prod/old") || !strings.Contains(got.Status.Message, "spec.restoreFrom") {
-		t.Fatalf("%s/%s (%s)", got.Status.Phase, why, got.Status.Message)
-	}
-	rs.Spec.AllowIdentityMismatch = true
-	if got, why := restoreOutcome(t, append(objs, rs)...); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
-		t.Errorf("allowed: %s/%s (%s)", got.Status.Phase, why, got.Status.Message)
+	for _, tc := range []struct {
+		name   string
+		objs   []client.Object
+		reason string   // "" when the restore goes ahead
+		msg    []string // in the message of a refusal
+	}{
+		{name: "another identity", objs: []client.Object{instance(""), fbSecrets(), foreign, unstartedRestore()},
+			reason: "IdentityMismatch", msg: []string{"allowIdentityMismatch", otherIdentity}},
+		{name: "another identity, allowed", objs: []client.Object{instance(""), fbSecrets(), foreign, allowed}},
+		{name: "another identity, data only", objs: []client.Object{instance(""), fbSecrets(), foreign, dataOnly}},
+		{name: "same identity", objs: []client.Object{instance(""), fbSecrets(), own, unstartedRestore()}},
+		{name: "identity not recorded", objs: []client.Object{instance(""), fbSecrets(), completedBackup("b1"), unstartedRestore()}},
+		{name: "remote backup of another identity", objs: append(slices.Clip(remote), fromRemote),
+			reason: "IdentityMismatch", msg: []string{"prod/old", "spec.restoreFrom"}},
+		{name: "remote backup of another identity, allowed", objs: append(slices.Clip(remote), fromRemoteAllowed)},
+		{name: "newer Forgejo", objs: []client.Object{instance(""), newer, unstartedRestore()},
+			reason: "NewerBackup", msg: []string{"set spec.image of Forgejo fb to " + testImageNewer}},
+		{name: "newer Forgejo, data only", objs: []client.Object{instance(""), newer, dataOnly}},
+		{name: "newer Forgejo, instance upgraded", objs: []client.Object{upgraded, newer, unstartedRestore()}},
+		{name: "dump of a newer PostgreSQL", objs: []client.Object{pg17, pg18Dump, unstartedRestore()}, reason: "NewerDump"},
+		{name: "archive larger than the data volume", objs: []client.Object{instance(""), dataPVC, big, unstartedRestore()},
+			reason: "DataVolumeTooSmall", msg: []string{"1Gi"}},
+		{name: "larger archive, database only", objs: []client.Object{instance(""), dataPVC, big, dbOnly}},
+		{name: "archive fits", objs: []client.Object{instance(""), dataPVC, fits, unstartedRestore()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, why := restoreOutcome(t, tc.objs...)
+			if tc.reason == "" {
+				if got.Status.Phase != forgejov1.RestorePhaseScalingDown {
+					t.Fatalf("%s/%s (%s), want ScalingDown", got.Status.Phase, why, got.Status.Message)
+				}
+				return
+			}
+			if got.Status.Phase != forgejov1.RestorePhaseFailed || why != tc.reason {
+				t.Fatalf("%s/%s (%s), want Failed/%s", got.Status.Phase, why, got.Status.Message, tc.reason)
+			}
+			for _, want := range tc.msg {
+				if !strings.Contains(got.Status.Message, want) {
+					t.Errorf("message %q lacks %q", got.Status.Message, want)
+				}
+			}
+			if got.Status.StartTime != nil {
+				t.Errorf("maintenance started for a refused restore")
+			}
+		})
 	}
 }
 
-// The database of a backup of a newer Forgejo is not restored: the deployed version would not
-// start on it. The message says to upgrade first.
-func TestRestoreRefusesABackupOfANewerForgejo(t *testing.T) {
-	newer := completedBackup("b1")
-	newer.Status.ForgejoImage = testImageNewer
-	got, why := restoreOutcome(t, instance(""), newer, restoreOf("r1"))
-	if got.Status.Phase != forgejov1.RestorePhaseFailed || why != "NewerBackup" ||
-		!strings.Contains(got.Status.Message, "set spec.image of Forgejo fb to "+testImageNewer) {
-		t.Fatalf("%s/%s (%s)", got.Status.Phase, why, got.Status.Message)
+// A restore waits while a PostgreSQL major upgrade runs, and does not scale Forgejo down while
+// a Secret its pods need is missing or unusable (the SSH host keys, those of
+// spec.objectStorage): the Forgejo pipeline stops before the workload step then (no
+// scale-down), and Forgejo could not start again afterwards. It waits as Pending, which is no
+// maintenance. An unreachable bucket does not hold it.
+func TestRestoreWaitsBeforeScalingDown(t *testing.T) {
+	s := backup.FakeScheme(t)
+	storageReady := func(f *forgejov1.Forgejo, reason, msg string) {
+		meta.SetStatusCondition(&f.Status.Conditions, metav1.Condition{Type: forgejov1.ConditionObjectStorageReady,
+			Status: metav1.ConditionFalse, Reason: reason, Message: msg})
 	}
-	// The data volume alone does not depend on the version.
-	dataOnly := restoreOf("r2")
-	dataOnly.Spec.RestoreDatabase = ptr.To(false)
-	if got, why := restoreOutcome(t, instance(""), newer, dataOnly); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
-		t.Errorf("data only: %s/%s (%s)", got.Status.Phase, why, got.Status.Message)
-	}
-	// Once the instance runs the backup's version, it is restored.
-	upgraded := instance("")
-	upgraded.Status.Image = testImageNewer
-	if got, why := restoreOutcome(t, upgraded, newer, restoreOf("r3")); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
-		t.Errorf("upgraded: %s/%s (%s)", got.Status.Phase, why, got.Status.Message)
+	for _, tc := range []struct {
+		name     string
+		instance func() *forgejov1.Forgejo
+		release  func(*forgejov1.Forgejo)
+		want     string
+	}{{
+		name:     "PostgreSQL major upgrade",
+		instance: func() *forgejov1.Forgejo { return upgradingInstance(forgejov1.DatabaseUpgradeUpgrading) },
+		release:  func(f *forgejov1.Forgejo) { f.Status.Database.Upgrade.Phase = forgejov1.DatabaseUpgradeSucceeded },
+		want:     "Waiting for the PostgreSQL major upgrade to " + testPG18 + " to finish (phase Upgrading)",
+	}, {
+		name: "SSH host keys",
+		instance: func() *forgejov1.Forgejo {
+			f := instance("")
+			f.Status.SSH = &forgejov1.SSHStatus{HostKeysSecretName: "fb-ssh-host-keys", Message: "Secret fb-ssh-host-keys with the SSH host keys the pods serve is missing"}
+			return f
+		},
+		release: func(f *forgejov1.Forgejo) { f.Status.SSH.Message = "" },
+		want:    "Waiting for the SSH host keys: Secret fb-ssh-host-keys with the SSH host keys the pods serve is missing",
+	}, {
+		name: "object storage Secrets",
+		instance: func() *forgejov1.Forgejo {
+			f := instance("")
+			f.Spec.ObjectStorage = &forgejov1.ObjectStorageSpec{}
+			storageReady(f, "CredentialsUnavailable", `secret "s3" not found`)
+			return f
+		},
+		release: func(f *forgejov1.Forgejo) { storageReady(f, "UnreachableFromOperator", "dial tcp: i/o timeout") },
+		want:    `Waiting for spec.objectStorage: secret "s3" not found`,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := newRestore("r1", "")
+			rs.Finalizers = []string{forgejo.FinalizerName}
+			rs.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
+			rs.Spec.BackupName = "b1"
+			f := tc.instance()
+			c := newFakeClient(s, f, completedBackup("b1"), rs)
+
+			got := reconcileRestore(t, c, s, rs.Name, 1)
+			if got.Status.Phase != forgejov1.RestorePhasePending || got.Status.Message != tc.want {
+				t.Fatalf("phase %s (%s), want Pending: %s", got.Status.Phase, got.Status.Message, tc.want)
+			}
+			if active, _ := backup.MaintenanceRestore([]forgejov1.ForgejoRestore{*got}); active != nil {
+				t.Fatal("a waiting restore puts the instance into maintenance")
+			}
+			tc.release(f)
+			if err := c.Update(context.Background(), f); err != nil {
+				t.Fatal(err)
+			}
+			if got = reconcileRestore(t, c, s, rs.Name, 1); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
+				t.Fatalf("phase %s (%s), want ScalingDown once released", got.Status.Phase, got.Status.Message)
+			}
+		})
 	}
 }
 
-// A data archive larger than the data volume cannot be extracted onto it; the restore fails
-// before it empties the volume.
-func TestRestoreRefusesADataArchiveLargerThanTheVolume(t *testing.T) {
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "fb-data", Namespace: ns}}
-	pvc.Spec.Resources.Requests = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("4Gi")}
-	pvc.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}
-	big := completedBackup("b1")
-	big.Status.DataSizeBytes = 2 << 30
-	got, why := restoreOutcome(t, instance(""), pvc, big, restoreOf("r1"))
-	if got.Status.Phase != forgejov1.RestorePhaseFailed || why != "DataVolumeTooSmall" || !strings.Contains(got.Status.Message, "1Gi") {
-		t.Fatalf("%s/%s (%s)", got.Status.Phase, why, got.Status.Message)
+// A restore does not start its Job while a pod of an earlier restore of the instance may
+// still be writing.
+func TestRestoreWaitsForOtherRestorePods(t *testing.T) {
+	s := backup.FakeScheme(t)
+	b := completedBackup("b1")
+	rs := newRestore("r2", forgejov1.RestorePhaseScalingDown)
+	rs.Finalizers = []string{forgejo.FinalizerName}
+	rs.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
+	rs.Spec.BackupName = "b1"
+	f := instance(rs.Name)
+	old := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "r1-restore-abcde", Namespace: ns,
+		Labels: map[string]string{forgejo.LabelInstance: "fb", forgejo.LabelComponent: forgejo.ComponentRestore, batchv1.JobNameLabel: "r1-restore"}}}
+	old.Status.Phase = corev1.PodRunning
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, b, rs, old).WithStatusSubresource(rs).Build()
+	reconcileRestore(t, c, s, rs.Name, 1)
+
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: backup.RestoreJobName(rs)}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
+		t.Errorf("restore Job created while another restore pod runs (err %v)", err)
 	}
-	dbOnly := restoreOf("r2")
-	dbOnly.Spec.RestoreData = ptr.To(false)
-	fits := completedBackup("b1")
-	fits.Status.DataSizeBytes = 512 << 20
-	for name, tc := range map[string]struct {
-		b  *forgejov1.ForgejoBackup
-		rs *forgejov1.ForgejoRestore
-	}{"database only": {big, dbOnly}, "fits": {fits, restoreOf("r3")}} {
-		if got, why := restoreOutcome(t, instance(""), pvc.DeepCopy(), tc.b.DeepCopy(), tc.rs); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
-			t.Errorf("%s: %s/%s (%s)", name, got.Status.Phase, why, got.Status.Message)
-		}
+	if got := getRestore(t, c, rs.Name); got.Status.Phase != forgejov1.RestorePhaseScalingDown {
+		t.Errorf("phase %s, want ScalingDown (waiting)", got.Status.Phase)
+	}
+
+	// Once that pod has finished, the Job starts and records when it was created.
+	old.Status.Phase = corev1.PodSucceeded
+	if err := c.Status().Update(context.Background(), old); err != nil {
+		t.Fatal(err)
+	}
+	got := reconcileRestore(t, c, s, rs.Name, 1)
+	if got.Status.Phase != forgejov1.RestorePhaseRestoring || got.Status.JobStartTime == nil {
+		t.Errorf("phase %s jobStartTime %v (%s), want Restoring with jobStartTime", got.Status.Phase, got.Status.JobStartTime, got.Status.Message)
 	}
 }
 
@@ -192,7 +281,7 @@ func scalingDown(t *testing.T) (*forgejov1.Forgejo, *forgejov1.ForgejoRestore) {
 // the restore Job starts only once it has completed.
 func TestRestoreTakesAPreRestoreBackupFirst(t *testing.T) {
 	ctx := context.Background()
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	f, rs := scalingDown(t)
 	waiting := newRestore("r2", forgejov1.RestorePhasePending)
 	waiting.UID = "r2-uid"
@@ -247,7 +336,7 @@ func TestRestoreTakesAPreRestoreBackupFirst(t *testing.T) {
 // starts again. spec.preRestoreBackup false, an instance that has never run and a Broken one
 // take none.
 func TestPreRestoreBackupFailureAndOptOut(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	f, rs := scalingDown(t)
 	failed := &forgejov1.ForgejoBackup{ObjectMeta: metav1.ObjectMeta{Name: backup.PreRestoreBackupName(rs), Namespace: ns}}
 	failed.Spec.ForgejoRef.Name = "fb"
@@ -292,7 +381,7 @@ func TestPreRestoreBackupFailureAndOptOut(t *testing.T) {
 // still reads. A recorded one that is gone fails the restore instead of being taken again.
 func TestStartedPreRestoreBackupIsAwaited(t *testing.T) {
 	ctx := context.Background()
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	f, rs := scalingDown(t)
 	c := newFakeClient(s, f, fbSecrets(), dbAppSecret("pw"), completedBackup("b1"), rs)
 	name := backup.PreRestoreBackupName(rs)
@@ -337,7 +426,7 @@ func TestStartedPreRestoreBackupIsAwaited(t *testing.T) {
 // After the pre-restore backup, the scale-down timeout counts from its completion: a backup that
 // outlasted the timeout does not fail the restore, a scale-down that stays stuck after it does.
 func TestScaleDownTimeoutAfterThePreRestoreBackup(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	for _, tc := range []struct {
 		name   string
 		backup func(*forgejov1.ForgejoBackup)
@@ -364,5 +453,26 @@ func TestScaleDownTimeoutAfterThePreRestoreBackup(t *testing.T) {
 				t.Fatalf("%s/%s (%s)", got.Status.Phase, reason(got.Status.Conditions), got.Status.Message)
 			}
 		})
+	}
+}
+
+// spec.replicas: 0 does not mean "no pods" for an instance whose HPA owns the replica count:
+// the restore waits for Forgejo to become available instead of completing right away.
+func TestRestoreScaleUpWaitsForHPAManagedInstance(t *testing.T) {
+	s := backup.FakeScheme(t)
+	rs := newRestore("r1", forgejov1.RestorePhaseScalingUp)
+	rs.Finalizers = []string{forgejo.FinalizerName}
+	rs.Labels = map[string]string{forgejo.LabelForgejo: "fb"}
+	f := instance("")
+	f.Spec.Replicas = ptr.To[int32](0)
+	f.Spec.HighAvailability.Enabled = true
+	f.Spec.Autoscaling.Horizontal = &forgejov1.HorizontalAutoscalingSpec{Enabled: true, MinReplicas: 2, MaxReplicas: 4}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: forgejo.DeploymentName(f), Namespace: ns}}
+	dep.Spec.Replicas = ptr.To[int32](0)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, rs, dep).WithStatusSubresource(rs).Build()
+
+	got := reconcileRestore(t, c, s, rs.Name, 1)
+	if got.Status.Phase != forgejov1.RestorePhaseScalingUp {
+		t.Errorf("phase %s (%s), want ScalingUp until the HPA-managed instance is available", got.Status.Phase, got.Status.Message)
 	}
 }

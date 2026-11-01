@@ -1,10 +1,12 @@
 package runner
 
 import (
+	"cmp"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -126,34 +128,47 @@ func path(m map[string]any, keys ...string) any {
 	return cur
 }
 
-func TestRenderConfigConnection(t *testing.T) {
-	r := testRunner()
-	m := renderMap(t, r, 1, "uuid-1")
-	conn := path(m, "server", "connections", ConnectionName).(map[string]any)
-	if conn["url"] != "http://git-http.ns.svc.cluster.local:3000/" {
-		t.Errorf("url %v", conn["url"])
-	}
-	if conn["uuid"] != "uuid-1" || conn["token_url"] != "file:"+TokensDir+"/token-1" {
-		t.Errorf("connection %v", conn)
-	}
-	if _, inline := conn["token"]; inline {
-		t.Error("the configuration carries the secret inline")
-	}
-	if got := path(m, "runner", "labels").([]any); len(got) != 1 || got[0] != "docker:docker://"+forgejov1.DefaultRunnerJobImage {
-		t.Errorf("default labels %v", got)
-	}
-	if path(m, "container", "docker_host") != "-" {
-		t.Errorf("docker_host without mountSocket: %v", path(m, "container", "docker_host"))
-	}
-	if path(m, "cache", "enabled") != true || path(m, "cache", "dir") != CacheDir {
-		t.Errorf("cache %v", m["cache"])
-	}
-	if path(m, "runner", "shutdown_timeout") != "10m0s" {
-		t.Errorf("shutdown_timeout %v", path(m, "runner", "shutdown_timeout"))
+// The defaults of each executor. The connection reads the runner's secret from its file and
+// never carries it inline.
+func TestRenderConfigDefaults(t *testing.T) {
+	for _, tt := range []struct {
+		executor  forgejov1.RunnerExecutor
+		label     string
+		container any
+	}{
+		{forgejov1.RunnerExecutorDocker, "docker:docker://" + forgejov1.DefaultRunnerJobImage, map[string]any{"docker_host": "-"}},
+		// Host has no container section.
+		{forgejov1.RunnerExecutorHost, labelHost, nil},
+	} {
+		t.Run(string(tt.executor), func(t *testing.T) {
+			m := renderMap(t, testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Executor = tt.executor }), 1, "uuid-1")
+			conn := path(m, "server", "connections", ConnectionName).(map[string]any)
+			if conn["url"] != "http://git-http.ns.svc.cluster.local:3000/" || conn["uuid"] != "uuid-1" ||
+				conn["token_url"] != "file:"+TokensDir+"/token-1" {
+				t.Errorf("connection %v", conn)
+			}
+			if _, inline := conn["token"]; inline {
+				t.Error("the configuration carries the secret inline")
+			}
+			if got := path(m, "runner", "labels").([]any); len(got) != 1 || got[0] != tt.label {
+				t.Errorf("default labels %v", got)
+			}
+			if !reflect.DeepEqual(m["container"], tt.container) {
+				t.Errorf("container section %v, want %v", m["container"], tt.container)
+			}
+			if path(m, "cache", "enabled") != true || path(m, "cache", "dir") != CacheDir {
+				t.Errorf("cache %v", m["cache"])
+			}
+			if path(m, "runner", "shutdown_timeout") != "10m0s" {
+				t.Errorf("shutdown_timeout %v", path(m, "runner", "shutdown_timeout"))
+			}
+		})
 	}
 }
 
-func TestRenderConfigUserConfigMergedOperatorKeysWin(t *testing.T) {
+// spec.config is merged into the defaults, the keys the operator owns win, and a spec.config
+// that is not an object is refused.
+func TestRenderConfigUserConfig(t *testing.T) {
 	r := testRunner(func(r *forgejov1.ForgejoRunner) {
 		r.Spec.Docker.MountSocket = true
 		r.Spec.Labels = []string{"ubuntu:docker://ubuntu:24.04"}
@@ -183,21 +198,8 @@ func TestRenderConfigUserConfigMergedOperatorKeysWin(t *testing.T) {
 	if len(conns) != 1 || conns[ConnectionName] == nil {
 		t.Errorf("connections %v", conns)
 	}
-}
 
-func TestRenderConfigHostHasNoContainerSection(t *testing.T) {
-	r := testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Executor = forgejov1.RunnerExecutorHost })
-	m := renderMap(t, r, 0, "u")
-	if m["container"] != nil {
-		t.Errorf("container section %v", m["container"])
-	}
-	if l := path(m, "runner", "labels").([]any); len(l) != 1 || l[0] != labelHost {
-		t.Errorf("default host labels %v", l)
-	}
-}
-
-func TestRenderConfigInvalid(t *testing.T) {
-	r := testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Config = &runtime.RawExtension{Raw: []byte(`[1]`)} })
+	r.Spec.Config = &runtime.RawExtension{Raw: []byte(`[1]`)}
 	if _, err := RenderConfig(r, testForgejo(), 0, "u"); err == nil {
 		t.Fatal("a non-object spec.config was accepted")
 	}
@@ -266,34 +268,32 @@ func restrictedViolations(spec corev1.PodSpec) []string {
 	return out
 }
 
+// The host executor's pod passes the restricted Pod Security Standard. The privileged Docker
+// daemon is rendered only for executor Docker, never for a missing one.
 func TestHostPodPassesRestricted(t *testing.T) {
-	r := testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Executor = forgejov1.RunnerExecutorHost })
-	spec := PodSpec(r)
-	if v := restrictedViolations(spec); len(v) > 0 {
-		t.Fatalf("host pod violates restricted: %v", v)
-	}
-	if spec.Containers[0].Image != forgejov1.DefaultRunnerToolchainImage {
-		t.Errorf("host runner image %s", spec.Containers[0].Image)
-	}
-	if len(spec.InitContainers) != 1 || spec.InitContainers[0].Image != forgejov1.DefaultRunnerImage {
-		t.Errorf("install container %+v", spec.InitContainers)
-	}
-	if spec.ShareProcessNamespace == nil || !*spec.ShareProcessNamespace {
-		t.Error("job processes are not reaped (shareProcessNamespace)")
-	}
-	if got := spec.Containers[0].Command; got[0] != runnerBinDir+"/forgejo-runner" || got[len(got)-1] != ConfigDir+"/config-$(POD_INDEX).yaml" {
-		t.Errorf("command %v", got)
-	}
-}
-
-// The privileged Docker daemon is rendered only for executor Docker, never for a missing one.
-func TestNoPrivilegedPodWithoutDockerExecutor(t *testing.T) {
-	r := testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Executor = "" })
-	if got := Executor(r); got != forgejov1.RunnerExecutorHost {
-		t.Fatalf("Executor of an empty spec.executor = %s, want Host", got)
-	}
-	if v := restrictedViolations(PodSpec(r)); len(v) > 0 {
-		t.Fatalf("pod of an empty spec.executor violates restricted: %v", v)
+	for _, executor := range []forgejov1.RunnerExecutor{forgejov1.RunnerExecutorHost, ""} {
+		t.Run(cmp.Or(string(executor), "no executor"), func(t *testing.T) {
+			r := testRunner(func(r *forgejov1.ForgejoRunner) { r.Spec.Executor = executor })
+			if got := Executor(r); got != forgejov1.RunnerExecutorHost {
+				t.Fatalf("Executor = %s, want Host", got)
+			}
+			spec := PodSpec(r)
+			if v := restrictedViolations(spec); len(v) > 0 {
+				t.Fatalf("host pod violates restricted: %v", v)
+			}
+			if spec.Containers[0].Image != forgejov1.DefaultRunnerToolchainImage {
+				t.Errorf("host runner image %s", spec.Containers[0].Image)
+			}
+			if len(spec.InitContainers) != 1 || spec.InitContainers[0].Image != forgejov1.DefaultRunnerImage {
+				t.Errorf("install container %+v", spec.InitContainers)
+			}
+			if spec.ShareProcessNamespace == nil || !*spec.ShareProcessNamespace {
+				t.Error("job processes are not reaped (shareProcessNamespace)")
+			}
+			if got := spec.Containers[0].Command; got[0] != runnerBinDir+"/forgejo-runner" || got[len(got)-1] != ConfigDir+"/config-$(POD_INDEX).yaml" {
+				t.Errorf("command %v", got)
+			}
+		})
 	}
 }
 

@@ -16,6 +16,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/rclone"
@@ -29,8 +31,21 @@ const (
 	testHostKeyFile    = "ssh_host_ed25519_key"
 )
 
-// Exported test helpers (fake S3 store, Secrets, remote backups) shared with the backup_test
-// package of this directory.
+// Exported test helpers (scheme, fake S3 store, Secrets, remote backups) shared with the
+// backup_test package of this directory.
+
+// FakeScheme holds the types of client-go and of this operator, for fake clients.
+func FakeScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := forgejov1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
 
 // FakeBucket and FakeKey are the bucket and the backup key of a FakeS3.
 const (

@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -27,7 +26,6 @@ const (
 )
 
 const (
-	img17          = "codeberg.org/forgejo/forgejo:17"
 	testAccessKey  = "GKa1b2c3d4e5f6a7b8c9d0e1f2"
 	testSecretKey  = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
 	testS3Secret   = "s3-credentials"
@@ -49,27 +47,6 @@ func s3CredentialsSecret(f *forgejov1.Forgejo, access, secret string) *corev1.Se
 		Data: map[string][]byte{"AWS_ACCESS_KEY_ID": []byte(access), "AWS_SECRET_ACCESS_KEY": []byte(secret)}}
 }
 
-// renderInstanceConfig runs the config step for f and returns app.ini.
-func renderInstanceConfig(t *testing.T, f *forgejov1.Forgejo) string {
-	t.Helper()
-	ctx := context.Background()
-	secrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace},
-		Data: map[string][]byte{forgejo.SecretKeyInternalToken: []byte("tok")}}
-	rc := testContext(t, f, secrets)
-	rc.Recorder = events.NewFakeRecorder(10)
-	rc.TargetImage = forgejo.Image(f)
-	rc.Layout = forgejo.LayoutForImage(rc.TargetImage)
-	rc.DB = &forgejo.DBConnection{Host: "db", Port: 5432, Name: testForgejoName, User: testForgejoName, Password: "pw", SSLMode: testSSLModeDisable}
-	if _, err := ReconcileConfig(ctx, rc); err != nil {
-		t.Fatal(err)
-	}
-	sec := &corev1.Secret{}
-	if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.ConfigSecretName(f)}, sec); err != nil {
-		t.Fatal(err)
-	}
-	return string(sec.Data[forgejo.ConfigSecretKey])
-}
-
 // Forgejo 15 and 17 read [storage] the same way (modules/setting/storage.go is identical), so
 // both get the same app.ini: every subsystem inherits [storage], none has its own target, the
 // access key is not in it, and [lfs] PATH (ignored with a bucket) is left out.
@@ -83,9 +60,8 @@ MINIO_USE_SSL = false
 SERVE_DIRECT = false
 STORAGE_TYPE = minio
 `
-	var first string
-	for _, image := range []string{img15, img17, "codeberg.org/forgejo/forgejo:17-rootless"} {
-		ini := renderInstanceConfig(t, objectStorageInstance(image))
+	for _, image := range []string{img15, img17, img17 + "-rootless"} {
+		ini, _, _ := renderConfig(t, objectStorageInstance(image))
 		if got := section(ini, "storage"); got != want {
 			t.Errorf("%s: [storage]\n%s\nwant\n%s", image, got, want)
 		}
@@ -97,16 +73,10 @@ STORAGE_TYPE = minio
 		if strings.Contains(ini, "\n[lfs]\n") || strings.Contains(ini, "MINIO_ACCESS_KEY_ID") || strings.Contains(ini, "MINIO_SECRET_ACCESS_KEY") {
 			t.Errorf("%s: no [lfs] PATH and no access key expected:\n%s", image, ini)
 		}
-		body := section(ini, "storage")
-		if first == "" {
-			first = body
-		} else if body != first {
-			t.Errorf("%s: [storage] differs between majors", image)
-		}
 	}
 
 	// Without spec.objectStorage nothing changes: no [storage], LFS on the volume.
-	ini := renderInstanceConfig(t, testInstance())
+	ini, _, _ := renderConfig(t, testInstance())
 	if strings.Contains(ini, "[storage") || section(ini, "lfs") != "PATH = /data/git/lfs\n" {
 		t.Errorf("without objectStorage:\n%s", ini)
 	}
@@ -124,7 +94,7 @@ func TestObjectStorageConfigOptions(t *testing.T) {
 	os.Subsystems = forgejov1.ObjectStorageSubsystems{LFS: ptr.To(false), Avatars: ptr.To(false), ActionsLogs: ptr.To(false),
 		ActionsArtifacts: ptr.To(false), Attachments: ptr.To(true)}
 	f.Spec.Config = map[string]map[string]string{"storage": {"MINIO_CHECKSUM_ALGORITHM": "md5"}}
-	ini := renderInstanceConfig(t, f)
+	ini, _, _ := renderConfig(t, f)
 
 	st := section(ini, "storage")
 	for _, line := range []string{"MINIO_ENDPOINT = s3.example.com\n", "MINIO_USE_SSL = true\n", "MINIO_INSECURE_SKIP_VERIFY = true\n",
@@ -150,18 +120,9 @@ func TestObjectStorageConfigOptions(t *testing.T) {
 	}
 
 	os.S3.PathStyle = ptr.To(false)
-	if st := section(renderInstanceConfig(t, f), "storage"); !strings.Contains(st, "MINIO_BUCKET_LOOKUP = dns\n") {
-		t.Errorf("pathStyle false:\n%s", st)
+	if ini, _, _ := renderConfig(t, f); !strings.Contains(section(ini, "storage"), "MINIO_BUCKET_LOOKUP = dns\n") {
+		t.Errorf("pathStyle false:\n%s", section(ini, "storage"))
 	}
-}
-
-// envOf maps a container's environment by name.
-func envOf(c corev1.Container) map[string]corev1.EnvVar {
-	env := map[string]corev1.EnvVar{}
-	for _, e := range c.Env {
-		env[e.Name] = e
-	}
-	return env
 }
 
 // s3Containers are the bootstrap and forgejo containers, which both get the bucket.
@@ -364,11 +325,7 @@ func TestReconcileWorkloadObjectStorageDigest(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		dep := &appsv1.Deployment{}
-		if err := rc.Client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep); err != nil {
-			t.Fatal(err)
-		}
-		got := dep.Spec.Template.Annotations[forgejo.AnnotationObjectStorage]
+		got := getDeployment(t, rc).Spec.Template.Annotations[forgejo.AnnotationObjectStorage]
 		if len(got) != 16 || got == digest(testAccessKey, secretKey, "") || strings.HasPrefix(contentDigest(testAccessKey, secretKey, ""), got) {
 			t.Fatalf("annotation %q is not a keyed digest", got)
 		}

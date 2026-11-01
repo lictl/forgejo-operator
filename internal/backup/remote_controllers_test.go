@@ -36,8 +36,7 @@ func remoteFixture(t *testing.T) (*backup.FakeS3, *forgejov1.Forgejo, []client.O
 	f.Spec.Backup.Remote = &forgejov1.RemoteBackupSpec{S3: store.FakeConnection("team")}
 	fakeSecrets := backup.FakeSecrets(ns, fbKey)
 	objs := make([]client.Object, 0, 3+len(fakeSecrets))
-	objs = append(objs, f,
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: testSecretsName, Namespace: ns}, Data: map[string][]byte{"secret-key": []byte("sk")}},
+	objs = append(objs, f, fbSecrets(),
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fb-admin", Namespace: ns}, Data: map[string][]byte{testPasswordField: []byte("pw")}},
 	)
 	for _, s := range fakeSecrets {
@@ -61,7 +60,7 @@ func uploadPending(name string) *forgejov1.ForgejoBackup {
 // A backup that completes on the backup PVC is queued for upload; the upload does not hold
 // up its completion.
 func TestCompletedBackupIsQueuedForUpload(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	_, _, objs := remoteFixture(t)
 	b := runningBackup("q1")
 	job := finishedJob(t, s, b.Status.JobName, b, batchv1.JobComplete)
@@ -72,13 +71,13 @@ func TestCompletedBackupIsQueuedForUpload(t *testing.T) {
 
 	got := getBackup(t, c, b.Name)
 	if got.Status.Phase != forgejov1.BackupPhaseCompleted || got.Status.Remote == nil || got.Status.Remote.Phase != forgejov1.RemoteBackupPending ||
-		got.Status.Remote.Path != "regression/fb/q1-q1uid" || got.Status.Remote.Location != "s3://backups/team/regression/fb/q1-q1uid/" {
+		got.Status.Remote.Path != "reconcilers/fb/q1-q1uid" || got.Status.Remote.Location != "s3://backups/team/reconcilers/fb/q1-q1uid/" {
 		t.Fatalf("status %+v / remote %+v", got.Status, got.Status.Remote)
 	}
 }
 
 func TestUploadRunsVerifiesAndReleasesItsJob(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	ctx := context.Background()
 	_, _, objs := remoteFixture(t)
 	b := uploadPending("u1")
@@ -162,7 +161,7 @@ func uploading(t *testing.T, store *backup.FakeS3, name string) *forgejov1.Forge
 // A failed upload keeps the backup Completed (its copy on the PVC is fine), is counted, and
 // removes what it left in the bucket: objects without a manifest in the backup's own directory.
 func TestFailedUploadKeepsTheBackupAndPurgesTheBucket(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	store, f, objs := remoteFixture(t)
 	b := uploading(t, store, "u2")
 	job := finishedJob(t, s, b.Status.Remote.JobName, b, batchv1.JobFailed)
@@ -200,7 +199,7 @@ func TestFailedUploadKeepsTheBackupAndPurgesTheBucket(t *testing.T) {
 // The bucket is only looked at once the upload's pods have stopped: a pod of a vanished Job
 // may still write.
 func TestFailedUploadWaitsForItsPods(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	store, _, objs := remoteFixture(t)
 	b := uploading(t, store, "u4")
 	pod := jobPod(b.Status.Remote.JobName, backup.ContainerUpload, 0, "")
@@ -223,7 +222,7 @@ func TestFailedUploadWaitsForItsPods(t *testing.T) {
 // An upload Job that vanished after it uploaded everything (its manifest is in the bucket)
 // is recorded as uploaded, never purged; a manifest another upload wrote is left alone.
 func TestVanishedUploadJobIsCheckedAgainstTheBucket(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	store, _, objs := remoteFixture(t)
 	files := map[string][]byte{"db.dump": []byte("PGDMP"), "data.tar.gz": []byte("tar"), "identity.json": backup.FakeIdentity(t, "sk")}
 
@@ -257,7 +256,7 @@ func TestVanishedUploadJobIsCheckedAgainstTheBucket(t *testing.T) {
 
 // Without a usable key nothing is uploaded, and the reason says why.
 func TestUploadFailsWithoutAKey(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	_, _, objs := remoteFixture(t)
 	var kept []client.Object
 	for _, o := range objs {
@@ -282,7 +281,7 @@ func TestUploadFailsWithoutAKey(t *testing.T) {
 // A restore of a remote backup needs no ForgejoBackup: it reads the manifest from the bucket,
 // and its Job downloads and checks the files before the usual steps.
 func TestRestoreOfARemoteBackup(t *testing.T) {
-	s := scheme(t)
+	s := backup.FakeScheme(t)
 	ctx := context.Background()
 	store, f, objs := remoteFixture(t)
 	f.Status.Backup.ActiveRestore = "r1"

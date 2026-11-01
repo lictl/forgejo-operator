@@ -150,9 +150,9 @@ On `v17` (from V3).
 A made-up image tag cannot run, so `Future` (an image newer than the operator's table), the version policy on later dates, strict-duration warnings and the prepared Forgejo 18 rendering are verified by unit tests.
 
 1. **V12.1 unit tests**: in the repository root run
-   `go test ./internal/forgejo/ ./internal/upgrade/ ./internal/core/ ./internal/autopilot/ -count=1 -v -run 'TestClassify|TestSupportPolicyFollowsTheCalendar|TestTraits|TestDirectUpgrade|TestReportVersionSupport|TestUpgradeGateAcrossMajors|TestConfigFollowsForgejoMajor|TestConfigWarnsAboutDurationsForgejo17Refuses|TestBootstrapScriptPasswordFromStdin|TestConfigGuardMatchesLKGProfile' 2>&1 | grep -E '^(=== RUN|--- |ok|FAIL|PASS)'`.
+   `go test ./internal/forgejo/ ./internal/upgrade/ ./internal/core/ ./internal/autopilot/ -count=1 -v -run 'TestClassify|TestSupportPolicyFollowsTheCalendar|TestTraits|TestDirectUpgrade|TestReportVersionSupport|TestUpgradeGate|TestConfigFollowsForgejoMajor|TestConfigWarnsAboutDurationsForgejo17Refuses|TestBootstrapScriptPasswordFromStdin|TestReconcileConfigGuard' 2>&1 | grep -E '^(=== RUN|--- |ok|FAIL|PASS)'`.
    Expect every listed test `--- PASS` and every package `ok`. Record the `--- PASS` lines.
-2. **V12.2 cluster part**: record as skipped ("Future needs an image newer than the table; covered by TestClassify/TestReportVersionSupport/TestUpgradeGateAcrossMajors").
+2. **V12.2 cluster part**: record as skipped ("Future needs an image newer than the table; covered by TestClassify/TestReportVersionSupport/TestUpgradeGate").
 
 ## V13 — Upstream version check
 
