@@ -185,14 +185,18 @@ Apply `ha15`: the manifest of H1 with `name: ha15` and `image: codeberg.org/forg
 5. **H9.5 migrated once**: `kubectl -n e2e-ha logs <R> -c bootstrap | grep -c 'Migration\['` > 0 (e.g. `Migration[v16a_...]`); for every other current server pod and the cron pod the same count is 0.
 6. **H9.6 result**: `status.version` starts with `17.`, `Ready=True`, healthz `pass`, repo `demo` has `http.txt`, the issue `keep me 15` exists, HTTP-PUSH(ha15, after, a.txt) works. CRON-COUNTS(ha15) after 70 s: server pods `total 0`, the cron pod (on `:17`) `archive_cleanup` ≥ 1. Events of `ha15` include `UpgradeSucceeded`.
 
-## H10 — Turning HA off
+## H10 — HA mode is fixed at creation
 
-On `ha15`: LOGIN(ha15, `$W/jar15`), SESSION-OK → 200. If MASTER(ha15) is `ha15-valkey-0`, move the primary first: `kubectl -n e2e-ha delete pod ha15-valkey-0 --wait=false`, and wait until `status.highAvailability.valkey.master` names another pod and `ValkeyReady` is `True/Available` (≤ 2 min); record that primary and the count of `ValkeyFailedOver` events of `ha15`. Then `kubectl -n e2e-ha patch fj ha15 --type merge -p '{"spec":{"replicas":1,"highAvailability":{"enabled":false}}}'`.
+Record the desired replica counts and pod UIDs of `solo` and `ha15` before these checks.
+Every refused patch must report `highAvailability.enabled cannot be changed`; the
+instance spec and its workloads must remain unchanged after the rejected request.
 
-1. **H10.1 cron runner removed**: within 1 min `sts ha15-cron` is NotFound and an event `CronRunnerDeleted` exists; `ha15-config` has only `app.ini`.
-2. **H10.2 Valkey removed after the soak**: `ValkeyRetained` events appear first (the non-HA app.ini must run healthy for a minute and become the last known good one); within 5 min `kubectl -n e2e-ha get sts,svc,pdb ha15-valkey` are all NotFound and an event `ValkeyDeleted` exists; `status.highAvailability` and the `ValkeyReady` condition are gone; `ha15` is `1/1`, `Recreate`, `Ready=True`.
-3. **H10.3 session and cron**: SESSION-OK(`$W/jar15`) → `200` (sessions are in the database); CRON-COUNTS(ha15) after 70 s: the single pod `scheduled` ≥ 10.
-4. **H10.4 on again is no failover**: `kubectl -n e2e-ha patch fj ha15 --type merge -p '{"spec":{"highAvailability":{"enabled":true}}}'` (same operator process). Within 8 min `ha15` is `Running`/`Ready=True` with `ha15-valkey` `3/3`, `status.highAvailability.valkey.master` is `ha15-valkey-0` (a new group), `lastFailoverTime` is absent, and 2 min later the count of `ValkeyFailedOver` events of `ha15` is still the one recorded before H10.1.
+1. **H10.1 enabling is refused**: `kubectl -n e2e-ha patch fj solo --type merge -p '{"spec":{"highAvailability":{"enabled":true}}}'` fails admission. No `solo-cron` or `solo-valkey` is created.
+2. **H10.2 disabling is refused**: `kubectl -n e2e-ha patch fj ha15 --type merge -p '{"spec":{"replicas":1,"highAvailability":{"enabled":false}}}'` fails admission. The replica count remains unchanged; `ha15-cron` and `ha15-valkey` remain Ready.
+3. **H10.3 omission cannot disable**: both `kubectl -n e2e-ha patch fj ha15 --type merge -p '{"spec":{"highAvailability":null}}'` and `kubectl -n e2e-ha patch fj ha15 --type json -p '[{"op":"remove","path":"/spec/highAvailability/enabled"}]'` fail admission. CRON-COUNTS(ha15) still shows tasks only in its cron runner.
+4. **H10.4 equivalent disabled forms are allowed**: on `solo`, patch `highAvailability` to `{"enabled":false}`, then `{}` (JSON replacement), then `null` (merge removal). All succeed: `solo` still has one server pod running cron and no cron runner or Valkey. Scaling and Valkey tuning of HA instances remain supported.
+
+5. **H10.5 mutable settings remain accepted**: `kubectl -n e2e-ha patch fj ha15 --type merge --dry-run=server -p '{"spec":{"replicas":2,"highAvailability":{"valkey":{"resources":{"requests":{"cpu":"100m"}}}}}}'` succeeds admission without changing the live instance. Its output retains `highAvailability.enabled: true` and shows the requested replicas and Valkey CPU request.
 
 ## H12 — At most one cron runner (`ha17`, after H7)
 

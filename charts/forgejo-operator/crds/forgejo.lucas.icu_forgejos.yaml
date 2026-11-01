@@ -1103,7 +1103,9 @@ spec:
                       enabled runs Forgejo for several replicas: cache and queues in a Valkey replication
                       group with Sentinel (StatefulSet "<name>-valkey", three pods), Forgejo's cron tasks in a
                       single runner pod (StatefulSet "<name>-cron") instead of every replica, and rolling
-                      updates. See docs/high-availability.md.
+                      updates. The mode is immutable after creation; omitted means false. Changing it on a
+                      running instance could overlap cron runners and switch queues without draining them.
+                      Choose the mode when creating the Forgejo. See docs/high-availability.md.
                     type: boolean
                   valkey:
                     default: {}
@@ -3437,6 +3439,13 @@ spec:
                 cannot be changed afterwards (it may be removed)
               rule: '!has(self.restoreFrom) || (has(oldSelf.restoreFrom) && self.restoreFrom
                 == oldSelf.restoreFrom)'
+            - fieldPath: .highAvailability.enabled
+              message: highAvailability.enabled cannot be changed after creation (omitted
+                means false); choose the mode when creating the Forgejo
+              reason: FieldValueForbidden
+              rule: (has(self.highAvailability) && has(self.highAvailability.enabled)
+                && self.highAvailability.enabled) == (has(oldSelf.highAvailability)
+                && has(oldSelf.highAvailability.enabled) && oldSelf.highAvailability.enabled)
             - fieldPath: .replicas
               message: replicas greater than 1 require highAvailability.enabled (Valkey
                 for shared cache and queues, a single cron runner)

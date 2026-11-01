@@ -32,7 +32,7 @@ either; see [ssh.md](ssh.md#when-something-is-wrong). The same holds while the e
 
 | Feature | Spec | Default |
 |---|---|---|
-| High availability (Valkey with Sentinel, cron runner) | `spec.highAvailability.enabled` | off |
+| High availability (Valkey with Sentinel, cron runner) | `spec.highAvailability.enabled` (fixed at creation) | off |
 | Horizontal autoscaling (HPA) | `spec.autoscaling.horizontal` | off; needs HA |
 | PodDisruptionBudget | automatic when more than one replica | — |
 | Auto-tuning | `spec.autoPilot.autoTuning.enabled` | on |
@@ -100,23 +100,14 @@ here only how the autopilot steps handle them.
   has not run the config, so the last known good app.ini is then recorded from the server pods
   alone (event `LastKnownGoodConfig` says so). Auto-tuning counts it as one more database client. Only a
   StatefulSet `<name>-cron` that the instance controls is its cron runner.
-- **Disabling HA.** The cron runner is deleted at once. Valkey (StatefulSet, Service and PDB) is
-  deleted only when nothing can bring a Valkey app.ini back:
-  - the desired (non-redis) app.ini is deployed, not a rolled-back last known good one, and
-    no rollback is pending;
-  - the Deployment is fully rolled out and every Forgejo pod runs that app.ini;
-  - with config rollback on, the last known good app.ini no longer uses Valkey. The LKG
-    Secret is annotated `forgejo.lucas.icu/uses-valkey: "true"` when it was rendered
-    for HA (or recognised by its content). Valkey therefore stays until the non-HA app.ini has
-    run healthy for a minute and replaced the LKG.
-
-  Until then a `ValkeyRetained` event (at most hourly) says why. If Valkey is gone anyway
-  (for example config rollback was off at the time), a rollback to an LKG that needs it is
-  declined with `ConfigRollbackUnavailable`. With HA enabled, a last known good app.ini rendered
-  without it (LevelDB queues, cron tasks in every pod) is declined the same way, as is one
-  rendered with another Valkey password (the LKG Secret's annotation
-  `forgejo.lucas.icu/valkey-url-hash`, a digest of the Valkey URL, differs): after a change
-  of `valkey-password`, Valkey runs with the new password only.
+- **Configuration compatibility.** The HA mode is fixed at creation; the API server refuses
+  changes of `highAvailability.enabled`. With HA enabled, config rollback refuses a last
+  known good app.ini rendered without HA (LevelDB queues, cron tasks in every pod), or with
+  another Valkey password (`ConfigRollbackUnavailable`). The LKG Secret records a digest
+  of the Valkey URL in `forgejo.lucas.icu/valkey-url-hash`; after a password change only the
+  new password works. If a non-HA instance has stale owned Valkey resources, defensive
+  cleanup waits until the desired non-redis config is fully rolled out, no rollback is
+  pending, and any LKG config no longer needs Valkey (`ValkeyRetained` while waiting).
 - **Shared storage.** Every HA pod mounts the data volume: the server replicas, a surge pod
   during rolling updates and the cron runner, so even one replica means several pods. They work
   on a `ReadWriteOnce` volume on a single node, but not across nodes. When the data PVC is not
@@ -230,7 +221,7 @@ Safeguards:
   belong to the upgrade's auto-rollback. An active rollback stays in place through them.
 - With `highAvailability` off, an LKG that uses Valkey is only rolled back to while Valkey
   still exists; otherwise the rejection is dropped (`ConfigRollbackUnavailable`). With it on, the
-  LKG must have been rendered with the current Valkey password (see **Disabling HA** above).
+  LKG must have been rendered with the current Valkey password (see **Configuration compatibility** above).
 - An LKG is only rolled back to when it was rendered for the same config profile as the image
   now deployed (annotation `forgejo.lucas.icu/config-profile`; e.g. Forgejo 18 needs
   no `INTERNAL_TOKEN` but 17 does), otherwise `ConfigRollbackUnavailable`. See

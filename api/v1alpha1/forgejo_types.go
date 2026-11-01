@@ -113,6 +113,7 @@ const (
 
 // ForgejoSpec defines the desired state of a Forgejo instance.
 // +kubebuilder:validation:XValidation:rule="!has(self.restoreFrom) || (has(oldSelf.restoreFrom) && self.restoreFrom == oldSelf.restoreFrom)",message="restoreFrom can only be set when the Forgejo is created and cannot be changed afterwards (it may be removed)"
+// +kubebuilder:validation:XValidation:rule="(has(self.highAvailability) && has(self.highAvailability.enabled) && self.highAvailability.enabled) == (has(oldSelf.highAvailability) && has(oldSelf.highAvailability.enabled) && oldSelf.highAvailability.enabled)",message="highAvailability.enabled cannot be changed after creation (omitted means false); choose the mode when creating the Forgejo",fieldPath=".highAvailability.enabled",reason="FieldValueForbidden"
 // +kubebuilder:validation:XValidation:rule="!has(self.replicas) || self.replicas <= 1 || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="replicas greater than 1 require highAvailability.enabled (Valkey for shared cache and queues, a single cron runner)",fieldPath=".replicas",reason="FieldValueForbidden"
 // +kubebuilder:validation:XValidation:rule="!has(self.autoscaling.horizontal) || !has(self.autoscaling.horizontal.enabled) || !self.autoscaling.horizontal.enabled || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="autoscaling.horizontal requires highAvailability.enabled (Valkey for shared cache and queues, a single cron runner)",fieldPath=".autoscaling.horizontal.enabled",reason="FieldValueForbidden"
 // +kubebuilder:validation:XValidation:rule="!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || (has(self.ingress.host) && size(self.ingress.host) > 0) || (has(self.server.domain) && size(self.server.domain) > 0) || (has(self.server.rootURL) && size(self.server.rootURL) > 0) || (has(self.gateway) && has(self.gateway.hostnames))",message="ingress.enabled requires ingress.host (or server.domain, server.rootURL or gateway.hostnames): without a public host name ROOT_URL would be the in-cluster Service address",fieldPath=".ingress.host",reason="FieldValueRequired"
@@ -1220,7 +1221,9 @@ type HighAvailabilitySpec struct {
 	// enabled runs Forgejo for several replicas: cache and queues in a Valkey replication
 	// group with Sentinel (StatefulSet "<name>-valkey", three pods), Forgejo's cron tasks in a
 	// single runner pod (StatefulSet "<name>-cron") instead of every replica, and rolling
-	// updates. See docs/high-availability.md.
+	// updates. The mode is immutable after creation; omitted means false. Changing it on a
+	// running instance could overlap cron runners and switch queues without draining them.
+	// Choose the mode when creating the Forgejo. See docs/high-availability.md.
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 

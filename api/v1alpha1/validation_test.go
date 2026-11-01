@@ -202,6 +202,38 @@ const (
 	errExistingClaim = "spec.storage.existingClaim: Invalid value: storage.existingClaim cannot be set, changed or removed"
 )
 
+func TestForgejoHighAvailabilityModeValidation(t *testing.T) {
+	modes := []struct {
+		name    string
+		spec    string
+		enabled bool
+	}{
+		{"omitted", "  {}", false},
+		{"empty", "  highAvailability: {}", false},
+		{"null", "  highAvailability: null", false},
+		{"disabled", "  highAvailability: {enabled: false}", false},
+		{"enabled", "  highAvailability: {enabled: true}", true},
+	}
+	cases := make([]validationCase, 0, (1+len(modes))*len(modes)+1)
+	for _, next := range modes {
+		cases = append(cases, validationCase{name: "create/" + next.name, obj: fj(next.spec)})
+		for _, old := range modes {
+			want := ""
+			if next.enabled != old.enabled {
+				want = "highAvailability.enabled cannot be changed"
+			}
+			cases = append(cases, validationCase{
+				name: old.name + " to " + next.name, old: fj(old.spec), obj: fj(next.spec), want: want,
+			})
+		}
+	}
+	cases = append(cases, validationCase{
+		name: "HA scaling and Valkey settings remain mutable", old: fj("  highAvailability: {enabled: true}"),
+		obj: fj("  replicas: 3\n  highAvailability:\n    enabled: true\n    valkey: {image: valkey:8.1, resources: {requests: {cpu: 100m}}}"),
+	})
+	runCases(t, "forgejos", cases)
+}
+
 func TestForgejoValidation(t *testing.T) {
 	const s3 = `endpoint: https://s3.example.com
       bucket: bucket
