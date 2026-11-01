@@ -114,7 +114,8 @@ func DindImage(r *forgejov1.ForgejoRunner) string {
 
 // MutateStatefulSet renders the StatefulSet of the runner pods into sts (create or update).
 // Fields the API server would default are set explicitly, so that an unchanged spec compares
-// equal.
+// equal; maxUnavailable, which only some servers default, keeps its stored default
+// (forgejo.StatefulSetRollingUpdate).
 func MutateStatefulSet(sts *appsv1.StatefulSet, in WorkloadInput) {
 	r := in.Runner
 	exists := sts.ResourceVersion != ""
@@ -125,10 +126,7 @@ func MutateStatefulSet(sts *appsv1.StatefulSet, in WorkloadInput) {
 		sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
 	}
 	sts.Spec.ServiceName = ""
-	sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
-		Type:          appsv1.RollingUpdateStatefulSetStrategyType,
-		RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{Partition: ptr.To[int32](0)},
-	}
+	sts.Spec.UpdateStrategy = forgejo.StatefulSetRollingUpdate(sts.Spec.UpdateStrategy)
 	sts.Spec.RevisionHistoryLimit = ptr.To[int32](5)
 	sts.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
 		WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,

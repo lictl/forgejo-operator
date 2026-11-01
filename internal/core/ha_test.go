@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -258,6 +259,32 @@ func TestReconcileWorkloadCronRunner(t *testing.T) {
 	}
 	if got := getCronRunner(t, rc).ResourceVersion; got != rv {
 		t.Fatalf("cron runner updated without a change: %s -> %s", rv, got)
+	}
+}
+
+// Kubernetes 1.37 defaults maxUnavailable of a StatefulSet's rolling update to 1: the cron
+// runner keeps it, so the next pass changes nothing.
+func TestCronRunnerKeepsDefaultedMaxUnavailable(t *testing.T) {
+	ctx := context.Background()
+	f := withHA(testInstance())
+	f.Status.Image = img17
+	rc := haWorkloadContext(t, f)
+	if _, err := ReconcileWorkload(ctx, rc); err != nil {
+		t.Fatal(err)
+	}
+	cron := getCronRunner(t, rc)
+	if cron == nil {
+		t.Fatal("no cron runner")
+	}
+	cron.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = ptr.To(intstr.FromInt32(1))
+	if err := rc.Client.Update(ctx, cron); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReconcileWorkload(ctx, rc); err != nil {
+		t.Fatal(err)
+	}
+	if got := getCronRunner(t, rc).ResourceVersion; got != cron.ResourceVersion {
+		t.Fatalf("cron runner updated over a defaulted maxUnavailable: %s -> %s", cron.ResourceVersion, got)
 	}
 }
 

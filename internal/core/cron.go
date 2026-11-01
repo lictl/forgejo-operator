@@ -157,10 +157,7 @@ func reconcileCronRunner(ctx context.Context, rc *forgejo.ReconcileContext, repl
 			// crash-looping runner gets the fixed template); OrderedReady would wait for it.
 			sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
 		}
-		sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
-			Type:          appsv1.RollingUpdateStatefulSetStrategyType,
-			RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{Partition: ptr.To[int32](0)},
-		}
+		sts.Spec.UpdateStrategy = forgejo.StatefulSetRollingUpdate(sts.Spec.UpdateStrategy)
 		sts.Spec.RevisionHistoryLimit = ptr.To[int32](revisionHistory)
 		// The API server's default; the pod mounts the data claim, it has no claim templates.
 		sts.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{

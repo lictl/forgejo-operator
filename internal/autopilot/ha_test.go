@@ -17,6 +17,7 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 	clienttesting "k8s.io/client-go/testing"
@@ -131,13 +132,22 @@ func TestValkeyStatefulSet(t *testing.T) {
 	}
 
 	// Reconciling again does not change the StatefulSet (no update loop on API server defaults
-	// that the operator sets itself).
-	rv := sts.ResourceVersion
-	if _, err := ReconcileHA(context.Background(), env.rc); err != nil {
-		t.Fatal(err)
-	}
-	if sts = valkeySTS(t, env, f); sts.ResourceVersion != rv {
-		t.Fatal("StatefulSet updated without a change")
+	// that the operator sets itself), also once the API server has defaulted maxUnavailable
+	// (Kubernetes 1.37).
+	for _, defaulted := range []bool{false, true} {
+		if defaulted {
+			sts.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = ptr.To(intstr.FromInt32(1))
+			if err := env.rc.Client.Update(context.Background(), sts); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rv := sts.ResourceVersion
+		if _, err := ReconcileHA(context.Background(), env.rc); err != nil {
+			t.Fatal(err)
+		}
+		if sts = valkeySTS(t, env, f); sts.ResourceVersion != rv {
+			t.Fatalf("StatefulSet updated without a change (maxUnavailable defaulted: %v)", defaulted)
+		}
 	}
 }
 
