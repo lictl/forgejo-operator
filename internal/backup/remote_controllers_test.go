@@ -51,6 +51,8 @@ func uploadPending(name string) *forgejov1.ForgejoBackup {
 	b.Status.Phase = forgejov1.BackupPhaseCompleted
 	b.Status.CompletionTime = &metav1.Time{Time: time.Now().Add(-time.Minute)}
 	b.Status.ForgejoImage = testImage16
+	b.Status.ForgejoUID = string(instance("").UID)
+	b.Status.SecretKeyFingerprint = forgejo.SecretKeyFingerprint(fbSecrets().Data)
 	path := backup.BackupRemotePath(b)
 	b.Status.Remote = &forgejov1.RemoteBackupStatus{Phase: forgejov1.RemoteBackupPending, Path: path,
 		Location: "s3://" + backup.FakeBucket + "/team/" + path + "/"}

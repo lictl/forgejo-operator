@@ -49,7 +49,7 @@ func JobPods(ctx context.Context, c client.Client, job *batchv1.Job) ([]corev1.P
 
 // JobPodsByName returns the pods of the Job with the given name, newest first. It also finds
 // pods whose Job is already gone.
-func JobPodsByName(ctx context.Context, c client.Client, namespace, name string) ([]corev1.Pod, error) {
+func JobPodsByName(ctx context.Context, c client.Reader, namespace, name string) ([]corev1.Pod, error) {
 	pods := &corev1.PodList{}
 	if err := c.List(ctx, pods, client.InNamespace(namespace),
 		client.MatchingLabels{batchv1.JobNameLabel: name}); err != nil {
@@ -330,7 +330,7 @@ func Stalled(job *batchv1.Job, pods []corev1.Pod, timeout time.Duration) string 
 }
 
 // RestoreUsing returns an unfinished restore that reads the given backup, or "".
-func RestoreUsing(ctx context.Context, c client.Client, b *forgejov1.ForgejoBackup) (string, error) {
+func RestoreUsing(ctx context.Context, c client.Reader, b *forgejov1.ForgejoBackup) (string, error) {
 	restores, err := ListRestores(ctx, c, b.Namespace, b.Spec.ForgejoRef.Name)
 	if err != nil {
 		return "", err

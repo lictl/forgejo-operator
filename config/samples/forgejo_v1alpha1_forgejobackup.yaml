@@ -1,6 +1,10 @@
 # A one-shot backup of the Forgejo "forgejo-sample": a pg_dump of its database plus a
 # tar.gz of its data volume, written to the "forgejo-sample-backups" PVC under
 # /forgejobackup-sample/. Deleting this object deletes the files.
+# status.forgejoUID and status.secretKeyFingerprint bind remote upload to the source
+# instance before its Job starts; a changed identity fails the upload safely.
+# status.serviceAccountName and status.imagePullSecrets retain registry-access references
+# for cleanup after the source Forgejo is deleted (names only, no credential values).
 apiVersion: forgejo.lucas.icu/v1alpha1
 kind: ForgejoBackup
 metadata:

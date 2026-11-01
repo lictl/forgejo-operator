@@ -450,7 +450,8 @@ small database took about 75 s, the `pg_upgrade` Job 40 s of it.
 - autopilot does not restart, resize or roll back Forgejo, and storage autopilot does not grow
   the CNPG volumes (`StorageHealthy=False/ExpansionDeferred` while one is above the threshold);
 - a change of `spec.database.cnpg.imageName` cancels the upgrade in `Pending` and `BackingUp`
-  (a running pre-upgrade backup finishes first; one still `Pending` is not waited for and runs
+  (a running pre-upgrade backup, including a prepared Job recorded in status, finishes first;
+  one still `Pending` without a Job name is not waited for and runs
   later like a manual backup), and is queued from `Upgrading` on (`DatabaseUpgradeQueued`
   event): `pg_upgrade` is never interrupted.
 

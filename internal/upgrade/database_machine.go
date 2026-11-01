@@ -188,8 +188,8 @@ func (m *dbMachine) cancellable() bool {
 }
 
 // cancel ends an upgrade withdrawn before its image was written. A pre-upgrade backup that is
-// already running finishes first, with Forgejo stopped. One that has not started (Pending) is
-// not waited for: nothing writes yet, and it may itself be waiting, for example for a restore.
+// already running or prepared finishes first, with Forgejo stopped. One that has no Job
+// journaled is not waited for: nothing writes yet, and it may itself be waiting, for example for a restore.
 // It runs later like a manual backup.
 func (m *dbMachine) cancel(desired string) error {
 	rc, u, f := m.rc, m.u, m.rc.Instance
@@ -199,7 +199,7 @@ func (m *dbMachine) cancel(desired string) error {
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
-		if err == nil && b.DeletionTimestamp.IsZero() && b.Status.Phase == forgejov1.BackupPhaseRunning {
+		if err == nil && b.DeletionTimestamp.IsZero() && backup.BackupMayBeWriting(b) {
 			m.cancelling = true
 			u.Message = fmt.Sprintf("spec.database.cnpg.imageName changed to %s: cancelling the upgrade to %s once pre-upgrade backup %s has finished",
 				desired, u.ToImage, b.Name)

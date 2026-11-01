@@ -44,6 +44,7 @@ before-migration   forgejo   Manual   Completed   12s         40s
 `status` records `phase` (`Pending` → `Running` → `Completed`/`Failed`), `startTime`,
 `completionTime`, `jobName`, `pvcName`, `path`, `forgejoImage` (the image running when the
 backup was taken), `postgresImage` (the PostgreSQL image whose `pg_dump` wrote the dump),
+`forgejoUID` (the source instance UID recorded before the Job starts),
 `secretKeyFingerprint` (the fingerprint of the instance's `SECRET_KEY` when the backup was
 taken, as remote manifests record it; see [What a restore refuses](#what-a-restore-refuses) and
 [Scheduled backups and retention](#scheduled-backups-and-retention)), `databaseSizeBytes`,
@@ -55,13 +56,27 @@ the record of a finished backup: the Job is deleted once its outcome is written 
 
 What happens:
 
-* The backup waits while a `ForgejoRestore` of the same instance is in progress, while the
-  instance is being created from a remote backup (`spec.restoreFrom`), and while a PostgreSQL
-  major upgrade is in flight (except that upgrade's own backup, which waits only for restores
-  that have started: one that has not waits for the upgrade, see
-  [upgrades.md](upgrades.md#postgresql-major-upgrades)). It fails
-  straight away if the instance does not exist, and fails after 2 minutes if the database is
-  not ready or the backup PVC cannot be provisioned.
+* Before starting a Job, the controller reads the instance and restores from the API server.
+  A queued backup waits while the instance is `Broken`, during an in-flight Forgejo or PostgreSQL
+  upgrade or a failed upgrade's workload hold, while a `ForgejoRestore` is in progress, and
+  during bootstrap from `spec.restoreFrom`. Only an upgrade's own `PreUpgrade` backup may run
+  in that upgrade's `BackingUp` phase; the PostgreSQL backup waits only for restores that have
+  started (a pending restore waits for the upgrade). A pre-restore backup skips its own restore
+  and other pending restores. If its instance becomes unsafe, that backup fails instead of
+  deadlocking the restore against a paused upgrade; the restore changes nothing and reports
+  how to retry with `spec.preRestoreBackup: false`. See [upgrades.md](upgrades.md).
+  A missing or deleting instance fails the backup immediately. An unavailable database,
+  backup PVC, or missing `SECRET_KEY` required by remote backup fails after 2 minutes.
+* Before creating the Job, the controller journals its source identity, Job name, images,
+  volume, path, ServiceAccount name and explicit image-pull Secret names in status. After an
+  interrupted start it tracks that execution, even if the
+  Job disappeared, and preserves the journal if another object took the Job name. A create
+  that was explicitly refused has not started any work: its unused preparation is discarded,
+  and a name held by a deleted predecessor can retry after garbage collection. When the source
+  instance is gone, cleanup uses the recorded image and pull-credential references
+  (`status.serviceAccountName` and `status.imagePullSecrets`), without mounting an API token.
+  Keep those ServiceAccounts and registry Secrets available until retained backups are removed;
+  status stores their names, never credential values.
 * The operator creates the backup PVC `<forgejo>-backups` on first use, using
   `spec.backup.storage` (`size` 20Gi by default, `storageClassName`), or uses
   `spec.backup.storage.existingClaim`. It is `ReadWriteOnce`. The PVC is owned by the
@@ -345,7 +360,7 @@ spec:
 | Phase | What happens |
 |-------|--------------|
 | `Pending` | Validates that the backup exists, is `Completed` and belongs to the same instance (for a remote backup: reads and checks its manifest, see [Restoring a remote backup](#restoring-a-remote-backup)). Fails otherwise, and when the restore would lose data or identity (reasons `NewerDump`, `NewerBackup`, `IdentityMismatch` and `DataVolumeTooSmall`, see [What a restore refuses](#what-a-restore-refuses)). Waits for a PostgreSQL major upgrade of the instance to finish, for another restore of the instance to finish, while the Secret of SSH host keys is missing or unusable (`status.ssh.message` of the instance; Forgejo could not start again, see [ssh.md](ssh.md#when-something-is-wrong)), and while the Secrets of `spec.objectStorage` are missing or unusable (`ObjectStorageReady=False/CredentialsUnavailable` or `InvalidSpec`; message `Waiting for spec.objectStorage: ...`): no pod could start without them, and the instance's pipeline would not scale it down. The instance keeps serving meanwhile, and the restore starts once the Secrets are back. A bucket the operator cannot reach does not hold a restore. A restore already in `ScalingDown` when a Secret disappears times out (`ScaleDownTimeout`). |
-| `ScalingDown` | The Forgejo pipeline turns on maintenance mode: `status.backup.activeRestore` is set, the Deployment is scaled to 0, the phase becomes `Restoring` and health checks and autopilot actions are suspended. The restore waits until no Forgejo pod exists, no backup of the instance is running and no Job or pod of another restore of the instance is still running. It fails after 15 minutes if that does not happen, for example because `spec.paused` is set or the reconcile is blocked earlier. Then it takes the pre-restore backup and waits for it (message `Taking pre-restore backup ...`, without a time limit; see [The pre-restore backup](#the-pre-restore-backup)). |
+| `ScalingDown` | The Forgejo pipeline turns on maintenance mode: `status.backup.activeRestore` is set, the Deployment is scaled to 0, the phase becomes `Restoring` and health checks and autopilot actions are suspended. The restore waits until no Forgejo pod exists, no backup of the instance is running and no Job or pod of another restore of the instance is still running. Before starting destructive work it checks dump Jobs and pods directly from the API server, including orphaned pods of failed or deleted backups. Failed backups without running execution do not block it. It fails after 15 minutes if that does not happen, for example because `spec.paused` is set or the reconcile is blocked earlier. Then it takes the pre-restore backup and waits for it (message `Taking pre-restore backup ...`, without a time limit; see [The pre-restore backup](#the-pre-restore-backup)). |
 | `Restoring` | Job `<restore>-restore` runs (see below); `status.jobStartTime` records when it was created. If its newest pod cannot start within 10 minutes, the Job is stopped and the restore fails. It reports "nothing was changed" only when no earlier pod got past `verify`. Otherwise the failure counts as one that may have changed the instance (see below). A Job that is not found a minute after `jobStartTime` fails the restore with `JobMissing` only after the operator has confirmed with the API server that it is gone. |
 | `ScalingUp` | Maintenance ends and Forgejo is scaled back up. With `spec.highAvailability.enabled`, Valkey is emptied first (event `ValkeyReset`): its pods stop together and start again without data, which takes under a minute, and no Forgejo pod starts before one is Ready. Its queues held work created after the backup point, by row ID (webhook deliveries, PR checks, push updates, mirror syncs), which would act on unrelated rows once the restored database hands out those IDs again, and its cache state from after that point. The bootstrap init container runs `forgejo migrate` against the restored database, in a single pod until that pod is available. The restore waits up to 15 minutes for the Deployment to be available. It completes right away when the instance wants no pods (`spec.replicas: 0` without horizontal autoscaling; with an HPA, `minReplicas` applies). |
 | `Completed` / `Failed` | Terminal. The restore Job is deleted (see [Jobs are deleted when they finish](#jobs-are-deleted-when-they-finish)). See below for when a failed restore ends maintenance. |
@@ -633,9 +648,21 @@ recovery), never writes into, or cleans up, another backup's directory.
 When the backup Job has finished, the `ForgejoBackup` is `Completed`: restores and upgrades do
 not wait for the upload. `status.remote` goes `Pending` → `Uploading` → `Uploaded` or `Failed`:
 
-1. The controller checks the key Secret (at least 16 characters, no surrounding white space),
-   the credentials and the CA, then writes the identity bundle into Secret
-   `<backup>-identity`, controlled by the backup.
+1. Before the dump Job starts, the controller records the source `forgejoUID` and
+   `secretKeyFingerprint` in backup status. The upload reads the current instance and identity
+   Secrets directly from the API server and refuses a replacement instance or a different
+   `SECRET_KEY` (`IdentityChanged`). Missing source records fail with `IdentityUnavailable`;
+   take a new backup. The local completed backup remains available.
+   The controller checks the backup encryption key (at least 16 characters, no surrounding
+   white space), credentials and CA, then writes the verified identity bundle into immutable
+   Secret `<backup>-identity`, controlled by the backup. A retry reuses this Secret without
+   overwriting identity already being read by an upload Job. The remote manifest uses the
+   recorded source UID and fingerprint. Before creating either Job, the controller also
+   records all execution coordinates in backup status. If the following Running or Uploading
+   status write is lost, tracking resumes from that record even if the Job has disappeared.
+   A changed instance never replaces the recorded volume or remote target. Cleanup checks
+   live Jobs and orphaned pods before removing files or the upload identity Secret; a stale
+   cache cannot release them while they are still in use.
 2. Job `<backup>-upload` runs one container of the rclone image (uid 1000, read-only root file
    system, no capabilities) with the backup PVC mounted read-only. rclone is configured
    entirely through environment variables: the access key comes from the credentials Secret

@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
+	"github.com/lictl/forgejo-operator/internal/backup"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
 )
 
@@ -715,6 +716,22 @@ func TestDatabaseUpgradeCancel(t *testing.T) {
 	}
 	if dbPass(t, c, f); condition(f, forgejov1.ConditionDatabaseUpgrading).Reason != reasonPostgresUpgradeCancelled {
 		t.Fatalf("condition %+v", condition(f, forgejov1.ConditionDatabaseUpgrading))
+	}
+
+	// A prepared Job may already run even if the Running phase patch was lost.
+	f, c = pendingUpgrade(t)
+	dbPass(t, c, f)
+	dbPass(t, c, f)
+	u = forgejo.DatabaseUpgrade(f)
+	prepared := backupObject(t, c, u.BackupName)
+	prepared.Status.Phase = forgejov1.BackupPhasePending
+	prepared.Status.JobName = backup.BackupJobName(prepared)
+	if err := c.Update(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	f.Spec.Database.CNPG.ImageName = pg17
+	if rc, _ = dbPass(t, c, f); u.Phase != forgejov1.DatabaseUpgradeBackingUp || !zeroReplicas(rc) {
+		t.Fatalf("cancelled while a prepared backup may run: %s", u.Phase)
 	}
 
 	// A backup that has not started (it may itself wait, e.g. for a restore) is not waited for.

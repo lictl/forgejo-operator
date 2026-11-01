@@ -40,12 +40,21 @@ kubectl -n $NS get fj $N -o jsonpath='{.status.conditions[?(@.type=="BackupHealt
 - The backup key Secret is missing or unusable (`BackupKeyMissing`, `BackupKeyUnusable`).
 - Quota or object-lock rules on the bucket.
 
+A source identity check can also refuse the upload: `IdentityChanged` means the Forgejo UID
+or `SECRET_KEY` no longer matches the source recorded before the dump. `IdentityUnavailable`
+means those source records or the current identity are missing. The local backup remains
+available; do not relabel its fingerprint or attach another instance's Secrets to it.
+
 ## Mitigation
 
 1. Fix credentials, network or key as the message says.
 2. Uploads are not retried for an old backup; the next scheduled backup is uploaded. To get an
    off-cluster copy now, take a manual backup (see
    [ForgejoBackupFailed](ForgejoBackupFailed.md#mitigation)); it is uploaded when it completes.
+
+For an identity refusal, resolve the instance's identity problem, then take a new backup and
+confirm it uploads. Uploads already started retain their recorded target and identity through
+operator restarts; cleanup waits for live Jobs and orphaned pods to stop.
 
 ## Escalation
 

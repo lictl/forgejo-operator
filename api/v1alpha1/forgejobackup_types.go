@@ -16,6 +16,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -79,6 +80,8 @@ type ForgejoBackupStatus struct {
 	StartTime *metav1.Time `json:"startTime,omitempty"`
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// jobName is recorded before creating the Job. A Pending backup with a Job name may
+	// already be writing and is recovered before any new start or deletion.
 	// +optional
 	JobName string `json:"jobName,omitempty"`
 	// pvcName holding the backup files.
@@ -90,10 +93,23 @@ type ForgejoBackupStatus struct {
 	// forgejoImage running when the backup was taken (restores must use a compatible image).
 	// +optional
 	ForgejoImage string `json:"forgejoImage,omitempty"`
+	// serviceAccountName is copied from the source podTemplate before the backup Job starts.
+	// Cleanup uses it when the source instance is gone, without mounting its API token.
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+	// imagePullSecrets are the source's explicit registry Secret references, recorded before
+	// the backup Job starts. Orphan cleanup uses these names; no credential values are stored.
+	// +listType=atomic
+	// +optional
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 	// postgresImage whose pg_dump wrote the database dump: the image of the instance's running
 	// PostgreSQL. A restore into a server of an older major is refused.
 	// +optional
 	PostgresImage string `json:"postgresImage,omitempty"`
+	// forgejoUID identifies the source instance before the backup Job starts. Remote uploads
+	// refuse an instance recreated under the same name.
+	// +optional
+	ForgejoUID string `json:"forgejoUID,omitempty"`
 	// secretKeyFingerprint identifies the SECRET_KEY of the instance when the backup was taken
 	// (forgejo.SecretKeyFingerprint, 16 hex digits, as remote manifests record it and the
 	// annotation forgejo.lucas.icu/identity of the data volume). A restore of the database into
@@ -148,6 +164,8 @@ type RemoteBackupStatus struct {
 	// says by then.
 	// +optional
 	S3 *S3Connection `json:"s3,omitempty"`
+	// jobName and the original target are recorded before creating the upload Job, so a
+	// lost status patch or a vanished Job cannot erase its settlement coordinates.
 	// +optional
 	JobName string `json:"jobName,omitempty"`
 	// +optional

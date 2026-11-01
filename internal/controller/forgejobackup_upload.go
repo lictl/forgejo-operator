@@ -51,36 +51,52 @@ func (r *ForgejoBackupReconciler) reconcileUpload(ctx context.Context, b *forgej
 	}
 	switch st.Phase {
 	case forgejov1.RemoteBackupUploaded, forgejov1.RemoteBackupFailed:
-		return ctrl.Result{}, r.releaseUpload(ctx, b)
+		return r.releaseUpload(ctx, b)
 	case forgejov1.RemoteBackupUploading:
 		return r.trackUpload(ctx, b, f)
 	default:
-		return r.startUpload(ctx, b, f)
+		return r.startUpload(ctx, b)
 	}
 }
 
 // releaseUpload deletes the finished upload Job and the identity Secret it read.
-func (r *ForgejoBackupReconciler) releaseUpload(ctx context.Context, b *forgejov1.ForgejoBackup) error {
+func (r *ForgejoBackupReconciler) releaseUpload(ctx context.Context, b *forgejov1.ForgejoBackup) (ctrl.Result, error) {
+	if stopped, err := r.jobStopped(ctx, b, uploadJobName(b), false); err != nil || !stopped {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+	}
 	if err := backup.DeleteFinishedJob(ctx, r.Client, b, uploadJobName(b)); err != nil {
-		return fmt.Errorf("deleting finished upload job: %w", err)
+		return ctrl.Result{}, fmt.Errorf("deleting finished upload job: %w", err)
 	}
 	sec := &corev1.Secret{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: backup.IdentitySecretName(b)}, sec)
 	if apierrors.IsNotFound(err) {
-		return nil
+		return ctrl.Result{}, nil
 	}
 	if err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
 	if !metav1.IsControlledBy(sec, b) || !sec.DeletionTimestamp.IsZero() {
-		return nil
+		return ctrl.Result{}, nil
 	}
-	return client.IgnoreNotFound(r.Delete(ctx, sec, client.Preconditions{UID: &sec.UID}))
+	return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, sec, client.Preconditions{UID: &sec.UID}))
 }
 
-func (r *ForgejoBackupReconciler) startUpload(ctx context.Context, b *forgejov1.ForgejoBackup, f *forgejov1.Forgejo) (ctrl.Result, error) {
-	if f == nil || !f.DeletionTimestamp.IsZero() {
+func (r *ForgejoBackupReconciler) startUpload(ctx context.Context, b *forgejov1.ForgejoBackup) (ctrl.Result, error) {
+	f := &forgejov1.Forgejo{}
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.ForgejoRef.Name}, f); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.uploadFailed(ctx, b, "InstanceNotFound", fmt.Sprintf("Not uploaded: Forgejo %q is gone", b.Spec.ForgejoRef.Name))
+	}
+	if !f.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, r.uploadFailed(ctx, b, "InstanceNotFound", fmt.Sprintf("Not uploaded: Forgejo %q is being deleted", f.Name))
+	}
+	if b.Status.ForgejoUID == "" || b.Status.SecretKeyFingerprint == "" {
+		return ctrl.Result{}, r.uploadFailed(ctx, b, "IdentityUnavailable", "Not uploaded: the backup has no recorded source UID and SECRET_KEY fingerprint")
+	}
+	if b.Status.ForgejoUID != string(f.UID) {
+		return ctrl.Result{}, r.uploadFailed(ctx, b, "IdentityChanged", "Not uploaded: the source Forgejo was replaced by another instance")
 	}
 	if !backup.RemoteEnabled(f) {
 		return ctrl.Result{}, r.uploadFailed(ctx, b, "RemoteDisabled", "Not uploaded: spec.backup.remote is not set any more")
@@ -107,21 +123,22 @@ func (r *ForgejoBackupReconciler) startUpload(ctx context.Context, b *forgejov1.
 			return failConfig(fmt.Errorf("CA certificate: %w", err))
 		}
 	}
-	id, err := backup.BuildIdentity(ctx, r.Client, f)
+	id, err := backup.BuildIdentity(ctx, r.reader(), f)
 	if err != nil {
 		return ctrl.Result{}, r.uploadFailed(ctx, b, "IdentityUnavailable", "Not uploaded: "+err.Error())
+	}
+	if s := id.Secret(backup.IdentityRoleSecrets); s == nil || forgejo.SecretKeyFingerprint(s.Data) != b.Status.SecretKeyFingerprint {
+		return ctrl.Result{}, r.uploadFailed(ctx, b, "IdentityChanged", "Not uploaded: the current SECRET_KEY differs from the database backup")
 	}
 	pgImage := b.Status.PostgresImage
 	if pgImage == "" {
 		pgImage = forgejo.RunningPostgresImage(f)
 	}
 	m := backup.RemoteManifest{
-		Backup: b.Name, Namespace: b.Namespace, Forgejo: f.Name, BackupUID: string(b.UID), ForgejoUID: string(f.UID),
+		Backup: b.Name, Namespace: b.Namespace, Forgejo: f.Name, BackupUID: string(b.UID), ForgejoUID: b.Status.ForgejoUID,
 		Reason: backup.Reason(b), ForgejoImage: b.Status.ForgejoImage, PostgresImage: pgImage,
 		IncludesData: b.Status.IncludesData, KeyFingerprint: cipher.Fingerprint(),
-	}
-	if s := id.Secret(backup.IdentityRoleSecrets); s != nil {
-		m.SecretKeyFingerprint = forgejo.SecretKeyFingerprint(s.Data)
+		SecretKeyFingerprint: b.Status.SecretKeyFingerprint,
 	}
 	if b.Status.CompletionTime != nil {
 		m.CompletedAt = b.Status.CompletionTime.UTC().Format(time.RFC3339)
@@ -152,34 +169,62 @@ func (r *ForgejoBackupReconciler) startUpload(ctx context.Context, b *forgejov1.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := backup.CreateJob(ctx, r.Client, b, job); err != nil {
-		var conflict *backup.JobConflictError
-		if !errors.As(err, &conflict) {
-			return ctrl.Result{}, fmt.Errorf("creating upload job: %w", err)
-		}
-		if conflict.Transient {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		return ctrl.Result{}, r.uploadFailed(ctx, b, "JobNameConflict", fmt.Sprintf("Not uploaded: %v", conflict))
-	}
-
-	orig := b.DeepCopy()
 	now := metav1.Now()
-	st := b.Status.Remote
+	st := b.Status.Remote.DeepCopy()
 	st.Phase = forgejov1.RemoteBackupUploading
 	st.JobName = job.Name
 	st.StartTime = &now
 	// What the Job writes to: an upload that does not succeed is checked there, whatever
 	// spec.backup.remote says by then.
 	st.S3 = conn.DeepCopy()
+	st.Location = backup.RemoteLocation(conn, st.Path)
 	st.KeySecret = &keyRef
 	st.KeyFingerprint = cipher.Fingerprint()
 	st.Message = fmt.Sprintf("Upload job %s is uploading to %s", job.Name, st.Location)
+	// Journal the original destination and key references before the Job can upload. They
+	// are also needed to settle a lost Job, so a record on the Job itself is not sufficient.
+	prepared := st.DeepCopy()
+	prepared.Phase = forgejov1.RemoteBackupPending
+	orig := b.DeepCopy()
+	b.Status.Remote = prepared
+	if err := r.patchStatus(ctx, b, orig); err != nil {
+		return ctrl.Result{}, err
+	}
+	if res, stopped, err := r.createPreparedUpload(ctx, b, job, orig); stopped {
+		return res, err
+	}
+
+	orig = b.DeepCopy()
+	b.Status.Remote = st
 	if err := r.patchStatus(ctx, b, orig); err != nil {
 		return ctrl.Result{}, err
 	}
 	r.event(b, corev1.EventTypeNormal, "UploadStarted", "Upload", "Started job %s uploading to %s", job.Name, st.Location)
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
+}
+
+// createPreparedUpload discards preparation only when the API explicitly refused creation.
+// An ambiguous create error leaves the journal intact for recovery on the next reconcile.
+func (r *ForgejoBackupReconciler) createPreparedUpload(ctx context.Context, b *forgejov1.ForgejoBackup, job *batchv1.Job, orig *forgejov1.ForgejoBackup) (ctrl.Result, bool, error) {
+	if err := backup.CreateJob(ctx, r.Client, b, job); err != nil {
+		var conflict *backup.JobConflictError
+		if !errors.As(err, &conflict) {
+			return ctrl.Result{}, true, fmt.Errorf("creating upload job: %w", err)
+		}
+		// A refused create cannot have uploaded anything. Restore the unstarted state
+		// so a transient predecessor collision can retry after garbage collection.
+		prepared := b.DeepCopy()
+		b.Status.Remote = orig.Status.Remote
+		if err := r.patchStatus(ctx, b, prepared); err != nil {
+			return ctrl.Result{}, true, err
+		}
+		if conflict.Transient {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+		}
+		return ctrl.Result{}, true, r.uploadFailed(ctx, b, "JobNameConflict", fmt.Sprintf("Not uploaded: %v", conflict))
+	}
+
+	return ctrl.Result{}, false, nil
 }
 
 // identityConflictError: the identity Secret's name is taken by a Secret of something else.
@@ -198,11 +243,13 @@ func (r *ForgejoBackupReconciler) ensureIdentitySecret(ctx context.Context, b *f
 		return err
 	}
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: backup.IdentitySecretName(b), Namespace: b.Namespace}}
-	err = r.Get(ctx, client.ObjectKeyFromObject(sec), sec)
+	err = r.reader().Get(ctx, client.ObjectKeyFromObject(sec), sec)
 	switch {
 	case apierrors.IsNotFound(err):
 		sec.Labels = forgejo.Labels(f, forgejo.ComponentBackup)
 		sec.Type = corev1.SecretTypeOpaque
+		immutable := true
+		sec.Immutable = &immutable
 		sec.Data = map[string][]byte{backup.IdentityFile: data}
 		if err := controllerutil.SetControllerReference(b, sec, r.Scheme); err != nil {
 			return err
@@ -213,8 +260,14 @@ func (r *ForgejoBackupReconciler) ensureIdentitySecret(ctx context.Context, b *f
 	case !metav1.IsControlledBy(sec, b):
 		return &identityConflictError{name: sec.Name}
 	}
-	sec.Data = map[string][]byte{backup.IdentityFile: data}
-	return r.Update(ctx, sec)
+	stored := &backup.Identity{}
+	if err := json.Unmarshal(sec.Data[backup.IdentityFile], stored); err != nil {
+		return fmt.Errorf("reading saved backup identity: %w", err)
+	}
+	if s := stored.Secret(backup.IdentityRoleSecrets); s == nil || forgejo.SecretKeyFingerprint(s.Data) != b.Status.SecretKeyFingerprint {
+		return &identityConflictError{name: sec.Name}
+	}
+	return nil
 }
 
 func (r *ForgejoBackupReconciler) trackUpload(ctx context.Context, b *forgejov1.ForgejoBackup, f *forgejov1.Forgejo) (ctrl.Result, error) {
@@ -242,7 +295,7 @@ func (r *ForgejoBackupReconciler) trackUpload(ctx context.Context, b *forgejov1.
 			return ctrl.Result{}, r.uploadFailed(ctx, b, "JobNameConflict", fmt.Sprintf("Upload job %s was replaced: %v", st.JobName, err))
 		}
 	}
-	pods, err := backup.JobPodsByName(ctx, r.Client, b.Namespace, st.JobName)
+	pods, err := backup.JobPodsByName(ctx, r.reader(), b.Namespace, st.JobName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

@@ -170,9 +170,39 @@ spec:
                 description: forgejoImage running when the backup was taken (restores
                   must use a compatible image).
                 type: string
+              forgejoUID:
+                description: |-
+                  forgejoUID identifies the source instance before the backup Job starts. Remote uploads
+                  refuse an instance recreated under the same name.
+                type: string
+              imagePullSecrets:
+                description: |-
+                  imagePullSecrets are the source's explicit registry Secret references, recorded before
+                  the backup Job starts. Orphan cleanup uses these names; no credential values are stored.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+                x-kubernetes-list-type: atomic
               includesData:
                 type: boolean
               jobName:
+                description: |-
+                  jobName is recorded before creating the Job. A Pending backup with a Job name may
+                  already be writing and is recovered before any new start or deletion.
                 type: string
               message:
                 type: string
@@ -226,6 +256,9 @@ spec:
                     type: array
                     x-kubernetes-list-type: atomic
                   jobName:
+                    description: |-
+                      jobName and the original target are recorded before creating the upload Job, so a
+                      lost status patch or a vanished Job cannot erase its settlement coordinates.
                     type: string
                   keyFingerprint:
                     description: keyFingerprint identifies the key the backup was
@@ -398,6 +431,11 @@ spec:
                   an instance with another SECRET_KEY is refused unless the ForgejoRestore sets
                   allowIdentityMismatch, and retention never prunes a backup of another identity. Empty
                   (backups of older operator versions) is not checked and counts as the instance's.
+                type: string
+              serviceAccountName:
+                description: |-
+                  serviceAccountName is copied from the source podTemplate before the backup Job starts.
+                  Cleanup uses it when the source instance is gone, without mounting its API token.
                 type: string
               startTime:
                 format: date-time
