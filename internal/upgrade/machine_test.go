@@ -41,7 +41,7 @@ func fixture(u *forgejov1.UpgradeStatus) *forgejov1.Forgejo {
 	}
 }
 
-func newClient(t *testing.T, objs ...client.Object) client.Client {
+func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(s); err != nil {
@@ -50,18 +50,23 @@ func newClient(t *testing.T, objs ...client.Object) client.Client {
 	if err := forgejov1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
-	return fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
+	return s
+}
+
+func newClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).Build()
 }
 
 func reconcile(t *testing.T, f *forgejov1.Forgejo, objs ...client.Object) (*forgejo.ReconcileContext, client.Client) {
 	t.Helper()
 	c := newClient(t, objs...)
-	return reconcileWith(t, c, c.Scheme(), f), c
+	return reconcileWith(t, c, f), c
 }
 
-func reconcileWith(t *testing.T, c client.Client, s *runtime.Scheme, f *forgejov1.Forgejo) *forgejo.ReconcileContext {
+func reconcileWith(t *testing.T, c client.Client, f *forgejov1.Forgejo) *forgejo.ReconcileContext {
 	t.Helper()
-	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: s, Instance: f, TargetImage: f.Status.Image}
+	rc := &forgejo.ReconcileContext{Client: c, APIReader: c, Scheme: c.Scheme(), Instance: f, TargetImage: f.Status.Image}
 	if _, err := Reconcile(context.Background(), rc); err != nil {
 		t.Fatal(err)
 	}
@@ -89,6 +94,27 @@ func serverPod(f *forgejov1.Forgejo, name, image string, created *metav1.Time, i
 	}
 }
 
+// serverPodRunning is a server pod of imgA that runs.
+func serverPodRunning(f *forgejov1.Forgejo, name string) *corev1.Pod {
+	p := serverPod(f, name, imgA, ago(time.Hour), corev1.ContainerState{}, 0)
+	p.Status.Phase = corev1.PodRunning
+	return p
+}
+
+// deployment is core's server Deployment with replicas replicas of image, available of them
+// available.
+func deployment(image string, replicas, available int32) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: "ns", Generation: 2},
+		Spec: appsv1.DeploymentSpec{Replicas: ptr.To(replicas), Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: serverContainer, Image: image}}}}},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: replicas, UpdatedReplicas: replicas, AvailableReplicas: available},
+	}
+}
+
+// A rollback whose restore failed keeps Forgejo stopped (a later restore lifts that, see
+// TestFailedRollbackRestoreLiftedByLaterRestore). Setting spec.image back to the old image starts
+// it without a restore.
 func TestFailedRollbackRestoreKeepsForgejoStopped(t *testing.T) {
 	f := fixture(&forgejov1.UpgradeStatus{
 		Phase: forgejov1.UpgradePhaseRollingBack, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, RestoreName: testRollbackRestore,
@@ -103,39 +129,13 @@ func TestFailedRollbackRestoreKeepsForgejoStopped(t *testing.T) {
 		t.Fatalf("target %s, override %v, upgrading %v", rc.TargetImage, rc.ReplicasOverride, rc.Upgrading)
 	}
 
-	// Still stopped while idle and no later restore has restored anything.
-	u.CompletionTime = &metav1.Time{Time: u.CompletionTime.Truncate(time.Second)} // as persisted
-	if err := c.Create(context.Background(), restore("manual", forgejov1.RestorePhaseRestoring, ptr.To(metav1.Now()))); err != nil {
-		t.Fatal(err)
+	// Still stopped in the idle passes that follow.
+	if rc = reconcileWith(t, c, f); rc.ReplicasOverride == nil || *rc.ReplicasOverride != 0 || rc.TargetImage != imgA {
+		t.Fatalf("idle: override %v, target %s", rc.ReplicasOverride, rc.TargetImage)
 	}
-	if rc = reconcileWith(t, c, c.Scheme(), f); rc.ReplicasOverride == nil || *rc.ReplicasOverride != 0 {
-		t.Fatalf("override %v while the manual restore runs", rc.ReplicasOverride)
-	}
-
-	// A later restore that reached ScalingUp lifts the hold for good.
-	r := &forgejov1.ForgejoRestore{}
-	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "manual"}, r); err != nil {
-		t.Fatal(err)
-	}
-	r.Status.Phase = forgejov1.RestorePhaseScalingUp
-	if err := c.Update(context.Background(), r); err != nil {
-		t.Fatal(err)
-	}
-	if rc = reconcileWith(t, c, c.Scheme(), f); rc.ReplicasOverride != nil || rc.TargetImage != imgA || f.Status.Upgrade.RollbackRestoreFailed {
-		t.Fatalf("after restore: override %v, target %s", rc.ReplicasOverride, rc.TargetImage)
-	}
-}
-
-func TestFailedRollbackRestoreReleasedBySpecImage(t *testing.T) {
-	f := fixture(&forgejov1.UpgradeStatus{
-		Phase: forgejov1.UpgradePhaseFailed, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, RestoreName: testRollbackRestore,
-		StartTime: ago(time.Hour), RolloutStartTime: ago(50 * time.Minute), CompletionTime: ago(time.Minute),
-		FailedImage: imgB, RollbackRestoreFailed: true,
-	})
 	f.Spec.Image = imgA
-	rc, _ := reconcile(t, f)
-	if rc.ReplicasOverride != nil || rc.TargetImage != imgA {
-		t.Fatalf("override %v, target %s", rc.ReplicasOverride, rc.TargetImage)
+	if rc = reconcileWith(t, c, f); rc.ReplicasOverride != nil || rc.TargetImage != imgA {
+		t.Fatalf("spec.image set back: override %v, target %s", rc.ReplicasOverride, rc.TargetImage)
 	}
 }
 
@@ -152,63 +152,72 @@ func TestKeptFailureHoldsSingleReplica(t *testing.T) {
 	if rc.TargetImage != imgB || rc.ReplicasOverride == nil || *rc.ReplicasOverride != 1 || !forgejo.UpgradeHoldsWorkload(f) {
 		t.Fatalf("target %s, override %v", rc.TargetImage, rc.ReplicasOverride)
 	}
-	if rc = reconcileWith(t, c, c.Scheme(), f); rc.ReplicasOverride == nil || *rc.ReplicasOverride != 1 {
+	if rc = reconcileWith(t, c, f); rc.ReplicasOverride == nil || *rc.ReplicasOverride != 1 {
 		t.Fatalf("idle override %v", rc.ReplicasOverride)
 	}
 
 	// The kept image became available: the hold ends.
 	f.Status.Image = imgB
-	if rc = reconcileWith(t, c, c.Scheme(), f); rc.ReplicasOverride != nil || f.Status.Upgrade.Phase != forgejov1.UpgradePhaseSucceeded {
+	if rc = reconcileWith(t, c, f); rc.ReplicasOverride != nil || f.Status.Upgrade.Phase != forgejov1.UpgradePhaseSucceeded {
 		t.Fatalf("override %v, phase %s", rc.ReplicasOverride, f.Status.Upgrade.Phase)
 	}
 }
 
-// availableDeployment is the server Deployment with every one of its replicas available on image.
-func availableDeployment(image string, replicas int32) *appsv1.Deployment {
-	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: "ns", Generation: 2},
-		Spec: appsv1.DeploymentSpec{Replicas: ptr.To(replicas), Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: serverContainer, Image: image}}}}},
-		Status: appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: replicas, UpdatedReplicas: replicas, AvailableReplicas: replicas},
-	}
-}
-
-// The operator was away past the timeout (status.image still the old image) while the new pod
-// crashed a few times and then became available: the upgrade succeeds instead of rolling back.
-func TestAvailableRolloutWinsOverTimeoutAndRestarts(t *testing.T) {
-	f := fixture(&forgejov1.UpgradeStatus{
-		Phase: forgejov1.UpgradePhaseVerifying, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup,
-		StartTime: ago(2 * time.Hour), RolloutStartTime: ago(time.Hour),
-	})
-	pod := serverPod(f, "new", imgB, ago(time.Hour), corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}, 0)
-	pod.Status.Phase = corev1.PodRunning
-	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: serverContainer, Ready: true, RestartCount: 5,
+// The live Deployment decides whether an upgrade is verified: every replica of the new image
+// available. status.image alone is not enough. A Deployment that rolled out wins over the timeout
+// and the restart counts, also while status.image still names the old image (core had no pass to
+// record it, for example while the operator was away), and status.image follows.
+func TestRolloutVerifiedByTheDeployment(t *testing.T) {
+	stale := deployment(imgB, 1, 1)
+	stale.Status.ObservedGeneration = 1
+	// restarted is the new pod after it crashed a few times and then became available.
+	restarted := serverPod(fixture(nil), "new", imgB, ago(time.Hour), corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}, 0)
+	restarted.Status.Phase = corev1.PodRunning
+	restarted.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: serverContainer, Ready: true, RestartCount: 5,
 		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
-	rc, c := reconcile(t, f, availableDeployment(imgB, 1), pod)
-	u := f.Status.Upgrade
-	if u.Phase != forgejov1.UpgradePhaseSucceeded || u.RestoreName != "" || rc.TargetImage != imgB || f.Status.Image != imgB {
-		t.Fatalf("phase %s, restore %q, target %s, status.image %s", u.Phase, u.RestoreName, rc.TargetImage, f.Status.Image)
-	}
-	restores := &forgejov1.ForgejoRestoreList{}
-	if err := c.List(context.Background(), restores); err != nil || len(restores.Items) != 0 {
-		t.Fatalf("restores %v, err %v", restores.Items, err)
-	}
-
-	// The next pass stays idle: status.image no longer lags behind the finished upgrade.
-	if rc = reconcileWith(t, c, c.Scheme(), f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseSucceeded || rc.Upgrading {
-		t.Fatalf("phase %s, upgrading %v", f.Status.Upgrade.Phase, rc.Upgrading)
-	}
-
-	// Not every replica is available past the timeout: still rolled back.
-	f = fixture(&forgejov1.UpgradeStatus{
-		Phase: forgejov1.UpgradePhaseVerifying, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup,
-		StartTime: ago(2 * time.Hour), RolloutStartTime: ago(time.Hour),
-	})
-	partial := availableDeployment(imgB, 2)
-	partial.Status.AvailableReplicas = 1
-	reconcile(t, f, partial)
-	if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseRollingBack || f.Status.Image != imgA {
-		t.Fatalf("phase %s, status.image %s", u.Phase, f.Status.Image)
+	for _, tt := range []struct {
+		name string
+		// statusImage is status.image; rolledOutAgo is when the new image was deployed (the
+		// timeout is 15m).
+		statusImage  string
+		rolledOutAgo time.Duration
+		objs         []client.Object
+		want         forgejov1.UpgradePhase
+	}{
+		{"no Deployment", imgB, 5 * time.Minute, nil, forgejov1.UpgradePhaseVerifying},
+		{"not available", imgB, 5 * time.Minute, []client.Object{deployment(imgB, 1, 0)}, forgejov1.UpgradePhaseVerifying},
+		{"old image", imgB, 5 * time.Minute, []client.Object{deployment(imgA, 1, 1)}, forgejov1.UpgradePhaseVerifying},
+		{"generation not observed", imgB, 5 * time.Minute, []client.Object{stale}, forgejov1.UpgradePhaseVerifying},
+		{"rolled out", imgA, 5 * time.Minute, []client.Object{deployment(imgB, 1, 1)}, forgejov1.UpgradePhaseSucceeded},
+		{"rolled out past the timeout after restarts", imgA, time.Hour, []client.Object{deployment(imgB, 1, 1), restarted},
+			forgejov1.UpgradePhaseSucceeded},
+		{"partly available past the timeout", imgA, time.Hour, []client.Object{deployment(imgB, 2, 1)}, forgejov1.UpgradePhaseRollingBack},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := fixture(&forgejov1.UpgradeStatus{
+				Phase: forgejov1.UpgradePhaseVerifying, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup,
+				StartTime: ago(2 * time.Hour), RolloutStartTime: ago(tt.rolledOutAgo),
+			})
+			f.Status.Image = tt.statusImage
+			rc, c := reconcile(t, f, tt.objs...)
+			u := f.Status.Upgrade
+			if u.Phase != tt.want {
+				t.Fatalf("phase %s (want %s): %s", u.Phase, tt.want, u.Message)
+			}
+			if tt.want != forgejov1.UpgradePhaseSucceeded {
+				if f.Status.Image != tt.statusImage {
+					t.Fatalf("status.image %s", f.Status.Image)
+				}
+				return
+			}
+			if u.RestoreName != "" || restores(t, c) != 0 || rc.TargetImage != imgB || rc.Upgrading || f.Status.Image != imgB {
+				t.Fatalf("restore %q, target %s, upgrading %v, status.image %s", u.RestoreName, rc.TargetImage, rc.Upgrading, f.Status.Image)
+			}
+			// The next pass stays idle: status.image no longer lags behind the finished upgrade.
+			if rc = reconcileWith(t, c, f); f.Status.Upgrade.Phase != forgejov1.UpgradePhaseSucceeded || rc.Upgrading {
+				t.Fatalf("next pass: phase %s, upgrading %v", f.Status.Upgrade.Phase, rc.Upgrading)
+			}
+		})
 	}
 }
 
@@ -216,9 +225,7 @@ func TestBackingUpGivesUpOnPodsThatDoNotStop(t *testing.T) {
 	f := fixture(&forgejov1.UpgradeStatus{
 		Phase: forgejov1.UpgradePhaseBackingUp, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup, StartTime: ago(16 * time.Minute),
 	})
-	stuck := serverPod(f, "stuck", imgA, ago(time.Hour), corev1.ContainerState{}, 0)
-	stuck.Status.Phase = corev1.PodRunning
-	rc, _ := reconcile(t, f, stuck)
+	rc, _ := reconcile(t, f, serverPodRunning(f, "stuck"))
 	u := f.Status.Upgrade
 	if u.Phase != forgejov1.UpgradePhaseFailed || u.RolloutStartTime != nil || rc.ReplicasOverride != nil || rc.TargetImage != imgA {
 		t.Fatalf("phase %s, override %v, target %s", u.Phase, rc.ReplicasOverride, rc.TargetImage)
@@ -232,7 +239,7 @@ func TestFreshUpgradeDeploysWithRolloutStartTime(t *testing.T) {
 	if f.Status.Upgrade.Phase != forgejov1.UpgradePhasePending || rc.TargetImage != imgA {
 		t.Fatalf("Pending deploys %s", rc.TargetImage)
 	}
-	rc = reconcileWith(t, c, c.Scheme(), f)
+	rc = reconcileWith(t, c, f)
 	if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseRollingOut || u.RolloutStartTime == nil || rc.TargetImage != imgB {
 		t.Fatalf("phase %s, target %s", u.Phase, rc.TargetImage)
 	}
@@ -246,13 +253,6 @@ func TestCancelBeforeDeploy(t *testing.T) {
 		f.Spec.Image = imgA
 		return f
 	}
-	dep := func(image string) *appsv1.Deployment {
-		return &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: "ns"},
-			Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{Name: serverContainer, Image: image}}}}},
-		}
-	}
 	bk := &forgejov1.ForgejoBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: testPreBackup, Namespace: "ns"},
 		Status:     forgejov1.ForgejoBackupStatus{Phase: forgejov1.BackupPhaseRunning},
@@ -260,7 +260,7 @@ func TestCancelBeforeDeploy(t *testing.T) {
 
 	// A running backup finishes first, with Forgejo stopped.
 	f := pending()
-	rc, c := reconcile(t, f, dep(imgA), bk)
+	rc, c := reconcile(t, f, deployment(imgA, 1, 1), bk)
 	if f.Status.Upgrade.Phase != forgejov1.UpgradePhaseBackingUp || rc.ReplicasOverride == nil || *rc.ReplicasOverride != 0 {
 		t.Fatalf("phase %s, override %v", f.Status.Upgrade.Phase, rc.ReplicasOverride)
 	}
@@ -268,11 +268,11 @@ func TestCancelBeforeDeploy(t *testing.T) {
 	if err := c.Update(context.Background(), bk); err != nil {
 		t.Fatal(err)
 	}
-	rc = reconcileWith(t, c, c.Scheme(), f)
+	rc = reconcileWith(t, c, f)
 	if u := f.Status.Upgrade; u.Phase != forgejov1.UpgradePhaseCancelled || u.FailedImage != "" || rc.TargetImage != imgA || rc.ReplicasOverride != nil {
 		t.Fatalf("phase %s, failedImage %q, target %s", u.Phase, u.FailedImage, rc.TargetImage)
 	}
-	if rc = reconcileWith(t, c, c.Scheme(), f); rc.TargetImage != imgA || f.Status.Upgrade.Phase != forgejov1.UpgradePhaseCancelled {
+	if rc = reconcileWith(t, c, f); rc.TargetImage != imgA || f.Status.Upgrade.Phase != forgejov1.UpgradePhaseCancelled {
 		t.Fatalf("idle after cancel: target %s", rc.TargetImage)
 	}
 
@@ -280,7 +280,7 @@ func TestCancelBeforeDeploy(t *testing.T) {
 	f = pending()
 	bk.Status.Phase = forgejov1.BackupPhaseCompleted
 	bk.ResourceVersion = ""
-	rc, _ = reconcile(t, f, dep(imgB), bk)
+	rc, _ = reconcile(t, f, deployment(imgB, 1, 0), bk)
 	if f.Status.Upgrade.Phase != forgejov1.UpgradePhaseRollingOut || rc.TargetImage != imgB {
 		t.Fatalf("phase %s, target %s", f.Status.Upgrade.Phase, rc.TargetImage)
 	}
@@ -308,21 +308,25 @@ func TestRetryKeepsMigratingPodAndDeletesFailingOne(t *testing.T) {
 	}
 }
 
-// A later restore lifts the hold after a failed rollback restore only when it restored the
-// database, and the data volume when its backup has a data archive.
-func TestFailedRollbackRestoreNeedsDatabaseAndData(t *testing.T) {
+// After a failed rollback restore, a restore created later lifts the hold for good once it has
+// restored (ScalingUp, when it waits for Forgejo to come back) the database, and the data volume
+// when its backup has a data archive.
+func TestFailedRollbackRestoreLiftedByLaterRestore(t *testing.T) {
 	cases := []struct {
 		name          string
+		phase         forgejov1.RestorePhase
 		db, data      *bool
 		backupHasData bool
 		backupGone    bool
 		lifts         bool
 	}{
-		{name: "database and data", backupHasData: true, lifts: true},
-		{name: "data only", db: ptr.To(false), backupHasData: true},
-		{name: "database only from a backup with data", data: ptr.To(false), backupHasData: true},
-		{name: "database only from a backup without data", data: ptr.To(false), lifts: true},
-		{name: "database only from a deleted backup", data: ptr.To(false), backupGone: true},
+		{name: "restore still running", phase: forgejov1.RestorePhaseRestoring, backupHasData: true},
+		{name: "restore scaling up", phase: forgejov1.RestorePhaseScalingUp, backupHasData: true, lifts: true},
+		{name: "database and data", phase: forgejov1.RestorePhaseCompleted, backupHasData: true, lifts: true},
+		{name: "data only", phase: forgejov1.RestorePhaseCompleted, db: ptr.To(false), backupHasData: true},
+		{name: "database only from a backup with data", phase: forgejov1.RestorePhaseCompleted, data: ptr.To(false), backupHasData: true},
+		{name: "database only from a backup without data", phase: forgejov1.RestorePhaseCompleted, data: ptr.To(false), lifts: true},
+		{name: "database only from a deleted backup", phase: forgejov1.RestorePhaseCompleted, data: ptr.To(false), backupGone: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -331,7 +335,7 @@ func TestFailedRollbackRestoreNeedsDatabaseAndData(t *testing.T) {
 				RestoreName: testRollbackRestore, StartTime: ago(time.Hour), RolloutStartTime: ago(50 * time.Minute),
 				CompletionTime: ago(10 * time.Minute), FailedImage: imgB, RollbackRestoreFailed: true,
 			})
-			r := restore("manual", forgejov1.RestorePhaseCompleted, ago(time.Minute))
+			r := restore("manual", tc.phase, ago(time.Minute))
 			r.Spec.BackupName = "later"
 			r.Spec.RestoreDatabase, r.Spec.RestoreData = tc.db, tc.data
 			objs := []client.Object{r}
@@ -344,8 +348,9 @@ func TestFailedRollbackRestoreNeedsDatabaseAndData(t *testing.T) {
 			}
 			rc, _ := reconcile(t, f, objs...)
 			stopped := rc.ReplicasOverride != nil && *rc.ReplicasOverride == 0
-			if stopped == tc.lifts || f.Status.Upgrade.RollbackRestoreFailed == tc.lifts {
-				t.Fatalf("want lifted %v: stopped %v, rollbackRestoreFailed %v", tc.lifts, stopped, f.Status.Upgrade.RollbackRestoreFailed)
+			if stopped == tc.lifts || f.Status.Upgrade.RollbackRestoreFailed == tc.lifts || rc.TargetImage != imgA {
+				t.Fatalf("want lifted %v: stopped %v, rollbackRestoreFailed %v, target %s", tc.lifts, stopped,
+					f.Status.Upgrade.RollbackRestoreFailed, rc.TargetImage)
 			}
 		})
 	}
