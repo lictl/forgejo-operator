@@ -17,14 +17,14 @@ editor and viewer roles of each kind) are for people, not for the operator; noth
 
 ## manager-role
 
-Every verb is used by the code; nothing is granted on `*`, and no rule uses `resourceNames`
+Every verb is used by the code (delete on CNPG Clusters only for an admission check, see the
+table); nothing is granted on `*`, and no rule uses `resourceNames`
 (the names of an instance's objects are not known in advance). The operator never deletes data:
 the data and backup PVCs, the CNPG Cluster and the identity Secrets go only through Kubernetes'
-garbage collection under `spec.storage.retainPolicy: Delete`. The one exception is the rollback
-of a failed PostgreSQL major upgrade, which deletes the CNPG Cluster to create it again on the old
-major, and only while its cold pre-upgrade backup, read again right before, can restore it (it
-exists, is `Completed` with a dump of the old major, and its volume exists); never after a revert
-whose `pg_upgrade` did not start ([upgrades.md](upgrades.md#postgresql-major-upgrades)).
+garbage collection under `spec.storage.retainPolicy: Delete`. Nor does a failed PostgreSQL major
+upgrade delete the Cluster or restore a backup: one that left the old data untouched is reverted
+in place; one after which the data may have changed leaves the Cluster as it is, with Forgejo
+stopped and the instance Broken ([upgrades.md](upgrades.md#failures-of-a-postgresql-upgrade)).
 
 | API group | Resources | Verbs | Used for |
 |-----------|-----------|-------|----------|
@@ -44,7 +44,7 @@ whose `pg_upgrade` did not start ([upgrades.md](upgrades.md#postgresql-major-upg
 | `networking.k8s.io` | `ingresses` | get, list, watch, create, update, delete | Ingress `<name>` |
 | `events.k8s.io` | `events` | create, patch | Events on the operator's objects |
 | `metrics.k8s.io` | `pods` | list | Usage of the Forgejo pods for vertical sizing |
-| `postgresql.cnpg.io` | `clusters` | get, list, watch, create, update, patch, delete | CNPG Cluster `<name>-db`; patch: storage growth; delete: only the rollback of a failed PostgreSQL major upgrade (above) |
+| `postgresql.cnpg.io` | `clusters` | get, list, watch, create, update, patch, delete | CNPG Cluster `<name>-db`; patch: storage growth, the identity annotations, removing the restore-pending mark; delete: never called, but the `OwnerReferencesPermissionEnforcement` admission plugin requires it to change the owner reference under `spec.storage.retainPolicy` |
 | `monitoring.coreos.com` | `servicemonitors`, `prometheusrules` | get, create, update, delete | Read live, never listed or watched |
 | `gateway.networking.k8s.io` | `httproutes`, `tcproutes`, `referencegrants` | get, create, update, delete | Read live, never listed or watched (see [networking.md](networking.md#permissions)) |
 | `cert-manager.io` | `certificates` | get, create, update, delete | Read live, never listed or watched (see [networking.md](networking.md#permissions)) |

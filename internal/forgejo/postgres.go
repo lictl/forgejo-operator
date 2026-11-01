@@ -304,7 +304,7 @@ func DatabaseUpgradeInFlightPhase(p forgejov1.DatabaseUpgradePhase) bool {
 
 // DatabaseUpgradeInFlight reports whether status.database.upgrade records a PostgreSQL major
 // upgrade that has not finished. Backups, restores, runner registrations and Forgejo
-// upgrades wait for it (except the upgrade's own backup and restore).
+// upgrades wait for it (except the upgrade's own backup).
 func DatabaseUpgradeInFlight(f *forgejov1.Forgejo) bool {
 	u := DatabaseUpgrade(f)
 	return u != nil && DatabaseUpgradeInFlightPhase(u.Phase)

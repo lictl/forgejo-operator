@@ -416,7 +416,7 @@ spec.database ─────────────► Pending ─► BackingU
                                        (nothing          │ old data back  (not back,
                                         changed)         ▼ (same system  pg_upgrade had started)
                                                     RolledBack     ID)
-                                                    (not back, pg_upgrade never started: Failed, Cluster kept)
+                                                    (not back, pg_upgrade never started: Failed, Forgejo not held)
 ```
 
 | Phase | What happens | Forgejo | Cluster image |
@@ -432,8 +432,7 @@ spec.database ─────────────► Pending ─► BackingU
 | `Cancelled` | `spec.database.cnpg.imageName` changed before the new image was written | usual | old |
 
 The state is persisted in `status.database.upgrade`, so an operator restart resumes it; the
-backup and the restore have names derived from `startTime` and are created only once the phase
-that needs them is saved. While it is in flight, `DatabaseUpgrading=True` (reason = phase),
+backup has a name derived from `startTime` and is created only once `BackingUp` is saved. While it is in flight, `DatabaseUpgrading=True` (reason = phase),
 `status.phase` is `Upgrading` and `Progressing=True`. On a local cluster a 17 → 18 upgrade of a
 small database took about 75 s, the `pg_upgrade` Job 40 s of it.
 
@@ -442,7 +441,7 @@ small database took about 75 s, the `pg_upgrade` Job 40 s of it.
 - a change of `spec.image` (also the retry annotation) waits: `Upgrading=False/WaitingForDatabaseUpgrade`,
   and the Forgejo upgrade starts once the database upgrade has finished;
 - a `ForgejoRestore` waits in `Pending` and a `ForgejoBackup` in `Pending` ("Waiting for the
-  PostgreSQL major upgrade ..."), except the upgrade's own backup and restore; scheduled backups
+  PostgreSQL major upgrade ..."), except the upgrade's own backup; scheduled backups
   are deferred. The upgrade's own backup does not wait for such a restore (it could not start
   before the upgrade has finished), only for one that has already started;
 - `ForgejoRunner` registration Jobs wait (they write to the database through `forgejo-cli`);
