@@ -81,7 +81,8 @@ Details and reasons are in [docs/design.md](docs/design.md).
   `test/prometheus/`.
 - An RBAC marker change also updates [docs/permissions.md](docs/permissions.md).
   `internal/forgejo/rbac_test.go` checks the namespaced overlay and keeps `pods/exec` out of
-  the manager role.
+  the manager role. The fake client grants everything; to prove code needs no more than the
+  role, run it through a guard like `rbacGuard` in `internal/upgrade/rbac_test.go`.
 - Feature packages test with `testing` and the fake client; Ginkgo and envtest are used only
   in `internal/controller`.
 - New log messages follow the

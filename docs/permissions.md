@@ -37,7 +37,7 @@ stopped and the instance Broken ([upgrades.md](upgrades.md#failures-of-a-postgre
 | core | `nodes`, `persistentvolumes` | get, list, watch | Placing backup and restore Jobs where node-local volumes can be attached; schedulable nodes and their memory (HA warnings, vertical sizing); whether nodes carry `topology.kubernetes.io/zone` (HA spreading) |
 | `storage.k8s.io` | `storageclasses` | get, list, watch | `allowVolumeExpansion` before growing a volume |
 | `apps` | `deployments` | get, list, watch, create, update, patch, delete | Forgejo `<name>`; patch: autopilot restarts, vertical sizing and stopping Forgejo for a database restore; delete: never called, but the `OwnerReferencesPermissionEnforcement` admission plugin requires it to adopt a `<name>` Deployment that nothing controls |
-| `apps` | `statefulsets` | get, list, watch, create, update, delete | Valkey `<name>-valkey` and the cron runner `<name>-cron` with HA (update: scaling the cron runner down before a new image; delete: both when HA is turned off), and `ForgejoRunner` pods |
+| `apps` | `statefulsets` | get, list, watch, create, update, patch, delete | Valkey `<name>-valkey` and the cron runner `<name>-cron` with HA (update: scaling the cron runner down before a new image; patch: stopping it for a database restore; delete: both when HA is turned off), and `ForgejoRunner` pods |
 | `batch` | `jobs` | get, list, watch, create, delete | Backup, upload, restore and runner registration Jobs, deleted once their result is recorded; CNPG's major upgrade Job is only read |
 | `autoscaling` | `horizontalpodautoscalers` | get, list, watch, create, update, delete | HPA `<name>` |
 | `policy` | `poddisruptionbudgets` | get, list, watch, create, update, delete | PDBs `<name>` and `<name>-valkey` |
@@ -56,8 +56,11 @@ stopped and the instance Broken ([upgrades.md](upgrades.md#failures-of-a-postgre
 | | `*/finalizers` | update | Owner references with `blockOwnerDeletion` on the children of each kind |
 
 `internal/forgejo/rbac_test.go` fails when the markers grant a resource that is not classified
-as namespaced or cluster-scoped, when `pods/exec` appears in manager-role, or when the
-cluster-scoped rules and `cluster_reader_role.yaml` differ.
+as namespaced or cluster-scoped, when `pods/exec` appears in manager-role, when the
+cluster-scoped rules and `cluster_reader_role.yaml` differ, or when a kind whose owner
+references change loses delete. The tests of the database-upgrade step run it through
+`rbacGuard` (`internal/upgrade/rbac_test.go`), a fake client that refuses, as Forbidden, every
+call manager-role does not grant.
 
 ### Cluster-wide write access
 

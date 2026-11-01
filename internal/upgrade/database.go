@@ -53,6 +53,7 @@ import (
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods;persistentvolumeclaims;secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;patch
 
 const (
 	// AnnotationRetryDatabase set to "true" on a Forgejo retries a PostgreSQL image whose upgrade
@@ -577,9 +578,8 @@ func holdForDatabaseRestore(ctx context.Context, rc *forgejo.ReconcileContext, c
 	// Also while this step stops the pipeline (the workload step that applies the override is
 	// skipped then, for example while a deleted cluster's pods and volumes go): Forgejo's open
 	// connections would keep the old PostgreSQL pod terminating, and nothing may write meanwhile.
-	if err := stopForgejo(ctx, rc); err != nil {
-		return err
-	}
+	// The hold is recorded below also when that fails, so that Broken names what waits.
+	stopErr := stopForgejo(ctx, rc)
 	if held {
 		msg := fmt.Sprintf("%s Forgejo is kept stopped until a ForgejoRestore has restored the database from a backup (for example %s, "+
 			"database only); a restore of the data volume alone does not end this.", u.Message, u.BackupName)
@@ -591,11 +591,11 @@ func holdForDatabaseRestore(ctx context.Context, rc *forgejo.ReconcileContext, c
 				// What the version gate reported in this pass about the image asked for meanwhile
 				// stays: an upgrade (or its retry) that waits for that restore, or a refusal, whose
 				// Warning event is emitted when this condition changes.
-				return nil
+				return stopErr
 			}
 		}
 		rc.SetCondition(forgejov1.ConditionDatabaseUpgrading, metav1.ConditionFalse, ReasonPostgresUpgradeFailed, msg)
-		return nil
+		return stopErr
 	}
 	name := forgejo.DatabaseClusterName(f)
 	state := fmt.Sprintf("CNPG cluster %s is created again, empty", name)
@@ -605,7 +605,7 @@ func holdForDatabaseRestore(ctx context.Context, rc *forgejo.ReconcileContext, c
 	rc.SetBroken(forgejo.BrokenDatabaseRestorePending, fmt.Sprintf(
 		"%s (annotation %s). Forgejo stays stopped until a ForgejoRestore of the database created after it has restored a backup into "+
 			"it; the annotation is removed then", state, forgejo.AnnotationRecreateDatabase))
-	return nil
+	return stopErr
 }
 
 // stopForgejo scales the server Deployment and the cron runner of rc.Instance to zero if they
