@@ -251,6 +251,7 @@ go build -o bin/manager ./cmd
 bin/manager --watch-namespace=dev     # run against your kubeconfig, scoped to one namespace
 make manifests generate               # after changing API types or RBAC markers
 make test                             # unit tests and the envtest suite
+make test-e2e                         # isolated Kind: data lifecycle and manager checks
 make forgejo-versions                 # compare the Forgejo version table with upstream releases
 ```
 
