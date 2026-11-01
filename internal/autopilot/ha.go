@@ -505,7 +505,9 @@ done
 }
 
 // ensureValkeyStatefulSet ensures StatefulSet "<name>-valkey". Fields the API server would
-// default are set explicitly, so an unchanged spec compares equal and causes no update.
+// default are set explicitly, so an unchanged spec compares equal and causes no update;
+// maxUnavailable, which only some servers default, keeps its stored default
+// (forgejo.StatefulSetRollingUpdate).
 func ensureValkeyStatefulSet(ctx context.Context, rc *forgejo.ReconcileContext, password string, reset valkeyResetPlan) (*appsv1.StatefulSet, error) {
 	f := rc.Instance
 	image := f.Spec.HighAvailability.Valkey.Image
@@ -615,10 +617,7 @@ func ensureValkeyStatefulSet(ctx context.Context, rc *forgejo.ReconcileContext, 
 			// Sentinels, not for their readiness.
 			sts.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
 		}
-		sts.Spec.UpdateStrategy = appsv1.StatefulSetUpdateStrategy{
-			Type:          appsv1.RollingUpdateStatefulSetStrategyType,
-			RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{Partition: ptr.To[int32](0)},
-		}
+		sts.Spec.UpdateStrategy = forgejo.StatefulSetRollingUpdate(sts.Spec.UpdateStrategy)
 		sts.Spec.RevisionHistoryLimit = ptr.To[int32](3)
 		sts.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
 			WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
