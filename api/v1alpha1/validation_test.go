@@ -186,6 +186,9 @@ func fj(spec string) string { return forgejo("git", spec) }
 
 const errCredentials = "credentialsSecret"
 
+// errIngressHost is the message of an enabled Ingress without an explicit host.
+const errIngressHost = "ingress.enabled requires ingress.host"
+
 // errSLOTarget is the field path of the availability target's validation errors.
 const errSLOTarget = "spec.monitoring.slo.availabilityTarget"
 
@@ -298,10 +301,12 @@ func TestForgejoValidation(t *testing.T) {
 		{name: "nodePort on NodePort", obj: fj("  server:\n    http: {type: NodePort, nodePort: 30080}")},
 		{name: "port out of range", obj: fj("  server:\n    ssh:\n      service: {port: 70000}"), want: "spec.server.ssh.service.port"},
 		{name: "loadBalancerClass on ClusterIP", obj: fj("  server:\n    ssh:\n      service: {loadBalancerClass: lb}"), want: "loadBalancerClass requires type LoadBalancer"},
-		{name: "ingress without host", obj: fj("  ingress: {enabled: true}"), want: "ingress.enabled requires ingress.host"},
+		{name: "ingress without host", obj: fj("  ingress: {enabled: true}"), want: errIngressHost},
 		{name: "ingress disabled without host", obj: fj("  ingress: {enabled: false}")},
 		{name: "ingress with host", obj: fj("  ingress: {enabled: true, host: git.example.com, path: /git}")},
-		{name: "ingress with domain", obj: fj("  server: {domain: git.example.com}\n  ingress: {enabled: true}")},
+		{name: "ingress with domain but no host", obj: fj("  server: {domain: git.example.com}\n  ingress: {enabled: true}"), want: errIngressHost},
+		{name: "ingress with rootURL but no host", obj: fj("  server: {rootURL: 'https://git.example.com:8443/git/'}\n  ingress: {enabled: true}"), want: errIngressHost},
+		{name: "ingress explicit host with other public identities", obj: fj("  server: {domain: ssh.example.com, rootURL: 'https://public.example.com/'}\n  ingress: {enabled: true, host: git.example.com}")},
 		{name: "ingress host upper case", obj: fj("  ingress: {enabled: true, host: Git.example.com}"), want: "spec.ingress.host"},
 		{name: "ingress path //", obj: fj("  ingress: {enabled: true, host: git.example.com, path: /a//b}"), want: "must not contain '//'"},
 		{name: "ingress path /.", obj: fj("  ingress: {enabled: true, host: git.example.com, path: /a/.}"), want: "must not end with '/.' or '/..'"},
@@ -321,7 +326,10 @@ func TestForgejoValidation(t *testing.T) {
 		{name: "gateway without parentRefs", obj: fj("  gateway:\n    parentRefs: []"), want: "spec.gateway.parentRefs"},
 		{name: "gateway ssh without SSH", obj: fj("  server:\n    ssh: {enabled: false}\n  gateway:\n    parentRefs: [{name: eg}]\n    ssh:\n      parentRefs: [{name: eg, sectionName: ssh}]"),
 			want: "gateway.ssh requires server.ssh.enabled"},
-		{name: "ingress with gateway host names", obj: fj("  ingress: {enabled: true}\n  gateway:\n    parentRefs: [{name: eg}]\n    hostnames: [git.example.com]")},
+		{name: "ingress with gateway host names but no host", obj: fj("  ingress: {enabled: true}\n  gateway:\n    parentRefs: [{name: eg}]\n    hostnames: [git.example.com]"), want: errIngressHost},
+		{name: "ingress with wildcard gateway but no host", obj: fj("  ingress: {enabled: true}\n  gateway:\n    parentRefs: [{name: eg}]\n    hostnames: ['*.example.com']"), want: errIngressHost},
+		{name: "ingress with empty gateway host names but no host", obj: fj("  ingress: {enabled: true}\n  gateway:\n    parentRefs: [{name: eg}]\n    hostnames: []"), want: errIngressHost},
+		{name: "ingress with host beside wildcard gateway", obj: fj("  ingress: {enabled: true, host: git.example.com}\n  gateway:\n    parentRefs: [{name: eg}]\n    hostnames: ['*.example.com']")},
 
 		// TLS.
 		{name: "issuer kind", obj: fj("  tls:\n    certManager:\n      issuerRef: {name: ca, kind: ClusterIssuer}")},

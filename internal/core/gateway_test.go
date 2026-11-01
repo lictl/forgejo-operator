@@ -199,7 +199,7 @@ func TestGatewayRouteOptions(t *testing.T) {
 	f := gatewayInstance()
 	f.Spec.Gateway.SSH = nil
 	f.Spec.Gateway.Path = "/git/"
-	f.Spec.Gateway.Hostnames = []string{"*.example.com", testCodeHost}
+	f.Spec.Gateway.Hostnames = []string{testWildcardHost, testCodeHost}
 	f.Spec.Gateway.RequestTimeout = ptr.To("")
 	f.Spec.Gateway.RemoveRequestHeaders = []string{"x-real-ip", "X-Forwarded-For"}
 	f.Spec.Gateway.ParentRefs[0].Namespace = f.Namespace // same namespace: left out
@@ -225,7 +225,7 @@ func TestGatewayRouteOptions(t *testing.T) {
 	if got := rule["matches"]; !reflect.DeepEqual(got, []any{map[string]any{testKeyPath: map[string]any{testKeyType: "PathPrefix", "value": "/git"}}}) {
 		t.Errorf("matches: %#v", got)
 	}
-	if got := nested(t, route, "spec", "hostnames"); !reflect.DeepEqual(got, []any{"*.example.com", testCodeHost}) {
+	if got := nested(t, route, "spec", "hostnames"); !reflect.DeepEqual(got, []any{testWildcardHost, testCodeHost}) {
 		t.Errorf("hostnames: %#v", got)
 	}
 	if ref := nested(t, route, "spec", "parentRefs").([]any)[0].(map[string]any); ref["namespace"] != nil {
