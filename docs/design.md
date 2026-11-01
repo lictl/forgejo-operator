@@ -549,6 +549,16 @@ bypass the cache) and not watched: the steps re-read them on every pass, every 1
 the instance controls it, and checked once per operator process (`optionalAbsent`), so instances
 that do not use a feature cost no request per pass.
 
+## Release publication
+
+Both registry release workflows preserve the gate from their own source revision
+before checking out a release tag. They refuse to invoke that tag's `hack/release.sh`
+until the tagged commit is in canonical GitHub `main` history and its required
+GitHub workflows and latest-attempt jobs have succeeded; old tags cannot remove
+the workflow's policy. Forgejo's manual CI is
+diagnostic only. Missing or unreadable evidence fails closed; the shared gate
+and its offline tests are described in the [release runbook](release.md#exact-commit-ci-gate).
+
 ## Capability levels
 
 | Level | Capability | How |

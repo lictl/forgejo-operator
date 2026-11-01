@@ -11,6 +11,9 @@ version="${TAG#v}"
 revision="$(git rev-parse HEAD)"
 test "$revision" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
 git merge-base --is-ancestor HEAD origin/main
+# Both registries use canonical GitHub main CI, including the latest run attempts.
+# Forgejo reads public results anonymously; its diagnostic CI is not a release gate.
+python3 hack/check-release-ci.py "$TAG" "$revision"
 awk -v tag="$TAG" '$0 == "## " tag {emit=1; next} /^## / && emit {exit} emit {print}' CHANGELOG.md > /tmp/forgejo-release-notes.md
 test -s /tmp/forgejo-release-notes.md || { echo 'Missing reviewed release notes'; exit 1; }
 export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"

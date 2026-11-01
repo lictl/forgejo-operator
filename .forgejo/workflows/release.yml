@@ -11,23 +11,39 @@ on:
         type: string
 jobs:
   release:
-    if: github.repository == 'lictl/forgejo-operator'
+    if: github.repository == 'lictl/forgejo-operator' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
     runs-on: docker
     container:
       image: docker.io/library/docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb
     steps:
       - name: Install job tools
         run: apk add --no-cache bash curl git go nodejs python3
+      # For push/dispatch, github.sha identifies the workflow source revision,
+      # independently of inputs.tag. Forgejo does not expose workflow_sha.
+      - name: Check out trusted release policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Preserve trusted release policy
+        run: |
+          mkdir -p "$RUNNER_TEMP/forgejo-release-policy"
+          cp hack/check-release-ci.py "$RUNNER_TEMP/forgejo-release-policy/check-release-ci.py"
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Build and publish Forgejo packages
+      # The preserved policy checks public GitHub CI without a GitHub credential.
+      - name: Verify canonical CI, build and publish Forgejo packages
         env:
           REGISTRY_HOST: git.lucas.icu
           REGISTRY_USER: lictl
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
         run: |
+          set -eu
+          revision="$(git rev-parse HEAD)"
+          test "$revision" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+          python3 "$RUNNER_TEMP/forgejo-release-policy/check-release-ci.py" "$TAG" "$revision"
           bash hack/release.sh
