@@ -555,6 +555,11 @@ func (in *ForgejoBackupStatus) DeepCopyInto(out *ForgejoBackupStatus) {
 		in, out := &in.CompletionTime, &out.CompletionTime
 		*out = (*in).DeepCopy()
 	}
+	if in.ImagePullSecrets != nil {
+		in, out := &in.ImagePullSecrets, &out.ImagePullSecrets
+		*out = make([]v1.LocalObjectReference, len(*in))
+		copy(*out, *in)
+	}
 	if in.Remote != nil {
 		in, out := &in.Remote, &out.Remote
 		*out = new(RemoteBackupStatus)

@@ -318,6 +318,19 @@ func TestRestoreTakesAPreRestoreBackupFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = reconcileRestore(t, c, s, rs.Name, 1)
+	if got.Status.Phase != forgejov1.RestorePhaseScalingDown || jobExists(t, c, backup.RestoreJobName(rs)) {
+		t.Fatal("completed backup status bypassed its still-running Job")
+	}
+	job := &batchv1.Job{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: pre.Status.JobName}, job); err != nil {
+		t.Fatal(err)
+	}
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	if err := c.Status().Update(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	got = reconcileRestore(t, c, s, rs.Name, 1)
 	if got.Status.Phase != forgejov1.RestorePhaseRestoring || !jobExists(t, c, backup.RestoreJobName(rs)) {
 		t.Fatalf("after the backup: %s (%s)", got.Status.Phase, got.Status.Message)
 	}

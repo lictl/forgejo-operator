@@ -3,7 +3,9 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
@@ -49,7 +51,7 @@ func JobPods(ctx context.Context, c client.Client, job *batchv1.Job) ([]corev1.P
 
 // JobPodsByName returns the pods of the Job with the given name, newest first. It also finds
 // pods whose Job is already gone.
-func JobPodsByName(ctx context.Context, c client.Client, namespace, name string) ([]corev1.Pod, error) {
+func JobPodsByName(ctx context.Context, c client.Reader, namespace, name string) ([]corev1.Pod, error) {
 	pods := &corev1.PodList{}
 	if err := c.List(ctx, pods, client.InNamespace(namespace),
 		client.MatchingLabels{batchv1.JobNameLabel: name}); err != nil {
@@ -157,20 +159,123 @@ func (e *JobConflictError) Error() string {
 	return fmt.Sprintf("Job %s already exists and %s", e.Job, owner)
 }
 
+// JobRefusedError reports that the API server rejected a Job (a quota, an admission webhook,
+// RBAC, validation). The answer says the Job was not stored, so no pod of it ran. A timeout,
+// a server error or a dropped connection says nothing of the kind and is never wrapped in it.
+type JobRefusedError struct {
+	Job string
+	Err error
+}
+
+func (e *JobRefusedError) Error() string {
+	return fmt.Sprintf("the API server refused Job %s: %v", e.Job, e.Err)
+}
+
+func (e *JobRefusedError) Unwrap() error { return e.Err }
+
+// createRefused reports whether err is a rejection by the API server, as opposed to a failure
+// that leaves open whether the object was stored.
+func createRefused(err error) bool {
+	return apierrors.IsForbidden(err) || apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) ||
+		apierrors.IsUnauthorized(err) || apierrors.IsNotFound(err) || apierrors.IsRequestEntityTooLargeError(err) ||
+		apierrors.IsMethodNotSupported(err) || apierrors.IsNotAcceptable(err) || apierrors.IsUnsupportedMediaType(err)
+}
+
 // CreateJob creates a Job for owner. An existing Job of the same name is accepted only when
 // owner controls it (compared by UID), e.g. after a restart between creating the Job and
 // recording it; otherwise it returns a *JobConflictError, so a Job of another object is never
-// mistaken for this object's own.
+// mistaken for this object's own. A rejection by the API server is returned as a
+// *JobRefusedError.
 func CreateJob(ctx context.Context, c client.Client, owner client.Object, job *batchv1.Job) error {
 	err := c.Create(ctx, job)
 	if !apierrors.IsAlreadyExists(err) {
+		if err != nil && createRefused(err) {
+			return &JobRefusedError{Job: job.Name, Err: err}
+		}
 		return err
 	}
 	existing := &batchv1.Job{}
 	if err := c.Get(ctx, client.ObjectKeyFromObject(job), existing); err != nil {
-		return fmt.Errorf("job %s exists but cannot be read yet: %w", job.Name, err)
+		return &jobUnreadableError{job: job.Name, err: err}
 	}
 	return CheckOwned(existing, owner)
+}
+
+// jobUnreadableError: the Job exists, but a read does not show it yet (a lagging cache).
+type jobUnreadableError struct {
+	job string
+	err error
+}
+
+func (e *jobUnreadableError) Error() string {
+	return fmt.Sprintf("job %s exists but cannot be read yet: %v", e.job, e.err)
+}
+
+func (e *jobUnreadableError) Unwrap() error { return e.err }
+
+// createRetryDelays are the pauses between the attempts of CreateJobRetrying.
+var createRetryDelays = []time.Duration{200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond}
+
+// createUndecided reports whether err leaves open that the Job was stored: a server error, a
+// timeout, throttling, or a failure without an answer from the API server (a dropped
+// connection, a client timeout).
+func createUndecided(err error) bool {
+	var unreadable *jobUnreadableError
+	if errors.As(err, &unreadable) {
+		return true
+	}
+	var conflict *JobConflictError
+	var refused *JobRefusedError
+	if errors.As(err, &conflict) || errors.As(err, &refused) {
+		return false
+	}
+	var status apierrors.APIStatus
+	if errors.As(err, &status) {
+		code := int(status.Status().Code)
+		return code >= http.StatusInternalServerError || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests
+	}
+	return true
+}
+
+// CreateJobRetrying is CreateJob for a Job whose execution is journaled before it is
+// created. While the error leaves open whether the Job was stored, it asks again a few
+// times: CreateJob accepts a Job the owner controls, so an earlier attempt that did land is
+// found by the next one and cannot start a second run. What remains after the last attempt
+// is the caller's to settle. A rejection or a name conflict that follows an attempt of unknown
+// outcome is not reported as a *JobRefusedError or *JobConflictError: the earlier attempt may
+// have stored the Job (a quota rejects the next create once the first one used the last slot,
+// and a lagging cache can show the Job as a predecessor's), so the caller must keep its
+// journal and let recovery judge the Job with a live read.
+func CreateJobRetrying(ctx context.Context, c client.Client, owner client.Object, job *batchv1.Job) error {
+	undecided := false
+	for attempt := 0; ; attempt++ {
+		// A fresh copy per attempt: a failed create must not leave the Job half filled in.
+		try := job.DeepCopy()
+		err := CreateJob(ctx, c, owner, try)
+		if err == nil {
+			try.DeepCopyInto(job)
+			return nil
+		}
+		if undecided {
+			var refused *JobRefusedError
+			var conflict *JobConflictError
+			if errors.As(err, &refused) {
+				return fmt.Errorf("%w (an earlier attempt may have stored the Job)", refused.Err)
+			}
+			if errors.As(err, &conflict) {
+				return errors.New(conflict.Error() + " (an earlier attempt may have stored the Job)")
+			}
+		}
+		if attempt == len(createRetryDelays) || !createUndecided(err) || ctx.Err() != nil {
+			return err
+		}
+		undecided = true
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(createRetryDelays[attempt]):
+		}
+	}
 }
 
 // RemoveJob deletes job with background propagation, so that garbage collection also removes
@@ -330,7 +435,7 @@ func Stalled(job *batchv1.Job, pods []corev1.Pod, timeout time.Duration) string 
 }
 
 // RestoreUsing returns an unfinished restore that reads the given backup, or "".
-func RestoreUsing(ctx context.Context, c client.Client, b *forgejov1.ForgejoBackup) (string, error) {
+func RestoreUsing(ctx context.Context, c client.Reader, b *forgejov1.ForgejoBackup) (string, error) {
 	restores, err := ListRestores(ctx, c, b.Namespace, b.Spec.ForgejoRef.Name)
 	if err != nil {
 		return "", err

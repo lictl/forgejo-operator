@@ -142,6 +142,14 @@ func IsBackupActive(b *forgejov1.ForgejoBackup) bool {
 	return b.Status.Phase != forgejov1.BackupPhaseCompleted && b.Status.Phase != forgejov1.BackupPhaseFailed
 }
 
+// BackupMayBeWriting includes a prepared execution whose Running status patch was lost.
+// This is a status hint, not proof of quiescence: a terminal backup can still have orphaned
+// pods. Destructive operations must also check its live Jobs and pods.
+func BackupMayBeWriting(b *forgejov1.ForgejoBackup) bool {
+	return b.Status.Phase == forgejov1.BackupPhaseRunning ||
+		((b.Status.Phase == "" || b.Status.Phase == forgejov1.BackupPhasePending) && b.Status.JobName != "")
+}
+
 // IsRestoreActive reports whether a restore has not reached a terminal phase.
 func IsRestoreActive(r *forgejov1.ForgejoRestore) bool {
 	return r.Status.Phase != forgejov1.RestorePhaseCompleted && r.Status.Phase != forgejov1.RestorePhaseFailed
@@ -233,7 +241,7 @@ func BlocksBackups(r *forgejov1.ForgejoRestore) bool {
 }
 
 // ListBackups returns the instance's backups, oldest first.
-func ListBackups(ctx context.Context, c client.Client, namespace, instance string) ([]forgejov1.ForgejoBackup, error) {
+func ListBackups(ctx context.Context, c client.Reader, namespace, instance string) ([]forgejov1.ForgejoBackup, error) {
 	list := &forgejov1.ForgejoBackupList{}
 	if err := c.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		return nil, err
@@ -249,7 +257,7 @@ func ListBackups(ctx context.Context, c client.Client, namespace, instance strin
 }
 
 // ListRestores returns the instance's restores, oldest first.
-func ListRestores(ctx context.Context, c client.Client, namespace, instance string) ([]forgejov1.ForgejoRestore, error) {
+func ListRestores(ctx context.Context, c client.Reader, namespace, instance string) ([]forgejov1.ForgejoRestore, error) {
 	list := &forgejov1.ForgejoRestoreList{}
 	if err := c.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		return nil, err

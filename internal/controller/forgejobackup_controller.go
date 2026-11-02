@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -68,6 +69,17 @@ type ForgejoBackupReconciler struct {
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Recorder  events.EventRecorder
+	// Now is the clock of the pause after a refused Job create; nil means time.Now.
+	Now func() time.Time
+
+	refusals refusalBackoff
+}
+
+func (r *ForgejoBackupReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch;update;patch
@@ -110,6 +122,9 @@ func (r *ForgejoBackupReconciler) reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.Get(ctx, req.NamespacedName, b); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if recovered, err := r.recoverStartedJobs(ctx, b); err != nil || recovered {
+		return ctrl.Result{RequeueAfter: time.Second}, err
+	}
 	if !b.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, b)
 	}
@@ -150,7 +165,7 @@ func (r *ForgejoBackupReconciler) reconcile(ctx context.Context, req ctrl.Reques
 	if b.Status.Phase == forgejov1.BackupPhaseRunning {
 		return r.track(ctx, b, f)
 	}
-	return r.start(ctx, b, f)
+	return r.start(ctx, b)
 }
 
 // releaseJobs deletes the finished Jobs of a finished backup: its backup Job, whose outcome
@@ -214,44 +229,22 @@ func (r *ForgejoBackupReconciler) ensureMetadata(ctx context.Context, b *forgejo
 	return true, r.Update(ctx, b)
 }
 
-func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.ForgejoBackup, f *forgejov1.Forgejo) (ctrl.Result, error) {
-	if f == nil {
+func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.ForgejoBackup) (ctrl.Result, error) {
+	// Starting a Job is irreversible; a cached healthy instance may already be upgrading,
+	// Broken or replaced. Read its current safety holds before provisioning any resources.
+	f := &forgejov1.Forgejo{}
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.ForgejoRef.Name}, f); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.fail(ctx, b, "InstanceNotFound", fmt.Sprintf("Forgejo %q not found", b.Spec.ForgejoRef.Name))
 	}
-
-	restores, err := backup.ListRestores(ctx, r.Client, f.Namespace, f.Name)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	// The cold backup of a PostgreSQL major upgrade in flight does not wait for restores that
-	// have not started (phase "" or Pending): they wait for the upgrade (see the restore
-	// controller's begin), which waits for this backup. Neither does the pre-restore backup of
-	// a restore, which keeps Forgejo stopped until this backup is done: they wait for that
-	// restore, and the restore itself does not count.
-	ownDatabaseUpgradeBackup := forgejo.DatabaseUpgradeInFlight(f) && forgejo.DatabaseUpgrade(f).BackupName == b.Name
-	ownRestore := backup.PreRestoreOf(b, restores)
-	for i := range restores {
-		rs := &restores[i]
-		if ownRestore != nil && rs.Name == ownRestore.Name {
-			continue
-		}
-		if (ownDatabaseUpgradeBackup || ownRestore != nil) && (rs.Status.Phase == "" || rs.Status.Phase == forgejov1.RestorePhasePending) {
-			continue
-		}
-		if backup.BlocksBackups(rs) {
-			return r.wait(ctx, b, fmt.Sprintf("Waiting for ForgejoRestore %s to finish", rs.Name), 10*time.Second)
-		}
+	if !f.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, r.fail(ctx, b, "InstanceDeleting", "Cannot start a backup of a deleting Forgejo")
 	}
 
-	if backup.Bootstrapping(f) {
-		// Nothing to back up before spec.restoreFrom has restored the instance.
-		return r.wait(ctx, b, fmt.Sprintf("Waiting for Forgejo %q to be restored from spec.restoreFrom", f.Name), 30*time.Second)
-	}
-	if u := forgejo.DatabaseUpgrade(f); forgejo.DatabaseUpgradeInFlight(f) && u.BackupName != b.Name {
-		// Only the upgrade's own cold backup runs meanwhile; the database is stopped or being
-		// moved to another major.
-		return r.wait(ctx, b, fmt.Sprintf("Waiting for the PostgreSQL major upgrade of Forgejo %q to %s to finish (phase %s)",
-			f.Name, u.ToImage, u.Phase), 30*time.Second)
+	if result, held, err := r.startHold(ctx, b, f); err != nil || held {
+		return result, err
 	}
 	if !backup.DatabaseReady(f) {
 		return r.waitForDependency(ctx, b, "DatabaseNotReady", fmt.Sprintf("Database of Forgejo %q is not ready", f.Name))
@@ -286,10 +279,16 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	// The SECRET_KEY the dumped database is encrypted with; restores compare it with theirs.
 	identity := ""
 	sec := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err == nil {
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.SecretsName(f)}, sec); err == nil {
 		identity = forgejo.SecretKeyFingerprint(sec.Data)
 	} else if !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
+	}
+	if backup.RemoteEnabled(f) && identity == "" {
+		return r.waitForDependency(ctx, b, "IdentityUnavailable", "The SECRET_KEY is required before taking a remote backup")
+	}
+	if b.Status.ForgejoUID != "" && (b.Status.ForgejoUID != string(f.UID) || b.Status.SecretKeyFingerprint != identity) {
+		return ctrl.Result{}, r.fail(ctx, b, "IdentityChanged", "The instance identity changed after this backup was prepared; create a new ForgejoBackup")
 	}
 	now := metav1.Now()
 	job, err := backup.BackupJob(backup.JobInput{
@@ -305,35 +304,136 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := backup.CreateJob(ctx, r.Client, b, job); err != nil {
+	refusals := refusalKey{uid: b.UID}
+	if wait := r.refusals.remaining(refusals, r.now()); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
+	started := b.DeepCopy()
+	started.Status.ForgejoUID = string(f.UID)
+	started.Status.SecretKeyFingerprint = identity
+	started.Status.Phase = forgejov1.BackupPhaseRunning
+	started.Status.StartTime = &now
+	started.Status.JobName = job.Name
+	started.Status.PVCName = pvc
+	started.Status.Path = "/" + b.Name
+	started.Status.ForgejoImage = image
+	started.Status.ServiceAccountName = f.Spec.PodTemplate.ServiceAccountName
+	started.Status.ImagePullSecrets = slices.Clone(f.Spec.ImagePullSecrets)
+	started.Status.PostgresImage = pgImage
+	started.Status.IncludesData = includeData
+	started.Status.Message = fmt.Sprintf("Backup job %s is running", job.Name)
+	setCondition(&started.Status.Conditions, b.Generation, metav1.ConditionFalse, "Running", started.Status.Message)
+	// Journal every execution coordinate before the Job can write. The Job may disappear
+	// before a lost Running patch is recovered; its source and cleanup path must survive it.
+	prepared := started.Status.DeepCopy()
+	prepared.Phase = b.Status.Phase
+	prepared.Conditions = b.Status.Conditions
+	prepared.Message = fmt.Sprintf("Preparing backup job %s", job.Name)
+	orig := b.DeepCopy()
+	b.Status = *prepared
+	if err := r.patchStatus(ctx, b, orig); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := backup.CreateJobRetrying(ctx, r.Client, b, job); err != nil {
 		var conflict *backup.JobConflictError
-		if !errors.As(err, &conflict) {
+		var refused *backup.JobRefusedError
+		if !errors.As(err, &conflict) && !errors.As(err, &refused) {
+			// Whether the Job was stored is open: the journal stays for recovery.
+			return ctrl.Result{}, fmt.Errorf("creating backup job: %w", err)
+		}
+		// This create was refused, so it cannot have started our execution. Forget only
+		// this known-unused preparation; recovery must retain an uncertain journal.
+		prepared := b.DeepCopy()
+		b.Status = orig.Status
+		if err := r.patchStatus(ctx, b, prepared); err != nil {
+			return ctrl.Result{}, err
+		}
+		if refused != nil {
+			// A quota, an admission webhook or RBAC can clear up; ask again after a pause.
+			r.refusals.refuse(refusals, r.now())
+			if !forgejo.IsNamespaceTerminating(err) {
+				r.event(b, corev1.EventTypeWarning, "JobRefused", "Backup", "%v; will try again", refused)
+			}
 			return ctrl.Result{}, fmt.Errorf("creating backup job: %w", err)
 		}
 		if conflict.Transient {
+			// The old Job goes away by itself. Pace the next attempt like a refusal: the journal
+			// and its discard would otherwise requeue the backup at once, in a loop.
+			r.refusals.refuse(refusals, r.now())
 			return r.wait(ctx, b, fmt.Sprintf("Waiting for the old Job %s to be deleted", conflict.Job), 5*time.Second)
 		}
+		r.refusals.clear(refusals)
 		return ctrl.Result{}, r.fail(ctx, b, "JobNameConflict",
 			fmt.Sprintf("Cannot run the backup: %v; delete that Job or use a different ForgejoBackup name", conflict))
 	}
 
-	orig := b.DeepCopy()
-	b.Status.Phase = forgejov1.BackupPhaseRunning
-	b.Status.StartTime = &now
-	b.Status.JobName = job.Name
-	b.Status.PVCName = pvc
-	b.Status.Path = "/" + b.Name
-	b.Status.ForgejoImage = image
-	b.Status.PostgresImage = pgImage
-	b.Status.SecretKeyFingerprint = identity
-	b.Status.IncludesData = includeData
-	b.Status.Message = fmt.Sprintf("Backup job %s is running", job.Name)
-	setCondition(&b.Status.Conditions, b.Generation, metav1.ConditionFalse, "Running", b.Status.Message)
+	r.refusals.clear(refusals)
+
+	orig = b.DeepCopy()
+	b.Status = started.Status
 	if err := r.patchStatus(ctx, b, orig); err != nil {
 		return ctrl.Result{}, err
 	}
 	r.event(b, corev1.EventTypeNormal, "BackupStarted", "Backup", "Started job %s writing to %s:%s", job.Name, pvc, b.Status.Path)
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
+}
+
+// startHold applies live safety state to queued backups, including the exceptions that
+// allow an upgrade or restore to take its own safety backup without a circular wait.
+func (r *ForgejoBackupReconciler) startHold(ctx context.Context, b *forgejov1.ForgejoBackup, f *forgejov1.Forgejo) (ctrl.Result, bool, error) {
+	restores, err := backup.ListRestores(ctx, r.reader(), f.Namespace, f.Name)
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+	// The cold backup of a PostgreSQL major upgrade in flight does not wait for restores that
+	// have not started (phase "" or Pending): they wait for the upgrade (see the restore
+	// controller's begin), which waits for this backup. Neither does the pre-restore backup of
+	// a restore, which keeps Forgejo stopped until this backup is done: they wait for that
+	// restore, and the restore itself does not count.
+	dbUpgrade := forgejo.DatabaseUpgrade(f)
+	ownDatabaseUpgradeBackup := dbUpgrade != nil && dbUpgrade.Phase == forgejov1.DatabaseUpgradeBackingUp &&
+		dbUpgrade.BackupName == b.Name && backup.Reason(b) == forgejov1.BackupReasonPreUpgrade
+	ownRestore := backup.PreRestoreOf(b, restores)
+	ownForgejoUpgradeBackup := f.Status.Upgrade != nil && f.Status.Upgrade.Phase == forgejov1.UpgradePhaseBackingUp &&
+		f.Status.Upgrade.BackupName == b.Name && f.Status.Upgrade.RolloutStartTime == nil && backup.Reason(b) == forgejov1.BackupReasonPreUpgrade
+	blocked := ""
+	switch {
+	case forgejo.IsBroken(f):
+		blocked = fmt.Sprintf("Forgejo %q is Broken", f.Name)
+	case forgejo.UpgradeHoldsWorkload(f) || (forgejo.UpgradeInFlight(f) && !ownForgejoUpgradeBackup):
+		blocked = fmt.Sprintf("the Forgejo upgrade of %q has not finished safely", f.Name)
+	case forgejo.DatabaseUpgradeHoldsWorkload(f) || (forgejo.DatabaseUpgradeInFlight(f) && !ownDatabaseUpgradeBackup):
+		blocked = fmt.Sprintf("the PostgreSQL major upgrade of Forgejo %q has not finished safely", f.Name)
+	}
+	if blocked != "" {
+		if ownRestore != nil {
+			// Maintenance pauses the Forgejo upgrade, so waiting would deadlock its pre-restore
+			// backup. Fail unchanged; the restore reports how to retry without a safety backup.
+			return ctrl.Result{}, true, r.fail(ctx, b, "InstanceUnsafe", "Cannot take the pre-restore backup: "+blocked)
+		}
+		result, err := r.wait(ctx, b, "Waiting because "+blocked, 30*time.Second)
+		return result, true, err
+	}
+	for i := range restores {
+		rs := &restores[i]
+		if ownRestore != nil && rs.Name == ownRestore.Name {
+			continue
+		}
+		if (ownDatabaseUpgradeBackup || ownRestore != nil) && (rs.Status.Phase == "" || rs.Status.Phase == forgejov1.RestorePhasePending) {
+			continue
+		}
+		if backup.BlocksBackups(rs) {
+			result, err := r.wait(ctx, b, fmt.Sprintf("Waiting for ForgejoRestore %s to finish", rs.Name), 10*time.Second)
+			return result, true, err
+		}
+	}
+
+	if backup.Bootstrapping(f) {
+		// Nothing to back up before spec.restoreFrom has restored the instance.
+		result, err := r.wait(ctx, b, fmt.Sprintf("Waiting for Forgejo %q to be restored from spec.restoreFrom", f.Name), 30*time.Second)
+		return result, true, err
+	}
+	return ctrl.Result{}, false, nil
 }
 
 func (r *ForgejoBackupReconciler) track(ctx context.Context, b *forgejov1.ForgejoBackup, f *forgejov1.Forgejo) (ctrl.Result, error) {
@@ -522,7 +622,7 @@ func (r *ForgejoBackupReconciler) cleanup(ctx context.Context, b *forgejov1.Forg
 	if b.Status.PVCName == "" || backup.FilesRemoved(b) {
 		return true, nil
 	}
-	if name, err := backup.RestoreUsing(ctx, r.Client, b); err != nil || name != "" {
+	if name, err := backup.RestoreUsing(ctx, r.reader(), b); err != nil || name != "" {
 		return false, err
 	}
 	if time.Since(b.DeletionTimestamp.Time) > cleanupTimeout {
@@ -531,24 +631,8 @@ func (r *ForgejoBackupReconciler) cleanup(ctx context.Context, b *forgejov1.Forg
 		return true, nil
 	}
 
-	// Stop a still-running backup first so it cannot write after the cleanup, and an upload,
-	// which would read files that are going away.
 	for _, name := range []string{b.Status.JobName, uploadJobName(b)} {
-		if name == "" {
-			continue
-		}
-		job := &batchv1.Job{}
-		err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: name}, job)
-		if err == nil && metav1.IsControlledBy(job, b) {
-			if state, _ := backup.StateOf(job); state == backup.JobRunning {
-				if job.DeletionTimestamp.IsZero() {
-					if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
-						return false, err
-					}
-				}
-				return false, nil
-			}
-		} else if !apierrors.IsNotFound(err) {
+		if stopped, err := r.jobStopped(ctx, b, name, true); err != nil || !stopped {
 			return false, err
 		}
 	}
@@ -647,7 +731,8 @@ func (r *ForgejoBackupReconciler) createCleanupJob(ctx context.Context, b *forge
 		BackupPVC:    b.Status.PVCName,
 	}
 	f := &forgejov1.Forgejo{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.ForgejoRef.Name}, f); err == nil {
+	err := r.reader().Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Spec.ForgejoRef.Name}, f)
+	if err == nil && (b.Status.ForgejoUID == "" || b.Status.ForgejoUID == string(f.UID)) {
 		in.Instance = f
 		in.ForgejoImage = backup.CurrentImage(f)
 		// A bound backup volume constrains the pod by itself; before its first bind, keep it
@@ -655,7 +740,7 @@ func (r *ForgejoBackupReconciler) createCleanupJob(ctx context.Context, b *forge
 		if in.Affinity, err = backup.Placement(ctx, r.Client, f, false, b.Status.PVCName); err != nil {
 			return err
 		}
-	} else if !apierrors.IsNotFound(err) {
+	} else if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
 	if in.ForgejoImage == "" {
@@ -664,6 +749,12 @@ func (r *ForgejoBackupReconciler) createCleanupJob(ctx context.Context, b *forge
 	job, err := backup.CleanupJob(in, b)
 	if err != nil {
 		return err
+	}
+	if in.Instance == nil {
+		// The recorded image can require private registry access after its Forgejo is
+		// deleted. Keep only the original references; cleanup never mounts an API token.
+		job.Spec.Template.Spec.ServiceAccountName = b.Status.ServiceAccountName
+		job.Spec.Template.Spec.ImagePullSecrets = slices.Clone(b.Status.ImagePullSecrets)
 	}
 	if err := backup.CreateJob(ctx, r.Client, b, job); err != nil {
 		var conflict *backup.JobConflictError
@@ -699,23 +790,11 @@ func (r *ForgejoBackupReconciler) removeFailedFiles(ctx context.Context, b *forg
 	} else if !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
-	if b.Status.JobName != "" {
-		bj := &batchv1.Job{}
-		err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.JobName}, bj)
-		if err == nil && metav1.IsControlledBy(bj, b) {
-			if state, _ := backup.StateOf(bj); state == backup.JobRunning {
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-			}
-		} else if err != nil && !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
+	if stopped, err := r.jobStopped(ctx, b, b.Status.JobName, false); err != nil || !stopped {
+		if res, held := r.holdForForeignJob(b, err); held {
+			return res, nil
 		}
-		pods, err := backup.JobPodsByName(ctx, r.Client, b.Namespace, b.Status.JobName)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if backup.UnfinishedPods(pods) > 0 {
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 	}
 	pvc := &corev1.PersistentVolumeClaim{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: b.Namespace, Name: b.Status.PVCName}, pvc); err != nil {

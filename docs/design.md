@@ -87,9 +87,40 @@ durations and pull policies have their ranges, forms and enums.
   backups whose `secretKeyFingerprint` is another identity's, and prunes no complete scheduled
   backup while the newest one is less than half the size of another one it holds (the size-drop
   guard, `internal/backup/retentionguard.go`).
-- **Identity.** The backup controller builds the identity bundle (the instance's Secrets and
-  sanitised spec) in Go and hands it to the upload Job in Secret `<backup>-identity`, which it
-  deletes with the Job.
+- **Identity.** Before creating the dump Job, the backup controller persists the source
+  `forgejoUID` and `secretKeyFingerprint`. Upload checks the live instance UID and identity
+  Secrets against those records, refusing missing records or a changed identity instead of
+  packaging another instance's keys with the dump. It builds the identity bundle (Secrets and
+  sanitised spec) in Go and hands it to the upload Job in immutable Secret `<backup>-identity`,
+  reusing it unchanged after an interrupted upload start and deleting it with the Job. The
+  manifest records the source UID and fingerprint from backup status.
+- **Interrupted starts.** Before creating a dump or upload Job, the controller journals its
+  complete execution metadata in backup status: Job name, start time, source identity,
+  images, backup PVC and path, source ServiceAccount and image-pull Secret names, or the
+  original remote target and key references. A queued
+  operation with a recorded Job name resumes tracking before new-start checks or deletion,
+  including when its Job has vanished. It never reconstructs those coordinates from a
+  changed instance. Restores and PostgreSQL upgrade cancellation also treat such a prepared
+  execution as running. A known-refused Job create (a rejection by the API server, or a name
+  conflict) discards only its unused preparation. A rejection is asked again after an
+  in-memory pause that doubles up to five minutes: the journal and its discard are status
+  writes, which requeue the object at once and would bypass the work queue's backoff. An error
+  that leaves open whether the Job was stored is retried within the pass (`CreateJob` accepts
+  a Job the backup controls); if it persists, or if a rejection or a conflict follows it (the
+  first attempt may have used the last slot of a quota, or a lagging cache may show its Job as
+  a predecessor's), the journal stays. A predecessor's Job that is being deleted gets the
+  same pause as a refusal. A collision found during
+  recovery preserves the uncertain journal and leaves the foreign Job alone; transient
+  conflicts wait for garbage collection. Steps without a deadline of their own (removing the
+  files of a failed backup, releasing the upload identity) report a foreign Job under a
+  journaled name with a Warning event and look again every five minutes, instead of failing
+  the reconcile in a loop. File cleanup and upload identity release confirm through live reads that the
+  Jobs and orphaned pods have stopped; deletion stops only an owned Job, with a UID precondition,
+  before cleaning files. Before destructive work, restores also check live dump Jobs and pods,
+  including those of terminal or deleted backups. A historical failed backup without running
+  execution does not block the restore. Cleanup after the source instance is gone uses the
+  recorded image and pull-credential references, with ServiceAccount token mounting disabled;
+  no credential values are stored in status.
 - **Key management.** `<name>-backup-key` is generated once by the `secrets` step, carries no
   owner reference under any `retainPolicy`, and is never changed; an existing one (e.g. restored
   from an offline copy) is used as it is. Until the generated Secret is annotated
@@ -193,7 +224,12 @@ identity or data: `secrets` would otherwise generate a new `SECRET_KEY`, and `da
 `storage` an empty cluster or volume, for an instance whose own are gone. `backup-schedule`,
 `database-upgrade` need it as well. `backup-schedule` and `storage-autopilot` also wait while
 `Broken` is `True` for any reason (`waitWhileBroken`, from the persisted condition), so that a
-Broken instance takes no backups, prunes none and grows no volume. `database-upgrade` needs only the final maintenance flags: it
+Broken instance takes no backups, prunes none and grows no volume. The backup controller also
+checks live instance state before executing an already queued backup: `Broken`, active Forgejo
+or PostgreSQL upgrades and failed upgrade workload holds prevent the Job from starting. Only
+the named `PreUpgrade` backup in its own upgrade's `BackingUp` phase bypasses that upgrade;
+a pre-restore backup bypasses its own restore, but fails on an unsafe instance so it cannot
+deadlock a restore that pauses the upgrade. `database-upgrade` needs only the final maintenance flags: it
 must run before `database`, which stops while CloudNativePG upgrades a major in place, and it
 chooses the image `database` writes, so a newer PostgreSQL major reaches the Cluster only once
 Forgejo is stopped and a cold backup of the old major exists (see

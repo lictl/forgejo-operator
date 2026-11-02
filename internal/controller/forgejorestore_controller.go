@@ -455,14 +455,10 @@ func (r *ForgejoRestoreReconciler) scaleDown(ctx context.Context, rs *forgejov1.
 	} else if n > 0 {
 		return waitDown(fmt.Sprintf("Waiting for %d Forgejo pod(s) to terminate", n))
 	}
-	backups, err := backup.ListBackups(ctx, r.Client, f.Namespace, f.Name)
-	if err != nil {
+	if busy, err := r.backupActivity(ctx, rs, f); err != nil {
 		return ctrl.Result{}, err
-	}
-	for i := range backups {
-		if backups[i].Name != backup.PreRestoreBackupName(rs) && backups[i].Status.Phase == forgejov1.BackupPhaseRunning {
-			return r.wait(ctx, rs, fmt.Sprintf("Waiting for ForgejoBackup %s to finish", backups[i].Name))
-		}
+	} else if busy != "" {
+		return r.wait(ctx, rs, "Waiting for "+busy+" to finish")
 	}
 	// Two restores must never write to the instance at once, e.g. the pods of an earlier,
 	// failed or deleted restore that are still shutting down.
