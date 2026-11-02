@@ -24,7 +24,7 @@ spec:
     # domain: git.example.com      # public host name (DOMAIN, SSH_DOMAIN, ROOT_URL)
   # ingress:
   #   enabled: true
-  #   host: git.example.com
+  #   host: git.example.com        # required when enabled, also with server.domain/rootURL
   #   # Unset: the cluster's default IngressClass, applied when the Ingress is created, is kept.
   #   className: nginx
   #   tlsSecretName: git-example-com-tls

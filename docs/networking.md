@@ -22,6 +22,12 @@ cert-manager), and reports a missing CRD in a condition instead of failing. A fa
 request is not taken for a missing CRD: the pass fails and is retried. It never creates a
 Gateway: Gateways belong to the platform, routes to the application.
 
+An enabled Ingress requires an explicit `spec.ingress.host`. That host is used for both
+the routing rule and its TLS hosts. `server.domain`, `server.rootURL` and Gateway hostnames
+configure their own identities and routes; they do not supply an omitted Ingress host.
+Admission rejects such a configuration, and the reconciler refuses to render a hostless
+Ingress, which would otherwise match every host handled by its Ingress controller.
+
 The operator creates these objects, but updates or deletes only the ones the instance controls.
 An HTTPRoute, TCPRoute, Certificate or ReferenceGrant that already has the name the operator
 would use and belongs to someone else (your own, or another controller's) is neither taken over
@@ -323,6 +329,7 @@ Traefik's Kubernetes Gateway provider serves the HTTPRoute (tested with Traefik 
 
 | Symptom | Look at |
 |---------|---------|
+| `ingress.enabled requires ingress.host` at admission | set `spec.ingress.host` explicitly, even when `server.domain`, `server.rootURL` or Gateway hostnames are configured |
 | `RoutesReady=Unknown/Pending` for minutes | `kubectl get gatewayclass` (Accepted?), the Gateway's `status.listeners`, the Gateway controller's logs |
 | `RoutesReady=False/NotAccepted` | the listener names (`sectionName`), `allowedRoutes` of the listeners, and the route: `kubectl get httproute <name> -o yaml` |
 | `RoutesReady=False/NoHostnames` | set `spec.gateway.hostnames`, or `spec.server.domain` or `spec.server.rootURL` to a DNS name |

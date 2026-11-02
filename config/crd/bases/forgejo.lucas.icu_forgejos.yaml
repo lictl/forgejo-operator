@@ -1411,8 +1411,8 @@ spec:
                     type: boolean
                   host:
                     description: |-
-                      host is the public host name. Required while enabled, unless server.domain,
-                      server.rootURL or gateway.hostnames gives one.
+                      host is the public host name used for both the Ingress rule and TLS hosts. Required
+                      while enabled; server.domain, server.rootURL and gateway.hostnames do not supply it.
                     maxLength: 253
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
@@ -3460,14 +3460,12 @@ spec:
                 || !self.autoscaling.horizontal.enabled || (has(self.highAvailability.enabled)
                 && self.highAvailability.enabled)'
             - fieldPath: .ingress.host
-              message: 'ingress.enabled requires ingress.host (or server.domain, server.rootURL
-                or gateway.hostnames): without a public host name ROOT_URL would be
-                the in-cluster Service address'
+              message: 'ingress.enabled requires ingress.host: set an explicit host
+                for the Ingress rule and TLS; server and Gateway host names do not
+                supply it'
               reason: FieldValueRequired
               rule: '!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled
-                || (has(self.ingress.host) && size(self.ingress.host) > 0) || (has(self.server.domain)
-                && size(self.server.domain) > 0) || (has(self.server.rootURL) && size(self.server.rootURL)
-                > 0) || (has(self.gateway) && has(self.gateway.hostnames))'
+                || (has(self.ingress.host) && size(self.ingress.host) > 0)'
             - fieldPath: .gateway.ssh
               message: gateway.ssh requires server.ssh.enabled
               reason: FieldValueForbidden

@@ -116,7 +116,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="(has(self.highAvailability) && has(self.highAvailability.enabled) && self.highAvailability.enabled) == (has(oldSelf.highAvailability) && has(oldSelf.highAvailability.enabled) && oldSelf.highAvailability.enabled)",message="highAvailability.enabled cannot be changed after creation (omitted means false); choose the mode when creating the Forgejo",fieldPath=".highAvailability.enabled",reason="FieldValueForbidden"
 // +kubebuilder:validation:XValidation:rule="!has(self.replicas) || self.replicas <= 1 || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="replicas greater than 1 require highAvailability.enabled (Valkey for shared cache and queues, a single cron runner)",fieldPath=".replicas",reason="FieldValueForbidden"
 // +kubebuilder:validation:XValidation:rule="!has(self.autoscaling.horizontal) || !has(self.autoscaling.horizontal.enabled) || !self.autoscaling.horizontal.enabled || (has(self.highAvailability.enabled) && self.highAvailability.enabled)",message="autoscaling.horizontal requires highAvailability.enabled (Valkey for shared cache and queues, a single cron runner)",fieldPath=".autoscaling.horizontal.enabled",reason="FieldValueForbidden"
-// +kubebuilder:validation:XValidation:rule="!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || (has(self.ingress.host) && size(self.ingress.host) > 0) || (has(self.server.domain) && size(self.server.domain) > 0) || (has(self.server.rootURL) && size(self.server.rootURL) > 0) || (has(self.gateway) && has(self.gateway.hostnames))",message="ingress.enabled requires ingress.host (or server.domain, server.rootURL or gateway.hostnames): without a public host name ROOT_URL would be the in-cluster Service address",fieldPath=".ingress.host",reason="FieldValueRequired"
+// +kubebuilder:validation:XValidation:rule="!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || (has(self.ingress.host) && size(self.ingress.host) > 0)",message="ingress.enabled requires ingress.host: set an explicit host for the Ingress rule and TLS; server and Gateway host names do not supply it",fieldPath=".ingress.host",reason="FieldValueRequired"
 // +kubebuilder:validation:XValidation:rule="!has(self.gateway) || !has(self.gateway.ssh) || !has(self.server.ssh.enabled) || self.server.ssh.enabled",message="gateway.ssh requires server.ssh.enabled",fieldPath=".gateway.ssh",reason="FieldValueForbidden"
 type ForgejoSpec struct {
 	// image is the Forgejo container image. The official root image
@@ -409,8 +409,8 @@ type IngressSpec struct {
 	// +optional
 	ClassName *string `json:"className,omitempty"`
 
-	// host is the public host name. Required while enabled, unless server.domain,
-	// server.rootURL or gateway.hostnames gives one.
+	// host is the public host name used for both the Ingress rule and TLS hosts. Required
+	// while enabled; server.domain, server.rootURL and gateway.hostnames do not supply it.
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +optional

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -90,6 +91,9 @@ func reconcileService(ctx context.Context, rc *forgejo.ReconcileContext, name st
 func reconcileIngress(ctx context.Context, rc *forgejo.ReconcileContext) error {
 	f := rc.Instance
 	spec := f.Spec.Ingress
+	if spec.Host == "" {
+		return errors.New("ingress.host is required while ingress is enabled; refusing to create or update a hostless Ingress")
+	}
 	ing := &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: forgejo.IngressName(f), Namespace: f.Namespace}}
 	err := apply(ctx, rc, ing, true, func() error {
 		ing.Labels = mergeMaps(ing.Labels, forgejo.Labels(f, forgejo.ComponentServer))
@@ -119,11 +123,7 @@ func reconcileIngress(ctx context.Context, rc *forgejo.ReconcileContext) error {
 			}},
 		}
 		if secret := ingressTLSSecret(f); secret != "" {
-			tls := networkingv1.IngressTLS{SecretName: secret}
-			if spec.Host != "" {
-				tls.Hosts = []string{spec.Host}
-			}
-			ing.Spec.TLS = []networkingv1.IngressTLS{tls}
+			ing.Spec.TLS = []networkingv1.IngressTLS{{SecretName: secret, Hosts: []string{spec.Host}}}
 		}
 		return nil
 	})
