@@ -70,9 +70,9 @@ helm upgrade --install forgejo-operator \
 The alternate OCI chart source is
 `oci://git.lucas.icu/lictl/charts/forgejo-operator`. The controller image is
 `ghcr.io/lictl/forgejo-operator:<operator-version>`, mirrored at
-`git.lucas.icu/lictl/forgejo-operator:<operator-version>`. No first release has
-been tagged yet. See [installation](docs/installation.md) for current release
-availability, image overrides, CRD upgrades and prerequisites. For local
+`git.lucas.icu/lictl/forgejo-operator:<operator-version>`. Releases are release
+candidates. See [installation](docs/installation.md) for release availability, image
+overrides, CRD upgrades and prerequisites. For local
 development use `make deploy-local` against an isolated cluster.
 
 This install manages instances in every namespace, with a ClusterRole that writes Secrets,
