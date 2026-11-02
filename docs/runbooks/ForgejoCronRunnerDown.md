@@ -46,6 +46,9 @@ forgejo_operator_cron_runner_ready{namespace="<ns>", name="<name>"}
 
 ## Mitigation
 
+The HA mode is fixed when the instance is created. Recovery keeps the existing mode
+and restores the cron runner's ability to run safely.
+
 1. Lost node: once the node is confirmed down (or its containers stopped), force-delete the pod:
    `kubectl -n $NS delete pod $N-cron-0 --force --grace-period=0`. Deleting the Node object or
    the `node.kubernetes.io/out-of-service` taint does the same.

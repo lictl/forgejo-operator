@@ -6,11 +6,15 @@ was written for one process; this page says what the operator adds so that sever
 are safe, what HA covers and what it does not. How it is built is in [design.md](design.md);
 scaling, the HPA and the PDB in [autopilot.md](autopilot.md#horizontal-scaling-and-disruption-budget).
 
+Choose `highAvailability.enabled` when creating the instance. Its effective value is
+immutable afterwards; omitted means `false`. HA instances can still change replica counts,
+autoscaling and Valkey settings.
+
 ```yaml
 spec:
   replicas: 3                 # or autoscaling.horizontal
   highAvailability:
-    enabled: true
+    enabled: true            # chosen at creation; immutable afterwards
   storage:
     accessModes: [ReadWriteMany]
   database:                   # a replicated PostgreSQL you run
@@ -26,7 +30,7 @@ spec:
 | A server pod fails, is evicted or deleted | The other pods keep serving; rolling updates replace pods one at a time with a surge pod (`maxUnavailable: 0`); PDB `<name>` keeps one pod through drains. A terminating pod keeps serving for 10 s (preStop) while its endpoint is removed, then lets requests and git operations finish for up to 50 s (`GRACEFUL_HAMMER_TIME`). |
 | Several pods and Forgejo's cron tasks | At most one pod, the **cron runner** (StatefulSet `<name>-cron`), runs them; see [below](#the-cron-runner). |
 | Shared cache and queues | Valkey with Sentinel (StatefulSet `<name>-valkey`, three pods); the primary fails over to a replica in seconds; see [below](#valkey-with-sentinel). |
-| Sessions and logins | Kept in PostgreSQL (`[session] PROVIDER=db`): a Valkey failover logs nobody out, and turning HA on or off keeps every session. |
+| Sessions and logins | Kept in PostgreSQL (`[session] PROVIDER=db`): a Valkey failover logs nobody out. |
 | Spreading | Server and Valkey pods (and the cron runner, on a `ReadWriteMany` volume) prefer different nodes, and different zones where the nodes carry `topology.kubernetes.io/zone` (`ScheduleAnyway`, so one node still works); see [Spreading](#spreading). |
 
 What it does **not** cover:
@@ -133,7 +137,7 @@ at any time without a new app.ini):
 `forgejo_operator_cron_runner_ready` is exported while it should run.
 
 Without HA nothing changes: the single pod runs the cron tasks with `app.ini`, and there is no
-`<name>-cron`. Turning HA off deletes the cron runner (event `CronRunnerDeleted`).
+`<name>-cron`. The API server rejects changes between HA and non-HA modes after creation.
 
 ## Valkey with Sentinel
 
@@ -222,8 +226,8 @@ query) and reports:
   majority), `False/NoMaster`, `False/NotReady`, `False/NotProvisioned`,
   `Unknown/UnreachableFromOperator` (pods Ready, Sentinels not reachable from the operator);
 - event `ValkeyFailedOver` (Warning) when the primary moved to another pod of the group (a new
-  group, whose pods all replaced the old ones, is none: HA turned off and on, the StatefulSet
-  recreated, Valkey emptied);
+  group, whose pods all replaced the old ones, is none: the StatefulSet recreated or Valkey
+  emptied);
 - metrics `forgejo_operator_valkey_master_available`, `forgejo_operator_valkey_ready_members` and
   `forgejo_operator_valkey_failovers_total`, and alerts `ForgejoValkeyNoMaster` (critical, 2m),
   `ForgejoValkeyFailedOver`, `ForgejoValkeyDegraded` (15m) and `ForgejoCronRunnerDown` (15m)
@@ -257,15 +261,18 @@ list nodes, pods are spread across nodes only. `ScheduleAnyway` is a preference:
 node, or with fewer nodes than pods, everything is still scheduled. Use `DoNotSchedule` in your
 own constraints to make spreading a requirement.
 
-## Turning HA on and off
+## Choosing the HA mode
 
-- **On:** Valkey is created first; the server pods roll onto `app-web.ini` once a Valkey pod is
-  Ready, and the cron runner starts. During the rolling update the old pod (with its cron tasks
-  and LevelDB queues) and the cron runner run side by side for a moment. Sessions stay valid.
-- **Off:** `spec.replicas` must be 1 (and the HPA off) first, as the API server requires. The cron
-  runner is deleted, the single pod runs the full `app.ini` again (LevelDB queues), and Valkey is
-  deleted once nothing can bring the HA config back ([autopilot.md](autopilot.md#high-availability-valkey)).
-  Work still queued in Valkey at that moment is not carried over.
+`spec.highAvailability.enabled` is fixed at creation. Switching it on a running instance
+would hand cron tasks between the server and a separate runner while the old pod may
+still run, and would change between local and Valkey queues without draining queued work.
+The API server rejects both enabling and disabling HA, including removing `enabled` or
+the entire `highAvailability` object from an HA instance. Omitting it, setting it to
+`false`, or writing an empty object are equivalent for a non-HA instance.
+
+If the mode must change, create another instance with the desired mode and plan the data
+transfer and cutover separately. Scaling an HA instance to one replica keeps its cron
+runner and Valkey; it does not change the mode.
 
 ## Failure modes
 
