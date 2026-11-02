@@ -9,6 +9,7 @@ make manifests generate
 make lint-config lint test test-rules
 helm lint --strict charts/forgejo-operator
 helm template forgejo-operator charts/forgejo-operator --include-crds
+python3 hack/test-check-release-ci.py
 ```
 
 Generated CRDs and DeepCopy files come from Kubebuilder; edit API markers and

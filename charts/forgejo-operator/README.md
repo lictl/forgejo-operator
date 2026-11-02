@@ -30,4 +30,16 @@ Before upgrading, apply the `config/crd/bases/` manifests from the matching
 release tag. Do not delete CRDs on uninstall unless you intend to delete the
 corresponding custom resources.
 
+Set `prometheus.enabled=true` to install a ServiceMonitor for the controller metrics.
+By default it scrapes authenticated HTTPS using the controller-runtime self-signed
+certificate and skips certificate verification. It preserves the instance labels
+on operator metrics with `honorLabels: true`. See the
+[observability guide](https://github.com/lictl/forgejo-operator/blob/main/docs/observability.md#scraping-the-operator)
+for scrape permissions and verified TLS configuration.
+
+The chart does not install cert-manager or configure operator metrics certificates
+through it. The former `certManager` chart value is rejected; remove it from your
+values file. `Forgejo.spec.tls.certManager` remains available when cert-manager is
+installed separately, for Forgejo's public HTTPS endpoint.
+
 The chart is covered by the accompanying [MIT license](LICENSE).

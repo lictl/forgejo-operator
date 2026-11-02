@@ -10,7 +10,16 @@ jobs:
   test-e2e:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    name: Kubernetes ${{ matrix.kubernetes }}
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kubernetes: "1.30"
+            node-image: kindest/node:v1.30.10@sha256:4de75d0e82481ea846c0ed1de86328d821c1e6a6a91ac37bf804e5313670e507
+          - kubernetes: "1.37"
+            node-image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -45,6 +54,7 @@ jobs:
       - name: Verify kind installation
         run: kind version
 
-      - name: Running Test e2e
-        run: |
-          make test-e2e
+      - name: Run manager and data lifecycle E2E
+        env:
+          KIND_NODE_IMAGE: ${{ matrix.node-image }}
+        run: make test-e2e

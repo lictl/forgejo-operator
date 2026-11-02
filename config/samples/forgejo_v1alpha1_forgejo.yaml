@@ -13,15 +13,18 @@ metadata:
 spec:
   # The current Forgejo LTS release (the default); docs/versions.md lists the supported ones.
   image: codeberg.org/forgejo/forgejo:15
-  # More than one replica requires highAvailability.enabled (Valkey for cache, sessions and
-  # queues); the API server refuses replicas > 1 without it.
+  # More than one replica requires highAvailability.enabled (Valkey for cache and queues,
+  # plus one cron runner); the API server refuses replicas > 1 without it.
   replicas: 1
+  # Choose HA when creating the instance; enabled is immutable (omitted means false).
+  # highAvailability:
+  #   enabled: true
   server:
     appName: Forgejo
     # domain: git.example.com      # public host name (DOMAIN, SSH_DOMAIN, ROOT_URL)
   # ingress:
   #   enabled: true
-  #   host: git.example.com
+  #   host: git.example.com        # required when enabled, also with server.domain/rootURL
   #   # Unset: the cluster's default IngressClass, applied when the Ingress is created, is kept.
   #   className: nginx
   #   tlsSecretName: git-example-com-tls

@@ -28,6 +28,11 @@ annotation is set.
 
 ## Diagnosis
 
+Rollout verification reads the Deployment directly before evaluating failure or timeout.
+If that read fails, reconciliation retries without starting a rollback; inspect operator
+API connectivity and permissions when an upgrade remains in `RollingOut` or `Verifying`
+with reconcile errors.
+
 ```sh
 kubectl -n $NS get fj $N -o jsonpath='{.status.upgrade}{"\n"}'     # phase, failedImage, failureReason, rollbackRestoreFailed
 kubectl -n $NS get fj $N -o jsonpath='{.status.conditions[?(@.type=="Upgrading")]}{"\n"}'

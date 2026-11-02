@@ -11,15 +11,27 @@ on:
         type: string
 permissions:
   contents: read
+  actions: read
   packages: write
 concurrency:
   group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
   cancel-in-progress: false
 jobs:
   release:
-    if: github.repository == 'lictl/forgejo-operator'
+    if: github.repository == 'lictl/forgejo-operator' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
+      # Capture policy from the workflow revision, before checking out a possibly
+      # older tag whose release driver has no CI gate.
+      - name: Check out trusted release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Preserve trusted release policy
+        run: |
+          mkdir -p "$RUNNER_TEMP/forgejo-release-policy"
+          cp hack/check-release-ci.py "$RUNNER_TEMP/forgejo-release-policy/check-release-ci.py"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
@@ -35,11 +47,16 @@ jobs:
           echo "e25d5cd675092bb5d1d03632fdc46cdf3fede7b514dc5f023a105e00d3ce5ad4  $HOME/.docker/cli-plugins/docker-buildx" | sha256sum -c -
           chmod +x "$HOME/.docker/cli-plugins/docker-buildx"
           docker buildx version
-      - name: Build and publish GHCR artifacts
+      - name: Verify canonical CI, build and publish GHCR artifacts
         env:
+          CI_GITHUB_TOKEN: ${{ github.token }}
           REGISTRY_HOST: ghcr.io
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_TOKEN: ${{ github.token }}
           TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
         run: |
+          set -eu
+          revision="$(git rev-parse HEAD)"
+          test "$revision" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+          python3 "$RUNNER_TEMP/forgejo-release-policy/check-release-ci.py" "$TAG" "$revision"
           bash hack/release.sh

@@ -25,6 +25,12 @@ Jobs are deleted once the result is recorded in status. So has `ForgejoRunner`
 (`internal/controller/forgejorunner_controller.go`, backed by `internal/runner`; see
 [ForgejoRunner](#forgejorunner)).
 
+Backup, cleanup, upload and restore Jobs inherit
+`spec.podTemplate.serviceAccountName` from an available instance, so Kubernetes can
+supply its registry credentials when no explicit image pull secrets are set. Explicit
+`spec.imagePullSecrets` are preserved, and every Job disables automatic service account
+token mounting.
+
 ### Validation
 
 Mistakes that the operator could only report later (as `Degraded`, a failed child object or a
@@ -36,10 +42,14 @@ and the mistakes below. The operator's runtime checks stay as a second line.
 
 | Kind | Refused |
 |------|---------|
-| `Forgejo` | a name that is not a DNS-1035 label, longer than 56 (Service `<name>-valkey`), with CNPG longer than 47 (CNPG limits Cluster `<name>-db` to 50), or with `highAvailability.enabled` longer than 45 (pod label `controller-revision-hash=<name>-valkey-<hash>`); a name ending in `-valkey` (its PDB `<name>` would be the Valkey PDB of another instance); an empty `image`, `database.cnpg.imageName` or `highAvailability.valkey.image` (it would follow the operator's default); with type CNPG, a `database.cnpg.imageName` whose tag does not start with the PostgreSQL major (CNPG reads the major from it); `replicas` > 1 or `autoscaling.horizontal.enabled` without `highAvailability.enabled` (also through the scale subresource); `minReplicas` > `maxReplicas`; type `External` without `external`, `external` without type `External`, and CNPG settings with `External` (except `imageName`, used by backup Jobs); `ingress.enabled` without a host (`ingress.host`, `server.domain`, `server.rootURL` or `gateway.hostnames`); Ingress and Gateway paths that Kubernetes or `HTTPPathMatch` refuse; `gateway.ssh` with SSH disabled; an issuer kind other than `Issuer`/`ClusterIssuer` for cert-manager's group; `nodePort` or `loadBalancerClass` on a Service type that ignores it; a `domain` or `rootURL` that is no host name or http(s) URL; an admin user name Forgejo refuses or reserves (e.g. `admin`); a `backup.schedule` that is no five-field cron expression or descriptor; `restoreFrom` set or changed after creation; `database.type` changed, or `storage.existingClaim` set, changed or removed, after creation (Forgejo would start on another, empty database or volume) |
+| `Forgejo` | a name that is not a DNS-1035 label, longer than 56 (Service `<name>-valkey`), with CNPG longer than 47 (CNPG limits Cluster `<name>-db` to 50), or with `highAvailability.enabled` longer than 45 (pod label `controller-revision-hash=<name>-valkey-<hash>`); a name ending in `-valkey` (its PDB `<name>` would be the Valkey PDB of another instance); an empty `image`, `database.cnpg.imageName` or `highAvailability.valkey.image` (it would follow the operator's default); with type CNPG, a `database.cnpg.imageName` whose tag does not start with the PostgreSQL major (CNPG reads the major from it); `replicas` > 1 or `autoscaling.horizontal.enabled` without `highAvailability.enabled` (also through the scale subresource); `minReplicas` > `maxReplicas`; type `External` without `external`, `external` without type `External`, and CNPG settings with `External` (except `imageName`, used by backup Jobs); `ingress.enabled` without explicit `ingress.host` (server and Gateway host names do not supply it); Ingress and Gateway paths that Kubernetes or `HTTPPathMatch` refuse; `gateway.ssh` with SSH disabled; an issuer kind other than `Issuer`/`ClusterIssuer` for cert-manager's group; `nodePort` or `loadBalancerClass` on a Service type that ignores it; a `domain` or `rootURL` that is no host name or http(s) URL; an admin user name Forgejo refuses or reserves (e.g. `admin`); a `backup.schedule` that is no five-field cron expression or descriptor; `restoreFrom` set or changed after creation; `database.type` changed, or `storage.existingClaim` set, changed or removed, after creation (Forgejo would start on another, empty database or volume) |
 | `ForgejoBackup` | any change of `spec` |
 | `ForgejoRestore` | any change of `spec`; neither or both of `backupName` and `remote`; `restoreDatabase` and `restoreData` both false |
 | `ForgejoRunner` | a name longer than 52 (pod label `controller-revision-hash=<name>-<hash>`), with a `.` (pod host names), or ending in `-valkey` or `-cron` (its StatefulSet `<name>` would be an HA instance's Valkey or cron runner); a missing `executor`; a changed `forgejoRef`; both `scope.organization` and `scope.repository`; labels of the other executor's form; `docker` settings with `Host` and `host.image` with `Docker` |
+
+The effective `spec.highAvailability.enabled` value is immutable after creation; omitted
+means false. Switching modes could overlap cron runners and lose queued work. Replica counts
+and Valkey settings remain mutable.
 
 `forgejoRef.name` of the other kinds must be a possible `Forgejo` name. Ports, percentages,
 durations and pull policies have their ranges, forms and enums.
@@ -177,17 +187,17 @@ checks, the restore handshake or volume expansion. Around the table:
 | 6 | backup-ownership | backup | – | owner references of the instance's `ForgejoBackup`s and `<name>-backups` PVC, per `spec.storage.retainPolicy` |
 | 7 | database-upgrade | upgrade | 2, 4 | `rc.DatabaseImage` (the image the `database` step writes), `rc.Upgrading`, `rc.DatabaseUpgrading`, `rc.ReplicasOverride`; `status.database.upgrade`, `DatabaseUpgrading`; pre-upgrade `ForgejoBackup` (database only). Never deletes or recreates the Cluster: a failure that may have changed the data, a failed verification or a lost Cluster keeps Forgejo at zero with `Broken=True/DatabaseUpgradeFailed` (`holdsForgejo`), and the annotation `forgejo.lucas.icu/recreate-database` with `Broken=True/DatabaseRestorePending`, until a later `ForgejoRestore` of the database. Stops while a deleted Cluster's pods, volumes, Secrets and Services keep a new one from being created (`DatabaseReady=False/ClusterDeleting`), and while a new instance asks for a major the operator does not run (see [upgrades.md](upgrades.md#postgresql-major-upgrades)) |
 | 8 | database | core | 5, 7 | CNPG `Cluster <name>-db`, or the external DB check; `rc.DB`, `rc.DatabaseReady`, `status.database` (with the image, major and system ID of the data), `DatabaseReady`; writes `rc.DatabaseImage`, never a major older than the data's. Stops until CNPG is ready or the external credentials resolve (an unreachable external DB is only reported) |
-| 9 | high-availability | autopilot | 8 | Valkey password in `<name>-secrets`; StatefulSet, headless Service and PDB `<name>-valkey` (Valkey with Sentinel); `rc.ValkeyURL` (`redis+sentinel://`), `rc.NodeZones`. Empties Valkey (scaled to zero until no pod is left, then back to three) once for each restore in `ScalingUp` (`rc.ScalingUpRestore`) and when the password changes. Stops while no Valkey pod is Ready and while it empties Valkey, except in maintenance (see [high-availability.md](high-availability.md#valkey-with-sentinel)) |
+| 9 | high-availability | autopilot | 8 | With the HA mode chosen at creation: Valkey password in `<name>-secrets`; StatefulSet, headless Service and PDB `<name>-valkey` (Valkey with Sentinel); `rc.ValkeyURL` (`redis+sentinel://`), `rc.NodeZones`. Empties Valkey (scaled to zero until no pod is left, then back to three) once for each restore in `ScalingUp` (`rc.ScalingUpRestore`) and when the password changes. Stops while no Valkey pod is Ready and while it empties Valkey, except in maintenance (see [high-availability.md](high-availability.md#valkey-with-sentinel)) |
 | 10 | storage | core | 9 | PVC `<name>-data` (unless `spec.storage.existingClaim`) |
 | 11 | restore-from | backup | 10 | with `spec.restoreFrom`: `ForgejoRestore <name>-restore-from` of the backup once the database is ready, unless the database or data volume predates the instance (`TargetNotEmpty`); `status.restoredFrom` follows it; at `ScalingUp` the annotation `restored-from` on `<name>-secrets`, then `Completed` |
 | 12 | ssh-host-keys | core | 5 | Secret `<name>-ssh-host-keys` (generated once); `rc.SSHHostKeys`, `rc.SSHHostKeysUnavailable`, `status.ssh` (see [SSH host keys](#ssh-host-keys)) |
 | 13 | object-storage | core | – | with `spec.objectStorage`: reads its Secrets, `rc.ObjectStorage` (digest of the credentials and CA), `rc.ObjectStorageUnavailable` (any failed answer of the endpoint, not `UnreachableFromOperator`), `ObjectStorageReady` from the operator's check of the bucket (see [object-storage.md](object-storage.md)). Stops only while the Secrets are unusable; a bucket the operator cannot reach is only reported |
-| 14 | upgrade | upgrade | 10, 13 | `rc.TargetImage`, `rc.Layout`, `rc.Upgrading`, `rc.ReplicasOverride`, `status.upgrade`, `Upgrading`; pre-upgrade `ForgejoBackup`, rollback `ForgejoRestore` |
+| 14 | upgrade | upgrade | 10, 13 | `rc.TargetImage`, `rc.Layout`, `rc.Upgrading`, `rc.ReplicasOverride`, `status.upgrade`, `Upgrading`; pre-upgrade `ForgejoBackup`, rollback `ForgejoRestore`; verifies the Deployment with `APIReader` before judging rollout failure or timeout |
 | 15 | tuning | autopilot | 14 | `rc.Tuning`, `rc.TuningEnv`, `rc.ResourcesOverride`, `rc.HPAManaged`, `status.autoPilot.tuning` |
 | 16 | config | core | 12, 15 | Secret `<name>-config` (`app.ini`, including `SSH_SERVER_HOST_KEYS`, and with HA `app-web.ini`, the same without cron tasks; one hash covers both); `rc.ConfigSecretName`, `rc.ConfigHash`, `rc.DesiredConfigHash` |
 | 17 | config-guard | autopilot | 16 | may switch `rc.ConfigSecretName`/`rc.ConfigHash` to `<name>-config-lkg` |
 | 18 | workload | core | 17 | Deployment `<name>` and, with HA, the cron runner StatefulSet `<name>-cron` (see [Upgrade and migration holds](#upgrade-and-migration-holds)); `status.configHash` |
-| 19 | network | core | – | Services `<name>-http`, `<name>-ssh`; Ingress `<name>` (TLS Secret defaults to `<name>-tls` with `spec.tls.certManager`) |
+| 19 | network | core | – | Services `<name>-http`, `<name>-ssh`; Ingress `<name>` (explicit `spec.ingress.host` for the rule and TLS hosts; a missing host is rejected before rendering; TLS Secret defaults to `<name>-tls` with `spec.tls.certManager`) |
 | 20 | gateway | core | – | HTTPRoute `<name>`, TCPRoute `<name>-ssh` (v1, else v1alpha2) when the Gateway API CRDs exist; `RoutesReady` from the routes' `status.parents` (see [networking.md](networking.md)) |
 | 21 | tls | core | – | cert-manager Certificate `<name>-tls` (Secret `<name>-tls`), ReferenceGrant `<name>-tls` for `spec.tls.gatewayNamespaces`; `TLSReady` from the Certificate's `Ready` |
 | 22 | scaling | autopilot | 15 | HPA `<name>`, PDB `<name>` |
@@ -264,6 +274,12 @@ workload update.
    minutes of a restore failing, it double-checks with a live read.
 
 ## Upgrade and migration holds
+
+An upgrade verifies the Deployment directly with `APIReader` before evaluating cached
+pod failures or the rollout timeout. An available target image succeeds even when the
+informer still reports an unavailable Deployment; a failed live read returns an error
+without selecting a rollback or stopping the workload. This protects writes accepted
+while the operator or its cache was behind.
 
 `forgejo migrate` (run by the `bootstrap` init container) takes no lock, so it must never
 run in two pods at once. Three signals hold the workload at one pod with the `Recreate`
@@ -559,6 +575,13 @@ The objects of a `ForgejoRunner` are named in `internal/runner/names.go`, carry
 
 ## Optional integrations
 
+The Helm chart and Kustomize manifests expose authenticated HTTPS operator metrics
+using controller-runtime's self-signed certificate by default. Their ServiceMonitors
+skip certificate verification and preserve instance labels with `honorLabels: true`.
+They neither bundle cert-manager nor include cert-manager configuration for operator
+metrics; a separately managed certificate and custom monitor TLS configuration can
+provide verified TLS (see [observability.md](observability.md#scraping-the-operator)).
+
 CNPG, prometheus-operator (ServiceMonitor/PrometheusRule), metrics-server, Gateway API
 (HTTPRoute, TCPRoute, ReferenceGrant) and cert-manager (Certificate) are optional.
 Check `rc.HasAPI(gvk)` (or `rc.FirstAPI` for kinds served in several versions, such as TCPRoute
@@ -574,6 +597,16 @@ bypass the cache) and not watched: the steps re-read them on every pass, every 1
 `RoutesReady` or `TLSReady` is not True. An object the spec does not ask for is deleted only when
 the instance controls it, and checked once per operator process (`optionalAbsent`), so instances
 that do not use a feature cost no request per pass.
+
+## Release publication
+
+Both registry release workflows preserve the gate from their own source revision
+before checking out a release tag. They refuse to invoke that tag's `hack/release.sh`
+until the tagged commit is in canonical GitHub `main` history and its required
+GitHub workflows and latest-attempt jobs have succeeded; old tags cannot remove
+the workflow's policy. Forgejo's manual CI is
+diagnostic only. Missing or unreadable evidence fails closed; the shared gate
+and its offline tests are described in the [release runbook](release.md#exact-commit-ci-gate).
 
 ## Capability levels
 
