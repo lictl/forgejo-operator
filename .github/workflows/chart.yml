@@ -44,6 +44,8 @@ jobs:
           cmp "$test_dir/a.tgz" "$test_dir/b.tgz"
       - name: Check source mode and time normalization
         run: python3 hack/test-normalize-source-times.py
+      - name: Test release publication gate
+        run: python3 hack/test-check-release-ci.py
       - name: Check two Linux architectures compile
         run: |
           go version
