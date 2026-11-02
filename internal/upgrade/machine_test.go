@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 	"github.com/lictl/forgejo-operator/internal/forgejo"
@@ -218,6 +220,74 @@ func TestRolloutVerifiedByTheDeployment(t *testing.T) {
 				t.Fatalf("next pass: phase %s, upgrading %v", f.Status.Upgrade.Phase, rc.Upgrading)
 			}
 		})
+	}
+}
+
+// A stale informer must neither start a destructive rollback of an available Deployment nor
+// report success for an unavailable one. Read errors leave the rollout running for a retry.
+func TestRolloutVerificationUsesLiveDeployment(t *testing.T) {
+	readErr := errors.New("deployment read failed")
+	crashing := serverPod(fixture(nil), "new", imgB, ago(time.Minute), corev1.ContainerState{
+		Waiting: &corev1.ContainerStateWaiting{Reason: waitingCrashLoopBackOff},
+	}, crashRestarts)
+	for _, phase := range []forgejov1.UpgradePhase{forgejov1.UpgradePhaseRollingOut, forgejov1.UpgradePhaseVerifying} {
+		for _, tt := range []struct {
+			name         string
+			cached       []client.Object
+			live         []client.Object
+			rolledOutAgo time.Duration
+			readErr      error
+			want         forgejov1.UpgradePhase
+		}{
+			{"cached unavailable past timeout", []client.Object{deployment(imgB, 1, 0)}, []client.Object{deployment(imgB, 1, 1)},
+				time.Hour, nil, forgejov1.UpgradePhaseSucceeded},
+			{"cached missing past timeout", nil, []client.Object{deployment(imgB, 1, 1)},
+				time.Hour, nil, forgejov1.UpgradePhaseSucceeded},
+			{"cached crash before timeout", []client.Object{deployment(imgB, 1, 0), crashing}, []client.Object{deployment(imgB, 1, 1)},
+				time.Minute, nil, forgejov1.UpgradePhaseSucceeded},
+			{"cached available but live unavailable", []client.Object{deployment(imgB, 1, 1)}, []client.Object{deployment(imgB, 1, 0)},
+				time.Minute, nil, phase},
+			{"read error with cached success", []client.Object{deployment(imgB, 1, 1)}, nil,
+				time.Hour, readErr, phase},
+			{"read error with cached failure", []client.Object{deployment(imgB, 1, 0), crashing}, nil,
+				time.Hour, readErr, phase},
+		} {
+			t.Run(string(phase)+"/"+tt.name, func(t *testing.T) {
+				f := fixture(&forgejov1.UpgradeStatus{
+					Phase: phase, FromImage: imgA, ToImage: imgB, BackupName: testPreBackup,
+					StartTime: ago(2 * time.Hour), RolloutStartTime: ago(tt.rolledOutAgo),
+				})
+				cached := newClient(t, tt.cached...)
+				live := fake.NewClientBuilder().WithScheme(cached.Scheme()).WithObjects(tt.live...).WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*appsv1.Deployment); ok && tt.readErr != nil {
+							return tt.readErr
+						}
+						return c.Get(ctx, key, obj, opts...)
+					},
+				}).Build()
+				rc := &forgejo.ReconcileContext{
+					Client: cached, APIReader: rbacGuard(t, live, false), Scheme: cached.Scheme(), Instance: f, TargetImage: f.Status.Image,
+				}
+				if _, err := Reconcile(context.Background(), rc); !errors.Is(err, tt.readErr) {
+					t.Fatalf("reconcile error %v, want %v", err, tt.readErr)
+				}
+				u := f.Status.Upgrade
+				if u.Phase != tt.want {
+					t.Fatalf("phase %s, want %s: %s", u.Phase, tt.want, u.Message)
+				}
+				if u.RestoreName != "" || restores(t, cached) != 0 || rc.ReplicasOverride != nil || rc.TargetImage != imgB {
+					t.Fatalf("restore %q, replicas override %v, target %s", u.RestoreName, rc.ReplicasOverride, rc.TargetImage)
+				}
+				wantImage := imgA
+				if tt.want == forgejov1.UpgradePhaseSucceeded {
+					wantImage = imgB
+				}
+				if f.Status.Image != wantImage || rc.Upgrading != (tt.want != forgejov1.UpgradePhaseSucceeded) {
+					t.Fatalf("status.image %s, upgrading %v", f.Status.Image, rc.Upgrading)
+				}
+			})
+		}
 	}
 }
 

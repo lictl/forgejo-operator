@@ -390,14 +390,14 @@ func (m *machine) rollingOut() error {
 }
 
 // verified reports whether the Deployment has rolled out the new image with every replica
-// available. It goes by the live Deployment, before the timeout and the restart counts are
-// looked at: core writes status.image only at the end of a pass, so the first pass after the
+// available. It reads directly from the API server before looking at the timeout and restart
+// counts: core writes status.image only at the end of a pass, so the first pass after the
 // operator was away (a crash, an operator rollout, spec.paused) would otherwise roll back an
 // upgrade whose pods became available meanwhile, and with it every write since.
 func (m *machine) verified() (bool, error) {
 	rc, u, f := m.rc, m.u, m.rc.Instance
 	dep := &appsv1.Deployment{}
-	err := rc.Client.Get(m.ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep)
+	err := rc.APIReader.Get(m.ctx, types.NamespacedName{Namespace: f.Namespace, Name: forgejo.DeploymentName(f)}, dep)
 	if apierrors.IsNotFound(err) {
 		return false, nil
 	}
