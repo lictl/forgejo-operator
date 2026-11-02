@@ -18,7 +18,7 @@ Shared facts:
   B=http://$N-http.$NS.svc.cluster.local:3000
   ```
 - Images in the image store of the docker engine the local cluster runs on (no registry needed): `codeberg.org/forgejo/forgejo:14`, `:15`, `:15-rootless`, `:16`, `:17`, `:17-rootless`. Check first with `docker images | grep codeberg.org/forgejo/forgejo`; pull a missing one with `docker pull <image>`.
-- Version facts on 2026-10-22 (the operator classifies with the current date): supported are **15 (LTS)** and **17**; `:15` is 15.0.10, `:16` is 16.0.6 (`Deprecated` until 2026-10-29, `EndOfLife` from that day on), `:17` is 17.0.0 (supported, with an upstream advisory: the condition message says "use 17.0.1 or newer"), `:14` is 14.0.5 (`EndOfLife`).
+- Version facts (the operator classifies with the current date; recorded on 2026-10-22 and brought in line with the version table of 2026-11-02 without a new run): supported are **15 (LTS)** and **17**; `:15` is 15.0.11 and `:17` is 17.0.1 (neither has an advisory; the older patch releases 15.0.10 and 17.0.0 do, see V3.7), `:16` is 16.0.x (`Deprecated` until 2026-10-29, `EndOfLife` from that day on: on a later date V5 sees `EndOfLife`), `:14` is 14.0.5 (`EndOfLife`). The floating tags move with every patch release: `docker pull` all six images again before the run, because a stale local `:15` (15.0.10) or `:17` (17.0.0) fails V0.1, V1.7 and V3.5 (they carry the advisory).
 - The condition is read with `kubectl -n $NS get fj $N -o jsonpath='{.status.conditions[?(@.type=="VersionSupported")]}'` (fields `status`, `reason`, `message`).
 - Events: `kubectl -n $NS get events --field-selector involvedObject.name=$N,reason=<Reason> -o jsonpath='{range .items[*]}{.type} {.reason}: {.message}{"\n"}{end}'`.
 - Prometheus: `http://kps-kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090` (`/api/v1/query?query=...` with `--data-urlencode`, `/api/v1/rules`, `/api/v1/alerts`). Operator metrics are scraped every 30-60 s.
@@ -37,7 +37,7 @@ Reusable procedures (referenced below):
 
 ## V0 — Prerequisites
 
-1. **V0.1 images**: all six images listed in the shared facts are present (pull missing ones). Record `docker image inspect <image> --format '{{index .Config.Labels "org.opencontainers.image.version"}}'` for each (expect 14.0.5, 15.0.10, 15.0.10, 16.0.6, 17.0.0, 17.0.0).
+1. **V0.1 images**: all six images listed in the shared facts are present (pull missing ones). Record `docker image inspect <image> --format '{{index .Config.Labels "org.opencontainers.image.version"}}'` for each (expect 14.0.5, 15.0.11, 15.0.11, 16.0.x, 17.0.1, 17.0.1).
 2. **V0.2 CRD default and printer column**: `kubectl get crd forgejos.forgejo.lucas.icu -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.image.default}'` → `codeberg.org/forgejo/forgejo:15`; `kubectl get crd forgejos.forgejo.lucas.icu -o jsonpath='{.spec.versions[0].additionalPrinterColumns[*].name}'` contains `Support`.
 3. **V0.3 namespace**: `kubectl create namespace e2e-versions`.
 
@@ -73,8 +73,9 @@ Forgejo `v17` with `spec.image: codeberg.org/forgejo/forgejo:17`.
 2. **V3.2 healthz + admin**: as V1.3 and V1.4.
 3. **V3.3 HTTP push**: HTTP-PUSH(v17, demo, http.txt).
 4. **V3.4 SSH push**: SSH-PUSH(v17, demo, ssh.txt).
-5. **V3.5 VersionSupported**: `status=True`, `reason=Supported`, message starts with `Forgejo 17 is supported: the latest release` and contains `2027-01-28` and `The running patch release 17.0.0 is older than recommended: use 17.0.1 or newer` (the 17.0.0 advisory; it appears once `status.version` is set, allow 2 min). Exactly one event `VersionAdvisory` (type Warning) for `v17`; no `UnsupportedVersion` event.
+5. **V3.5 VersionSupported**: `status=True`, `reason=Supported`, message starts with `Forgejo 17 is supported: the latest release` and contains `2027-01-28`; with 17.0.1 it has no advisory text (no `older than recommended`; allow 2 min after `status.version` is set). No `VersionAdvisory` and no `UnsupportedVersion` event for `v17`.
 6. **V3.6 rendered app.ini**: same expectations as V1.8 (profile `internal-token`, INTERNAL_TOKEN present, no INTERNAL_LISTENER_PATH).
+7. **V3.7 advisory for an older patch release**: pull `codeberg.org/forgejo/forgejo:15.0.10` (it misses the security fixes of 15.0.11) and apply Forgejo `v15old` with `spec.image: codeberg.org/forgejo/forgejo:15.0.10`. Within 8 min `Running`, `Ready=True`, `status.version` starts with `15.0.10`. `VersionSupported` is `status=True`, `reason=Supported`, and its message contains `The running patch release 15.0.10 is older than recommended: use 15.0.11 or newer` and `eMudhra` (allow 2 min after `status.version` is set). Exactly one `VersionAdvisory` Warning event for `v15old`, no `UnsupportedVersion` event; Prometheus `forgejo_operator_version_advisory{namespace="e2e-versions",name="v15old",major="15"}` = 1 (allow 3 min). The cleanup of V14 removes it.
 
 ## V4 — Fresh install 17-rootless
 
@@ -130,7 +131,7 @@ Forgejo `v16` with `spec.image: codeberg.org/forgejo/forgejo:16` and `spec.upgra
 Forgejo `v14` with `spec.image: codeberg.org/forgejo/forgejo:14` and `spec.upgrade.timeout: 6m`.
 
 1. **V10.1 running**: within 8 min `Running`, `Ready=True`, `status.version` starts with `14.` (an end-of-life version still runs).
-2. **V10.2 condition**: `VersionSupported` = `status=False`, `reason=EndOfLife`, message contains `reached its upstream end of life` and `Upgrade to 15 (LTS, 15.0.10 or newer) or 17 (17.0.1 or newer, through 15 first) now`; one `UnsupportedVersion` Warning event; Prometheus `forgejo_operator_version_supported{namespace="e2e-versions",name="v14"}` = 0 with `support="EndOfLife"` (allow 3 min).
+2. **V10.2 condition**: `VersionSupported` = `status=False`, `reason=EndOfLife`, message contains `reached its upstream end of life` and `Upgrade to 15 (LTS, 15.0.11 or newer) or 17 (17.0.1 or newer, through 15 first) now`; one `UnsupportedVersion` Warning event; Prometheus `forgejo_operator_version_supported{namespace="e2e-versions",name="v14"}` = 0 with `support="EndOfLife"` (allow 3 min).
 3. **V10.3 path refused**: patch `spec.image` to `codeberg.org/forgejo/forgejo:17`. Within 2 min: `Upgrading` reason `UpgradePathUnsupported` with a message containing `Upgrade to Forgejo 15 first`; `Degraded=True` reason `UpgradePathUnsupported`; one `UpgradePathUnsupported` Warning event; the Deployment image is still `:14`; `status.upgrade` is empty (no upgrade started) and no ForgejoBackup with reason PreUpgrade exists for `v14`; `Ready=True`.
 4. **V10.4 via 15**: patch `spec.image` to `codeberg.org/forgejo/forgejo:15`; UPGRADE-WATCH(v14) → `Succeeded` within 12 min; `status.version` starts with `15.`; `Degraded` is not True (reason `AsExpected` or absent); `VersionSupported=True/Supported`.
 5. **V10.5 free resources**: delete Forgejo `v14` and `v16`.
@@ -156,7 +157,7 @@ A made-up image tag cannot run, so `Future` (an image newer than the operator's 
 
 ## V13 — Upstream version check
 
-1. **V13.1 tool**: in the repository root run `go run ./hack/forgejo-versions; echo "exit=$?"` (needs internet access to codeberg.org, no credentials). Expect `exit=0`, a matrix with rows `15 yes ... verified Supported 15.0.10 15.0.10, 15.0.10-rootless`, `16 ... verified Deprecated` (or `EndOfLife` from 2026-10-29), `17 ... verified Supported 17.0.x`, `18 ... upcoming Future`, and no line starting with `STALE`. If codeberg.org is unreachable (`exit=2`), record that instead of a failure.
+1. **V13.1 tool**: in the repository root run `go run ./hack/forgejo-versions; echo "exit=$?"` (needs internet access to codeberg.org, no credentials). Expect `exit=0`, a matrix with rows `15 yes ... verified Supported 15.0.11 15.0.11, 15.0.11-rootless`, `16 ... verified Deprecated` (or `EndOfLife` from 2026-10-29), `17 ... verified Supported 17.0.x`, `18 ... upcoming Future`, and no line starting with `STALE`. If codeberg.org is unreachable (`exit=2`), record that instead of a failure.
 
 ## V14 — Cleanup
 

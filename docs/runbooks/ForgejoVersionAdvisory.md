@@ -11,7 +11,7 @@
 ## Meaning
 
 The instance runs a supported major, but a patch release that the operator's version table
-recommends replacing: it misses critical security fixes (for example 15.0.7) or upstream
+recommends replacing: it misses security fixes (for example 15.0.10) or upstream
 advises against it (for example 17.0.0). The `VersionSupported` condition stays `True` and names
 the minimum patch release.
 

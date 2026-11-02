@@ -113,7 +113,9 @@ func TestClassify(t *testing.T) {
 	}{
 		{Versions, now, "15", SupportSupported, false, []string{"current LTS", "2027-07-15"}},
 		{Versions, now, "15.0.8", SupportSupported, true, []string{"The running patch release 15.0.8"}},
-		{Versions, now, "15.0.10", SupportSupported, false, nil},
+		// 15.0.11 (2026-10-26) fixes security issues that 15.0.10 still has.
+		{Versions, now, "15.0.10", SupportSupported, true, []string{"The running patch release 15.0.10", "use 15.0.11 or newer", "eMudhra"}},
+		{Versions, now, "15.0.11", SupportSupported, false, nil},
 		{Versions, now, "17", SupportSupported, false, nil}, // floating: the patch is unknown
 		{Versions, now, "17.0.0", SupportSupported, true, []string{"The running patch release 17.0.0"}},
 		{Versions, now, "17.0.1", SupportSupported, false, []string{"latest release", "2027-01-28"}},
@@ -122,8 +124,8 @@ func TestClassify(t *testing.T) {
 		// offered (the targets are listed oldest first).
 		{Versions, now, "16.0.6", SupportDeprecated, false, []string{"2026-10-29", "Upgrade to 17 (17.0.1 or newer) before 2026-10-29"}},
 		{Versions, "2026-10-29", "16", SupportEndOfLife, false, nil}, // its EOL day
-		{Versions, now, "14", SupportEndOfLife, false, []string{"Upgrade to 15 (LTS, 15.0.10 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
-		{Versions, now, "11.0.16", SupportEndOfLife, false, []string{"Upgrade to 15 (LTS, 15.0.10 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
+		{Versions, now, "14", SupportEndOfLife, false, []string{"Upgrade to 15 (LTS, 15.0.11 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
+		{Versions, now, "11.0.16", SupportEndOfLife, false, []string{"Upgrade to 15 (LTS, 15.0.11 or newer) or 17 (17.0.1 or newer, through 15 first) now"}},
 		// 17 ended and nothing newer is verified: tell the user to update the operator.
 		{Versions, "2027-02-01", "17", SupportEndOfLife, false, []string{"update the operator"}},
 		{Versions, now, "18", SupportFuture, false, []string{"newest verified: 17", "2027-01-14"}},

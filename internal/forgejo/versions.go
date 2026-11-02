@@ -19,13 +19,18 @@ var Versions = VersionTable{
 		{
 			Major: 15, LTS: true, Released: date(2026, time.April, 16), EOL: date(2027, time.July, 15),
 			UpgradeFrom: 11,
-			Advisory: &Advisory{FixedIn: 10, Note: "15.0.8 and 15.0.9 fix critical security issues and 15.0.10 " +
-				"authorization issues"},
+			Advisory: &Advisory{FixedIn: 11, Note: "15.0.8 and 15.0.9 fix critical security issues, 15.0.10 " +
+				"authorization issues and 15.0.11 more security issues, among them Actions of a pull request " +
+				"review running as trusted from arbitrary commits; upstream says the images of 15.0.11 no " +
+				"longer carry the compromised eMudhra TLS certificates"},
 			Traits: Traits{InternalToken: true},
 		},
 		{
 			Major: 16, Released: date(2026, time.July, 16), EOL: date(2026, time.October, 29),
 			UpgradeFrom: 15,
+			// FixedIn stays 6 although 16.0.7 exists: the message of an unsupported major must not
+			// depend on the patch release (it would be emitted again as the patch changes), so a
+			// row that is past its end of life gets no new advisory. Instances should leave 16.
 			Advisory: &Advisory{FixedIn: 6, Note: "16.0.4 and 16.0.5 fix critical security issues and 16.0.6 " +
 				"authorization issues"},
 			Traits: Traits{InternalToken: true},
@@ -34,7 +39,8 @@ var Versions = VersionTable{
 			Major: 17, Released: date(2026, time.October, 15), EOL: date(2027, time.January, 28),
 			UpgradeFrom: 15,
 			Advisory: &Advisory{FixedIn: 1, Note: "upstream advises against 17.0.0, which can fail pushes, merges " +
-				"and other git operations in some repositories (forgejo#14866)"},
+				"and other git operations in some repositories (forgejo#14866); 17.0.1 fixes that and the " +
+				"security issues of 15.0.11"},
 			Traits: Traits{InternalToken: true, StrictDurations: true},
 		},
 	},
