@@ -237,11 +237,11 @@ groups:
   - alert: ForgejoVersionAdvisory
     annotations:
       description: 'The running Forgejo {{ $labels.major }} patch release is older
-        than the one the operator''s version table recommends (critical security fixes,
-        or a release upstream advises against). The VersionSupported condition of
-        `kubectl describe fj fj -n ns` names the minimum patch release and why; pin
-        spec.image to it (N.0.P), or pull the floating tag again (imagePullPolicy:
-        Always). See docs/versions.md.'
+        than the one the operator''s version table recommends (security fixes, or
+        a release upstream advises against). The VersionSupported condition of `kubectl
+        describe fj fj -n ns` names the minimum patch release and why; pin spec.image
+        to it (N.0.P), or pull the floating tag again (imagePullPolicy: Always). See
+        docs/versions.md.'
       runbook_url: https://github.com/lictl/forgejo-operator/blob/main/docs/runbooks/ForgejoVersionAdvisory.md
       summary: Forgejo ns/fj runs a patch release that an advisory recommends replacing
     expr: max by (namespace, name, major) (forgejo_operator_version_advisory{namespace="ns",

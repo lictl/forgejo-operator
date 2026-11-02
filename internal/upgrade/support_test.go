@@ -151,7 +151,7 @@ func TestReportVersionSupport(t *testing.T) {
 	if evs := recorded(rc); len(evs) != 0 {
 		t.Fatalf("Unknown emitted %q", evs)
 	}
-	f.Status.Version = "15.0.10+gitea-1.22.0"
+	f.Status.Version = "15.0.11+gitea-1.22.0"
 	ReportVersionSupport(rc, supportNow)
 	if c := cond(); c.Reason != "Supported" {
 		t.Fatalf("digest with reported version: %+v", c)

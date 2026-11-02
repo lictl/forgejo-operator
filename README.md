@@ -90,7 +90,7 @@ kubectl get fj -n forgejo -w
 
 ```
 NAME             PHASE     VERSION               READY   REPLICAS   AGE
-forgejo-sample   Running   15.0.10+gitea-1.22.0  True    1          70s
+forgejo-sample   Running   15.0.11+gitea-1.22.0  True    1          70s
 ```
 
 The admin credentials are in the Secret `<name>-admin`:

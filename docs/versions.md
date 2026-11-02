@@ -33,16 +33,16 @@ instance.
 
 ## Support matrix
 
-As of 2026-10-22 (dates from the upstream
+As of 2026-11-02 (dates from the upstream
 [release schedule](https://forgejo.org/docs/latest/admin/release-schedule/)):
 
 | Major | LTS | Released | Upstream end of life | Operator | Notes |
 |-------|-----|----------|----------------------|----------|-------|
 | 11 to 14 | | | passed | `EndOfLife` | Upgrade to 15 first, then to 17 if you want it (`UpgradePathUnsupported` otherwise) |
 | 10 and older | | | passed | `EndOfLife` | Upgrade to 11 first, then to 15: 15 is upgraded to from 11 or newer (`UpgradePathUnsupported` otherwise) |
-| **15** | yes | 2026-04-16 | 2027-07-15 | `Supported`, the default image | Use 15.0.10 or newer: 15.0.8 and 15.0.9 fix critical security issues |
+| **15** | yes | 2026-04-16 | 2027-07-15 | `Supported`, the default image | Use 15.0.11 or newer: it fixes security issues (among them Actions of a pull request review running as trusted from arbitrary commits), and its images no longer carry the compromised eMudhra TLS certificates |
 | 16 | no | 2026-07-16 | 2026-10-29 | `Deprecated`, `EndOfLife` from 2026-10-29 | Upgrade to 17 |
-| **17** | no | 2026-10-15 | 2027-01-28 | `Supported` | Upstream advises against 17.0.0 (pushes and merges can fail, forgejo#14866): use 17.0.1 or newer once it is out |
+| **17** | no | 2026-10-15 | 2027-01-28 | `Supported` | Upstream advises against 17.0.0 (pushes and merges can fail, forgejo#14866): use 17.0.1 or newer, which fixes that and the security issues of 15.0.11 |
 | 18 | no | due 2027-01-14 | 2027-04-29 | `Future` (upcoming, its traits are prepared) | Replaces INTERNAL_TOKEN with a UNIX socket |
 | 19 | yes | due 2027-04-15 | 2028-07-13 | `Future` (upcoming) | Next LTS |
 
@@ -123,7 +123,7 @@ The per-instance PrometheusRule has **`ForgejoVersionUnsupported`** (warning, fo
 `max by (namespace, name, major, support) (forgejo_operator_version_supported) == 0`, and
 **`ForgejoVersionAdvisory`** (warning, for 1h):
 `max by (namespace, name, major) (forgejo_operator_version_advisory) == 1`. A supported major
-that misses critical security fixes (15.0.7) or runs a patch upstream advises against (17.0.0)
+that misses security fixes (15.0.10) or runs a patch upstream advises against (17.0.0)
 alerts through the latter.
 
 ## Upgrading between majors
@@ -133,7 +133,10 @@ The version gate of [upgrades.md](upgrades.md) applies, with two rules from the 
 - **Skipping majors** is allowed when the target's `UpgradeFrom` is at most the running
   major. Forgejo's migrations are cumulative and its upgrade guide says to upgrade straight to
   the latest release; for 15 (LTS) → 17 that is verified (15.0.10 → 17.0.0 migrated, then
-  served pushes and merges). Today 16, 17 and the upcoming 18 and 19 accept upgrades from 15 or
+  served pushes and merges; 15.0.10 → 17.0.1 ran on a real instance on 2026-11-02: the operator
+  took the pre-upgrade backup and migrated in 26 s with about 23 s of downtime, and pushes,
+  branch and tag updates and a merge worked also after the repository's refs were packed, the
+  case in which 17.0.0 fails). Today 16, 17 and the upcoming 18 and 19 accept upgrades from 15 or
   newer, and 15 from 11 or newer. An instance on 14 that asks for 17 is refused with
   `UpgradePathUnsupported` (Degraded, one Warning event, the current image keeps running) and
   must go to 15 first; one on 10 or older goes to 11 first, then to 15. Majors older than the
@@ -172,12 +175,14 @@ one migrated. Going back always means restoring the pre-upgrade backup (see
 2. **Unencrypted mirrors are refused on 17** (forgejo#13490): migrations and mirrors over
    `http://` and `git://` need `[migrations] ALLOW_UNENCRYPTED = true`; in-cluster sources also
    need `ALLOW_LOCALNETWORKS = true`.
-3. Prefer 17.0.1 or newer (the 17.0.0 advisory).
+3. Use 17.0.1 or newer (the 17.0.0 advisory; 17.0.1 fixes forgejo#14866 and the security
+   issues of 15.0.11). Pin the patch release (`codeberg.org/forgejo/forgejo:17.0.1`) if you
+   want the upgrade to happen at a time of your choosing: a floating `:17` follows upstream.
 4. Change the image; the operator takes the pre-upgrade backup, migrates with one pod, verifies
    and rolls back on failure:
 
    ```sh
-   kubectl patch fj <name> --type merge -p '{"spec":{"image":"codeberg.org/forgejo/forgejo:17"}}'
+   kubectl patch fj <name> --type merge -p '{"spec":{"image":"codeberg.org/forgejo/forgejo:17.0.1"}}'
    ```
 
 5. Expect `status.upgrade.phase: Succeeded`, `status.version` 17.x and `VersionSupported=True`.
@@ -198,7 +203,7 @@ Everything of 16 → 17, plus the 16 changes:
   `description` files, the `pulls` directories); the operator does not run them.
 
 If the direct jump fails and is rolled back, go through the last 16 patch release
-(`codeberg.org/forgejo/forgejo:16.0.6`), then 17, as the upstream guide recommends. 16 is
+(`codeberg.org/forgejo/forgejo:16.0.7`), then 17, as the upstream guide recommends. 16 is
 `EndOfLife` from 2026-10-29: use it only as a stepping stone.
 
 ### Recommended manual steps around a major upgrade
@@ -212,11 +217,21 @@ The upstream guide also recommends these, which the operator does not do yet:
   kubectl exec deploy/<name> -c forgejo -- /app/gitea/gitea manager flush-queues --config /etc/forgejo/app.ini
   ```
 
-- Check the instance afterwards:
+- Check the instance afterwards. `doctor check --all` does not work on an instance of this
+  operator (unless you configured a file log): the `paths` check requires the log directory
+  `/data/gitea/log`, which does not exist because the operator logs to the console
+  (`[log] MODE = console`), and the run aborts there (`Is REQUIRED but is not accessible ...
+  no such file or directory`). Run every other check instead; the pipeline runs inside the
+  container, so it does not depend on your shell:
 
   ```sh
-  kubectl exec deploy/<name> -c forgejo -- /app/gitea/gitea doctor check --all --config /etc/forgejo/app.ini --log-file /tmp/doctor.log
+  kubectl exec deploy/<name> -c forgejo -- sh -c '/app/gitea/gitea doctor check --list --config /etc/forgejo/app.ini \
+    | sed -E "1d; s/^\*?[[:space:]]+//; s/[[:space:]].*//" | grep -vx -e paths -e "" | sed "s/^/--run /" \
+    | xargs /app/gitea/gitea doctor check --config /etc/forgejo/app.ini --log-file /tmp/doctor.log'
   ```
+
+  Without `--fix` the checks only report. On 17.0.1 all 26 checks passed on the dogfood instance;
+  an orphaned avatar was the only warning.
 
 ## Per-major differences
 
@@ -348,8 +363,11 @@ Finding: `STALE Forgejo N.0 was released on ... but is not a verified release`.
 ### Patch releases
 
 The tool lists the newest patch of every major and checks that both image flavors exist. When a
-patch fixes a critical security issue, or upstream advises against an earlier patch, set the
-row's `Advisory` (`FixedIn`, `Note`). Nothing else changes: floating tags pick up patches.
+patch fixes a security issue, or upstream advises against an earlier patch, set the
+row's `Advisory` (`FixedIn`, `Note`). Nothing else changes: floating tags pick up patches. Do
+not do this for a major past its end of life (16): the message of an unsupported major must
+not depend on the patch release, or the `UnsupportedVersion` event is emitted again whenever the
+patch changes (`TestClassifyMessageIsStableAcrossPatches`, `TestReportVersionSupport`).
 
 ### End of life
 

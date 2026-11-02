@@ -304,7 +304,7 @@ func prometheusRuleSpec(f *forgejov1.Forgejo, scraped bool) (*ruleSpec, error) {
 		fmt.Sprintf(`max by (namespace, name, major) (forgejo_operator_version_advisory{%s}) == 1`, op),
 		fmt.Sprintf("Forgejo %s runs a patch release that an advisory recommends replacing", ref),
 		fmt.Sprintf("The running Forgejo {{ $labels.major }} patch release is older than the one the operator's version "+
-			"table recommends (critical security fixes, or a release upstream advises against). The VersionSupported "+
+			"table recommends (security fixes, or a release upstream advises against). The VersionSupported "+
 			"condition of `kubectl describe fj %s %s` names the minimum patch release and why; pin spec.image to it "+
 			"(N.0.P), or pull the floating tag again (imagePullPolicy: Always). See docs/versions.md.", f.Name, kc))
 

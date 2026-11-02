@@ -244,7 +244,7 @@ is deleted.
 | `forgejo_operator_volume_used_ratio` | gauge | `claim` | Used/capacity of each PVC |
 | `forgejo_operator_version_supported` | gauge | `major`, `support` | 1 when the running Forgejo major is within the support policy, else 0; `support` is `Supported`, `Deprecated`, `EndOfLife`, `Future` or `Unknown` ([versions.md](versions.md)) |
 | `forgejo_operator_version_end_of_life_timestamp_seconds` | gauge | `major` | Upstream end of life of the running major, when it is in the version table |
-| `forgejo_operator_version_advisory` | gauge | `major` | 1 when the running patch release is older than the one an advisory of the version table recommends (critical security fixes, or a patch upstream advises against), else 0; absent while the version is unknown ([versions.md](versions.md#metrics-and-alert)) |
+| `forgejo_operator_version_advisory` | gauge | `major` | 1 when the running patch release is older than the one an advisory of the version table recommends (security fixes, or a patch upstream advises against), else 0; absent while the version is unknown ([versions.md](versions.md#metrics-and-alert)) |
 | `forgejo_operator_valkey_master_available` | gauge | | With HA: 1 while `ValkeyReady` is True (or Unknown with Valkey pods Ready), else 0 ([high-availability.md](high-availability.md#valkey-with-sentinel)) |
 | `forgejo_operator_valkey_ready_members` | gauge | | With HA: Ready Valkey pods (3 when healthy) |
 | `forgejo_operator_valkey_failovers_total` | counter | | Changes of the Valkey primary seen by the operator |
@@ -296,7 +296,7 @@ those metrics are missing.
 | `ForgejoUpgradeFailed` | warning | An upgrade with `result!="succeeded"` (failed or rolled back) in the last hour | – |
 | `ForgejoDatabaseUpgradeFailed` | warning | A PostgreSQL major upgrade with `result!="succeeded"` (failed or rolled back) in the last hour. Only rendered with database type CNPG | – |
 | `ForgejoVersionUnsupported` | warning | `forgejo_operator_version_supported == 0`: the running major is `Deprecated`, `EndOfLife`, `Future` or `Unknown`; the `VersionSupported` condition says what to upgrade to and by when | 1h |
-| `ForgejoVersionAdvisory` | warning | `forgejo_operator_version_advisory == 1`: a supported major runs a patch release that an advisory recommends replacing (e.g. 15.0.7 without critical security fixes, or 17.0.0); the `VersionSupported` condition names the minimum patch | 1h |
+| `ForgejoVersionAdvisory` | warning | `forgejo_operator_version_advisory == 1`: a supported major runs a patch release that an advisory recommends replacing (e.g. 15.0.10 without the security fixes of 15.0.11, or 17.0.0); the `VersionSupported` condition names the minimum patch | 1h |
 | `ForgejoRunnersOffline` | warning | Per `ForgejoRunner` (label `runner`): `runner_jobs_waiting > 0 and runners_online == 0 and runners_desired > 0`: jobs wait and none of its runners is online ([actions-runners.md](actions-runners.md)) | 10m |
 | `ForgejoValkeyNoMaster` | critical | With HA: `forgejo_operator_valkey_master_available == 0`, suppressed while Restoring or Paused: Valkey has no Ready primary (no Sentinel majority, or no replica to promote), so every server pod fails its health check | 2m |
 | `ForgejoValkeyFailedOver` | warning | With HA: the Valkey primary moved to another pod in the last 15 minutes (`forgejo_operator_valkey_failovers_total` increased) | – |
