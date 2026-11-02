@@ -62,6 +62,9 @@ func (r *ForgejoBackupReconciler) reconcileUpload(ctx context.Context, b *forgej
 // releaseUpload deletes the finished upload Job and the identity Secret it read.
 func (r *ForgejoBackupReconciler) releaseUpload(ctx context.Context, b *forgejov1.ForgejoBackup) (ctrl.Result, error) {
 	if stopped, err := r.jobStopped(ctx, b, uploadJobName(b), false); err != nil || !stopped {
+		if res, held := r.holdForForeignJob(b, err); held {
+			return res, nil
+		}
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 	}
 	if err := backup.DeleteFinishedJob(ctx, r.Client, b, uploadJobName(b)); err != nil {
@@ -169,6 +172,10 @@ func (r *ForgejoBackupReconciler) startUpload(ctx context.Context, b *forgejov1.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	refusals := refusalKey{uid: b.UID, upload: true}
+	if wait := r.refusals.remaining(refusals, r.now()); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
 	now := metav1.Now()
 	st := b.Status.Remote.DeepCopy()
 	st.Phase = forgejov1.RemoteBackupUploading
@@ -185,14 +192,16 @@ func (r *ForgejoBackupReconciler) startUpload(ctx context.Context, b *forgejov1.
 	// are also needed to settle a lost Job, so a record on the Job itself is not sufficient.
 	prepared := st.DeepCopy()
 	prepared.Phase = forgejov1.RemoteBackupPending
+	prepared.Message = fmt.Sprintf("Preparing upload job %s", job.Name)
 	orig := b.DeepCopy()
 	b.Status.Remote = prepared
 	if err := r.patchStatus(ctx, b, orig); err != nil {
 		return ctrl.Result{}, err
 	}
-	if res, stopped, err := r.createPreparedUpload(ctx, b, job, orig); stopped {
+	if res, stopped, err := r.createPreparedUpload(ctx, b, job, orig, refusals); stopped {
 		return res, err
 	}
+	r.refusals.clear(refusals)
 
 	orig = b.DeepCopy()
 	b.Status.Remote = st
@@ -205,10 +214,12 @@ func (r *ForgejoBackupReconciler) startUpload(ctx context.Context, b *forgejov1.
 
 // createPreparedUpload discards preparation only when the API explicitly refused creation.
 // An ambiguous create error leaves the journal intact for recovery on the next reconcile.
-func (r *ForgejoBackupReconciler) createPreparedUpload(ctx context.Context, b *forgejov1.ForgejoBackup, job *batchv1.Job, orig *forgejov1.ForgejoBackup) (ctrl.Result, bool, error) {
-	if err := backup.CreateJob(ctx, r.Client, b, job); err != nil {
+func (r *ForgejoBackupReconciler) createPreparedUpload(ctx context.Context, b *forgejov1.ForgejoBackup, job *batchv1.Job,
+	orig *forgejov1.ForgejoBackup, refusals refusalKey) (ctrl.Result, bool, error) {
+	if err := backup.CreateJobRetrying(ctx, r.Client, b, job); err != nil {
 		var conflict *backup.JobConflictError
-		if !errors.As(err, &conflict) {
+		var refused *backup.JobRefusedError
+		if !errors.As(err, &conflict) && !errors.As(err, &refused) {
 			return ctrl.Result{}, true, fmt.Errorf("creating upload job: %w", err)
 		}
 		// A refused create cannot have uploaded anything. Restore the unstarted state
@@ -218,9 +229,18 @@ func (r *ForgejoBackupReconciler) createPreparedUpload(ctx context.Context, b *f
 		if err := r.patchStatus(ctx, b, prepared); err != nil {
 			return ctrl.Result{}, true, err
 		}
+		if refused != nil {
+			r.refusals.refuse(refusals, r.now())
+			if !forgejo.IsNamespaceTerminating(err) {
+				r.event(b, corev1.EventTypeWarning, "JobRefused", "Upload", "%v; will try again", refused)
+			}
+			return ctrl.Result{}, true, fmt.Errorf("creating upload job: %w", err)
+		}
 		if conflict.Transient {
+			r.refusals.refuse(refusals, r.now())
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
 		}
+		r.refusals.clear(refusals)
 		return ctrl.Result{}, true, r.uploadFailed(ctx, b, "JobNameConflict", fmt.Sprintf("Not uploaded: %v", conflict))
 	}
 

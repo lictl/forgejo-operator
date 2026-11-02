@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
@@ -65,6 +68,30 @@ func (r *ForgejoBackupReconciler) checkPreparedJob(ctx context.Context, b *forge
 	return backup.CheckOwned(job, b)
 }
 
+// foreignJobRecheck is how often a step that found a foreign Job under a journaled name
+// looks again; nothing but a person can end the hold.
+const foreignJobRecheck = 5 * time.Minute
+
+// foreignJobError: the Job under a journaled name is controlled by something else, so what
+// it touches is not this backup's to judge.
+type foreignJobError struct{ name string }
+
+func (e *foreignJobError) Error() string {
+	return fmt.Sprintf("job %s belongs to another object; leaving backup files and identity untouched", e.name)
+}
+
+// holdForForeignJob settles a foreignJobError for a step with no deadline of its own: it
+// warns once per recheck instead of failing the reconcile in a loop, and looks again later,
+// in case the Job was removed. Reports false for every other error.
+func (r *ForgejoBackupReconciler) holdForForeignJob(b *forgejov1.ForgejoBackup, err error) (ctrl.Result, bool) {
+	var foreign *foreignJobError
+	if !errors.As(err, &foreign) {
+		return ctrl.Result{}, false
+	}
+	r.event(b, corev1.EventTypeWarning, "ForeignJob", "Cleanup", "%v; delete that Job to continue", foreign)
+	return ctrl.Result{RequeueAfter: foreignJobRecheck}, true
+}
+
 // jobStopped confirms through live reads that neither the Job nor any orphaned pod can
 // still use the backup files or identity Secret. Deletion requests stop only an owned Job;
 // file cleanup always waits for its pods, including pods hidden by a lagging cache.
@@ -79,7 +106,7 @@ func (r *ForgejoBackupReconciler) jobStopped(ctx context.Context, b *forgejov1.F
 	}
 	if err == nil {
 		if !metav1.IsControlledBy(job, b) {
-			return false, fmt.Errorf("job %s belongs to another object; leaving backup files and identity untouched", name)
+			return false, &foreignJobError{name: name}
 		}
 		if state, _ := backup.StateOf(job); state == backup.JobRunning {
 			if stop && job.DeletionTimestamp.IsZero() {

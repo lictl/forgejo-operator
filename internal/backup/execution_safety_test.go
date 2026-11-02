@@ -28,6 +28,7 @@ const (
 	testDumpExecution   = "dump"
 	testUploadExecution = "upload"
 	testRemotePrefix    = "team"
+	testOldBackupUID    = "old-backup-uid"
 )
 
 func queuedBackup(name string, reason forgejov1.BackupReason) *forgejov1.ForgejoBackup {
@@ -637,7 +638,7 @@ func TestBackupJobCollisionRetriesAfterPredecessorIsGone(t *testing.T) {
 				jobName = backup.UploadJobName(b)
 			}
 			old := b.DeepCopy()
-			old.UID = "old-backup-uid"
+			old.UID = testOldBackupUID
 			j := finishedJob(t, s, jobName, old, batchv1.JobComplete)
 			c := newFakeClient(s, append(objs, b, j, dbAppSecret("pw"))...)
 			for range 3 {
@@ -691,7 +692,7 @@ func TestRecoveryCollisionPreservesExecutionJournal(t *testing.T) {
 				replacement := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: ns, UID: "replacement-job"}}
 				if transient {
 					old := b.DeepCopy()
-					old.UID = "old-backup-uid"
+					old.UID = testOldBackupUID
 					replacement = finishedJob(t, backup.FakeScheme(t), jobName, old, batchv1.JobComplete)
 				}
 				if err := c.Create(ctx, replacement); err != nil {
@@ -709,9 +710,10 @@ func TestRecoveryCollisionPreservesExecutionJournal(t *testing.T) {
 					t.Fatalf("transient recovery conflict became terminal: %+v", got.Status)
 				}
 				if !transient {
-					if _, err := (&controller.ForgejoBackupReconciler{Client: c, APIReader: c, Scheme: backup.FakeScheme(t)}).Reconcile(ctx,
-						ctrl.Request{NamespacedName: client.ObjectKeyFromObject(b)}); err == nil {
-						t.Fatal("cleanup did not report the foreign Job")
+					res, err := (&controller.ForgejoBackupReconciler{Client: c, APIReader: c, Scheme: backup.FakeScheme(t)}).Reconcile(ctx,
+						ctrl.Request{NamespacedName: client.ObjectKeyFromObject(b)})
+					if err != nil || res.RequeueAfter < time.Minute {
+						t.Fatalf("cleanup beside the foreign Job = %+v, %v; want a slow recheck without an error", res, err)
 					}
 				}
 				if jobExists(t, c, backup.CleanupJobName(b)) {

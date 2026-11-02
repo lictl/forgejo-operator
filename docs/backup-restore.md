@@ -71,8 +71,17 @@ What happens:
   volume, path, ServiceAccount name and explicit image-pull Secret names in status. After an
   interrupted start it tracks that execution, even if the
   Job disappeared, and preserves the journal if another object took the Job name. A create
-  that was explicitly refused has not started any work: its unused preparation is discarded,
-  and a name held by a deleted predecessor can retry after garbage collection. When the source
+  that the API server refused (a quota, an admission webhook, RBAC or validation; the
+  `JobRefused` Warning event) has not started any work: its unused preparation is discarded
+  and the start is asked again after a pause that doubles from 5 seconds to 5 minutes while
+  the refusal lasts (the pause is kept in memory, and nothing is written meanwhile). A name
+  held by a Job of another object fails the backup with `JobNameConflict`.
+  An error that leaves open whether the Job was stored (a timeout, a server error, a dropped
+  connection) is asked again a few times within the pass; if it persists, or a refusal or a
+  name conflict follows it, the journal stays and recovery judges the Job with a live read. A
+  Job that does not appear within a minute fails the backup (for an upload, its
+  `status.remote`) with `JobMissing`. A name held by a deleted predecessor gets the same
+  pause as a refusal. When the source
   instance is gone, cleanup uses the recorded image and pull-credential references
   (`status.serviceAccountName` and `status.imagePullSecrets`), without mounting an API token.
   Keep those ServiceAccounts and registry Secrets available until retained backups are removed;
@@ -374,6 +383,10 @@ the same name as its backup. A backup or restore never uses a Job it does not co
 Job with its name already exists and belongs to something else, the object fails with
 reason `JobNameConflict`. For a restore this happens before maintenance mode starts. A Job
 that is being deleted, or that was left by an earlier object of the same name, is waited for.
+A Job of another object under the name of a backup's journaled execution keeps the backup's
+files and the upload's identity Secret in place: removing the files of a failed backup and
+releasing the identity Secret wait, with a `ForeignJob` Warning event every five minutes,
+until that Job is deleted.
 
 The restore records how far its Job got in the condition `DataModified`. The controller
 looks at every pod of the Job, not only the newest:
@@ -504,6 +517,12 @@ when the restore replaces it, records its name in `status.preRestoreBackupName` 
   anything is changed: maintenance ends and Forgejo starts again on the untouched instance.
   Fix the cause (a full backup volume, a database that is not ready: a backup waits 2 minutes
   for it), then create the restore again.
+* If a Forgejo or PostgreSQL upgrade is in flight, or the instance became `Broken` after the
+  backup was created (a `Broken` instance gets none), the pre-restore backup fails at once
+  with reason `InstanceUnsafe`, because waiting would deadlock it against the paused
+  upgrade; the restore then fails with `PreRestoreBackupFailed` and changes nothing. Create
+  the restore again after the upgrade finished or `Broken` was resolved, or with
+  `spec.preRestoreBackup: false` to accept that nothing is kept of what it replaces.
 * It is an ordinary backup: restoring it with a new `ForgejoRestore` undoes the restore, and
   with `spec.backup.remote` it is uploaded. Retention never prunes it, locally or remotely;
   delete it once you no longer need it. Under `retainPolicy: Delete` it belongs to the

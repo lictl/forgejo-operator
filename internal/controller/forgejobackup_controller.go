@@ -69,6 +69,17 @@ type ForgejoBackupReconciler struct {
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Recorder  events.EventRecorder
+	// Now is the clock of the pause after a refused Job create; nil means time.Now.
+	Now func() time.Time
+
+	refusals refusalBackoff
+}
+
+func (r *ForgejoBackupReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 // +kubebuilder:rbac:groups=forgejo.lucas.icu,resources=forgejobackups,verbs=get;list;watch;update;patch
@@ -293,6 +304,10 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	refusals := refusalKey{uid: b.UID}
+	if wait := r.refusals.remaining(refusals, r.now()); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
 	started := b.DeepCopy()
 	started.Status.ForgejoUID = string(f.UID)
 	started.Status.SecretKeyFingerprint = identity
@@ -319,9 +334,11 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 	if err := r.patchStatus(ctx, b, orig); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := backup.CreateJob(ctx, r.Client, b, job); err != nil {
+	if err := backup.CreateJobRetrying(ctx, r.Client, b, job); err != nil {
 		var conflict *backup.JobConflictError
-		if !errors.As(err, &conflict) {
+		var refused *backup.JobRefusedError
+		if !errors.As(err, &conflict) && !errors.As(err, &refused) {
+			// Whether the Job was stored is open: the journal stays for recovery.
 			return ctrl.Result{}, fmt.Errorf("creating backup job: %w", err)
 		}
 		// This create was refused, so it cannot have started our execution. Forget only
@@ -331,12 +348,26 @@ func (r *ForgejoBackupReconciler) start(ctx context.Context, b *forgejov1.Forgej
 		if err := r.patchStatus(ctx, b, prepared); err != nil {
 			return ctrl.Result{}, err
 		}
+		if refused != nil {
+			// A quota, an admission webhook or RBAC can clear up; ask again after a pause.
+			r.refusals.refuse(refusals, r.now())
+			if !forgejo.IsNamespaceTerminating(err) {
+				r.event(b, corev1.EventTypeWarning, "JobRefused", "Backup", "%v; will try again", refused)
+			}
+			return ctrl.Result{}, fmt.Errorf("creating backup job: %w", err)
+		}
 		if conflict.Transient {
+			// The old Job goes away by itself. Pace the next attempt like a refusal: the journal
+			// and its discard would otherwise requeue the backup at once, in a loop.
+			r.refusals.refuse(refusals, r.now())
 			return r.wait(ctx, b, fmt.Sprintf("Waiting for the old Job %s to be deleted", conflict.Job), 5*time.Second)
 		}
+		r.refusals.clear(refusals)
 		return ctrl.Result{}, r.fail(ctx, b, "JobNameConflict",
 			fmt.Sprintf("Cannot run the backup: %v; delete that Job or use a different ForgejoBackup name", conflict))
 	}
+
+	r.refusals.clear(refusals)
 
 	orig = b.DeepCopy()
 	b.Status = started.Status
@@ -760,6 +791,9 @@ func (r *ForgejoBackupReconciler) removeFailedFiles(ctx context.Context, b *forg
 		return ctrl.Result{}, err
 	}
 	if stopped, err := r.jobStopped(ctx, b, b.Status.JobName, false); err != nil || !stopped {
+		if res, held := r.holdForForeignJob(b, err); held {
+			return res, nil
+		}
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 	}
 	pvc := &corev1.PersistentVolumeClaim{}

@@ -101,10 +101,20 @@ durations and pull policies have their ranges, forms and enums.
   operation with a recorded Job name resumes tracking before new-start checks or deletion,
   including when its Job has vanished. It never reconstructs those coordinates from a
   changed instance. Restores and PostgreSQL upgrade cancellation also treat such a prepared
-  execution as running. A known-refused Job create discards only its unused preparation,
-  allowing predecessor-name conflicts to retry. A collision found during recovery preserves
-  the uncertain journal and leaves the foreign Job alone; transient conflicts wait for garbage
-  collection. File cleanup and upload identity release confirm through live reads that the
+  execution as running. A known-refused Job create (a rejection by the API server, or a name
+  conflict) discards only its unused preparation. A rejection is asked again after an
+  in-memory pause that doubles up to five minutes: the journal and its discard are status
+  writes, which requeue the object at once and would bypass the work queue's backoff. An error
+  that leaves open whether the Job was stored is retried within the pass (`CreateJob` accepts
+  a Job the backup controls); if it persists, or if a rejection or a conflict follows it (the
+  first attempt may have used the last slot of a quota, or a lagging cache may show its Job as
+  a predecessor's), the journal stays. A predecessor's Job that is being deleted gets the
+  same pause as a refusal. A collision found during
+  recovery preserves the uncertain journal and leaves the foreign Job alone; transient
+  conflicts wait for garbage collection. Steps without a deadline of their own (removing the
+  files of a failed backup, releasing the upload identity) report a foreign Job under a
+  journaled name with a Warning event and look again every five minutes, instead of failing
+  the reconcile in a loop. File cleanup and upload identity release confirm through live reads that the
   Jobs and orphaned pods have stopped; deletion stops only an owned Job, with a UID precondition,
   before cleaning files. Before destructive work, restores also check live dump Jobs and pods,
   including those of terminal or deleted backups. A historical failed backup without running

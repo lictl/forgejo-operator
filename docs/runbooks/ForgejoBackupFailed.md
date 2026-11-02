@@ -42,6 +42,25 @@ sum by (reason, result) (increase(forgejo_operator_backups_total{namespace="<ns>
 - `pg_dump` cannot connect: database down, credentials rotated, connection limit.
 - The data volume cannot be mounted by the backup Job (ReadWriteOnce on another node).
 - The Job was evicted or timed out (slow storage, large data volume).
+- The reason of the `Ready` condition names a guard of the operator:
+  - `InstanceUnsafe`: a pre-restore backup could not run because an upgrade is in flight or
+    the instance became `Broken` after it was created. The restore then fails with
+    `PreRestoreBackupFailed` and changes nothing; create it again once the cause is resolved
+    (or with `spec.preRestoreBackup: false`).
+  - `InstanceNotFound`, `InstanceDeleting`: the `Forgejo` is gone or being deleted.
+  - `IdentityUnavailable`: the `<name>-secrets` Secret has no readable `SECRET_KEY`, which a
+    remote backup records; fix the Secret first, a new backup fails the same way until then.
+  - `IdentityChanged`: the instance (its UID or `SECRET_KEY`) is not the one the backup was
+    prepared for. Create a new backup.
+  - `JobMissing`: the Job disappeared, or the API server never stored it after an error without
+    an answer (a timeout, a restart). A Job that the API server refused (a ResourceQuota, an
+    admission webhook, RBAC) is asked again instead, with a growing pause, and shows as
+    `JobRefused` Warning events; fix the quota or policy.
+  - `JobNameConflict`: a Job of another object holds the Job's name. When it is found while the
+    Job is created, nothing was written: delete that Job and create a new backup. When it is
+    found later (the Job was replaced while the backup ran), the backup's files and an upload's
+    identity Secret stay in place and a `ForeignJob` Warning event repeats every five minutes
+    until that Job is deleted.
 
 ## Mitigation
 
