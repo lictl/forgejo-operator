@@ -139,7 +139,7 @@ func reconcileCNPG(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.S
 	cluster.SetGroupVersionKind(forgejo.CNPGClusterGVK)
 	cluster.SetName(name)
 	cluster.SetNamespace(f.Namespace)
-	if err := apply(ctx, rc, cluster, rc.OwnerRefsEnabled(), func() error {
+	if err := applyAdopting(ctx, rc, cluster, rc.OwnerRefsEnabled(), func() error {
 		if cluster.GetResourceVersion() == "" {
 			if rc.IdentityInitialized && !rc.DatabaseRecreate {
 				// Deleted after the identity step's check in this pass; it reports it in the next.

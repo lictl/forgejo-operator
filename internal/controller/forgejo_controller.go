@@ -139,6 +139,7 @@ const (
 	stepObjectStorage    = "object-storage"
 	stepRestoreIdentity  = "restore-identity"
 	stepRestoreFrom      = "restore-from"
+	stepOwnership        = "ownership"
 )
 
 // steps run in order. maintenance → restore-guard → identity → secrets → database → high-availability
@@ -168,6 +169,13 @@ var steps = []namedStep{
 	// spec.storage.retainPolicy. It reads only the instance and its backups, so a database
 	// or Valkey that is down must not delay it (the instance may be deleted meanwhile).
 	{name: stepBackupOwnership, fn: backup.ReconcileOwnership},
+	// spec.storage.retainPolicy: Retain on the data volume, the CNPG cluster and the identity
+	// Secrets. The steps that own these objects apply it too, but they sit behind the identity
+	// check, the database and Valkey, and do not run while the instance is Broken or paused: a
+	// policy that was just changed to Retain must not wait for them, or deleting the Forgejo
+	// would still delete the data. No needs and no waitWhileBroken; early, so that a conflict in
+	// a later step, which ends the pass, cannot starve it; also run while paused.
+	{name: stepOwnership, fn: core.ReconcileOwnership},
 	// PostgreSQL major upgrades: chooses the image the database step writes (rc.DatabaseImage)
 	// and stops Forgejo around CNPG's pg_upgrade. Not after database, which stops while CNPG
 	// upgrades; it needs only the final maintenance flags (restores and upgrades never overlap).
@@ -408,7 +416,12 @@ func (r *ForgejoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		upgrade.ExportVersionSupport(instance, time.Now())
 		// Planned availability samples, so the SLI shows the pause instead of a gap.
 		observability.SampleWhilePaused(ctx, rc)
-		return r.finish(ctx, original, instance, ctrl.Result{RequeueAfter: rc.RequeueAfter}, nil)
+		// A paused instance can still be deleted: the retain policy must reach its data.
+		_, ownershipErr := core.ReconcileOwnership(ctx, rc)
+		if ownershipErr != nil {
+			ownershipErr = fmt.Errorf("step %q: %w", stepOwnership, ownershipErr)
+		}
+		return r.finish(ctx, original, instance, ctrl.Result{RequeueAfter: rc.RequeueAfter}, ownershipErr)
 	}
 
 	p := runPipeline(ctx, rc, steps)

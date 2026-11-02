@@ -23,7 +23,8 @@ redact logs and manifests before sharing.
 Phase `Broken` (condition `Broken=True`) means the operator found something it does not repair:
 an identity Secret, the data volume or the CNPG cluster of an instance that has run is missing or
 belongs to another instance, or a PostgreSQL major upgrade failed after it may have changed the
-data. It then changes nothing about the instance until a person restores what is missing; pods
+data. It then changes nothing about the instance (apart from keeping `retainPolicy: Retain`
+applied to its data) until a person restores what is missing; pods
 that still run keep serving, and scheduled backups and retention wait so that the backups from
 before the incident are kept. The condition's message says what is missing and how to restore it;
 the [ForgejoBroken](runbooks/ForgejoBroken.md) runbook has the details for every reason.

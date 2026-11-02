@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1212,7 +1213,8 @@ func (r *ForgejoRunnerReconciler) finalize(ctx context.Context, fr *forgejov1.Fo
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: fr.Namespace, Name: runner.StatefulSetName(fr)}, sts); err == nil {
 		if metav1.IsControlledBy(sts, fr) && sts.DeletionTimestamp.IsZero() {
-			if err := r.Delete(ctx, sts, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+			if err := r.Delete(ctx, sts, client.PropagationPolicy(metav1.DeletePropagationBackground),
+				client.Preconditions{UID: ptr.To(sts.GetUID())}); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, err
 			}
 		}

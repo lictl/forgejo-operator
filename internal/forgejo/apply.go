@@ -3,19 +3,86 @@ package forgejo
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 )
 
+// NameConflictError reports an existing object that has the name the operator would use but
+// that the instance does not control. The operator neither adopts nor changes it; the step
+// reports the conflict (a condition, or a failed step) instead.
+type NameConflictError struct {
+	Kind, Name string
+	// Controller is the object's controller reference, nil when it has none.
+	Controller *metav1.OwnerReference
+}
+
+func (e *NameConflictError) Error() string {
+	by := "it has no controller"
+	if c := e.Controller; c != nil {
+		by = fmt.Sprintf("it is controlled by %s %s", c.Kind, c.Name)
+	}
+	return fmt.Sprintf("%s %s already exists and does not belong to this Forgejo (%s): the operator does not take "+
+		"over or change it. Delete it (or have its owner delete it) for the operator to create its own", e.Kind, e.Name, by)
+}
+
+// Controls reports whether the instance may write an existing object: its controller is the
+// instance, or an earlier Forgejo of the same name (whose children are taken over when the
+// name is used again, as controllerutil.SetControllerReference does), or the object has no
+// controller and carries the instance's identifying labels (it was left behind when an earlier
+// instance of this name was deleted with orphaning). The second result is the controller
+// reference of an object that another owner controls.
+func Controls(f *forgejov1.Forgejo, obj client.Object) (bool, *metav1.OwnerReference) {
+	if c := metav1.GetControllerOf(obj); c != nil {
+		return isInstanceRef(*c, f), c
+	}
+	labels := obj.GetLabels()
+	for _, k := range []string{LabelName, LabelInstance, LabelManagedBy} {
+		if labels[k] != Labels(f, "")[k] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // CreateOrUpdate wraps controllerutil.CreateOrUpdate and sets the instance as controller
-// owner of obj (unless setOwner is false, used for data-bearing resources under Retain).
+// owner of obj (unless setOwner is false, used for data-bearing resources under Retain). It
+// writes an existing object only while the instance controls it (Controls); a same-named
+// object of anyone else is left untouched and the error is a *NameConflictError, so that a
+// user's Secret or Service that happens to have the name is never overwritten or deleted
+// later as the operator's own.
 func (rc *ReconcileContext) CreateOrUpdate(ctx context.Context, obj client.Object, setOwner bool, mutate func() error) (controllerutil.OperationResult, error) {
+	return rc.createOrUpdate(ctx, obj, setOwner, false, mutate)
+}
+
+// CreateOrAdopt is CreateOrUpdate for the objects a person may put in place on purpose to
+// recover an instance, and that the operator then takes over as they are: the identity
+// Secrets, the data volume and the CNPG cluster (see ReconcileIdentity). It adopts an object
+// that nothing controls, with or without the instance's labels; one that another owner
+// controls (an ExternalSecret, say) is still refused.
+func (rc *ReconcileContext) CreateOrAdopt(ctx context.Context, obj client.Object, setOwner bool, mutate func() error) (controllerutil.OperationResult, error) {
+	return rc.createOrUpdate(ctx, obj, setOwner, true, mutate)
+}
+
+func (rc *ReconcileContext) createOrUpdate(ctx context.Context, obj client.Object, setOwner, adopt bool, mutate func() error) (controllerutil.OperationResult, error) {
 	return controllerutil.CreateOrUpdate(ctx, rc.Client, obj, func() error {
+		if obj.GetResourceVersion() != "" {
+			ok, c := Controls(rc.Instance, obj)
+			if adopt && c == nil {
+				ok = true
+			}
+			if !ok {
+				return &NameConflictError{Kind: rc.kindOf(obj), Name: obj.GetName(), Controller: c}
+			}
+		}
 		if err := mutate(); err != nil {
 			return err
 		}
@@ -24,6 +91,17 @@ func (rc *ReconcileContext) CreateOrUpdate(ctx context.Context, obj client.Objec
 		}
 		return nil
 	})
+}
+
+// kindOf is the kind of obj for messages.
+func (rc *ReconcileContext) kindOf(obj client.Object) string {
+	if k := obj.GetObjectKind().GroupVersionKind().Kind; k != "" {
+		return k
+	}
+	if gvks, _, err := rc.Scheme.ObjectKinds(obj); err == nil && len(gvks) > 0 {
+		return gvks[0].Kind
+	}
+	return "object"
 }
 
 // HasAPI reports whether the cluster serves the given group/version/kind (e.g. CNPG

@@ -28,7 +28,7 @@ func ReconcileStorage(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 
 	want := forgejo.QuantityOr(f.Spec.Storage.Size, "10Gi")
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: forgejo.DataPVCName(f), Namespace: f.Namespace}}
-	err := apply(ctx, rc, pvc, rc.OwnerRefsEnabled(), func() error {
+	err := applyAdopting(ctx, rc, pvc, rc.OwnerRefsEnabled(), func() error {
 		pvc.Labels = mergeMaps(pvc.Labels, forgejo.Labels(f, forgejo.ComponentServer))
 		if pvc.ResourceVersion == "" {
 			if rc.IdentityInitialized {

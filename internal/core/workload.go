@@ -94,7 +94,7 @@ func ReconcileWorkload(ctx context.Context, rc *forgejo.ReconcileContext) (forge
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: forgejo.DeploymentName(f), Namespace: f.Namespace}}
 	var webReplicas int32
 	var hold bool
-	err = apply(ctx, rc, dep, true, func() error {
+	err = apply(ctx, rc, dep, func() error {
 		exists := dep.ResourceVersion != ""
 		restartedAt := dep.Spec.Template.Annotations[forgejo.AnnotationRestartedAt]
 		hold = migrationHold(dep, restore) != ""

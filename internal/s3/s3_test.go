@@ -264,6 +264,22 @@ func TestObjects(t *testing.T) {
 	}
 }
 
+// A truncated answer without a continuation token is an incomplete list, not the whole one:
+// remote retention deletes a backup directory whose manifest it does not find.
+func TestListObjectsRefusesATruncatedAnswerWithoutToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`<ListBucketResult><IsTruncated>true</IsTruncated>` +
+			`<Contents><Key>team/ns/fj/b1/db.dump.bin</Key><Size>4</Size></Contents></ListBucketResult>`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	b := Bucket{Scheme: schemeHTTP, Host: u.Host, Name: "backups", Region: "test", AccessKeyID: "GKtest", SecretAccessKey: "test-secret"}
+	objs, err := ListObjects(context.Background(), b, "team/", 100)
+	if err == nil || ReasonOf(err) != ReasonFailed || len(objs) != 0 || !strings.Contains(err.Error(), "continuation token") {
+		t.Fatalf("listing = %+v, %v; want a failure naming the missing continuation token", objs, err)
+	}
+}
+
 func TestHTTPClientBoundsAStalledEndpoint(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

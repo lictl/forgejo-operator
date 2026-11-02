@@ -88,10 +88,16 @@ const (
 	ConditionDatabaseUpgrading = "DatabaseUpgrading"
 	// ConditionBroken is True when the operator found the instance in a state it does not
 	// repair, such as a missing Secret "<name>-secrets", data volume or CNPG cluster of an
-	// instance that has run. It then changes nothing about the instance until a person restores
+	// instance that has run. It then changes nothing about the instance (except that spec.storage.retainPolicy: Retain keeps being applied to its data) until a person restores
 	// what is missing; running pods are left alone. The reason says what is wrong. Only reported
 	// while it is True; see docs/troubleshooting.md, "Broken instances".
 	ConditionBroken = "Broken"
+	// ConditionRetainPolicyApplied is reported while spec.storage.retainPolicy is Retain (the
+	// default). It is True once none of the data-bearing objects (the data volume, the CNPG
+	// cluster and the identity Secrets) carries an owner reference to the instance, so that
+	// deleting the Forgejo keeps them. It is False while that has not been applied yet, which
+	// is the time not to delete the Forgejo. Under Delete the condition is absent.
+	ConditionRetainPolicyApplied = "RetainPolicyApplied"
 )
 
 // ForgejoPhase is a coarse, human-readable summary of the instance state.
@@ -777,8 +783,9 @@ type StorageSpec struct {
 	// +optional
 	ExistingClaim string `json:"existingClaim,omitempty"`
 
-	// retainPolicy controls whether the data PVC, backup PVC and CNPG cluster are deleted
-	// together with the Forgejo resource.
+	// retainPolicy controls whether the data PVC, backup PVC, CNPG cluster and identity Secrets
+	// are deleted together with the Forgejo resource. After switching to Retain, delete the
+	// Forgejo only once its condition RetainPolicyApplied is True.
 	// +kubebuilder:default=Retain
 	// +optional
 	RetainPolicy RetainPolicy `json:"retainPolicy,omitempty"`

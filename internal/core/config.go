@@ -207,7 +207,7 @@ func configHash(content string) string {
 func writeConfig(ctx context.Context, rc *forgejo.ReconcileContext, files map[string][]byte, hash string) error {
 	f := rc.Instance
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.ConfigSecretName(f), Namespace: f.Namespace}}
-	if err := apply(ctx, rc, sec, true, func() error {
+	if err := apply(ctx, rc, sec, func() error {
 		sec.Labels = mergeMaps(sec.Labels, forgejo.Labels(f, forgejo.ComponentServer))
 		sec.Annotations = mergeMaps(sec.Annotations, map[string]string{
 			forgejo.AnnotationConfigHash:    hash,

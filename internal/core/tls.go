@@ -108,9 +108,9 @@ func ReconcileTLS(ctx context.Context, rc *forgejo.ReconcileContext) (forgejo.St
 		return forgejo.StepResult{}, nil
 	}
 	cert, err := applyOptional(ctx, rc, forgejo.CertificateGVK, name, certificate(f, dnsNames), nil)
-	if conflict := (*nameConflictError)(nil); errors.As(err, &conflict) {
+	if conflict := (*forgejo.NameConflictError)(nil); errors.As(err, &conflict) {
 		msg := conflict.Error()
-		if c := conflict.controller; c != nil && c.Kind == "Ingress" {
+		if c := conflict.Controller; c != nil && c.Kind == "Ingress" {
 			msg += ". cert-manager's ingress-shim created it for Ingress " + c.Name + " from a cert-manager.io/issuer or " +
 				"cert-manager.io/cluster-issuer annotation: remove that annotation from spec.ingress.annotations, since " +
 				"spec.tls.certManager requests the certificate"
@@ -258,7 +258,7 @@ func reconcileReferenceGrant(ctx context.Context, rc *forgejo.ReconcileContext) 
 		spec.From = append(spec.From, referenceGrantFrom{Group: forgejo.GatewayAPIGroup, Kind: kindGateway, Namespace: ns})
 	}
 	_, err = applyOptional(ctx, rc, gvk, name, &spec, nil)
-	if conflict := (*nameConflictError)(nil); errors.As(err, &conflict) {
+	if conflict := (*forgejo.NameConflictError)(nil); errors.As(err, &conflict) {
 		return reasonNameConflict, conflict.Error(), nil
 	}
 	if err != nil {

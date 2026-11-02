@@ -137,8 +137,8 @@ volume alerts) from being created. When an object cannot be applied, the operato
 
 The steps after `monitoring` (scheduled backups, health checks and autopilot) keep running.
 Examples of such errors are a scrape interval that is not a Prometheus duration (`1min` instead of
-`1m`), a label key or value Kubernetes rejects, or an object of the same name that another owner
-controls. The operator checks the interval and labels itself before sending anything, and leaves
+`1m`), a label key or value Kubernetes rejects, or an object of the same name that the instance does not control
+(another owner's, or nobody's). The operator checks the interval and labels itself before sending anything, and leaves
 an existing object unchanged when they are invalid. `ForgejoDown` is rendered only while the
 ServiceMonitor exists.
 
@@ -604,6 +604,7 @@ once sampling works again. `status.stats` keeps the last good values in the mean
 | `BackupHealthy` | backup | State of scheduled backups (`BackupSizeDropped` while retention holds because the newest one is less than half the size of an earlier one, see [backup-restore.md](backup-restore.md#scheduled-backups-and-retention); `UploadFailed` when the latest one was not uploaded to `spec.backup.remote`; `BackupKeyNotExported`, `BackupKeyMissing`, `BackupKeyUnusable` while the backup key is not acknowledged as copied out of the cluster, missing or unusable, see [backup-restore.md](backup-restore.md#the-key)) |
 | `RestoredFromBackup` | backup | Bootstrap of `spec.restoreFrom`: `False` while the identity, database and data volume are restored (`TargetNotEmpty` when the database or data volume predates the instance), `True`/`Restored` once they are restored and recorded on `<name>-secrets` ([backup-restore.md](backup-restore.md#disaster-recovery)) |
 | `StorageHealthy` | autopilot | PVC capacity/usage |
+| `RetainPolicyApplied` | core | With `spec.storage.retainPolicy: Retain` (the default): `True/Applied` once the data volume, the CNPG cluster and the identity Secrets carry no owner reference to the instance, so that deleting the `Forgejo` keeps them; `False/Pending` while that is not applied yet (delete the `Forgejo` only after it is `True`). Absent under `Delete` |
 | `ValkeyReady` | autopilot | With HA only: Valkey has a Ready primary its Sentinels agree on. `True/Available`, `True/Degraded` (fewer than two replicas in sync, three Sentinels or three Ready pods), `False/NoMaster`, `False/NotReady`, `False/NotProvisioned`, `Unknown/UnreachableFromOperator` ([high-availability.md](high-availability.md#valkey-with-sentinel)) |
 | `Healthy` | observability | Result of the operator's `/api/healthz` probe. Reasons: `HealthCheckPassed`, `HealthCheckFailed` (message includes the streak), `Unreachable` (the operator cannot connect; status `Unknown`), `NoReadyReplicas`, `Maintenance` |
 

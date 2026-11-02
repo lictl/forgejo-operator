@@ -236,7 +236,9 @@ the PersistentVolume's reclaim policy is `Retain`).
 A backup that is deleted only because the `Forgejo` that owned it is gone keeps its files
 when the backup PVC outlives that instance (it is not controlled by it). This covers
 deleting the instance right after switching `retainPolicy` to `Retain`, before the operator
-removed the backup's owner reference. A `BackupFilesKept` event names the PVC and the
+removed the backup's owner reference. (Wait for condition `RetainPolicyApplied=True` of the
+`Forgejo` before deleting it after such a switch: it covers the data volume, the database and
+the identity Secrets too.) A `BackupFilesKept` event names the PVC and the
 directory. The operator reads the owner from the API server, not from its cache, for this
 decision. A backup deleted explicitly, while its instance exists or without an owner
 reference, is always cleaned up. So is one whose instance had `retainPolicy: Delete`, since
@@ -573,7 +575,8 @@ with the current object instead.
 
 A backup belongs to the instance named in its `spec.forgejoRef`. To recover after the
 instance was deleted (`retainPolicy: Retain` keeps the backup PVC and the `ForgejoBackup`
-objects, also when it was switched from `Delete` shortly before):
+objects, also when it was switched from `Delete`, provided `RetainPolicyApplied` was `True` before the
+instance was deleted):
 
 1. Recreate the `Forgejo` with the same name. It reuses `<name>-backups`, and the retained
    Secrets `<name>-secrets` and `<name>-ssh-host-keys`, so it keeps its SSH host key
@@ -592,7 +595,7 @@ exists (the API server refuses it): Forgejo would start on another database or v
 or not the instance's, and migrate it. To move an instance:
 
 * **Another database type**: take a backup and delete the `Forgejo` with `retainPolicy: Retain`
-  (the Secrets, the data volume and the backups stay). Create it again with the same name and
+  and condition `RetainPolicyApplied=True` (the Secrets, the data volume and the backups stay). Create it again with the same name and
   the new `spec.database`, then restore the database from the backup with a `ForgejoRestore`
   (`restoreData: false`). For type External, create it with `spec.replicas: 0` and scale it up
   after the restore, so that Forgejo does not start on the empty database meanwhile. For type

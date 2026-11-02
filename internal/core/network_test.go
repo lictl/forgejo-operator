@@ -122,8 +122,9 @@ func TestReconcileIngressClassName(t *testing.T) {
 			var objs []client.Object
 			if tc.existing != nil {
 				objs = append(objs, &networkingv1.Ingress{
-					ObjectMeta: metav1.ObjectMeta{Name: forgejo.IngressName(f), Namespace: f.Namespace},
-					Spec:       networkingv1.IngressSpec{IngressClassName: tc.existing},
+					ObjectMeta: metav1.ObjectMeta{Name: forgejo.IngressName(f), Namespace: f.Namespace,
+						Labels: forgejo.Labels(f, forgejo.ComponentServer)},
+					Spec: networkingv1.IngressSpec{IngressClassName: tc.existing},
 				})
 			}
 			rc := testContext(t, f, objs...)

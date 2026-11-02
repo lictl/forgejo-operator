@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -373,7 +374,7 @@ func prune(ctx context.Context, rc *forgejo.ReconcileContext, scheduled []*forge
 			}
 			continue
 		}
-		if err := rc.Client.Delete(ctx, b); client.IgnoreNotFound(err) != nil {
+		if err := rc.Client.Delete(ctx, b, client.Preconditions{UID: ptr.To(b.GetUID())}); client.IgnoreNotFound(err) != nil {
 			return "", fmt.Errorf("pruning backup %s: %w", b.Name, err)
 		}
 		rc.Event(corev1.EventTypeNormal, "BackupPruned", "Backup", "Deleted %s scheduled backup %s (retention %d)", b.Status.Phase, b.Name, keep)

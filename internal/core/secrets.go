@@ -55,7 +55,7 @@ func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		secretKeyPodDigestSalt:         func() (string, error) { return randomBase64() },
 	}
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.SecretsName(f), Namespace: f.Namespace}}
-	if err := apply(ctx, rc, sec, rc.OwnerRefsEnabled(), func() error {
+	if err := applyAdopting(ctx, rc, sec, rc.OwnerRefsEnabled(), func() error {
 		sec.Labels = mergeMaps(sec.Labels, forgejo.Labels(f, forgejo.ComponentServer))
 		if sec.Data == nil {
 			sec.Data = map[string][]byte{}
@@ -99,7 +99,7 @@ func ReconcileSecrets(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 	}
 
 	admin := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: forgejo.AdminSecretName(f), Namespace: f.Namespace}}
-	if err := apply(ctx, rc, admin, rc.OwnerRefsEnabled(), func() error {
+	if err := applyAdopting(ctx, rc, admin, rc.OwnerRefsEnabled(), func() error {
 		admin.Labels = mergeMaps(admin.Labels, forgejo.Labels(f, forgejo.ComponentServer))
 		if admin.Data == nil {
 			admin.Data = map[string][]byte{}

@@ -139,7 +139,8 @@ func reconcileCronRunner(ctx context.Context, rc *forgejo.ReconcileContext, repl
 		if err != nil || owned == nil || owned.DeletionTimestamp != nil {
 			return err
 		}
-		if err := rc.Client.Delete(ctx, owned, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+		if err := rc.Client.Delete(ctx, owned, client.PropagationPolicy(metav1.DeletePropagationBackground),
+			client.Preconditions{UID: ptr.To(owned.GetUID())}); client.IgnoreNotFound(err) != nil {
 			return err
 		}
 		rc.Event(corev1.EventTypeNormal, "CronRunnerDeleted", "HighAvailability",
@@ -147,7 +148,7 @@ func reconcileCronRunner(ctx context.Context, rc *forgejo.ReconcileContext, repl
 		return nil
 	}
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: forgejo.CronRunnerName(f), Namespace: f.Namespace}}
-	return apply(ctx, rc, sts, true, func() error {
+	return apply(ctx, rc, sts, func() error {
 		exists := sts.ResourceVersion != ""
 		sts.Labels = mergeMaps(sts.Labels, podLabelsFor(rc, forgejo.ComponentCron, nil))
 		sts.Spec.Replicas = ptr.To(replicas)

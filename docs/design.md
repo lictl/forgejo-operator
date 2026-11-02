@@ -195,31 +195,32 @@ checks, the restore handshake or volume expansion. Around the table:
 | 4 | identity | core | 3 | `rc.IdentityFingerprint`, `rc.IdentityInitialized`; checks that `<name>-secrets`, the data PVC and the CNPG cluster belong together (annotations `forgejo.lucas.icu/identity` and `forgejo.lucas.icu/running-image` on the PVC and the cluster, written here, adopted for older instances); recovers `status.image` from them. Stops with `Broken` while one of them is missing or foreign for an instance that has run (see [Broken instances](#broken-instances)) |
 | 5 | secrets | core | 4 | Secrets `<name>-secrets` (app secrets, metrics token, admin sync salt) and `<name>-admin`; never rotated. With `spec.backup.remote` and no `keySecret`: `<name>-backup-key`, never regenerated over a lost key that encrypted backups |
 | 6 | backup-ownership | backup | – | owner references of the instance's `ForgejoBackup`s and `<name>-backups` PVC, per `spec.storage.retainPolicy` |
-| 7 | database-upgrade | upgrade | 2, 4 | `rc.DatabaseImage` (the image the `database` step writes), `rc.Upgrading`, `rc.DatabaseUpgrading`, `rc.ReplicasOverride`; `status.database.upgrade`, `DatabaseUpgrading`; pre-upgrade `ForgejoBackup` (database only). Never deletes or recreates the Cluster: a failure that may have changed the data, a failed verification or a lost Cluster keeps Forgejo at zero with `Broken=True/DatabaseUpgradeFailed` (`holdsForgejo`), and the annotation `forgejo.lucas.icu/recreate-database` with `Broken=True/DatabaseRestorePending`, until a later `ForgejoRestore` of the database. Stops while a deleted Cluster's pods, volumes, Secrets and Services keep a new one from being created (`DatabaseReady=False/ClusterDeleting`), and while a new instance asks for a major the operator does not run (see [upgrades.md](upgrades.md#postgresql-major-upgrades)) |
-| 8 | database | core | 5, 7 | CNPG `Cluster <name>-db`, or the external DB check; `rc.DB`, `rc.DatabaseReady`, `status.database` (with the image, major and system ID of the data), `DatabaseReady`; writes `rc.DatabaseImage`, never a major older than the data's. Stops until CNPG is ready or the external credentials resolve (an unreachable external DB is only reported) |
-| 9 | high-availability | autopilot | 8 | With the HA mode chosen at creation: Valkey password in `<name>-secrets`; StatefulSet, headless Service and PDB `<name>-valkey` (Valkey with Sentinel); `rc.ValkeyURL` (`redis+sentinel://`), `rc.NodeZones`. Empties Valkey (scaled to zero until no pod is left, then back to three) once for each restore in `ScalingUp` (`rc.ScalingUpRestore`) and when the password changes. Stops while no Valkey pod is Ready and while it empties Valkey, except in maintenance (see [high-availability.md](high-availability.md#valkey-with-sentinel)) |
-| 10 | storage | core | 9 | PVC `<name>-data` (unless `spec.storage.existingClaim`) |
-| 11 | restore-from | backup | 10 | with `spec.restoreFrom`: `ForgejoRestore <name>-restore-from` of the backup once the database is ready, unless the database or data volume predates the instance (`TargetNotEmpty`); `status.restoredFrom` follows it; at `ScalingUp` the annotation `restored-from` on `<name>-secrets`, then `Completed` |
-| 12 | ssh-host-keys | core | 5 | Secret `<name>-ssh-host-keys` (generated once); `rc.SSHHostKeys`, `rc.SSHHostKeysUnavailable`, `status.ssh` (see [SSH host keys](#ssh-host-keys)) |
-| 13 | object-storage | core | – | with `spec.objectStorage`: reads its Secrets, `rc.ObjectStorage` (digest of the credentials and CA), `rc.ObjectStorageUnavailable` (any failed answer of the endpoint, not `UnreachableFromOperator`), `ObjectStorageReady` from the operator's check of the bucket (see [object-storage.md](object-storage.md)). Stops only while the Secrets are unusable; a bucket the operator cannot reach is only reported |
-| 14 | upgrade | upgrade | 10, 13 | `rc.TargetImage`, `rc.Layout`, `rc.Upgrading`, `rc.ReplicasOverride`, `status.upgrade`, `Upgrading`; pre-upgrade `ForgejoBackup`, rollback `ForgejoRestore`; verifies the Deployment with `APIReader` before judging rollout failure or timeout |
-| 15 | tuning | autopilot | 14 | `rc.Tuning`, `rc.TuningEnv`, `rc.ResourcesOverride`, `rc.HPAManaged`, `status.autoPilot.tuning` |
-| 16 | config | core | 12, 15 | Secret `<name>-config` (`app.ini`, including `SSH_SERVER_HOST_KEYS`, and with HA `app-web.ini`, the same without cron tasks; one hash covers both); `rc.ConfigSecretName`, `rc.ConfigHash`, `rc.DesiredConfigHash` |
-| 17 | config-guard | autopilot | 16 | may switch `rc.ConfigSecretName`/`rc.ConfigHash` to `<name>-config-lkg` |
-| 18 | workload | core | 17 | Deployment `<name>` and, with HA, the cron runner StatefulSet `<name>-cron` (see [Upgrade and migration holds](#upgrade-and-migration-holds)); `status.configHash` |
-| 19 | network | core | – | Services `<name>-http`, `<name>-ssh`; Ingress `<name>` (explicit `spec.ingress.host` for the rule and TLS hosts; a missing host is rejected before rendering; TLS Secret defaults to `<name>-tls` with `spec.tls.certManager`) |
-| 20 | gateway | core | – | HTTPRoute `<name>`, TCPRoute `<name>-ssh` (v1, else v1alpha2) when the Gateway API CRDs exist; `RoutesReady` from the routes' `status.parents` (see [networking.md](networking.md)) |
-| 21 | tls | core | – | cert-manager Certificate `<name>-tls` (Secret `<name>-tls`), ReferenceGrant `<name>-tls` for `spec.tls.gatewayNamespaces`; `TLSReady` from the Certificate's `Ready` |
-| 22 | scaling | autopilot | 15 | HPA `<name>`, PDB `<name>` |
-| 23 | monitoring | observability | – | ServiceMonitor, PrometheusRule `<name>` (alerts with `runbook_url`, SLO recording rules and burn-rate alerts), ConfigMap `<name>-dashboard`; failures become `Degraded=MonitoringFailed`, not step errors |
-| 24 | backup-schedule | backup | 2, 4 | scheduled `ForgejoBackup`s, retention (also of remote copies, see [backup-restore.md](backup-restore.md#remote-retention)) of the backups of `rc.IdentityFingerprint` only, held while the newest is less than half the size of another (`BackupSizeDropped`, see `internal/backup/retentionguard.go`), backup PVC growth, `status.backup` (with `remote`), `BackupHealthy` (also `False` while the backup key is missing, unusable or not exported) |
-| 25 | health | observability | 2 | `/api/healthz`, version and stats probes → `status.health`, `status.version`, `status.stats`, `Healthy`; one availability sample per interval (`forgejo_operator_availability_probes_total`), also while no pod is Ready, planned during maintenance (unless `rc.MaintenanceHeld`), `rc.RestoreScalingUp` and `rc.Upgrading` |
-| 26 | valkey-status | autopilot | – | with HA: the Sentinels' view of Valkey → `status.highAvailability.valkey`, `ValkeyReady`, `forgejo_operator_valkey_*`, `ValkeyFailedOver` events (not for a new replication group, recognised by its pods' UIDs); asks at most every 10 s while the pods stay the same, every minute while unreachable; no prerequisites, so it stays current while the database is down |
-| 27 | autopilot | autopilot | 18, 25 | self-healing restarts, config rollback, last-known-good bookkeeping, OOM- and usage-driven vertical sizing, `status.autoPilot` (the cron runner's pod counts like a server pod, except for the Deployment restart, which the server pods decide, and for the last known good config while it has not started a container for 5 minutes) |
-| 28 | storage-autopilot | autopilot | – | volume measurement → `status.storage`, `StorageHealthy`, `volume_used_ratio`; grows `<name>-data` and the CNPG `storage`/`walStorage` (the latter not during a PostgreSQL major upgrade); restarts Forgejo for a pending file system resize |
+| 7 | ownership | core | – | with `retainPolicy: Retain`, drops the owner reference to the instance from the existing data volume, CNPG cluster and identity Secrets (`<name>-secrets`, `-admin`, `-ssh-host-keys`); `RetainPolicyApplied`. The steps that own these objects do the same, but sit behind `identity`, `database` and `high-availability` and do not run while the instance is Broken or paused, so this step has no prerequisites, no `waitWhileBroken`, and also runs while `spec.paused` |
+| 8 | database-upgrade | upgrade | 2, 4 | `rc.DatabaseImage` (the image the `database` step writes), `rc.Upgrading`, `rc.DatabaseUpgrading`, `rc.ReplicasOverride`; `status.database.upgrade`, `DatabaseUpgrading`; pre-upgrade `ForgejoBackup` (database only). Never deletes or recreates the Cluster: a failure that may have changed the data, a failed verification or a lost Cluster keeps Forgejo at zero with `Broken=True/DatabaseUpgradeFailed` (`holdsForgejo`), and the annotation `forgejo.lucas.icu/recreate-database` with `Broken=True/DatabaseRestorePending`, until a later `ForgejoRestore` of the database. Stops while a deleted Cluster's pods, volumes, Secrets and Services keep a new one from being created (`DatabaseReady=False/ClusterDeleting`), and while a new instance asks for a major the operator does not run (see [upgrades.md](upgrades.md#postgresql-major-upgrades)) |
+| 9 | database | core | 5, 8 | CNPG `Cluster <name>-db`, or the external DB check; `rc.DB`, `rc.DatabaseReady`, `status.database` (with the image, major and system ID of the data), `DatabaseReady`; writes `rc.DatabaseImage`, never a major older than the data's. Stops until CNPG is ready or the external credentials resolve (an unreachable external DB is only reported) |
+| 10 | high-availability | autopilot | 9 | With the HA mode chosen at creation: Valkey password in `<name>-secrets`; StatefulSet, headless Service and PDB `<name>-valkey` (Valkey with Sentinel); `rc.ValkeyURL` (`redis+sentinel://`), `rc.NodeZones`. Empties Valkey (scaled to zero until no pod is left, then back to three) once for each restore in `ScalingUp` (`rc.ScalingUpRestore`) and when the password changes. Stops while no Valkey pod is Ready and while it empties Valkey, except in maintenance (see [high-availability.md](high-availability.md#valkey-with-sentinel)) |
+| 11 | storage | core | 10 | PVC `<name>-data` (unless `spec.storage.existingClaim`) |
+| 12 | restore-from | backup | 11 | with `spec.restoreFrom`: `ForgejoRestore <name>-restore-from` of the backup once the database is ready, unless the database or data volume predates the instance (`TargetNotEmpty`); `status.restoredFrom` follows it; at `ScalingUp` the annotation `restored-from` on `<name>-secrets`, then `Completed` |
+| 13 | ssh-host-keys | core | 5 | Secret `<name>-ssh-host-keys` (generated once); `rc.SSHHostKeys`, `rc.SSHHostKeysUnavailable`, `status.ssh` (see [SSH host keys](#ssh-host-keys)) |
+| 14 | object-storage | core | – | with `spec.objectStorage`: reads its Secrets, `rc.ObjectStorage` (digest of the credentials and CA), `rc.ObjectStorageUnavailable` (any failed answer of the endpoint, not `UnreachableFromOperator`), `ObjectStorageReady` from the operator's check of the bucket (see [object-storage.md](object-storage.md)). Stops only while the Secrets are unusable; a bucket the operator cannot reach is only reported |
+| 15 | upgrade | upgrade | 11, 14 | `rc.TargetImage`, `rc.Layout`, `rc.Upgrading`, `rc.ReplicasOverride`, `status.upgrade`, `Upgrading`; pre-upgrade `ForgejoBackup`, rollback `ForgejoRestore`; verifies the Deployment with `APIReader` before judging rollout failure or timeout |
+| 16 | tuning | autopilot | 15 | `rc.Tuning`, `rc.TuningEnv`, `rc.ResourcesOverride`, `rc.HPAManaged`, `status.autoPilot.tuning` |
+| 17 | config | core | 13, 16 | Secret `<name>-config` (`app.ini`, including `SSH_SERVER_HOST_KEYS`, and with HA `app-web.ini`, the same without cron tasks; one hash covers both); `rc.ConfigSecretName`, `rc.ConfigHash`, `rc.DesiredConfigHash` |
+| 18 | config-guard | autopilot | 17 | may switch `rc.ConfigSecretName`/`rc.ConfigHash` to `<name>-config-lkg` |
+| 19 | workload | core | 18 | Deployment `<name>` and, with HA, the cron runner StatefulSet `<name>-cron` (see [Upgrade and migration holds](#upgrade-and-migration-holds)); `status.configHash` |
+| 20 | network | core | – | Services `<name>-http`, `<name>-ssh`; Ingress `<name>` (explicit `spec.ingress.host` for the rule and TLS hosts; a missing host is rejected before rendering; TLS Secret defaults to `<name>-tls` with `spec.tls.certManager`) |
+| 21 | gateway | core | – | HTTPRoute `<name>`, TCPRoute `<name>-ssh` (v1, else v1alpha2) when the Gateway API CRDs exist; `RoutesReady` from the routes' `status.parents` (see [networking.md](networking.md)) |
+| 22 | tls | core | – | cert-manager Certificate `<name>-tls` (Secret `<name>-tls`), ReferenceGrant `<name>-tls` for `spec.tls.gatewayNamespaces`; `TLSReady` from the Certificate's `Ready` |
+| 23 | scaling | autopilot | 16 | HPA `<name>`, PDB `<name>` |
+| 24 | monitoring | observability | – | ServiceMonitor, PrometheusRule `<name>` (alerts with `runbook_url`, SLO recording rules and burn-rate alerts), ConfigMap `<name>-dashboard`; failures become `Degraded=MonitoringFailed`, not step errors |
+| 25 | backup-schedule | backup | 2, 4 | scheduled `ForgejoBackup`s, retention (also of remote copies, see [backup-restore.md](backup-restore.md#remote-retention)) of the backups of `rc.IdentityFingerprint` only, held while the newest is less than half the size of another (`BackupSizeDropped`, see `internal/backup/retentionguard.go`), backup PVC growth, `status.backup` (with `remote`), `BackupHealthy` (also `False` while the backup key is missing, unusable or not exported) |
+| 26 | health | observability | 2 | `/api/healthz`, version and stats probes → `status.health`, `status.version`, `status.stats`, `Healthy`; one availability sample per interval (`forgejo_operator_availability_probes_total`), also while no pod is Ready, planned during maintenance (unless `rc.MaintenanceHeld`), `rc.RestoreScalingUp` and `rc.Upgrading` |
+| 27 | valkey-status | autopilot | – | with HA: the Sentinels' view of Valkey → `status.highAvailability.valkey`, `ValkeyReady`, `forgejo_operator_valkey_*`, `ValkeyFailedOver` events (not for a new replication group, recognised by its pods' UIDs); asks at most every 10 s while the pods stay the same, every minute while unreachable; no prerequisites, so it stays current while the database is down |
+| 28 | autopilot | autopilot | 19, 26 | self-healing restarts, config rollback, last-known-good bookkeeping, OOM- and usage-driven vertical sizing, `status.autoPilot` (the cron runner's pod counts like a server pod, except for the Deployment restart, which the server pods decide, and for the last known good config while it has not started a container for 5 minutes) |
+| 29 | storage-autopilot | autopilot | – | volume measurement → `status.storage`, `StorageHealthy`, `volume_used_ratio`; grows `<name>-data` and the CNPG `storage`/`walStorage` (the latter not during a PostgreSQL major upgrade); restarts Forgejo for a pending file system resize |
 
-Steps 1–5, 8–10 and 14–18 form a chain, which `database-upgrade` (7) joins at `database` and
-`ssh-host-keys` (12) at `config`. `identity` (4) comes before anything that generates or creates
+Steps 1–5, 9–11 and 15–19 form a chain, which `database-upgrade` (8) joins at `database` and
+`ssh-host-keys` (13) at `config`. `identity` (4) comes before anything that generates or creates
 identity or data: `secrets` would otherwise generate a new `SECRET_KEY`, and `database` and
 `storage` an empty cluster or volume, for an instance whose own are gone. `backup-schedule`,
 `database-upgrade` need it as well. `backup-schedule` and `storage-autopilot` also wait while
@@ -238,16 +239,17 @@ secrets, so it needs neither the database nor storage. It runs before `upgrade`,
 which does not start an upgrade while the keys are unavailable. `restore-identity` (3) is a
 no-op unless the instance is created from a remote backup (`spec.restoreFrom`): then it creates
 the identity Secrets from the backup before `secrets` and `ssh-host-keys` would generate them,
-and stops the chain while it cannot. `restore-from` (11) hands the database and the data volume to
+and stops the chain while it cannot. `restore-from` (12) hands the database and the data volume to
 a `ForgejoRestore` once both exist (see [backup-restore.md](backup-restore.md#disaster-recovery)).
-`object-storage` (13) joins the chain at `upgrade`: pods reference its Secrets, so without them there is no upgrade, `app.ini`
+`object-storage` (14) joins the chain at `upgrade`: pods reference its Secrets, so without them there is no upgrade, `app.ini`
 or rollout. It needs nothing itself, so `ObjectStorageReady` stays current while the database is
 down, and an upgrade does not start while the bucket is unusable
 (`Upgrading=False/WaitingForObjectStorage`). `network`, `gateway` and `tls` render the spec only
 and need nothing. `valkey-status` needs nothing: it reads the Valkey pods and asks their
-Sentinels, so `ValkeyReady` stays current while the database step stops. `backup-ownership`
-and `storage-autopilot` need nothing either:
-ownership reads only the instance and its backups, and a full CNPG volume is a common reason
+Sentinels, so `ValkeyReady` stays current while the database step stops. `backup-ownership`,
+`ownership` and `storage-autopilot` need nothing either:
+the ownership steps read only the instance and its children, so a Retain policy reaches the data
+even while the instance is Broken or paused, and a full CNPG volume is a common reason
 why `database` stops, so growing it must not depend on that step. `storage-autopilot` runs
 last, so it sees this pass's maintenance and upgrade flags, and its restart comes after the
 workload update.
@@ -326,7 +328,8 @@ or the means to decrypt it: a new `SECRET_KEY` leaves two-factor secrets, Action
 mirror credentials undecryptable, and a new, empty database or data volume next to the other,
 old half serves an empty forge (and its "successful" backups would push the good ones out of
 retention). For these the operator sets condition `Broken` (phase `Broken`, alert
-`ForgejoBroken`) and changes nothing until a person acts:
+`ForgejoBroken`) and changes nothing until a person acts (the `ownership` step still drops the
+owner references that `Retain` forbids, which only keeps data):
 
 - **Identity** (step `identity`, reasons `SecretsMissing`, `DataVolumeMissing`,
   `DatabaseMissing`, `IdentityMismatch`). The data PVC and the CNPG cluster carry the
@@ -578,6 +581,19 @@ All names come from `internal/forgejo/names.go`. Every child resource carries
 scheduled, pre-upgrade and pre-restore backups) and the identity Secrets (`<name>-secrets`, `<name>-admin`,
 `<name>-ssh-host-keys`) get an owner reference only with `spec.storage.retainPolicy: Delete`.
 Manual backups never do, and neither does the backup encryption key `<name>-backup-key`.
+The `ownership` step drops the references of the data volume, the CNPG cluster and the identity
+Secrets under `Retain` on every pass, also while the instance is Broken or paused, and reports
+`RetainPolicyApplied`; delete a Forgejo after changing the policy to `Retain` only once it is
+`True`.
+
+An existing object of an instance's name is written only while the instance controls it, or
+nothing does and it carries the instance's labels (left behind by orphaning): a Secret,
+Service, Deployment or other object of a user that happens to have the name is not changed
+or later deleted as the operator's own, and the step fails with a `NameConflictError` that
+names it. The exceptions are the objects a person puts in place on purpose to recover an
+instance, which the operator adopts as they are: the identity Secrets, the data volume and the
+CNPG cluster (see the `identity` step).
+
 The objects of a `ForgejoRunner` are named in `internal/runner/names.go`, carry
 `runner.Labels` (instance label = the runner's name, component `runner` or
 `runner-registration`, `forgejo.lucas.icu/instance` = the Forgejo,
