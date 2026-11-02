@@ -2,10 +2,10 @@
 
 ## Supported versions
 
-forgejo-operator is in prerelease: the latest release, `v0.1.0-rc.1`, is a
-release candidate. Only the latest release is supported. Fixes are published
-as a new release; older releases are not patched, so upgrade to the latest
-one before reporting a problem that may already be fixed.
+forgejo-operator is in prerelease: its releases are release candidates. Only the
+latest release is supported. Fixes are published as a new release; older releases
+are not patched, so upgrade to the latest one before reporting a problem that may
+already be fixed.
 
 ## Reporting a vulnerability
 

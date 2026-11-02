@@ -22,6 +22,11 @@ jobs:
           diff -r config/crd/bases charts/forgejo-operator/crds
           helm lint --strict charts/forgejo-operator
           helm template forgejo-operator charts/forgejo-operator --include-crds > /tmp/forgejo-operator-render.yaml
+          # A release installs its own controller image: the Chart's default image tag is its appVersion,
+          # and appVersion is the Chart version with a leading v (hack/release.sh asserts both again).
+          chart_version="$(helm show chart charts/forgejo-operator | sed -n 's/^version: //p')"
+          test "$(helm show chart charts/forgejo-operator | sed -n 's/^appVersion: //p' | tr -d '"')" = "v$chart_version"
+          grep -qF "image: \"ghcr.io/lictl/forgejo-operator:v$chart_version\"" /tmp/forgejo-operator-render.yaml
           bash hack/test-chart-metrics.sh
           helm package charts/forgejo-operator -d /tmp
           helm show readme /tmp/forgejo-operator-*.tgz | grep -q 'Helm chart'

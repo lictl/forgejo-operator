@@ -1,9 +1,11 @@
 # Source mirror
 
-GitHub `lictl/forgejo-operator` is primary. The existing public
-`git.lucas.icu/lictl/forgejo-operator` repository already contains the same
-43-commit history at the pre-publication audit HEAD. Forgejo does not convert
-an existing repository into a pull mirror.
+GitHub `lictl/forgejo-operator` is primary. The public
+`git.lucas.icu/lictl/forgejo-operator` repository holds the same history and is
+brought up to date by hand (below). Forgejo does not convert an existing
+repository into a pull mirror. Its `main` must be fast-forwarded to the release
+commit before a release is tagged: the Forgejo release job checks the commit
+against its own `main`, and until then it refuses.
 
 After verifying both remotes and authenticating **as lictl on each host**,
 compare `main` ancestry. Push only `main` and reviewed release tags to the
