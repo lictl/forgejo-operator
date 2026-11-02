@@ -5,8 +5,8 @@ Use a focused pull request against `main` with the affected CRD kind, an
 example, and the checks you ran. For Go changes run `make lint test`; for
 API markers run `make manifests generate` and update the Chart CRD copies.
 For alert changes run `make test-rules`; for Chart changes run `helm lint
---strict charts/forgejo-operator` and render the chart. E2E must use a
-dedicated Kind cluster. Never commit credentials, kubeconfigs, private logs
+--strict charts/forgejo-operator` and render the chart. The [release lifecycle E2E suite](test/e2e/README.md) runs with `make test-e2e`
+in a disposable Kind cluster and isolated kubeconfig. Never commit credentials, kubeconfigs, private logs
 or production manifests. Existing file license notices must be retained.
 
 Use the [commit message rules](docs/commits.md) for new commits and PR squash
