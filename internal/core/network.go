@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
@@ -45,7 +46,7 @@ func ReconcileNetwork(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 func reconcileService(ctx context.Context, rc *forgejo.ReconcileContext, name string, spec forgejov1.ServiceSpec, portName string, port int32) error {
 	f := rc.Instance
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: f.Namespace}}
-	err := apply(ctx, rc, svc, true, func() error {
+	err := apply(ctx, rc, svc, func() error {
 		svc.Labels = mergeMaps(svc.Labels, forgejo.Labels(f, forgejo.ComponentServer))
 		svc.Annotations = mergeMaps(svc.Annotations, spec.Annotations)
 
@@ -95,7 +96,7 @@ func reconcileIngress(ctx context.Context, rc *forgejo.ReconcileContext) error {
 		return errors.New("ingress.host is required while ingress is enabled; refusing to create or update a hostless Ingress")
 	}
 	ing := &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: forgejo.IngressName(f), Namespace: f.Namespace}}
-	err := apply(ctx, rc, ing, true, func() error {
+	err := apply(ctx, rc, ing, func() error {
 		ing.Labels = mergeMaps(ing.Labels, forgejo.Labels(f, forgejo.ComponentServer))
 		ing.Annotations = mergeMaps(ing.Annotations, spec.Annotations)
 		pathType := networkingv1.PathTypePrefix
@@ -141,7 +142,7 @@ func deleteOwned(ctx context.Context, rc *forgejo.ReconcileContext, obj client.O
 	if owner := metav1.GetControllerOf(obj); owner == nil || owner.UID != rc.Instance.UID {
 		return nil
 	}
-	if err := rc.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+	if err := rc.Client.Delete(ctx, obj, client.Preconditions{UID: ptr.To(obj.GetUID())}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("deleting %s: %w", name, err)
 	}
 	return nil

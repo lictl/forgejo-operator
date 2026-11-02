@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1004,7 +1005,8 @@ func (r *ForgejoRestoreReconciler) finalize(ctx context.Context, rs *forgejov1.F
 		case !metav1.IsControlledBy(job, rs):
 			continue // not ours: neither stop it nor wait for it
 		case job.DeletionTimestamp.IsZero():
-			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground),
+				client.Preconditions{UID: ptr.To(job.GetUID())}); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, err
 			}
 		}

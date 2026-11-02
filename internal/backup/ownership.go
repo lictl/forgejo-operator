@@ -118,14 +118,7 @@ func SyncBackupPVCOwnership(ctx context.Context, c client.Client, scheme *runtim
 // withoutInstanceRefs drops every reference to f: by UID, and to an earlier Forgejo of the
 // same name (garbage collection would delete the object once that owner is gone).
 func withoutInstanceRefs(refs []metav1.OwnerReference, f *forgejov1.Forgejo) []metav1.OwnerReference {
-	var out []metav1.OwnerReference
-	for _, r := range refs {
-		if r.UID == f.UID || IsForgejoRef(r) && r.Name == f.Name {
-			continue
-		}
-		out = append(out, r)
-	}
-	return out
+	return forgejo.WithoutInstanceRefs(refs, f)
 }
 
 func hasRefTo(refs []metav1.OwnerReference, uid types.UID) bool {

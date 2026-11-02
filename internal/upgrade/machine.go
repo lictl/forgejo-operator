@@ -437,7 +437,7 @@ func (m *machine) currentPods() ([]corev1.Pod, error) {
 				continue
 			}
 			if failing(p) {
-				if err := m.rc.Client.Delete(m.ctx, p); client.IgnoreNotFound(err) != nil {
+				if err := m.rc.Client.Delete(m.ctx, p, client.Preconditions{UID: ptr.To(p.GetUID())}); client.IgnoreNotFound(err) != nil {
 					return nil, fmt.Errorf("restarting pod %s: %w", p.Name, err)
 				}
 				continue

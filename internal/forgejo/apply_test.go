@@ -1,68 +1,103 @@
 package forgejo
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"testing"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	forgejov1 "github.com/lictl/forgejo-operator/api/v1alpha1"
 )
 
-// mapperErr answers every lookup with err, or with a mapping for served kinds.
-type mapperErr struct {
-	meta.RESTMapper
-	served map[schema.GroupVersionKind]bool
-	err    error
-}
-
-func (m *mapperErr) RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
-	if m.served[gk.WithVersion(versions[0])] {
-		return &meta.RESTMapping{}, nil
+func controlledSecret(f *forgejov1.Forgejo, owner metav1.OwnerReference, labelled bool) *corev1.Secret {
+	s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: f.Namespace}}
+	if owner.Kind != "" {
+		s.OwnerReferences = []metav1.OwnerReference{owner}
 	}
-	return nil, m.err
+	if labelled {
+		s.Labels = Labels(f, ComponentServer)
+	}
+	return s
 }
 
-// Only a NoMatch answer means "not served"; a failed discovery is an error to retry on.
-func TestAPIServed(t *testing.T) {
-	gv := schema.GroupVersion{Group: GatewayAPIGroup, Version: "v1"}
-	other := schema.GroupVersion{Group: "cert-manager.io", Version: "v1"}
-	notFound := apierrors.NewNotFound(schema.GroupResource{}, "")
-	timeout := errors.New("the server was unable to return a response in the time allotted")
+func TestControls(t *testing.T) {
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: "ns", UID: "uid-now"}}
+	forgejoRef := func(name string, uid string) metav1.OwnerReference {
+		return metav1.OwnerReference{APIVersion: forgejov1.GroupVersion.String(), Kind: "Forgejo", Name: name, UID: k8stypes.UID(uid),
+			Controller: ptr.To(true)}
+	}
 	for _, tc := range []struct {
-		name   string
-		err    error
-		served bool
-		fails  bool
+		name string
+		obj  *corev1.Secret
+		want bool
 	}{
-		{"no match", &meta.NoKindMatchError{GroupKind: HTTPRouteGVK.GroupKind()}, false, false},
-		{"wrapped no match", fmt.Errorf("x: %w", &meta.NoResourceMatchError{}), false, false},
-		{"discovery: group not found", &apiutil.ErrResourceDiscoveryFailed{gv: notFound}, false, false},
-		{"discovery: all not found", &apiutil.ErrResourceDiscoveryFailed{gv: notFound, other: &meta.NoResourceMatchError{}}, false, false},
-		// errors.Is matches when any entry is NotFound, but the other one failed.
-		{"discovery: partly failed", &apiutil.ErrResourceDiscoveryFailed{gv: notFound, other: timeout}, false, true},
-		{"timeout", timeout, false, true},
+		{"controlled by the instance", controlledSecret(f, forgejoRef("fj", "uid-now"), false), true},
+		{"controlled by an earlier Forgejo of the same name", controlledSecret(f, forgejoRef("fj", "uid-before"), false), true},
+		{"controlled by another Forgejo", controlledSecret(f, forgejoRef("other", "uid-other"), true), false},
+		{"controlled by something else", controlledSecret(f, metav1.OwnerReference{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "x", UID: "x",
+			Controller: ptr.To(true)}, true), false},
+		{"an orphan with the instance's labels", controlledSecret(f, metav1.OwnerReference{}, true), true},
+		{"nobody's and unlabelled", controlledSecret(f, metav1.OwnerReference{}, false), false},
 	} {
-		rc := &ReconcileContext{RESTMapper: &mapperErr{err: tc.err}}
-		served, err := rc.APIServed(HTTPRouteGVK)
-		if served != tc.served || (err != nil) != tc.fails {
-			t.Errorf("%s: served %v, err %v", tc.name, served, err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if got, _ := Controls(f, tc.obj); got != tc.want {
+				t.Errorf("Controls = %t, want %t", got, tc.want)
+			}
+		})
 	}
+}
 
-	// FirstServedAPI tries the versions in order and stops at a failed discovery.
-	rc := &ReconcileContext{RESTMapper: &mapperErr{served: map[schema.GroupVersionKind]bool{TCPRouteGVKs[1]: true},
-		err: &meta.NoKindMatchError{}}}
-	if gvk, ok, err := rc.FirstServedAPI(TCPRouteGVKs...); !ok || err != nil || gvk != TCPRouteGVKs[1] {
-		t.Errorf("v1alpha2 only: %v %v %v", gvk, ok, err)
+// CreateOrUpdate refuses objects the instance does not control; CreateOrAdopt also takes over
+// one that nothing controls (a Secret restored by hand), but still not another owner's.
+func TestCreateOrAdoptStillRefusesAnotherOwnersObject(t *testing.T) {
+	f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Name: "fj", Namespace: "ns", UID: "uid-now"}}
+	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatal(err)
 	}
-	rc.RESTMapper = &mapperErr{served: map[schema.GroupVersionKind]bool{TCPRouteGVKs[1]: true}, err: timeout}
-	if _, ok, err := rc.FirstServedAPI(TCPRouteGVKs...); ok || err == nil {
-		t.Errorf("failed discovery of v1: ok %v, err %v", ok, err)
+	if err := forgejov1.AddToScheme(s); err != nil {
+		t.Fatal(err)
 	}
-	if served, err := (&ReconcileContext{}).APIServed(HTTPRouteGVK); served || err != nil {
-		t.Errorf("no mapper: %v %v", served, err)
+	external := metav1.OwnerReference{APIVersion: "external-secrets.io/v1", Kind: "ExternalSecret", Name: "es", UID: "es-uid", Controller: ptr.To(true)}
+	for _, tc := range []struct {
+		name    string
+		obj     *corev1.Secret
+		adopt   bool
+		refused bool
+	}{
+		{"update an unlabelled orphan", controlledSecret(f, metav1.OwnerReference{}, false), false, true},
+		{"adopt an unlabelled orphan", controlledSecret(f, metav1.OwnerReference{}, false), true, false},
+		{"update an ExternalSecret's", controlledSecret(f, external, false), false, true},
+		{"adopt an ExternalSecret's", controlledSecret(f, external, false), true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(tc.obj).Build()
+			rc := &ReconcileContext{Client: c, Scheme: s, Instance: f}
+			sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "ns"}}
+			write := rc.CreateOrUpdate
+			if tc.adopt {
+				write = rc.CreateOrAdopt
+			}
+			_, err := write(context.Background(), sec, false, func() error { sec.Data = map[string][]byte{"k": []byte("generated")}; return nil })
+			var conflict *NameConflictError
+			if tc.refused != errors.As(err, &conflict) {
+				t.Fatalf("error %v, refused want %t", err, tc.refused)
+			}
+			got := &corev1.Secret{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(sec), got); err != nil {
+				t.Fatal(err)
+			}
+			if written := string(got.Data["k"]) == "generated"; written == tc.refused {
+				t.Errorf("object written: %t, refused: %t", written, tc.refused)
+			}
+		})
 	}
 }

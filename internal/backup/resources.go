@@ -420,9 +420,7 @@ func rateLimited(warn Warner, key string) Warner {
 // instance exactly when the policy says so.
 func setBackupPVCOwnership(pvc *corev1.PersistentVolumeClaim, f *forgejov1.Forgejo, scheme *runtime.Scheme) error {
 	if forgejo.RetainData(f) {
-		if metav1.IsControlledBy(pvc, f) {
-			return controllerutil.RemoveControllerReference(f, pvc, scheme)
-		}
+		pvc.OwnerReferences = withoutInstanceRefs(pvc.OwnerReferences, f)
 		return nil
 	}
 	return controllerutil.SetControllerReference(f, pvc, scheme)

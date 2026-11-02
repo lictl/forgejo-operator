@@ -79,8 +79,13 @@ func ListObjects(ctx context.Context, b Bucket, prefix string, limit int) ([]Obj
 		if len(out) > limit {
 			return nil, &Error{Reason: ReasonFailed, Message: fmt.Sprintf("listing %q: more than %d objects", prefix, limit)}
 		}
-		if !page.IsTruncated || page.NextContinuationToken == "" {
+		if !page.IsTruncated {
 			return out, nil
+		}
+		if page.NextContinuationToken == "" {
+			// A partial list taken for the whole would make a complete backup look incomplete,
+			// and remote retention deletes what it takes to be an incomplete one.
+			return nil, &Error{Reason: ReasonFailed, Message: fmt.Sprintf("listing %q: the answer is truncated but names no continuation token", prefix)}
 		}
 		token = page.NextContinuationToken
 	}

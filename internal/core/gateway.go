@@ -188,7 +188,7 @@ func ReconcileGateway(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		}
 	} else {
 		route, err := applyRoute(ctx, rc, forgejo.HTTPRouteGVK, forgejo.HTTPRouteName(f), httpRoute(f, hostnames))
-		var conflict *nameConflictError
+		var conflict *forgejo.NameConflictError
 		switch {
 		case errors.As(err, &conflict):
 			conflicts = append(conflicts, conflict.Error())
@@ -207,7 +207,7 @@ func ReconcileGateway(ctx context.Context, rc *forgejo.ReconcileContext) (forgej
 		}
 		if ok {
 			route, err := applyRoute(ctx, rc, tcpGVK, forgejo.SSHRouteName(f), tcpRoute(f))
-			var conflict *nameConflictError
+			var conflict *forgejo.NameConflictError
 			switch {
 			case errors.As(err, &conflict):
 				conflicts = append(conflicts, conflict.Error())
@@ -504,46 +504,11 @@ func applyRoute(ctx context.Context, rc *forgejo.ReconcileContext, gvk schema.Gr
 	return applyOptional(ctx, rc, gvk, name, spec, annotations)
 }
 
-// nameConflictError reports an object of an optional integration that has the name the
-// operator would use, but that the instance does not control. The operator neither adopts nor
-// changes it; callers report it in a condition (NameConflict) instead of failing the step.
-type nameConflictError struct {
-	kind, name string
-	// controller is the object's controller reference, nil when it has none.
-	controller *metav1.OwnerReference
-}
-
-func (e *nameConflictError) Error() string {
-	by := "it has no controller"
-	if c := e.controller; c != nil {
-		by = fmt.Sprintf("it is controlled by %s %s", c.Kind, c.Name)
-	}
-	return fmt.Sprintf("%s %s already exists and does not belong to this Forgejo (%s): the operator does not take "+
-		"over or change it. Delete it (or have its owner delete it) for the operator to create its own", e.kind, e.name, by)
-}
-
-// controlledBy reports whether the instance may write an existing optional object: it is the
-// object's controller, or the object has no controller and carries the instance's labels (it
-// was left behind when an earlier instance of this name was deleted with orphaning).
-func controlledBy(f *forgejov1.Forgejo, obj client.Object) (bool, *metav1.OwnerReference) {
-	c := metav1.GetControllerOf(obj)
-	if c != nil {
-		return c.UID == f.UID, c
-	}
-	labels := obj.GetLabels()
-	for k, v := range forgejo.Labels(f, forgejo.ComponentServer) {
-		if labels[k] != v {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
 // applyOptional creates or updates a namespaced object of an optional integration (Gateway
 // API, cert-manager), owned by the instance, whose spec is rendered from a typed mirror (a
 // pointer to a struct). It returns the object as stored, status included. An existing object
-// is only updated while the instance controls it (controlledBy); otherwise nothing is
-// written, and the error is a *nameConflictError.
+// is only updated while the instance controls it (forgejo.Controls); otherwise nothing is
+// written, and the error is a *forgejo.NameConflictError.
 func applyOptional(ctx context.Context, rc *forgejo.ReconcileContext, gvk schema.GroupVersionKind, name string,
 	spec any, annotations map[string]string) (*unstructured.Unstructured, error) {
 	f := rc.Instance
@@ -556,12 +521,7 @@ func applyOptional(ctx context.Context, rc *forgejo.ReconcileContext, gvk schema
 	obj.SetNamespace(f.Namespace)
 	obj.SetName(name)
 	optionalAbsent.Delete(optionalKey(f, gvk.GroupKind(), name))
-	err = apply(ctx, rc, obj, true, func() error {
-		if obj.GetResourceVersion() != "" {
-			if ok, c := controlledBy(f, obj); !ok {
-				return &nameConflictError{kind: gvk.Kind, name: name, controller: c}
-			}
-		}
+	err = apply(ctx, rc, obj, func() error {
 		obj.SetLabels(mergeMaps(obj.GetLabels(), forgejo.Labels(f, forgejo.ComponentServer)))
 		if a := mergeMaps(obj.GetAnnotations(), annotations); len(a) > 0 {
 			obj.SetAnnotations(a)

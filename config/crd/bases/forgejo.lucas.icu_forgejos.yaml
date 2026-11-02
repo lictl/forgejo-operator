@@ -3294,8 +3294,9 @@ spec:
                   retainPolicy:
                     default: Retain
                     description: |-
-                      retainPolicy controls whether the data PVC, backup PVC and CNPG cluster are deleted
-                      together with the Forgejo resource.
+                      retainPolicy controls whether the data PVC, backup PVC, CNPG cluster and identity Secrets
+                      are deleted together with the Forgejo resource. After switching to Retain, delete the
+                      Forgejo only once its condition RetainPolicyApplied is True.
                     enum:
                     - Retain
                     - Delete

@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -214,5 +215,5 @@ func deleteIfOwned(ctx context.Context, rc *forgejo.ReconcileContext, obj client
 	if !metav1.IsControlledBy(obj, rc.Instance) {
 		return nil
 	}
-	return forgejo.IgnoreNoMatch(client.IgnoreNotFound(rc.Client.Delete(ctx, obj)))
+	return forgejo.IgnoreNoMatch(client.IgnoreNotFound(rc.Client.Delete(ctx, obj, client.Preconditions{UID: ptr.To(obj.GetUID())})))
 }

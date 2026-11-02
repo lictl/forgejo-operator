@@ -37,21 +37,27 @@ func setOwnership(rc *forgejo.ReconcileContext, obj client.Object, owned bool) e
 	if owned {
 		return controllerutil.SetControllerReference(rc.Instance, obj, rc.Scheme)
 	}
-	refs := obj.GetOwnerReferences()
-	kept := refs[:0]
-	for _, r := range refs {
-		if r.UID != rc.Instance.UID {
-			kept = append(kept, r)
-		}
-	}
-	obj.SetOwnerReferences(kept)
+	obj.SetOwnerReferences(forgejo.WithoutInstanceRefs(obj.GetOwnerReferences(), rc.Instance))
 	return nil
 }
 
 // apply creates or updates obj and logs changes. Ownership is handled by the mutate
 // function (see setOwnership) so that it can also be removed.
-func apply(ctx context.Context, rc *forgejo.ReconcileContext, obj client.Object, owned bool, mutate func() error) error {
-	op, err := rc.CreateOrUpdate(ctx, obj, false, func() error {
+func apply(ctx context.Context, rc *forgejo.ReconcileContext, obj client.Object, mutate func() error) error {
+	return applyWith(ctx, rc, rc.CreateOrUpdate, obj, true, mutate)
+}
+
+// applyAdopting is apply for the objects a person may put in place on purpose to recover an
+// instance (identity Secrets, the data volume, the CNPG cluster): an existing one that
+// nothing controls is taken over as it is, where apply refuses to touch it.
+func applyAdopting(ctx context.Context, rc *forgejo.ReconcileContext, obj client.Object, owned bool, mutate func() error) error {
+	return applyWith(ctx, rc, rc.CreateOrAdopt, obj, owned, mutate)
+}
+
+type createOrUpdateFunc func(context.Context, client.Object, bool, func() error) (controllerutil.OperationResult, error)
+
+func applyWith(ctx context.Context, rc *forgejo.ReconcileContext, write createOrUpdateFunc, obj client.Object, owned bool, mutate func() error) error {
+	op, err := write(ctx, obj, false, func() error {
 		if err := mutate(); err != nil {
 			return err
 		}

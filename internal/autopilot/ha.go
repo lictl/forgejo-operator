@@ -763,7 +763,8 @@ func deleteOwned(ctx context.Context, rc *forgejo.ReconcileContext, key client.O
 	if !metav1.IsControlledBy(obj, rc.Instance) {
 		return false, nil
 	}
-	if err := rc.Client.Delete(ctx, obj, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+	if err := rc.Client.Delete(ctx, obj, client.PropagationPolicy(metav1.DeletePropagationBackground),
+		client.Preconditions{UID: ptr.To(obj.GetUID())}); err != nil {
 		return false, client.IgnoreNotFound(err)
 	}
 	return true, nil

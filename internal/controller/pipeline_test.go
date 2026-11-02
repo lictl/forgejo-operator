@@ -13,6 +13,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -91,9 +92,9 @@ func TestPipelineValkeyStop(t *testing.T) {
 	})
 	rc := newRC()
 	p := runPipeline(context.Background(), rc, st)
-	want := []string{stepMaintenance, stepRestoreGuard, stepRestoreIdentity, stepIdentity, stepSecrets, stepBackupOwnership, stepDatabaseUpgrade, stepDatabase, stepHighAvailability,
-		stepSSHHostKeys, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepBackupSchedule, stepHealth, stepValkeyStatus,
-		stepStorageAutopilot}
+	want := []string{stepMaintenance, stepRestoreGuard, stepRestoreIdentity, stepIdentity, stepSecrets, stepBackupOwnership, stepOwnership, stepDatabaseUpgrade,
+		stepDatabase, stepHighAvailability, stepSSHHostKeys, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepBackupSchedule, stepHealth,
+		stepValkeyStatus, stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
 		t.Errorf("ran %v, want %v", *ran, want)
 	}
@@ -206,6 +207,90 @@ func TestPipelineStorageAndOwnershipRunWhenDatabaseStops(t *testing.T) {
 	}
 }
 
+// The retain policy must reach the data volume, the cluster and the identity Secrets whatever
+// else happens: a Broken instance (the identity step stops), a database that cannot start and
+// a failing step before it.
+func TestPipelineOwnershipRunsWhenTheChainStops(t *testing.T) {
+	for name, tc := range map[string]struct {
+		step   string
+		result forgejo.StepResult
+		err    error
+	}{
+		"identity stops (Broken)": {step: stepIdentity, result: forgejo.StepResult{Stop: true, RequeueAfter: time.Minute}},
+		"database stops":          {step: stepDatabase, result: forgejo.StepResult{Stop: true}},
+		"secrets fail":            {step: stepSecrets, err: errors.New("admin.existingSecret is missing")},
+		// A conflict in any step ends the pass: the ownership step is early enough not to depend on it.
+		"a later step conflicts": {step: stepWorkload, err: apierrors.NewConflict(schema.GroupResource{Resource: "deployments"}, "fj", errors.New("changed"))},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st, _ := stubSteps(func(step string, _ *forgejo.ReconcileContext) (forgejo.StepResult, error) {
+				if step == tc.step {
+					return tc.result, tc.err
+				}
+				return forgejo.StepResult{}, nil
+			})
+			if p := runPipeline(context.Background(), newRC(), st); !p.completed[stepOwnership] {
+				t.Errorf("%s did not complete: skipped %v failed %v", stepOwnership, p.skipped, p.failed)
+			}
+		})
+	}
+}
+
+func ownerRefTo(f *forgejov1.Forgejo) []metav1.OwnerReference {
+	yes := true
+	return []metav1.OwnerReference{{APIVersion: forgejov1.GroupVersion.String(), Kind: "Forgejo", Name: f.Name, UID: f.UID,
+		Controller: &yes, BlockOwnerDeletion: &yes}}
+}
+
+// Switching a Forgejo from retainPolicy Delete to Retain protects its data volume even when the
+// instance cannot run the steps that own it: paused, or Broken because the identity Secret is
+// gone (the case in which deleting the Forgejo is the documented way out). Reproduces the loss
+// of the repositories by garbage collection that the owning steps alone left open.
+func TestRetainPolicyReachesTheDataVolumeOfPausedAndBrokenInstances(t *testing.T) {
+	for name, tc := range map[string]struct {
+		paused bool
+		image  string
+	}{
+		"paused": {paused: true},
+		// status.image is set: the instance has run, and without Secret fj-secrets the identity
+		// step reports Broken and stops the chain.
+		"broken": {image: "codeberg.org/forgejo/forgejo:15"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			const ns = "retain-test"
+			f := &forgejov1.Forgejo{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "fj", UID: "fj-uid"},
+				Spec: forgejov1.ForgejoSpec{Paused: tc.paused}}
+			f.Status.Image = tc.image
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: forgejo.DataPVCName(f),
+				OwnerReferences: ownerRefTo(f)}}
+			s := testScheme(t)
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(f, pvc).WithStatusSubresource(f).Build()
+			r := &ForgejoReconciler{Client: c, Scheme: s}
+			key := types.NamespacedName{Namespace: ns, Name: f.Name}
+			// Errors of unrelated steps do not matter; the data volume does.
+			_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+
+			got := &corev1.PersistentVolumeClaim{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(pvc), got); err != nil {
+				t.Fatal(err)
+			}
+			if forgejo.HasInstanceRef(got.OwnerReferences, f) {
+				t.Fatalf("the data volume still belongs to the Forgejo: %+v", got.OwnerReferences)
+			}
+			fj := &forgejov1.Forgejo{}
+			if err := c.Get(context.Background(), key, fj); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.paused && !meta.IsStatusConditionTrue(fj.Status.Conditions, forgejov1.ConditionBroken) {
+				t.Fatalf("the instance is not Broken, so the test does not cover that case: %+v", fj.Status.Conditions)
+			}
+			if !meta.IsStatusConditionTrue(fj.Status.Conditions, forgejov1.ConditionRetainPolicyApplied) {
+				t.Errorf("RetainPolicyApplied is not True: %+v", fj.Status.Conditions)
+			}
+		})
+	}
+}
+
 // Even when the very first step fails, the steps without prerequisites run, and a step it
 // blocks through the chain names that failure.
 func TestPipelineStepsWithoutNeedsRunAfterMaintenanceError(t *testing.T) {
@@ -216,8 +301,8 @@ func TestPipelineStepsWithoutNeedsRunAfterMaintenanceError(t *testing.T) {
 		return forgejo.StepResult{}, nil
 	})
 	p := runPipeline(context.Background(), newRC(), st)
-	want := []string{stepMaintenance, stepBackupOwnership, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepValkeyStatus,
-		stepStorageAutopilot}
+	want := []string{stepMaintenance, stepBackupOwnership, stepOwnership, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring,
+		stepValkeyStatus, stepStorageAutopilot}
 	if !slices.Equal(*ran, want) {
 		t.Errorf("ran %v, want %v", *ran, want)
 	}
@@ -244,7 +329,8 @@ func TestStepTable(t *testing.T) {
 		byName[s.name] = s
 		order[s.name] = i
 	}
-	for _, name := range []string{stepBackupOwnership, stepStorageAutopilot, stepObjectStorage, stepNetwork, stepGateway, stepTLS, stepMonitoring, stepMaintenance} {
+	for _, name := range []string{stepBackupOwnership, stepOwnership, stepStorageAutopilot, stepObjectStorage, stepNetwork, stepGateway, stepTLS,
+		stepMonitoring, stepMaintenance} {
 		s, ok := byName[name]
 		if !ok {
 			t.Fatalf("step %q missing", name)
@@ -281,6 +367,7 @@ func TestStepTable(t *testing.T) {
 	}
 	for name, want := range map[string]string{
 		stepBackupOwnership:  "internal/backup.ReconcileOwnership",
+		stepOwnership:        "internal/core.ReconcileOwnership",
 		stepStorageAutopilot: "internal/autopilot.ReconcileStorage",
 		stepStorage:          "internal/core.ReconcileStorage",
 		stepObjectStorage:    "internal/core.ReconcileObjectStorage",

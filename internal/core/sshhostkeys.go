@@ -248,7 +248,7 @@ func adoptHostKeysSecret(ctx context.Context, rc *forgejo.ReconcileContext, sec 
 		return false, nil
 	}
 	obj := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sec.Name, Namespace: sec.Namespace}}
-	return false, apply(ctx, rc, obj, rc.OwnerRefsEnabled(), func() error {
+	return false, applyAdopting(ctx, rc, obj, rc.OwnerRefsEnabled(), func() error {
 		obj.Labels = mergeMaps(obj.Labels, want)
 		return nil
 	})
