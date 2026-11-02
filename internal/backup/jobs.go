@@ -265,6 +265,8 @@ func newJob(in JobInput, namespace, name, component string, affinity *corev1.Aff
 		AutomountServiceAccountToken: ptr.To(false),
 	}
 	if f := in.Instance; f != nil {
+		// The account may provide registry credentials. Its API token stays unmounted.
+		spec.ServiceAccountName = f.Spec.PodTemplate.ServiceAccountName
 		spec.ImagePullSecrets = f.Spec.ImagePullSecrets
 		spec.Tolerations = f.Spec.PodTemplate.Tolerations
 		spec.NodeSelector = f.Spec.PodTemplate.NodeSelector

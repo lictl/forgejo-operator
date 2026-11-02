@@ -25,6 +25,12 @@ Jobs are deleted once the result is recorded in status. So has `ForgejoRunner`
 (`internal/controller/forgejorunner_controller.go`, backed by `internal/runner`; see
 [ForgejoRunner](#forgejorunner)).
 
+Backup, cleanup, upload and restore Jobs inherit
+`spec.podTemplate.serviceAccountName` from an available instance, so Kubernetes can
+supply its registry credentials when no explicit image pull secrets are set. Explicit
+`spec.imagePullSecrets` are preserved, and every Job disables automatic service account
+token mounting.
+
 ### Validation
 
 Mistakes that the operator could only report later (as `Degraded`, a failed child object or a
