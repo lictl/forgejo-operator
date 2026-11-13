@@ -2,7 +2,9 @@ Thank you for installing {{ .Chart.Name }}.
 
 Your release is named {{ .Release.Name }}.
 
-The controller and CRDs have been installed in namespace {{ .Release.Namespace }}.
+The controller has been installed in namespace {{ .Release.Namespace }}. Helm installs the
+CRDs of a chart only on its first installation and never upgrades them: before upgrading, apply the
+CRDs of the new version (helm show crds <chart> --version <version> | kubectl apply -f -).
 
 To verify the installation:
 

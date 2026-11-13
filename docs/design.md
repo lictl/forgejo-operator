@@ -629,8 +629,9 @@ that do not use a feature cost no request per pass.
 Both registry release workflows preserve the gate from their own source revision
 before checking out a release tag. They refuse to invoke that tag's `hack/release.sh`
 until the tagged commit is in canonical GitHub `main` history and its required
-GitHub workflows and latest-attempt jobs have succeeded; old tags cannot remove
-the workflow's policy. Forgejo's manual CI is
+GitHub workflows and latest-attempt jobs have succeeded. On a manual dispatch from `main`
+an old tag cannot remove the workflow's policy; on a tag push the policy is the tagged
+commit's own workflow file. Forgejo's manual CI is
 diagnostic only. Missing or unreadable evidence fails closed; the shared gate
 and its offline tests are described in the [release runbook](release.md#exact-commit-ci-gate).
 

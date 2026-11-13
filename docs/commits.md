@@ -49,7 +49,7 @@ are chosen deliberately by the maintainer.
 changelog draft since the most recent reachable `v*` tag. Use `--base <ref>`
 to choose a different starting commit. Nonconforming and older commits go
 under Other changes for manual review. Check the draft against actual behavior,
-edit it into `CHANGELOG.md`, and verify the SemVer choice. The manual release
-workflow publishes the reviewed `CHANGELOG.md` section; it does not read
-commit prefixes or GitHub PR labels directly. No commit-message enforcement,
+edit it into `CHANGELOG.md` under `## vX.Y.Z`, and verify the SemVer choice. The
+release scripts refuse to run without that reviewed section, and it is the text of the
+prereleases; nothing reads commit prefixes or GitHub PR labels directly. No commit-message enforcement,
 automatic version bump or automatic release trigger is configured.

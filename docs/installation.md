@@ -1,8 +1,8 @@
 # Installation
 
-The first tagged candidate is `v0.1.0-rc.1` (Chart version `0.1.0-rc.1`).
-Use a published Chart version in these commands; do not substitute an
-unverified `latest` tag. Release candidates need evaluation before production use.
+Releases are release candidates (see the [releases](https://github.com/lictl/forgejo-operator/releases));
+the Chart version is the release without its `v`. Use a published Chart version in these commands; do not
+substitute an unverified `latest` tag. Release candidates need evaluation before production use.
 
 The operator needs Kubernetes 1.30 or newer and a CloudNativePG installation for
 operator-managed PostgreSQL. Check the [version policy](versions.md) and your

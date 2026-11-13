@@ -17,9 +17,9 @@ manager:
 
   image:
     repository: ghcr.io/lictl/forgejo-operator
-    ## Image tag (defaults to Chart.appVersion if not set)
+    ## Image tag. Not set: the controller image of the chart's own version (Chart.appVersion).
     ##
-    tag: "v0.1.0-rc.1"
+    # tag: ""
     pullPolicy: IfNotPresent
 
   ## Arguments
