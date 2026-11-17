@@ -35,13 +35,13 @@ for record in raw.split('\x1e'):
         continue
     subject, _, body = record.strip().partition('\x1f')
     match = subject_pattern.fullmatch(subject)
-    breaking_footer = re.search(r'(?m)^BREAKING(?:-| )CHANGE: (.+)$', body)
+    breaking_footer = re.search(r'(?ms)^BREAKING(?:-| )CHANGE: (.+?)(?:\n\n|\Z)', body)
     if match:
         kind, scope, bang, summary = match.groups()
         item = f'{summary} (`{scope}`)' if scope else summary
         if bang or breaking_footer:
             if breaking_footer:
-                item += f' — {breaking_footer.group(1)}'
+                item += ' — ' + ' '.join(breaking_footer.group(1).split())
             sections['Breaking changes'].append(item)
         elif kind == 'feat':
             sections['Features'].append(item)

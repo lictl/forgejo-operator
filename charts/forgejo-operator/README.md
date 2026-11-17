@@ -5,7 +5,7 @@ Forgejo instance or CloudNativePG. The [installation guide](https://github.com/l
 lists prerequisites and a first instance example; the [configuration guide](https://github.com/lictl/forgejo-operator/blob/main/docs/configuration.md)
 explains controller image, RBAC and optional integrations.
 
-Once a version has been released:
+Install a released version:
 
 ```sh
 helm upgrade --install forgejo-operator \
